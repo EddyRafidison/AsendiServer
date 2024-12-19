@@ -517,7 +517,8 @@ app.post("/app/transfer", function(req, res) {
         amount,
         tkn
     } = req.body;
-    //amount must be in SU
+    //amount must be sent or received as SU by client
+    //but received as bipolary unit by the server: SU and Ar
     var p = 1;
     var type = 1; //transfer between customers only
     const Sender = ('' + sender).replaceAll(' ',
@@ -565,9 +566,11 @@ app.post("/app/transfer", function(req, res) {
                             var maxStockDefault = 2000000;
                             var maxStockDistr = 5000000;
                             var reference = createTransactionId(Sender);
-                            var fees = (Amount*tfees)/100; //fees
+                            var fees = (Amount*tfees)/100; // total fees to pay by client
                             var minRequiredSenderBal = Amount + fees;
-                            var halfFees = fees/2; //this is back to the whole user as interest
+                            var sharedFees = (fees*3)/4; //These are restocked as Ar in the common stock but shared as SU to the global users in form of interests.
+                            var admin_fees = fees - sharedFees; //the admin hold the Ar real value as his. The value of SU is return to the common stock to be sold again.
+                            //All fees cannot be burnt. They return only to the common stock before anyone buys them again.
                             con.promise("SELECT password FROM auths WHERE username = ?;",
                                 [Sender])
                             .then((result) => DecryptText(result[0].password, password))
@@ -666,7 +669,7 @@ app.post("/app/transfer", function(req, res) {
                                                                                                             if (typeof(Number(data[0])) == 'number') {
                                                                                                                 var lastStock = BigNumber(data[0]);
                                                                                                                 var lastPrice = Number(data[1]);
-                                                                                                                var new_stock = lastStock.plus(halfFees);
+                                                                                                                var new_stock = lastStock.plus(sharedFees); //added as Ar
                                                                                                                 var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
                                                                                                                 connection.query(`INSERT INTO common (stock,kprice,ddate,dtime) values(?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price), date[0], date[1]], function(error, _results, _fields) {
                                                                                                                     if (error) {
@@ -789,7 +792,7 @@ app.post("/app/transfer", function(req, res) {
                                                                                                 if (typeof(Number(data[0])) == 'number') {
                                                                                                     var lastStock = BigNumber(data[0]);
                                                                                                     var lastPrice = Number(data[1]);
-                                                                                                    var new_stock = lastStock.plus(halfFees);
+                                                                                                    var new_stock = lastStock.plus(sharedFees); //added as Ar
                                                                                                     var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
                                                                                                     connection.query(`INSERT INTO common (stock,kprice,ddate,dtime) values(?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price), date[0], date[1]], function(error, _results, _fields) {
                                                                                                         if (error) {
@@ -1248,7 +1251,7 @@ app.post("/app/signup",
         const geo = geoip.lookup(userIp);
         if (geo) {
         var country = geo.country;
-        if(country == 'MG'){
+        if(country == 'MG' || userIp.includes('127.0.0.1')){
         const Email = ('' + (email)).replaceAll(' ',
             '+');
         const Birth = ('' + (birth)).replaceAll(' ',
