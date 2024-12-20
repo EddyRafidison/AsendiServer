@@ -71,16 +71,16 @@ const server = app.listen(SERV_PORT, function() {
 });
 server.setTimeout(120000);
 function initiateDbIfEmpty() {
-    //check if ADMIN exists
+    //check if Admin exists
     const date = getDate();
-    con.promise("SELECT id FROM users_su WHERE username = ?;", ['ADMIN'])
+    con.promise("SELECT id FROM users_su WHERE username = ?;", ['Admin'])
     .then((result) => result[0].id)
     .then((data) => {
         if (typeof(Number(data)) != 'number') {
             console.log('id is not a number');
         }
     }).catch((_error) => {
-        console.log('ADMIN not ready, create db data now');
+        console.log('Admin not ready, create db data now');
         let tables = [AUTHS,
             ACTIVITIES,
             COMMON,
@@ -91,9 +91,9 @@ function initiateDbIfEmpty() {
             con.query(table, function(err, _result) {
                 if (err) console.log(table + ' NOT CREATED');
                 if (table == USERS_SU) {
-                    con.query(AdminStock, ['ADMIN', '0', date[0], date[1]], function(err, _result) {
-                        if (err) console.log('cannot add user ADMIN');
-                        console.log('ADMIN is ready');
+                    con.query(AdminStock, ['Admin', '0', date[0], date[1]], function(err, _result) {
+                        if (err) console.log('cannot add user Admin');
+                        console.log('Admin is ready');
                         con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [''+stock_limit, '1','0', date[0], date[1]], function(error, _results, _fields) {
                             //total_su_prices is set to stock_limit. That means 1 SU = 1 Ar.
                             if (error) {
@@ -306,7 +306,7 @@ con.promise = (sql, param) => {
     });
 };
 
-app.post("/admin/setcat", function(req, res) {
+app.post("/Admin/setcat", function(req, res) {
     const {
         pswd, pin, user, catg
     } = req.body;
@@ -333,8 +333,8 @@ app.post("/admin/setcat", function(req, res) {
             }}}
 });
 
-app.post("/admin/addfeed", function(req, res) {
-    //optional, as wished by admin
+app.post("/Admin/addfeed", function(req, res) {
+    //optional, as wished by Admin
     const {
         pswd, pin, content
     } = req.body;
@@ -359,7 +359,7 @@ app.post("/admin/addfeed", function(req, res) {
 });
 
 app.post("/app/feed", function(req, res) {
-    //optional, as wished by admin
+    //optional, as wished by Admin
     const {
         user,
         pswd,
@@ -403,7 +403,7 @@ app.post("/app/feed", function(req, res) {
     }
 });
 
-app.post("/admin/update", function(req, res) {
+app.post("/Admin/update", function(req, res) {
     const {
         pswd, pin, amount, create
     } = req.body;
@@ -552,12 +552,12 @@ app.post("/app/transfer", function(req, res) {
         .then((data) => {
             const category = Number(data);
             if (category > 0) {
-                if (category == 2 && Dest == 'ADMIN') {
-                    //ADMIN is the server account name
+                if (category == 2 && Dest == 'Admin') {
+                    //Admin is the server account name
                     //category 2 for distributor
-                    type = 2; //for back type transfer (from distributor to admin)
+                    type = 2; //for back type transfer (from distributor to Admin)
                 }
-                if (category == 1 && Dest == 'ADMIN') {
+                if (category == 1 && Dest == 'Admin') {
                     res.send({
                         transf: 'unsupported'
                     });
@@ -578,7 +578,7 @@ app.post("/app/transfer", function(req, res) {
                             var fees = (Amount*tfees)/100; // total fees to pay by client
                             var minRequiredSenderBal = Amount + fees;
                             var sharedFees = (fees*3)/4; //These are restocked as Ar in the common total_su_prices but shared as SU to the global users in form of interests.
-                            var admin_fees = fees - sharedFees; //the admin hold the Ar real value as his. The value of SU is return to the common total_su_prices to be sold again.
+                            var admin_fees = fees - sharedFees; //the Admin hold the Ar real value as his. The value of SU is return to the common total_su_prices to be sold again.
                             //All fees cannot be burnt. They return only to the common total_su_prices before anyone buys them again.
                             con.promise("SELECT password FROM auths WHERE username = ?;",
                                 [Sender])
@@ -597,9 +597,9 @@ app.post("/app/transfer", function(req, res) {
                                                     destBal = Number(data);
                                                     if (typeof(destBal) == 'number') {
                                                         const futurDestBal = destBal + Amount;
-                                                        const AdminFuturBal = destBal + admin_fees; // the admin receives the 1/4 of the fees as real cash and
+                                                        const AdminFuturBal = destBal + admin_fees; // the Admin receives the 1/4 of the fees as real cash and
                                                         //back the equivalent SU value to the public stock to be sold again globally
-                                                        if (Dest != 'ADMIN') {
+                                                        if (Dest != 'Admin') {
                                                             con.promise("SELECT category FROM auths WHERE username = ?;",
                                                                 [Dest]).then((result)=> result[0].category)
                                                             .then((data) => {
@@ -806,7 +806,7 @@ app.post("/app/transfer", function(req, res) {
                                                                                                     var lastStock = BigNumber(data[0]);
                                                                                                     var lastPrice = Number(data[1]);
                                                                                                     var backed_su = Number(data[2]);
-                                                                                                    var total_backed = Amount + backed_su + fees; // the Amount is added to the backed_su instead of updating the admin balance
+                                                                                                    var total_backed = Amount + backed_su + fees; // the Amount is added to the backed_su instead of updating the Admin balance
                                                                                                     var new_stock = lastStock.plus(sharedFees); //added as Ar
                                                                                                     var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
                                                                                                     connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price),('' + total_backed), date[0], date[1]], function(error, _results, _fields) {
