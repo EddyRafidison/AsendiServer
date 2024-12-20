@@ -78,6 +78,8 @@ function initiateDbIfEmpty() {
     .then((data) => {
         if (typeof(Number(data)) != 'number') {
             console.log('id is not a number');
+        }else{
+            console.log(data);
         }
     }).catch((_error) => {
         console.log('Admin not ready, create db data now');
