@@ -22,21 +22,21 @@ id INT AUTO_INCREMENT PRIMARY KEY,
 username VARCHAR(30) NOT NULL,
 password VARCHAR(255) NOT NULL,
 name VARCHAR(50) NOT NULL, email VARCHAR(50) NOT NULL,
-birthdate VARCHAR(20) NOT NULL, cin VARCHAR(255) NOT NULL, address VARCHAR(50) NOT NULL, sk TEXT NOT NULL, category INT, ddate INT, dtime VARCHAR(10)
+birthdate VARCHAR(20) NOT NULL, cin VARCHAR(255) NOT NULL, address VARCHAR(50) NOT NULL, secret_word TEXT NOT NULL, category INT, deliver_date INT, deliver_time VARCHAR(10)
 );`;
-const stocksTbl = `CREATE TABLE IF NOT EXISTS stocks (
+const users_suTbl = `CREATE TABLE IF NOT EXISTS users_su (
 id INT AUTO_INCREMENT PRIMARY KEY,
-username VARCHAR(30) NOT NULL, balance VARCHAR(255), ddate INT, dtime VARCHAR (10)
+username VARCHAR(30) NOT NULL, balance VARCHAR(255) DEFAULT '0', deliver_date INT, deliver_time VARCHAR (10)
 );`;
-const adminStock = `INSERT INTO stocks (username, balance, ddate, dtime) VALUES (?,?,?,?);`;
+const adminStock = `INSERT INTO users_su (username, balance, deliver_date, deliver_time) VALUES (?,?,?,?);`;
 const activitiesTbl = `CREATE TABLE IF NOT EXISTS activities (
 id INT AUTO_INCREMENT PRIMARY KEY,
 sender VARCHAR(30) NOT NULL, receiver VARCHAR(30) NOT NULL,
 type INT,
-amount VARCHAR(30) NOT NULL, kprice VARCHAR(255) NOT NULL, fees VARCHAR(30), reference VARCHAR(20), ddate INT, dtime VARCHAR(10)
+amount VARCHAR(30) NOT NULL, su_price VARCHAR(255) DEFAULT '0', fees VARCHAR(30) DEFAULT '0', reference VARCHAR(20), deliver_date INT, deliver_time VARCHAR(10)
 );`;
-const notifsTbl = `CREATE TABLE IF NOT EXISTS notifs (id INT AUTO_INCREMENT PRIMARY KEY, content TEXT, ddate INT, dtime VARCHAR(10));`;
-const commonTbl = `CREATE TABLE IF NOT EXISTS common (id INT AUTO_INCREMENT PRIMARY KEY, stock VARCHAR(255) NOT NULL, kprice VARCHAR(255) NOT NULL, ddate INT, dtime VARCHAR(10));`;
+const notifsTbl = `CREATE TABLE IF NOT EXISTS notifs (id INT AUTO_INCREMENT PRIMARY KEY, content TEXT, deliver_date INT, deliver_time VARCHAR(10));`;
+const commonTbl = `CREATE TABLE IF NOT EXISTS common (id INT AUTO_INCREMENT PRIMARY KEY, total_su_prices VARCHAR(255) DEFAULT '0', su_price VARCHAR(255) DEFAULT '0', backed_su VARCHAR(255) DEFAULT '0', deliver_date INT, deliver_time VARCHAR(10));`;
 var hostname = process.env.DB_HOST;
 var database = process.env.DB_NAME;
 var username = "";
@@ -50,7 +50,7 @@ const MAIL_PORT = process.env.MAIL_PORT;
 const SERV_PORT = process.env.SERVER_PORT;
 const admin_pswd = process.env.ADMIN_PSWD;
 const admin_pin = process.env.ADMIN_PIN;
-const stock_div = 2000000;
+const stock_limit = 2000000;
 const app_version = process.env.APP_VERSION;
 const tfees = process.env.FEES;
 const first_welcome_clients = 2000;
@@ -73,7 +73,7 @@ server.setTimeout(120000);
 function initiateDbIfEmpty() {
     //check if ADMIN exists
     const date = getDate();
-    con.promise("SELECT id FROM stocks WHERE username = ?;", ['ADMIN'])
+    con.promise("SELECT id FROM users_su WHERE username = ?;", ['ADMIN'])
     .then((result) => result[0].id)
     .then((data) => {
         if (typeof(Number(data)) != 'number') {
@@ -85,17 +85,17 @@ function initiateDbIfEmpty() {
             activitiesTbl,
             commonTbl,
             notifsTbl,
-            stocksTbl];
+            users_suTbl];
         for (let i = 0; i < tables.length; i++) {
             let table = tables[i];
             con.query(table, function(err, _result) {
                 if (err) console.log(table + ' NOT CREATED');
-                if (table == stocksTbl) {
+                if (table == users_suTbl) {
                     con.query(adminStock, ['ADMIN', '0', date[0], date[1]], function(err, _result) {
                         if (err) console.log('cannot add user ADMIN');
                         console.log('ADMIN is ready');
-                        con.query(`INSERT INTO common (stock,kprice,ddate,dtime) values(?,?,?,?);`, [''+stock_div, '1', date[0], date[1]], function(error, _results, _fields) {
-                            //stock is set to stock_div. That means 1 SU = 1 Ar.
+                        con.query(`INSERT INTO common (total_su_prices,su_price,deliver_date,deliver_time) values(?,?,?,?);`, [''+stock_limit, '1', date[0], date[1]], function(error, _results, _fields) {
+                            //total_su_prices is set to stock_limit. That means 1 SU = 1 Ar.
                             if (error) {
                                 console.log('set first price failed');
                             } else {
@@ -151,6 +151,14 @@ function readFileSync(filePath) {
     });
 }
 
+app.use((req, res, next) => {
+    if(req.protocol !== 'https'){
+        if(!server_mail.includes('@gmail')){
+        return res.redirect('https://' + req.headers.host + req.url);
+        }
+    }
+next();
+});
 
 app.get("/app/info", function(req, res) {
     const r = req.query.r;
@@ -266,12 +274,12 @@ con.getConnection((err, connection) => {
     initiateDbIfEmpty();
     setInterval(()=> {
         let date = getDateBefore(7)[0];
-        con.promise("SELECT username FROM auths WHERE (category = ? AND ddate = ?);", [0, date])
+        con.promise("SELECT username FROM auths WHERE (category = ? AND deliver_date = ?);", [0, date])
         .then((result) => result)
         .then((data) => {
             for (let i = 0; i < data.length; i++) {
                 let client = data[i].username;
-                con.query("DELETE FROM stocks WHERE username = ?; DELETE FROM auths WHERE username = ?;", [client, client], function(err, _result) {
+                con.query("DELETE FROM users_su WHERE username = ?; DELETE FROM auths WHERE username = ?;", [client, client], function(err, _result) {
                     if (err) console.log(client + ' not deleted');
                     console.log(client + ' deleted');
                 });
@@ -335,7 +343,7 @@ app.post("/admin/addfeed", function(req, res) {
     const date = getDate();
     if (pswd == DecryptText(admin_pswd, password)) {
         if (pin == DecryptText(admin_pin, password)) {
-            con.query('INSERT INTO notifs (content, ddate, dtime) VALUES (?,?,?);', [Content, date[0], date[1]], function(err, _result) {
+            con.query('INSERT INTO notifs (content, deliver_date, deliver_time) VALUES (?,?,?);', [Content, date[0], date[1]], function(err, _result) {
                 if (err) {
                     res.send({
                         error: 'error'
@@ -371,7 +379,7 @@ app.post("/app/feed", function(req, res) {
     .then((result) => DecryptText(result[0].password, password))
     .then((data) => {
         if (data == Pswd) {
-            con.promise("SELECT * FROM notifs WHERE ddate = ? ORDER BY id DESC;", [date])
+            con.promise("SELECT * FROM notifs WHERE deliver_date = ? ORDER BY id DESC;", [date])
             .then((result) => result)
             .then((data) => {
                 res.send({
@@ -401,32 +409,33 @@ app.post("/admin/update", function(req, res) {
     } = req.body;
     const date = getDate();
     var new_price = 1;
-    //amount must be in ariary and MAYBE A NEGATIVE NUMBER if burn type transfer
+    //amount must be calculated as 1AR = 1SU
     if (pswd == DecryptText(admin_pswd, password)) {
         if (pin == DecryptText(admin_pin, password)) {
-            con.promise("SELECT stock,kprice FROM common ORDER BY id DESC LIMIT 1;",
+            con.promise("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
                 [])
-            .then((result) => [result[0].stock, result[0].kprice])
+            .then((result) => [result[0].total_su_prices, result[0].su_price, result[0].backed_su])
             .then((data) => {
                 if (typeof(Number(data[0])) == 'number') {
                     var lastStock = BigNumber(data[0]);
                     lastPrice = Number(data[1]);
-                    var new_stock = lastStock.plus(Number(amount)/lastPrice); //into SU
-                    if (create == '0') {
-                        //do not create new SU packet
-                        new_price = lastPrice;
-                    } else {
-                        //create new SU packet
+                    var backed_su = Number(data[2]);
+                    var Amount = Number(amount) / lastPrice;
+                    var new_stock = lastStock.plus(Amount); //into SU
+                    if(Amount <= backed_su){ //Amount must be lower or equal to backed_su for the update will be successful
+                    if (create == '0') { // DO NOT CREATE NEW SU. THE LIMIT HAS BEEN SET PRIMARILY
                         new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
                     }
-                    con.query(`INSERT INTO common (stock,kprice,ddate,dtime) values(?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price), date[0], date[1]], function(error, _results, _fields) {
+                    con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price),(''+ backed_su), date[0], date[1]], function(error, _results, _fields) {
                         if (error) {
                             throw error;
                         } else {
                             res.send({
-                                stock: 'updated'
+                                total_su_prices: 'updated'
                             });
-                        }});
+                        }});}else{
+                            res.send({limit : ''+backed_su});
+                        }
                 } else {
                     res.send({
                         error: 'type error'
@@ -468,13 +477,13 @@ app.post("/app/balance", function(req, res) {
     .then((result) => DecryptText(result[0].password, password))
     .then((data) => {
         if (data == Pswd) {
-            con.promise("SELECT MAX(kprice+0) AS kprice FROM common;",
+            con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
                 [])
-            .then((result) => result[0].kprice)
+            .then((result) => result[0].su_price)
             .then((data) => {
                 if (typeof(Number(data)) == 'number') {
                     price = Number(data);
-                    con.promise("SELECT balance FROM stocks WHERE username = ?;", [User])
+                    con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
                     .then((result) => result[0].balance)
                     .then((data) => {
                         var bal = Number(data) * price;
@@ -546,16 +555,16 @@ app.post("/app/transfer", function(req, res) {
                 if (category == 2 && Dest == 'ADMIN') {
                     //ADMIN is the server account name
                     //category 2 for distributor
-                    type = 2; //for burning type transfer (from distributor to admin)
+                    type = 2; //for back type transfer (from distributor to admin)
                 }
                 if (category == 1 && Dest == 'ADMIN') {
                     res.send({
                         transf: 'unsupported'
                     });
                 } else {
-                    con.promise("SELECT MAX(kprice+0) AS kprice FROM common;",
+                    con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
                         [])
-                    .then((result) => result[0].kprice)
+                    .then((result) => result[0].su_price)
                     .then((data) => {
                         if (typeof(Number(data)) == 'number') {
                             p = Number(data);
@@ -563,31 +572,33 @@ app.post("/app/transfer", function(req, res) {
                             var senderBal;
                             var destBal;
                             var date = getDate();
-                            var maxStockDefault = 2000000;
-                            var maxStockDistr = 5000000;
+                            var maxStockDefault = 2000000; //client side unit
+                            var maxStockDistr = 5000000; //client side unit
                             var reference = createTransactionId(Sender);
                             var fees = (Amount*tfees)/100; // total fees to pay by client
                             var minRequiredSenderBal = Amount + fees;
-                            var sharedFees = (fees*3)/4; //These are restocked as Ar in the common stock but shared as SU to the global users in form of interests.
-                            var admin_fees = fees - sharedFees; //the admin hold the Ar real value as his. The value of SU is return to the common stock to be sold again.
-                            //All fees cannot be burnt. They return only to the common stock before anyone buys them again.
+                            var sharedFees = (fees*3)/4; //These are restocked as Ar in the common total_su_prices but shared as SU to the global users in form of interests.
+                            var admin_fees = fees - sharedFees; //the admin hold the Ar real value as his. The value of SU is return to the common total_su_prices to be sold again.
+                            //All fees cannot be burnt. They return only to the common total_su_prices before anyone buys them again.
                             con.promise("SELECT password FROM auths WHERE username = ?;",
                                 [Sender])
                             .then((result) => DecryptText(result[0].password, password))
                             .then((data) => {
                                 if (data == Pswd) {
-                                    con.promise("SELECT balance FROM stocks WHERE username = ?;", [Sender])
+                                    con.promise("SELECT balance FROM users_su WHERE username = ?;", [Sender])
                                     .then((result) => result[0].balance)
                                     .then((data) => {
                                         senderBal = Number(data);
                                         if (typeof(senderBal) == 'number') {
                                             if (senderBal >= minRequiredSenderBal) {
-                                                con.promise("SELECT balance FROM stocks WHERE username = ?;", [Dest])
+                                                con.promise("SELECT balance FROM users_su WHERE username = ?;", [Dest])
                                                 .then((result) => result[0].balance)
                                                 .then((data) => {
                                                     destBal = Number(data);
                                                     if (typeof(destBal) == 'number') {
-                                                        const futurDestBal = (destBal + Amount);
+                                                        const futurDestBal = destBal + Amount;
+                                                        const AdminFuturBal = destBal + admin_fees; // the admin receives the 1/4 of the fees as real cash and
+                                                        //back the equivalent SU value to the public stock to be sold again globally
                                                         if (Dest != 'ADMIN') {
                                                             con.promise("SELECT category FROM auths WHERE username = ?;",
                                                                 [Dest]).then((result)=> result[0].category)
@@ -610,7 +621,7 @@ app.post("/app/transfer", function(req, res) {
                                                                             });
                                                                             connection.beginTransaction(function(err) {
                                                                                 if (err) connection.release();
-                                                                                connection.query(`INSERT INTO activities (sender,receiver,type,amount,kprice,fees,reference,ddate,dtime) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, ''+p, fees, reference, date[0], date[1]], function(error, _results, _fields) {
+                                                                                connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, ''+p, fees, reference, date[0], date[1]], function(error, _results, _fields) {
                                                                                     if (error) {
                                                                                         return connection.rollback(function(err) {
                                                                                             if (err) throw err;
@@ -622,7 +633,7 @@ app.post("/app/transfer", function(req, res) {
                                                                                     }
 
                                                                                     const lastbs = (senderBal - minRequiredSenderBal);
-                                                                                    connection.query('UPDATE stocks SET balance = ?, ddate = ?, dtime = ? WHERE username = ?;',
+                                                                                    connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
                                                                                         [('' + lastbs),
                                                                                             date[0],
                                                                                             date[1],
@@ -638,7 +649,7 @@ app.post("/app/transfer", function(req, res) {
                                                                                                 });
                                                                                             }
 
-                                                                                            connection.query('UPDATE stocks SET balance = ?, ddate = ?, dtime = ? WHERE username = ?;',
+                                                                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
                                                                                                 [('' + futurDestBal),
                                                                                                     date[0],
                                                                                                     date[1],
@@ -653,7 +664,7 @@ app.post("/app/transfer", function(req, res) {
                                                                                                             connection.release();
                                                                                                         });
                                                                                                     }
-                                                                                                    connection.query("SELECT stock,kprice FROM common ORDER BY id DESC LIMIT 1;",
+                                                                                                    connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
                                                                                                         function(err, result) {
                                                                                                             if (err) {
 
@@ -665,13 +676,15 @@ app.post("/app/transfer", function(req, res) {
                                                                                                                     connection.release();
                                                                                                                 });
                                                                                                             }
-                                                                                                            const data = [result[0].stock, result[0].kprice];
+                                                                                                            const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
                                                                                                             if (typeof(Number(data[0])) == 'number') {
                                                                                                                 var lastStock = BigNumber(data[0]);
                                                                                                                 var lastPrice = Number(data[1]);
+                                                                                                                var backed_su = Number(data[2]);
+                                                                                                                var total_backed = backed_su + fees; 
                                                                                                                 var new_stock = lastStock.plus(sharedFees); //added as Ar
                                                                                                                 var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
-                                                                                                                connection.query(`INSERT INTO common (stock,kprice,ddate,dtime) values(?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price), date[0], date[1]], function(error, _results, _fields) {
+                                                                                                                connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price), ('' + total_backed), date[0], date[1]], function(error, _results, _fields) {
                                                                                                                     if (error) {
                                                                                                                         return connection.rollback(function(err) {
                                                                                                                             if (err) throw err;
@@ -733,7 +746,7 @@ app.post("/app/transfer", function(req, res) {
                                                                 });
                                                                 connection.beginTransaction(function(err) {
                                                                     if (err) connection.release();
-                                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,kprice,fees,reference,ddate,dtime) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, ''+p, fees, reference, date[0], date[1]], function(error, _results, _fields) {
+                                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, ''+p, fees, reference, date[0], date[1]], function(error, _results, _fields) {
                                                                         if (error) {
                                                                             return connection.rollback(function(err) {
                                                                                 if (err) throw err;
@@ -745,7 +758,7 @@ app.post("/app/transfer", function(req, res) {
                                                                         }
 
                                                                         const lastbs = (senderBal - minRequiredSenderBal);
-                                                                        connection.query('UPDATE stocks SET balance = ?, ddate = ?, dtime = ? WHERE username = ?;',
+                                                                        connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
                                                                             [('' + lastbs),
                                                                                 date[0],
                                                                                 date[1],
@@ -761,8 +774,8 @@ app.post("/app/transfer", function(req, res) {
                                                                                     });
                                                                                 }
 
-                                                                                connection.query('UPDATE stocks SET balance = ?, ddate = ?, dtime = ? WHERE username = ?;',
-                                                                                    [('' + futurDestBal),
+                                                                                connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                    [('' + AdminFuturBal),
                                                                                         date[0],
                                                                                         date[1],
                                                                                         Dest],
@@ -776,7 +789,7 @@ app.post("/app/transfer", function(req, res) {
                                                                                                 connection.release();
                                                                                             });
                                                                                         }
-                                                                                        connection.query("SELECT stock,kprice FROM common ORDER BY id DESC LIMIT 1;",
+                                                                                        connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
                                                                                             function(err, result) {
                                                                                                 if (err) {
 
@@ -788,13 +801,15 @@ app.post("/app/transfer", function(req, res) {
                                                                                                         connection.release();
                                                                                                     });
                                                                                                 }
-                                                                                                const data = [result[0].stock, result[0].kprice];
+                                                                                                const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
                                                                                                 if (typeof(Number(data[0])) == 'number') {
                                                                                                     var lastStock = BigNumber(data[0]);
                                                                                                     var lastPrice = Number(data[1]);
+                                                                                                    var backed_su = Number(data[2]);
+                                                                                                    var total_backed = Amount + backed_su + fees; // the Amount is added to the backed_su instead of updating the admin balance
                                                                                                     var new_stock = lastStock.plus(sharedFees); //added as Ar
                                                                                                     var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
-                                                                                                    connection.query(`INSERT INTO common (stock,kprice,ddate,dtime) values(?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price), date[0], date[1]], function(error, _results, _fields) {
+                                                                                                    connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price),('' + total_backed), date[0], date[1]], function(error, _results, _fields) {
                                                                                                         if (error) {
                                                                                                             return connection.rollback(function(err) {
                                                                                                                 if (err) throw err;
@@ -916,7 +931,7 @@ app.post("/app/signin", function(req,
         pswd,
         tkn,
         recon,
-        sk
+        secret_word
     } = req.body;
     const User = ('' + user).replaceAll(' ',
         '+');
@@ -927,12 +942,12 @@ app.post("/app/signin", function(req,
         if(recon == '0'){
         res.send({msg: 'forbidden request', ua:''});
         }else{
-            con.promise("SELECT password,sk FROM auths WHERE username = ?",
+            con.promise("SELECT password,secret_word FROM auths WHERE username = ?",
                 [User])
-            .then((result) => [DecryptText(result[0].password, password), DecryptText(result[0].sk, password)])
+            .then((result) => [DecryptText(result[0].password, password), DecryptText(result[0].secret_word, password)])
             .then((data) => {
                 if (data[0] == Pswd) {
-                    if(data[1] == sk){
+                    if(data[1] == secret_word){
                     const encUA = EncryptText(userAgent, Pswd+User);
                     con.promise("SELECT category FROM auths WHERE username = ?",
                         [User])
@@ -950,7 +965,7 @@ app.post("/app/signin", function(req,
                                 .then((result) => result[0].id)
                                 .then((data) => {
                                     if (data <= first_welcome_clients) {
-                                        con.query('UPDATE stocks SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
+                                        con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
                                             if (err) throw err;
                                             console.log('bonus shared')
                                         });
@@ -1007,7 +1022,7 @@ app.post("/app/signin", function(req,
                         .then((result) => result[0].id)
                         .then((data) => {
                             if (data <= first_welcome_clients) {
-                                con.query('UPDATE stocks SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
+                                con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
                                     if (err) throw err;
                                     console.log('bonus shared')
                                 });
@@ -1108,7 +1123,7 @@ app.post("/app/dltacc", function(req,
             .then((data) => {
                 if (typeof(Number(data)) == 'number') {
                     price = Number(data);
-                    con.promise("SELECT balance FROM stocks WHERE username = ?;", [User])
+                    con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
                     .then((result) => result[0].balance)
                     .then((data) => {
                         var bal = Number(data) * price;
@@ -1158,17 +1173,17 @@ app.post("/app/reacc", function(req,
     res) {
     const {
         user,
-        sk
+        secret_word
     } = req.body;
     const User = ('' + user).replaceAll(' ',
         '+');
-    const Sk = ('' + sk).replaceAll(' ',
+    const secret_word = ('' + secret_word).replaceAll(' ',
         '+');
-    con.promise("SELECT sk FROM auths WHERE username = ?",
+    con.promise("SELECT secret_word FROM auths WHERE username = ?",
         [User])
-    .then((result) => DecryptText(result[0].sk, password))
+    .then((result) => DecryptText(result[0].secret_word, password))
     .then((data) => {
-        if (data == Sk) {
+        if (data == secret_word) {
             let newPC = EncryptText('123456', password);
             con.query('UPDATE auths SET password = ? WHERE username = ?', [newPC, User], function(err, _result) {
                 if (err) throw err;
@@ -1193,14 +1208,14 @@ app.post("/app/msk", function(req,
     const {
         user,
         pswd,
-        sk,
+        secret_word,
         tkn
     } = req.body;
     const User = ('' + user).replaceAll(' ',
         '+');
     const Pswd = ('' + pswd).replaceAll(' ',
         '+');
-    const Sk = ('' + sk).replaceAll(' ',
+    const secret_word = ('' + secret_word).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
     if(userAgent != DecryptText(tkn, Pswd+User)){
@@ -1211,8 +1226,8 @@ app.post("/app/msk", function(req,
     .then((result) => DecryptText(result[0].password, password))
     .then((data) => {
         if (data == Pswd) {
-            let ek = "" + EncryptText(Sk, password);
-            con.query('UPDATE auths SET sk = ? WHERE username = ?', [ek, User], function(err, _result) {
+            let ek = "" + EncryptText(secret_word, password);
+            con.query('UPDATE auths SET secret_word = ? WHERE username = ?', [ek, User], function(err, _result) {
                 if (err) throw err;
                 res.send({
                     auth: 'updated'
@@ -1243,7 +1258,7 @@ app.post("/app/signup",
             name,
             cin,
             pswd,
-            sk,
+            secret_word,
             cinimg1,
             cinimg2
         } = req.body;
@@ -1264,7 +1279,7 @@ app.post("/app/signup",
             '+'), password);
         const Pswd = EncryptText(('' + pswd).replaceAll(' ',
             '+'), password);
-        const Secretkey = EncryptText(('' + (sk)).replaceAll(' ',
+        const Secretkey = EncryptText(('' + (secret_word)).replaceAll(' ',
             '+'), password);
         var user_suffix_name = '' + createUserSuffixName(cin);
         var user_prefix_name = '' + getUserPrefixName(Name);
@@ -1302,7 +1317,7 @@ app.post("/app/signup",
                         });
                         connection.beginTransaction(function(err) {
                             if (err) connection.release();
-                            connection.query('INSERT INTO auths (username, password, name, email, birthdate, cin, address, sk, category, ddate, dtime) VALUES (?,?,?,?,?,?,?,?,?,?,?);', data, function(error, _results, _fields) {
+                            connection.query('INSERT INTO auths (username, password, name, email, birthdate, cin, address, secret_word, category, deliver_date, deliver_time) VALUES (?,?,?,?,?,?,?,?,?,?,?);', data, function(error, _results, _fields) {
                                 if (error) {
                                     return connection.rollback(function(err) {
                                         if (err) throw err;
@@ -1312,7 +1327,7 @@ app.post("/app/signup",
                                         connection.release();
                                     });
                                 }
-                                connection.query('INSERT INTO stocks (username,balance,ddate,dtime) values(?,?,?,?);',
+                                connection.query('INSERT INTO users_su (username,balance,deliver_date,deliver_time) values(?,?,?,?);',
                                     [username,
                                         '0',
                                         date[0],
@@ -1392,7 +1407,7 @@ app.post("/app/transrec", function(req, res) {
     .then((result) => DecryptText(result[0].password, password))
     .then((data) => {
         if (data == Pswd) {
-            con.promise("SELECT * FROM activities WHERE (ddate >= ? AND (sender = ? OR receiver = ?)) ORDER BY id DESC;", [daybefore, User, User])
+            con.promise("SELECT * FROM activities WHERE (deliver_date >= ? AND (sender = ? OR receiver = ?)) ORDER BY id DESC;", [daybefore, User, User])
             .then((result) => result)
             .then((data) => {
                 const d = {
