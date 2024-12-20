@@ -17,26 +17,26 @@ app.use(express.urlencoded({
     limit: '50mb',
     extended: true
 }));
-const authsTbl = `CREATE TABLE IF NOT EXISTS auths (
+const AUTHS = `CREATE TABLE IF NOT EXISTS auths (
 id INT AUTO_INCREMENT PRIMARY KEY,
 username VARCHAR(30) NOT NULL,
 password VARCHAR(255) NOT NULL,
 name VARCHAR(50) NOT NULL, email VARCHAR(50) NOT NULL,
 birthdate VARCHAR(20) NOT NULL, cin VARCHAR(255) NOT NULL, address VARCHAR(50) NOT NULL, secret_word TEXT NOT NULL, category INT, deliver_date INT, deliver_time VARCHAR(10)
 );`;
-const users_suTbl = `CREATE TABLE IF NOT EXISTS users_su (
+const USERS_SU = `CREATE TABLE IF NOT EXISTS users_su (
 id INT AUTO_INCREMENT PRIMARY KEY,
 username VARCHAR(30) NOT NULL, balance VARCHAR(255) DEFAULT '0', deliver_date INT, deliver_time VARCHAR (10)
 );`;
-const adminStock = `INSERT INTO users_su (username, balance, deliver_date, deliver_time) VALUES (?,?,?,?);`;
-const activitiesTbl = `CREATE TABLE IF NOT EXISTS activities (
+const AdminStock = `INSERT INTO users_su (username, balance, deliver_date, deliver_time) VALUES (?,?,?,?);`;
+const ACTIVITIES = `CREATE TABLE IF NOT EXISTS activities (
 id INT AUTO_INCREMENT PRIMARY KEY,
 sender VARCHAR(30) NOT NULL, receiver VARCHAR(30) NOT NULL,
 type INT,
 amount VARCHAR(30) NOT NULL, su_price VARCHAR(255) DEFAULT '0', fees VARCHAR(30) DEFAULT '0', reference VARCHAR(20), deliver_date INT, deliver_time VARCHAR(10)
 );`;
-const notifsTbl = `CREATE TABLE IF NOT EXISTS notifs (id INT AUTO_INCREMENT PRIMARY KEY, content TEXT, deliver_date INT, deliver_time VARCHAR(10));`;
-const commonTbl = `CREATE TABLE IF NOT EXISTS common (id INT AUTO_INCREMENT PRIMARY KEY, total_su_prices VARCHAR(255) DEFAULT '0', su_price VARCHAR(255) DEFAULT '0', backed_su VARCHAR(255) DEFAULT '0', deliver_date INT, deliver_time VARCHAR(10));`;
+const NOTIFS = `CREATE TABLE IF NOT EXISTS notifs (id INT AUTO_INCREMENT PRIMARY KEY, content TEXT, deliver_date INT, deliver_time VARCHAR(10));`;
+const COMMON = `CREATE TABLE IF NOT EXISTS common (id INT AUTO_INCREMENT PRIMARY KEY, total_su_prices VARCHAR(255) DEFAULT '0', su_price VARCHAR(255) DEFAULT '0', backed_su VARCHAR(255) DEFAULT '0', deliver_date INT, deliver_time VARCHAR(10));`;
 var hostname = process.env.DB_HOST;
 var database = process.env.DB_NAME;
 var username = "";
@@ -81,17 +81,17 @@ function initiateDbIfEmpty() {
         }
     }).catch((_error) => {
         console.log('ADMIN not ready, create db data now');
-        let tables = [authsTbl,
-            activitiesTbl,
-            commonTbl,
-            notifsTbl,
-            users_suTbl];
+        let tables = [AUTHS,
+            ACTIVITIES,
+            COMMON,
+            NOTIFS,
+            USERS_SU];
         for (let i = 0; i < tables.length; i++) {
             let table = tables[i];
             con.query(table, function(err, _result) {
                 if (err) console.log(table + ' NOT CREATED');
-                if (table == users_suTbl) {
-                    con.query(adminStock, ['ADMIN', '0', date[0], date[1]], function(err, _result) {
+                if (table == USERS_SU) {
+                    con.query(AdminStock, ['ADMIN', '0', date[0], date[1]], function(err, _result) {
                         if (err) console.log('cannot add user ADMIN');
                         console.log('ADMIN is ready');
                         con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [''+stock_limit, '1','0', date[0], date[1]], function(error, _results, _fields) {
