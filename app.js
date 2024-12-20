@@ -94,7 +94,7 @@ function initiateDbIfEmpty() {
                     con.query(adminStock, ['ADMIN', '0', date[0], date[1]], function(err, _result) {
                         if (err) console.log('cannot add user ADMIN');
                         console.log('ADMIN is ready');
-                        con.query(`INSERT INTO common (total_su_prices,su_price,deliver_date,deliver_time) values(?,?,?,?);`, [''+stock_limit, '1', date[0], date[1]], function(error, _results, _fields) {
+                        con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [''+stock_limit, '1','0', date[0], date[1]], function(error, _results, _fields) {
                             //total_su_prices is set to stock_limit. That means 1 SU = 1 Ar.
                             if (error) {
                                 console.log('set first price failed');
@@ -1173,11 +1173,11 @@ app.post("/app/reacc", function(req,
     res) {
     const {
         user,
-        secret_word
+        sk
     } = req.body;
     const User = ('' + user).replaceAll(' ',
         '+');
-    const secret_word = ('' + secret_word).replaceAll(' ',
+    const secret_word = ('' + sk).replaceAll(' ',
         '+');
     con.promise("SELECT secret_word FROM auths WHERE username = ?",
         [User])
@@ -1208,14 +1208,14 @@ app.post("/app/msk", function(req,
     const {
         user,
         pswd,
-        secret_word,
+        sk,
         tkn
     } = req.body;
     const User = ('' + user).replaceAll(' ',
         '+');
     const Pswd = ('' + pswd).replaceAll(' ',
         '+');
-    const secret_word = ('' + secret_word).replaceAll(' ',
+    const secret_word = ('' + sk).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
     if(userAgent != DecryptText(tkn, Pswd+User)){
