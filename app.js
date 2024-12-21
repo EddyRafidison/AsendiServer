@@ -405,12 +405,15 @@ app.post("/app/feed", function(req, res) {
     }
 });
 
-app.post("/admin/update-common-stock", function(req, res) {
+
+
+app.post("/admin/update-user-or-common-stock", function(req, res) {
     const {
-        pswd, pin, amount, create
+        pswd, pin, amount, user
     } = req.body;
     const date = getDate();
     var new_price = 1;
+    var User = user.toUpperCase().replaceAll(" ", "+");
     //amount must be calculated as 1AR = 1SU
     if (pswd == DecryptText(admin_pswd, password)) {
         if (pin == DecryptText(admin_pin, password)) {
@@ -422,21 +425,101 @@ app.post("/admin/update-common-stock", function(req, res) {
                     var last_total_prices = BigNumber(data[0]);
                     lastPrice = Number(data[1]);
                     var backed_su = Number(data[2]);
-                    var backed_su_price = backed_su * lastPrice;
+                    var backed_su_price = backed_su.multipliedBy(lastPrice);
                     var Amount = Number(amount); //as 1SU = 1AR
                     var new_total_prices = last_total_prices.plus(Amount); //into SU
                     if(Amount <= backed_su_price){ //Amount must be lower or equal to backed_su amount for the update will be successful
-                    if (create == '0') { // DO NOT CREATE NEW SU. THE LIMIT HAS BEEN SET PRIMARILY
-                        new_price = (new_total_prices.dividedBy(last_total_prices)).multipliedBy(lastPrice);
-                    }
-                    con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_total_prices.toFixed()), (''+ new_price),(''+ backed_su), date[0], date[1]], function(error, _results, _fields) {
+                        var remained_backed_su = backed_su - (Amount/lastPrice);
+                    if(User.includes('-')){ //top up client's account
+                        var date = getDate();
+                        var reference = createTransactionId('Asendi');
+                        con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
+                        .then((result) => result[0].balance)
+                        .then((data) => {
+                            var bal = Number(data);
+                            if (typeof(bal) == 'number') {
+                                //update activities, user balance, common
+                                con.getConnection((err, connection) => {
+                                    if (err) res.send({
+                                        transf: 'failed'
+                                    });
+                                    connection.beginTransaction(function(err) {
+                                        if (err) connection.release();
+                                        connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, ['Asendi', User, '2', '' + Amount, ''+lastPrice, '0', reference, date[0], date[1]], function(error, _results, _fields) {
+                                            if (error) {
+                                                return connection.rollback(function(err) {
+                                                    if (err) throw err;
+                                                    res.send({
+                                                        transf: 'failed'
+                                                    });
+                                                    connection.release();
+                                                });
+                                            }
+                                            const newUserBal = bal + (Amount/lastPrice);
+                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                [('' + newUserBal),
+                                                    date[0],
+                                                    date[1],
+                                                    User],
+                                                function(error, _results, _fields) {
+                                                    if (error) {
+                                                        return connection.rollback(function(err) {
+                                                            if (err) throw err;
+                                                            res.send({
+                                                                transf: 'failed'
+                                                            });
+                                                            connection.release();
+                                                        });
+                                                    }
+                                                    connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_total_prices.toFixed()), (''+ new_price),(''+ remained_backed_su), date[0], date[1]], function(error, _results, _fields) {
+                                                        if (error) {
+                                                            {
+                                                                return connection.rollback(function(err) {
+                                                                    if (err) throw err;
+                                                                    res.send({
+                                                                        transf: 'failed'
+                                                                    });
+                                                                    connection.release();
+                                                                });
+                                                            }
+                                                }
+                                                connection.commit(function(err) {
+                                                    if (err) {
+                                                        return connection.rollback(function(err) {
+                                                            if (err) throw err;
+                                                            res.send({
+                                                                transf: 'failed'
+                                                            });
+                                                            connection.release();
+                                                        });
+                                                    }
+                                                    res.send({
+                                                        transf: 'sent'
+                                                    });
+
+                                            }); 
+                                                });  
+                                        });
+                                        });
+                                });
+                            });
+                            } else {
+                                res.send({error : 'error result type'});
+                            }}).catch((_error)=>{
+                                res.send({user : 'null'});   
+                            });
+                    } else {     //top up common stock         
+                    new_price = (new_total_prices.dividedBy(last_total_prices)).multipliedBy(lastPrice);
+                    con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_total_prices.toFixed()), (''+ new_price),(''+ remained_backed_su), date[0], date[1]], function(error, _results, _fields) {
                         if (error) {
                             throw error;
                         } else {
                             res.send({
                                 total_su_prices: 'updated'
                             });
-                        }});}else{
+                        }});
+                    }
+                    }else{
                             res.send({limit : 'AR '+backed_su_price});
                         }
                 } else {
@@ -557,8 +640,8 @@ app.post("/app/transfer", function(req, res) {
             if (category > 0) {
                 if (category == 2 && Dest == 'Asendi') {
                     //Asendi is the server account name
-                    //category 2 for distributor
-                    type = 2; //for back type transfer (from distributor to Asendi)
+                    //category 2 for between customer & distributor
+                    type = 2;
                 }
                 if (category == 1 && Dest == 'Asendi') {
                     res.send({
@@ -575,9 +658,9 @@ app.post("/app/transfer", function(req, res) {
                             var senderBal;
                             var destBal;
                             var date = getDate();
-                            var maxStockDefault = 2000000; //client side unit
-                            var maxStockDistr = 5000000; //client side unit
                             var reference = createTransactionId(Sender);
+                            var maxStockDefault = 2000000; //client side unit
+                            var maxStockDistr = 5000000; //client side unit                          
                             var fees = (Amount*tfees)/100; // total fees to pay by client
                             var minRequiredSenderBal = Amount + fees;
                             var sharedFees = (fees*3)/4; //These are restocked as Ar in the common total_su_prices but shared as SU to the global users in form of interests.
@@ -600,7 +683,7 @@ app.post("/app/transfer", function(req, res) {
                                                     destBal = Number(data);
                                                     if (typeof(destBal) == 'number') {
                                                         const futurDestBal = destBal + Amount;
-                                                        const AsendiFuturBal = destBal + admin_fees; // the Asendi receives the 1/4 of the fees as real cash and
+                                                        const AsendiFuturBal = destBal + admin_fees; // Asendi receives the 1/4 of the fees as real cash and
                                                         //back the equivalent SU value to the public stock to be sold again globally
                                                         if (Dest != 'Asendi') {
                                                             con.promise("SELECT category FROM auths WHERE username = ?;",
@@ -936,6 +1019,7 @@ app.post("/app/signin", function(req,
         recon,
         secret_word
     } = req.body;
+    
     const User = ('' + user).replaceAll(' ',
         '+');
     const Pswd = ('' + pswd).replaceAll(' ',
@@ -968,9 +1052,15 @@ app.post("/app/signin", function(req,
                                 .then((result) => result[0].id)
                                 .then((data) => {
                                     if (data <= first_welcome_clients) {
+                                        var date = getDate();
+                                        var reference = createTransactionId('Asendi');
                                         con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
                                             if (err) throw err;
-                                            console.log('bonus shared')
+                                            console.log('bonus shared');
+                                            con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, ['Asendi', User, '2', '2000', '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
+                                                if (error) {
+                                                   
+                                                }});
                                         });
                                     }
                                 }).catch((error) => {
@@ -1025,9 +1115,15 @@ app.post("/app/signin", function(req,
                         .then((result) => result[0].id)
                         .then((data) => {
                             if (data <= first_welcome_clients) {
+                                var date = getDate();
+                                var reference = createTransactionId('Asendi');
                                 con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
                                     if (err) throw err;
-                                    console.log('bonus shared')
+                                    console.log('bonus shared');
+                                    con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, ['Asendi', User, '2', '2000', '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
+                                        if (error) {
+                                           
+                                        }});
                                 });
                             }
                         }).catch((error) => {
