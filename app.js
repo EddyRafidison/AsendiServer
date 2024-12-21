@@ -17,6 +17,7 @@ app.use(express.urlencoded({
     limit: '50mb',
     extended: true
 }));
+const Asendi = 'Asendi';
 const AUTHS = `CREATE TABLE IF NOT EXISTS auths (
 id INT AUTO_INCREMENT PRIMARY KEY,
 username VARCHAR(30) NOT NULL,
@@ -54,6 +55,7 @@ const stock_limit = 2000000;
 const app_version = process.env.APP_VERSION;
 const tfees = process.env.FEES;
 const first_welcome_clients = 2000;
+const welcome_bonus = 2000;
 var status = "not connected";
 //create transporter object with smtp server details
 const transporter = nodemailer.createTransport({
@@ -73,7 +75,7 @@ server.setTimeout(120000);
 function initiateDbIfEmpty() {
     //check if Asendi exists
     const date = getDate();
-    con.promise("SELECT id FROM users_su WHERE username = ?;", ['Asendi'])
+    con.promise("SELECT id FROM users_su WHERE username = ?;", [Asendi])
     .then((result) => result[0].id)
     .then((data) => {
         if (typeof(Number(data)) != 'number') {
@@ -93,7 +95,7 @@ function initiateDbIfEmpty() {
             con.query(table, function(err, _result) {
                 if (err) console.log(table + ' NOT CREATED');
                 if (table == USERS_SU) {
-                    con.query(AsendiStock, ['Asendi', '0', date[0], date[1]], function(err, _result) {
+                    con.query(AsendiStock, [Asendi, '0', date[0], date[1]], function(err, _result) {
                         if (err) console.log('cannot add user Asendi');
                         console.log('Asendi is ready');
                         con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [''+stock_limit, '1','0', date[0], date[1]], function(error, _results, _fields) {
@@ -432,7 +434,7 @@ app.post("/admin/update-user-or-common-stock", function(req, res) {
                         var remained_backed_su = backed_su - (Amount/lastPrice);
                     if(User.includes('-')){ //top up client's account
                         var date = getDate();
-                        var reference = createTransactionId('Asendi');
+                        var reference = createTransactionId(Asendi);
                         con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
                         .then((result) => result[0].balance)
                         .then((data) => {
@@ -445,7 +447,7 @@ app.post("/admin/update-user-or-common-stock", function(req, res) {
                                     });
                                     connection.beginTransaction(function(err) {
                                         if (err) connection.release();
-                                        connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, ['Asendi', User, '2', '' + Amount, ''+lastPrice, '0', reference, date[0], date[1]], function(error, _results, _fields) {
+                                        connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + Amount, ''+lastPrice, '0', reference, date[0], date[1]], function(error, _results, _fields) {
                                             if (error) {
                                                 return connection.rollback(function(err) {
                                                     if (err) throw err;
@@ -638,12 +640,12 @@ app.post("/app/transfer", function(req, res) {
         .then((data) => {
             const category = Number(data);
             if (category > 0) {
-                if (category == 2 && Dest == 'Asendi') {
+                if (category == 2 && Dest == Asendi) {
                     //Asendi is the server account name
                     //category 2 for between customer & distributor
                     type = 2;
                 }
-                if (category == 1 && Dest == 'Asendi') {
+                if (category == 1 && Dest == Asendi) {
                     res.send({
                         transf: 'unsupported'
                     });
@@ -685,7 +687,7 @@ app.post("/app/transfer", function(req, res) {
                                                         const futurDestBal = destBal + Amount;
                                                         const AsendiFuturBal = destBal + admin_fees; // Asendi receives the 1/4 of the fees as real cash and
                                                         //back the equivalent SU value to the public stock to be sold again globally
-                                                        if (Dest != 'Asendi') {
+                                                        if (Dest != Asendi) {
                                                             con.promise("SELECT category FROM auths WHERE username = ?;",
                                                                 [Dest]).then((result)=> result[0].category)
                                                             .then((data) => {
@@ -1053,11 +1055,11 @@ app.post("/app/signin", function(req,
                                 .then((data) => {
                                     if (data <= first_welcome_clients) {
                                         var date = getDate();
-                                        var reference = createTransactionId('Asendi');
-                                        con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
+                                        var reference = createTransactionId(Asendi);
+                                        con.query('UPDATE users_su SET balance = ? WHERE username = ?', [''+welcome_bonus, User], function(err, _result) {
                                             if (err) throw err;
                                             console.log('bonus shared');
-                                            con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, ['Asendi', User, '2', '2000', '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
+                                            con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', ''+welcome_bonus, '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
                                                 if (error) {
                                                    
                                                 }});
@@ -1116,11 +1118,11 @@ app.post("/app/signin", function(req,
                         .then((data) => {
                             if (data <= first_welcome_clients) {
                                 var date = getDate();
-                                var reference = createTransactionId('Asendi');
-                                con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['2000', User], function(err, _result) {
+                                var reference = createTransactionId(Asendi);
+                                con.query('UPDATE users_su SET balance = ? WHERE username = ?', [''+welcome_bonus, User], function(err, _result) {
                                     if (err) throw err;
                                     console.log('bonus shared');
-                                    con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, ['Asendi', User, '2', '2000', '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
+                                    con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', ''+welcome_bonus, '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
                                         if (error) {
                                            
                                         }});
