@@ -67,61 +67,62 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-const server = app.listen(SERV_PORT, function() {
+const server = app.listen(SERV_PORT, function () {
     console.log('server running on ' + server.address().port);
-    
+
 });
 server.setTimeout(120000);
 function initiateDbIfEmpty() {
     //check if Asendi exists
     const date = getDate();
     con.promise("SELECT id FROM users_su WHERE username = ?;", [Asendi])
-    .then((result) => result[0].id)
-    .then((data) => {
-        if (typeof(Number(data)) != 'number') {
-            console.log('id is not a number');
-        }else{
-            console.log('Asendi id: '+data);
-        }
-    }).catch((_error) => {
-        console.log('Asendi not ready, create db data now');
-        let tables = [AUTHS,
-            ACTIVITIES,
-            COMMON,
-            NOTIFS,
-            USERS_SU];
-        for (let i = 0; i < tables.length; i++) {
-            let table = tables[i];
-            con.query(table, function(err, _result) {
-                if (err) console.log(table + ' NOT CREATED');
-                if (table == USERS_SU) {
-                    con.query(AsendiStock, [Asendi, '0', date[0], date[1]], function(err, _result) {
-                        if (err) console.log('cannot add user Asendi');
-                        console.log('Asendi is ready');
-                        con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [''+stock_limit, '1','0', date[0], date[1]], function(error, _results, _fields) {
-                            //total_su_prices is set to stock_limit. That means 1 SU = 1 Ar.
-                            if (error) {
-                                console.log('set first price failed');
-                            } else {
-                                console.log('1SU set to 1Ar');
-                            }});
-                    });
-                }
-            });
-        }
-    })
+        .then((result) => result[0].id)
+        .then((data) => {
+            if (typeof (Number(data)) != 'number') {
+                console.log('id is not a number');
+            } else {
+                console.log('Asendi id: ' + data);
+            }
+        }).catch((_error) => {
+            console.log('Asendi not ready, create db data now');
+            let tables = [AUTHS,
+                ACTIVITIES,
+                COMMON,
+                NOTIFS,
+                USERS_SU];
+            for (let i = 0; i < tables.length; i++) {
+                let table = tables[i];
+                con.query(table, function (err, _result) {
+                    if (err) console.log(table + ' NOT CREATED');
+                    if (table == USERS_SU) {
+                        con.query(AsendiStock, [Asendi, '0', date[0], date[1]], function (err, _result) {
+                            if (err) console.log('cannot add user Asendi');
+                            console.log('Asendi is ready');
+                            con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, ['' + stock_limit, '1', '0', date[0], date[1]], function (error, _results, _fields) {
+                                //total_su_prices is set to stock_limit. That means 1 SU = 1 Ar.
+                                if (error) {
+                                    console.log('set first price failed');
+                                } else {
+                                    console.log('1SU set to 1Ar');
+                                }
+                            });
+                        });
+                    }
+                });
+            }
+        })
 }
 
 function testUrl(link, data) {
     fetch.post(link,
         data)
-    .then((response) => response.data)
-    .then((data) => {
-        console.log(data);
-    })
-    .catch(error => {
-        console.log(error);
-    });
+        .then((response) => response.data)
+        .then((data) => {
+            console.log(data);
+        })
+        .catch(error => {
+            console.log(error);
+        });
 }
 
 function readFileAsync(filePath) {
@@ -156,34 +157,34 @@ function readFileSync(filePath) {
 }
 
 app.use((req, res, next) => {
-    if(req.protocol !== 'https'){
-        if(!server_mail.includes('@gmail')){
-        return res.redirect('https://' + req.headers.host + req.url);
+    if (req.protocol !== 'https') {
+        if (!server_mail.includes('@gmail')) {
+            return res.redirect('https://' + req.headers.host + req.url);
         }
     }
-next();
+    next();
 });
 
-app.get("/app/info", function(req, res) {
+app.get("/app/info", function (req, res) {
     const r = req.query.r;
     const l = req.query.l;
-    var filepath = "privacy_"+l+".html";
+    var filepath = "privacy_" + l + ".html";
     if (r == 'terms') {
-        filepath = "terms_"+l+".html";
+        filepath = "terms_" + l + ".html";
     }
     readFileAsync(filepath)
-    .then((result) => result)
-    .then((data) => {
-        res.send(data);
-    })
-    .catch((_error) => {
-        res.send('error');
-    });
+        .then((result) => result)
+        .then((data) => {
+            res.send(data);
+        })
+        .catch((_error) => {
+            res.send('error');
+        });
 
 });
 
-app.get("/latest/apk", function(_req, res, next) {
-    res.download("./Asendi.apk", "Asendi.apk", function(err) {
+app.get("/latest/apk", function (_req, res, next) {
+    res.download("./Asendi.apk", "Asendi.apk", function (err) {
         if (err) {
             next(err);
         } else {
@@ -192,7 +193,7 @@ app.get("/latest/apk", function(_req, res, next) {
     });
 });
 
-app.post("/checkapp", function(_req, res) {
+app.post("/checkapp", function (_req, res) {
     const fileS = getAppFileSize();
     res.send({
         version: app_version,
@@ -203,55 +204,55 @@ app.post("/checkapp", function(_req, res) {
 function getAppFileSize() {
     const stats = fs.statSync("./Asendi.apk")
     const fileSizeInBytes = stats.size;
-    const fileSizeInMegabytes = fileSizeInBytes / (1024*1024);
-    return ''+fileSizeInMegabytes;
+    const fileSizeInMegabytes = fileSizeInBytes / (1024 * 1024);
+    return '' + fileSizeInMegabytes;
 }
 
-app.post("/app/contact", function(req, res) {
+app.post("/app/contact", function (req, res) {
     const {
         user,
         pswd,
         subj,
         msg,
         tkn
-    } = req.body;   
+    } = req.body;
     const User = ('' + user).replaceAll(' ',
         '+');
     const Pswd = ('' + pswd).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+User)){
-        res.send({status: 'forbidden request'});
-    }else{
-    con.promise("SELECT password, email FROM auths WHERE username = ?",
-        [User])
-    .then((result) => [DecryptText(result[0].password, password),
-        result[0].email])
-    .then((data) => {
-        if (data[0] == Pswd) {
-            transporter.sendMail({
-                from: server_mail,
-                to: server_mail,
-                subject: subj,
-                html: '<b>De</b> '+data[1]+' ('+User+')'+'<br>'+msg
-            },
-                function(err, _info) {
-                    if (err) throw err;
+    if (userAgent != DecryptText(tkn, Pswd + User)) {
+        res.send({ status: 'forbidden request' });
+    } else {
+        con.promise("SELECT password, email FROM auths WHERE username = ?",
+            [User])
+            .then((result) => [DecryptText(result[0].password, password),
+            result[0].email])
+            .then((data) => {
+                if (data[0] == Pswd) {
+                    transporter.sendMail({
+                        from: server_mail,
+                        to: server_mail,
+                        subject: subj,
+                        html: '<b>De</b> ' + data[1] + ' (' + User + ')' + '<br>' + msg
+                    },
+                        function (err, _info) {
+                            if (err) throw err;
 
+                        });
+                    res.send({
+                        status: 'sent'
+                    });
+                } else {
+                    res.send({
+                        status: 'error'
+                    });
+                }
+            }).catch((_error) => {
+                res.send({
+                    status: 'error'
                 });
-            res.send({
-                status: 'sent'
             });
-        } else {
-            res.send({
-                status: 'error'
-            });
-        }
-    }).catch((_error) => {
-        res.send({
-            status: 'error'
-        });
-    });
     }
 });
 
@@ -276,21 +277,21 @@ con.getConnection((err, connection) => {
     if (err) throw err;
     console.log('Database connected');
     initiateDbIfEmpty();
-    setInterval(()=> {
+    setInterval(() => {
         let date = getDateBefore(7)[0];
         con.promise("SELECT username FROM auths WHERE (category = ? AND deliver_date = ?);", [0, date])
-        .then((result) => result)
-        .then((data) => {
-            for (let i = 0; i < data.length; i++) {
-                let client = data[i].username;
-                con.query("DELETE FROM users_su WHERE username = ?; DELETE FROM auths WHERE username = ?;", [client, client], function(err, _result) {
-                    if (err) console.log(client + ' not deleted');
-                    console.log(client + ' deleted');
-                });
-            }
-        }).catch((error)=> {
-            console.log(error);
-        });
+            .then((result) => result)
+            .then((data) => {
+                for (let i = 0; i < data.length; i++) {
+                    let client = data[i].username;
+                    con.query("DELETE FROM users_su WHERE username = ?; DELETE FROM auths WHERE username = ?;", [client, client], function (err, _result) {
+                        if (err) console.log(client + ' not deleted');
+                        console.log(client + ' deleted');
+                    });
+                }
+            }).catch((error) => {
+                console.log(error);
+            });
     }, 10800000);
     connection.release();
 });
@@ -310,19 +311,19 @@ con.promise = (sql, param) => {
     });
 };
 
-app.post("/admin/setcat", function(req, res) {
+app.post("/admin/setcat", function (req, res) {
     const {
         pswd, pin, user, catg
     } = req.body;
-    const User = (''+user).replaceAll(' ',
+    const User = ('' + user).replaceAll(' ',
         '+');
-    const Catg = (''+catg).replaceAll(' ',
+    const Catg = ('' + catg).replaceAll(' ',
         '+');
     if (pswd == DecryptText(admin_pswd, password)) {
         if (pin == DecryptText(admin_pin, password)) {
-            if (typeof(Number(Catg)) == 'number') {
+            if (typeof (Number(Catg)) == 'number') {
                 const cat = Number(Catg);
-                con.query('UPDATE auths SET category = ? WHERE username = ?', [cat, User], function(err, _result) {
+                con.query('UPDATE auths SET category = ? WHERE username = ?', [cat, User], function (err, _result) {
                     if (err) {
                         res.send({
                             error: 'error'
@@ -334,20 +335,22 @@ app.post("/admin/setcat", function(req, res) {
                     }
 
                 });
-            }}}
+            }
+        }
+    }
 });
 
-app.post("/admin/addfeed", function(req, res) {
+app.post("/admin/addfeed", function (req, res) {
     //optional, as wished by Asendi
     const {
         pswd, pin, content
     } = req.body;
-    const Content = (''+ content).replaceAll(' ',
+    const Content = ('' + content).replaceAll(' ',
         '&nbsp;');
     const date = getDate();
     if (pswd == DecryptText(admin_pswd, password)) {
         if (pin == DecryptText(admin_pin, password)) {
-            con.query('INSERT INTO notifs (content, deliver_date, deliver_time) VALUES (?,?,?);', [Content, date[0], date[1]], function(err, _result) {
+            con.query('INSERT INTO notifs (content, deliver_date, deliver_time) VALUES (?,?,?);', [Content, date[0], date[1]], function (err, _result) {
                 if (err) {
                     res.send({
                         error: 'error'
@@ -359,10 +362,11 @@ app.post("/admin/addfeed", function(req, res) {
                 }
 
             });
-        }}
+        }
+    }
 });
 
-app.post("/app/feed", function(req, res) {
+app.post("/app/feed", function (req, res) {
     //optional, as wished by Asendi
     const {
         user,
@@ -375,41 +379,41 @@ app.post("/app/feed", function(req, res) {
         '+');
     const date = getDate()[0];
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+User)){
-        res.send({feed: 'forbidden request'});
-    }else{
-    con.promise("SELECT password FROM auths WHERE username = ?",
-        [User])
-    .then((result) => DecryptText(result[0].password, password))
-    .then((data) => {
-        if (data == Pswd) {
-            con.promise("SELECT * FROM notifs WHERE deliver_date = ? ORDER BY id DESC;", [date])
-            .then((result) => result)
+    if (userAgent != DecryptText(tkn, Pswd + User)) {
+        res.send({ feed: 'forbidden request' });
+    } else {
+        con.promise("SELECT password FROM auths WHERE username = ?",
+            [User])
+            .then((result) => DecryptText(result[0].password, password))
             .then((data) => {
-                res.send({
-                    feed: data
-                });
+                if (data == Pswd) {
+                    con.promise("SELECT * FROM notifs WHERE deliver_date = ? ORDER BY id DESC;", [date])
+                        .then((result) => result)
+                        .then((data) => {
+                            res.send({
+                                feed: data
+                            });
+                        }).catch((_error) => {
+                            res.send({
+                                data: 'empty'
+                            });
+                        });
+                } else {
+                    res.send({
+                        data: "incorrect auth"
+                    });
+                }
             }).catch((_error) => {
                 res.send({
-                    data: 'empty'
+                    data: 'error'
                 });
             });
-        } else {
-            res.send({
-                data: "incorrect auth"
-            });
-        }
-    }).catch((_error) => {
-        res.send({
-            data: 'error'
-        });
-    });
     }
 });
 
 
 
-app.post("/admin/update-user-or-common-stock", function(req, res) {
+app.post("/admin/update-user-or-common-stock", function (req, res) {
     const {
         pswd, pin, amount, user
     } = req.body;
@@ -421,119 +425,121 @@ app.post("/admin/update-user-or-common-stock", function(req, res) {
         if (pin == DecryptText(admin_pin, password)) {
             con.promise("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
                 [])
-            .then((result) => [result[0].total_su_prices, result[0].su_price, result[0].backed_su])
-            .then((data) => {
-                if (typeof(Number(data[0])) == 'number') {
-                    var last_total_prices = BigNumber(data[0]);
-                    lastPrice = Number(data[1]);
-                    var backed_su = Number(data[2]);
-                    var backed_su_price = backed_su.multipliedBy(lastPrice);
-                    var Amount = Number(amount); //as 1SU = 1AR
-                    var new_total_prices = last_total_prices.plus(Amount); //into SU
-                    if(Amount <= backed_su_price){ //Amount must be lower or equal to backed_su amount for the update will be successful
-                        var remained_backed_su = backed_su - (Amount/lastPrice);
-                    if(User.includes('-')){ //top up client's account
-                        var date = getDate();
-                        var reference = createTransactionId(Asendi);
-                        con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
-                        .then((result) => result[0].balance)
-                        .then((data) => {
-                            var bal = Number(data);
-                            if (typeof(bal) == 'number') {
-                                //update activities, user balance, common
-                                con.getConnection((err, connection) => {
-                                    if (err) res.send({
-                                        transf: 'failed'
-                                    });
-                                    connection.beginTransaction(function(err) {
-                                        if (err) connection.release();
-                                        connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + Amount, ''+lastPrice, '0', reference, date[0], date[1]], function(error, _results, _fields) {
-                                            if (error) {
-                                                return connection.rollback(function(err) {
-                                                    if (err) throw err;
-                                                    res.send({
-                                                        transf: 'failed'
-                                                    });
-                                                    connection.release();
+                .then((result) => [result[0].total_su_prices, result[0].su_price, result[0].backed_su])
+                .then((data) => {
+                    if (typeof (Number(data[0])) == 'number') {
+                        var last_total_prices = BigNumber(data[0]);
+                        lastPrice = Number(data[1]);
+                        var backed_su = Number(data[2]);
+                        var backed_su_price = backed_su.multipliedBy(lastPrice);
+                        var Amount = Number(amount); //as 1SU = 1AR
+                        var new_total_prices = last_total_prices.plus(Amount); //into SU
+                        if (Amount <= backed_su_price) { //Amount must be lower or equal to backed_su amount for the update will be successful
+                            var remained_backed_su = backed_su - (Amount / lastPrice);
+                            if (User.includes('-')) { //top up client's account
+                                var date = getDate();
+                                var reference = createTransactionId(Asendi);
+                                con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
+                                    .then((result) => result[0].balance)
+                                    .then((data) => {
+                                        var bal = Number(data);
+                                        if (typeof (bal) == 'number') {
+                                            //update activities, user balance, common
+                                            con.getConnection((err, connection) => {
+                                                if (err) res.send({
+                                                    transf: 'failed'
                                                 });
-                                            }
-                                            const newUserBal = bal + (Amount/lastPrice);
-                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                [('' + newUserBal),
-                                                    date[0],
-                                                    date[1],
-                                                    User],
-                                                function(error, _results, _fields) {
-                                                    if (error) {
-                                                        return connection.rollback(function(err) {
-                                                            if (err) throw err;
-                                                            res.send({
-                                                                transf: 'failed'
-                                                            });
-                                                            connection.release();
-                                                        });
-                                                    }
-                                                    connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_total_prices.toFixed()), (''+ new_price),(''+ remained_backed_su), date[0], date[1]], function(error, _results, _fields) {
+                                                connection.beginTransaction(function (err) {
+                                                    if (err) connection.release();
+                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + Amount, '' + lastPrice, '0', reference, date[0], date[1]], function (error, _results, _fields) {
                                                         if (error) {
-                                                            {
-                                                                return connection.rollback(function(err) {
-                                                                    if (err) throw err;
-                                                                    res.send({
-                                                                        transf: 'failed'
-                                                                    });
-                                                                    connection.release();
+                                                            return connection.rollback(function (err) {
+                                                                if (err) throw err;
+                                                                res.send({
+                                                                    transf: 'failed'
                                                                 });
-                                                            }
-                                                }
-                                                connection.commit(function(err) {
-                                                    if (err) {
-                                                        return connection.rollback(function(err) {
-                                                            if (err) throw err;
-                                                            res.send({
-                                                                transf: 'failed'
+                                                                connection.release();
                                                             });
-                                                            connection.release();
-                                                        });
-                                                    }
-                                                    res.send({
-                                                        transf: 'sent'
-                                                    });
+                                                        }
+                                                        const newUserBal = bal + (Amount / lastPrice);
+                                                        connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                            [('' + newUserBal),
+                                                            date[0],
+                                                            date[1],
+                                                                User],
+                                                            function (error, _results, _fields) {
+                                                                if (error) {
+                                                                    return connection.rollback(function (err) {
+                                                                        if (err) throw err;
+                                                                        res.send({
+                                                                            transf: 'failed'
+                                                                        });
+                                                                        connection.release();
+                                                                    });
+                                                                }
+                                                                connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_total_prices.toFixed()), ('' + new_price), ('' + remained_backed_su), date[0], date[1]], function (error, _results, _fields) {
+                                                                    if (error) {
+                                                                        {
+                                                                            return connection.rollback(function (err) {
+                                                                                if (err) throw err;
+                                                                                res.send({
+                                                                                    transf: 'failed'
+                                                                                });
+                                                                                connection.release();
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                    connection.commit(function (err) {
+                                                                        if (err) {
+                                                                            return connection.rollback(function (err) {
+                                                                                if (err) throw err;
+                                                                                res.send({
+                                                                                    transf: 'failed'
+                                                                                });
+                                                                                connection.release();
+                                                                            });
+                                                                        }
+                                                                        res.send({
+                                                                            transf: 'sent'
+                                                                        });
 
-                                            }); 
-                                                });  
+                                                                    });
+                                                                });
+                                                            });
+                                                    });
+                                                });
+                                            });
+                                        } else {
+                                            res.send({ error: 'error result type' });
+                                        }
+                                    }).catch((_error) => {
+                                        res.send({ user: 'null' });
+                                    });
+                            } else {     //top up common stock         
+                                new_price = (new_total_prices.dividedBy(last_total_prices)).multipliedBy(lastPrice);
+                                con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_total_prices.toFixed()), ('' + new_price), ('' + remained_backed_su), date[0], date[1]], function (error, _results, _fields) {
+                                    if (error) {
+                                        throw error;
+                                    } else {
+                                        res.send({
+                                            total_su_prices: 'updated'
                                         });
-                                        });
+                                    }
                                 });
-                            });
-                            } else {
-                                res.send({error : 'error result type'});
-                            }}).catch((_error)=>{
-                                res.send({user : 'null'});   
-                            });
-                    } else {     //top up common stock         
-                    new_price = (new_total_prices.dividedBy(last_total_prices)).multipliedBy(lastPrice);
-                    con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_total_prices.toFixed()), (''+ new_price),(''+ remained_backed_su), date[0], date[1]], function(error, _results, _fields) {
-                        if (error) {
-                            throw error;
+                            }
                         } else {
-                            res.send({
-                                total_su_prices: 'updated'
-                            });
-                        }});
-                    }
-                    }else{
-                            res.send({limit : 'AR '+backed_su_price});
+                            res.send({ limit: 'AR ' + backed_su_price });
                         }
-                } else {
+                    } else {
+                        res.send({
+                            error: 'type error'
+                        })
+                    }
+                }).catch((_error) => {
                     res.send({
-                        error: 'type error'
+                        error: 'error'
                     })
-                }
-            }).catch((_error) => {
-                res.send({
-                    error: 'error'
-                })
-            });
+                });
         } else {
             res.send({
                 auth: 'incorrect'
@@ -546,67 +552,67 @@ app.post("/admin/update-user-or-common-stock", function(req, res) {
     }
 });
 
-app.post("/app/balance", function(req, res) {
+app.post("/app/balance", function (req, res) {
     const {
         user,
         pswd, tkn
     } = req.body;
-    const User = (''+user).replaceAll(' ',
+    const User = ('' + user).replaceAll(' ',
         '+');
-    const Pswd = (''+pswd).replaceAll(' ',
+    const Pswd = ('' + pswd).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+User)){
-        res.send({msg: 'forbidden request'});
-    }else{  
-    var price = 0;
-    con.promise("SELECT password FROM auths WHERE username = ?;",
-        [User])
-    .then((result) => DecryptText(result[0].password, password))
-    .then((data) => {
-        if (data == Pswd) {
-            con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
-                [])
-            .then((result) => result[0].su_price)
+    if (userAgent != DecryptText(tkn, Pswd + User)) {
+        res.send({ msg: 'forbidden request' });
+    } else {
+        var price = 0;
+        con.promise("SELECT password FROM auths WHERE username = ?;",
+            [User])
+            .then((result) => DecryptText(result[0].password, password))
             .then((data) => {
-                if (typeof(Number(data)) == 'number') {
-                    price = Number(data);
-                    con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
-                    .then((result) => result[0].balance)
-                    .then((data) => {
-                        var bal = Number(data) * price;
-                        res.send({
-                            msg: ''+bal, fees: tfees
+                if (data == Pswd) {
+                    con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
+                        [])
+                        .then((result) => result[0].su_price)
+                        .then((data) => {
+                            if (typeof (Number(data)) == 'number') {
+                                price = Number(data);
+                                con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
+                                    .then((result) => result[0].balance)
+                                    .then((data) => {
+                                        var bal = Number(data) * price;
+                                        res.send({
+                                            msg: '' + bal, fees: tfees
+                                        });
+                                    }).catch((_error) => {
+                                        res.send({
+                                            msg: 'error'
+                                        });
+                                    });
+                            } else {
+                                res.send({
+                                    msg: 'error'
+                                })
+                            }
+                        }).catch((_error) => {
+                            res.send({
+                                msg: 'error'
+                            })
                         });
-                    }).catch((_error) => {
-                        res.send({
-                            msg: 'error'
-                        });
-                    });
                 } else {
                     res.send({
                         msg: 'error'
-                    })
+                    });
                 }
             }).catch((_error) => {
                 res.send({
                     msg: 'error'
-                })
+                });
             });
-        } else {
-            res.send({
-                msg: 'error'
-            });
-        }
-    }).catch((_error) => {
-        res.send({
-            msg: 'error'
-        });
-    });
-}
+    }
 });
 
-app.post("/app/transfer", function(req, res) {
+app.post("/app/transfer", function (req, res) {
     const {
         sender,
         pswd,
@@ -625,156 +631,93 @@ app.post("/app/transfer", function(req, res) {
     const Dest = ('' + dest).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+Sender)){
-        res.send({transf: 'forbidden request'});
-    }else{
-    var am = Number((amount).replaceAll(' ', '+'));
-    if(am >= 100){
-    if (Sender == Dest) {
-        res.send({
-            transf: 'failed'
-        });
+    if (userAgent != DecryptText(tkn, Pswd + Sender)) {
+        res.send({ transf: 'forbidden request' });
     } else {
-        con.promise("SELECT category FROM auths WHERE username = ?;",
-            [Sender]).then((result)=> result[0].category)
-        .then((data) => {
-            const category = Number(data);
-            if (category > 0) {
-                if (category == 2 && Dest == Asendi) {
-                    //Asendi is the server account name
-                    //category 2 for between customer & distributor
-                    type = 2;
-                }
-                if (category == 1 && Dest == Asendi) {
-                    res.send({
-                        transf: 'unsupported'
-                    });
-                } else {
-                    con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
-                        [])
-                    .then((result) => result[0].su_price)
+        var am = Number((amount).replaceAll(' ', '+'));
+        if (am >= 100) {
+            if (Sender == Dest) {
+                res.send({
+                    transf: 'failed'
+                });
+            } else {
+                con.promise("SELECT category FROM auths WHERE username = ?;",
+                    [Sender]).then((result) => result[0].category)
                     .then((data) => {
-                        if (typeof(Number(data)) == 'number') {
-                            p = Number(data);
-                            var Amount = (am / p);
-                            var senderBal;
-                            var destBal;
-                            var date = getDate();
-                            var reference = createTransactionId(Sender);
-                            var maxStockDefault = 2000000; //client side unit
-                            var maxStockDistr = 5000000; //client side unit                          
-                            var fees = (Amount*tfees)/100; // total fees to pay by client
-                            var minRequiredSenderBal = Amount + fees;
-                            var sharedFees = (fees*3)/4; //These are restocked as Ar in the common total_su_prices but shared as SU to the global users in form of interests.
-                            var admin_fees = fees - sharedFees; //the Asendi hold the Ar real value as his. The value of SU is return to the common total_su_prices to be sold again.
-                            //All fees cannot be burnt. They return only to the common total_su_prices before anyone buys them again.
-                            con.promise("SELECT password FROM auths WHERE username = ?;",
-                                [Sender])
-                            .then((result) => DecryptText(result[0].password, password))
-                            .then((data) => {
-                                if (data == Pswd) {
-                                    con.promise("SELECT balance FROM users_su WHERE username = ?;", [Sender])
-                                    .then((result) => result[0].balance)
+                        const category = Number(data);
+                        if (category > 0) {
+                            if (category == 2 && Dest == Asendi) {
+                                //Asendi is the server account name
+                                //category 2 for between customer & distributor
+                                type = 2;
+                            }
+                            if (category == 1 && Dest == Asendi) {
+                                res.send({
+                                    transf: 'unsupported'
+                                });
+                            } else {
+                                con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
+                                    [])
+                                    .then((result) => result[0].su_price)
                                     .then((data) => {
-                                        senderBal = Number(data);
-                                        if (typeof(senderBal) == 'number') {
-                                            if (senderBal >= minRequiredSenderBal) {
-                                                con.promise("SELECT balance FROM users_su WHERE username = ?;", [Dest])
-                                                .then((result) => result[0].balance)
+                                        if (typeof (Number(data)) == 'number') {
+                                            p = Number(data);
+                                            var Amount = (am / p);
+                                            var senderBal;
+                                            var destBal;
+                                            var date = getDate();
+                                            var reference = createTransactionId(Sender);
+                                            var maxStockDefault = 2000000; //client side unit
+                                            var maxStockDistr = 5000000; //client side unit                          
+                                            var fees = (Amount * tfees) / 100; // total fees to pay by client
+                                            var minRequiredSenderBal = Amount + fees;
+                                            var sharedFees = (fees * 3) / 4; //These are restocked as Ar in the common total_su_prices but shared as SU to the global users in form of interests.
+                                            var admin_fees = fees - sharedFees; //the Asendi hold the Ar real value as his. The value of SU is return to the common total_su_prices to be sold again.
+                                            //All fees cannot be burnt. They return only to the common total_su_prices before anyone buys them again.
+                                            con.promise("SELECT password FROM auths WHERE username = ?;",
+                                                [Sender])
+                                                .then((result) => DecryptText(result[0].password, password))
                                                 .then((data) => {
-                                                    destBal = Number(data);
-                                                    if (typeof(destBal) == 'number') {
-                                                        const futurDestBal = destBal + Amount;
-                                                        const AsendiFuturBal = destBal + admin_fees; // Asendi receives the 1/4 of the fees as real cash and
-                                                        //back the equivalent SU value to the public stock to be sold again globally
-                                                        if (Dest != Asendi) {
-                                                            con.promise("SELECT category FROM auths WHERE username = ?;",
-                                                                [Dest]).then((result)=> result[0].category)
+                                                    if (data == Pswd) {
+                                                        con.promise("SELECT balance FROM users_su WHERE username = ?;", [Sender])
+                                                            .then((result) => result[0].balance)
                                                             .then((data) => {
-                                                                const categDest = Number(data);
-                                                                if (categDest > 0) {
+                                                                senderBal = Number(data);
+                                                                if (typeof (senderBal) == 'number') {
+                                                                    if (senderBal >= minRequiredSenderBal) {
+                                                                        con.promise("SELECT balance FROM users_su WHERE username = ?;", [Dest])
+                                                                            .then((result) => result[0].balance)
+                                                                            .then((data) => {
+                                                                                destBal = Number(data);
+                                                                                if (typeof (destBal) == 'number') {
+                                                                                    const futurDestBal = destBal + Amount;
+                                                                                    const AsendiFuturBal = destBal + admin_fees; // Asendi receives the 1/4 of the fees as real cash and
+                                                                                    //back the equivalent SU value to the public stock to be sold again globally
+                                                                                    if (Dest != Asendi) {
+                                                                                        con.promise("SELECT category FROM auths WHERE username = ?;",
+                                                                                            [Dest]).then((result) => result[0].category)
+                                                                                            .then((data) => {
+                                                                                                const categDest = Number(data);
+                                                                                                if (categDest > 0) {
 
-                                                                    if (categDest == 1 && (futurDestBal*p) > maxStockDefault) {
-                                                                        res.send({
-                                                                            transf: 'unsupported'
-                                                                        });
-                                                                    } else if (categDest == 2 && (futurDestBal*p) > maxStockDistr) {
-                                                                        res.send({
-                                                                            transf: 'unsupported'
-                                                                        });
-                                                                    } else {
-                                                                        con.getConnection((err, connection) => {
-                                                                            if (err) res.send({
-                                                                                transf: 'failed'
-                                                                            });
-                                                                            connection.beginTransaction(function(err) {
-                                                                                if (err) connection.release();
-                                                                                connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, ''+p, fees, reference, date[0], date[1]], function(error, _results, _fields) {
-                                                                                    if (error) {
-                                                                                        return connection.rollback(function(err) {
-                                                                                            if (err) throw err;
-                                                                                            res.send({
-                                                                                                transf: 'failed'
-                                                                                            });
-                                                                                            connection.release();
-                                                                                        });
-                                                                                    }
-
-                                                                                    const lastbs = (senderBal - minRequiredSenderBal);
-                                                                                    connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                        [('' + lastbs),
-                                                                                            date[0],
-                                                                                            date[1],
-                                                                                            Sender],
-                                                                                        function(error, _results, _fields) {
-                                                                                            if (error) {
-                                                                                                return connection.rollback(function(err) {
-                                                                                                    if (err) throw err;
-                                                                                                    res.send({
-                                                                                                        transf: 'failed'
-                                                                                                    });
-                                                                                                    connection.release();
-                                                                                                });
-                                                                                            }
-
-                                                                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                                [('' + futurDestBal),
-                                                                                                    date[0],
-                                                                                                    date[1],
-                                                                                                    Dest],
-                                                                                                function(error, _results, _fields) {
-                                                                                                    if (error) {
-                                                                                                        return connection.rollback(function(err) {
-                                                                                                            if (err) throw err;
-                                                                                                            res.send({
+                                                                                                    if (categDest == 1 && (futurDestBal * p) > maxStockDefault) {
+                                                                                                        res.send({
+                                                                                                            transf: 'unsupported'
+                                                                                                        });
+                                                                                                    } else if (categDest == 2 && (futurDestBal * p) > maxStockDistr) {
+                                                                                                        res.send({
+                                                                                                            transf: 'unsupported'
+                                                                                                        });
+                                                                                                    } else {
+                                                                                                        con.getConnection((err, connection) => {
+                                                                                                            if (err) res.send({
                                                                                                                 transf: 'failed'
                                                                                                             });
-                                                                                                            connection.release();
-                                                                                                        });
-                                                                                                    }
-                                                                                                    connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
-                                                                                                        function(err, result) {
-                                                                                                            if (err) {
-
-                                                                                                                return connection.rollback(function(err) {
-                                                                                                                    if (err) throw err;
-                                                                                                                    res.send({
-                                                                                                                        transf: 'failed'
-                                                                                                                    });
-                                                                                                                    connection.release();
-                                                                                                                });
-                                                                                                            }
-                                                                                                            const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
-                                                                                                            if (typeof(Number(data[0])) == 'number') {
-                                                                                                                var lastStock = BigNumber(data[0]);
-                                                                                                                var lastPrice = Number(data[1]);
-                                                                                                                var backed_su = Number(data[2]);
-                                                                                                                var total_backed = backed_su + fees; 
-                                                                                                                var new_stock = lastStock.plus(sharedFees); //added as Ar
-                                                                                                                var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
-                                                                                                                connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price), ('' + total_backed), date[0], date[1]], function(error, _results, _fields) {
+                                                                                                            connection.beginTransaction(function (err) {
+                                                                                                                if (err) connection.release();
+                                                                                                                connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, '' + p, fees, reference, date[0], date[1]], function (error, _results, _fields) {
                                                                                                                     if (error) {
-                                                                                                                        return connection.rollback(function(err) {
+                                                                                                                        return connection.rollback(function (err) {
                                                                                                                             if (err) throw err;
                                                                                                                             res.send({
                                                                                                                                 transf: 'failed'
@@ -782,26 +725,142 @@ app.post("/app/transfer", function(req, res) {
                                                                                                                             connection.release();
                                                                                                                         });
                                                                                                                     }
-                                                                                                                    connection.commit(function(err) {
-                                                                                                                        if (err) {
-                                                                                                                            return connection.rollback(function(err) {
-                                                                                                                                if (err) throw err;
-                                                                                                                                res.send({
-                                                                                                                                    transf: 'failed'
+
+                                                                                                                    const lastbs = (senderBal - minRequiredSenderBal);
+                                                                                                                    connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                                        [('' + lastbs),
+                                                                                                                        date[0],
+                                                                                                                        date[1],
+                                                                                                                            Sender],
+                                                                                                                        function (error, _results, _fields) {
+                                                                                                                            if (error) {
+                                                                                                                                return connection.rollback(function (err) {
+                                                                                                                                    if (err) throw err;
+                                                                                                                                    res.send({
+                                                                                                                                        transf: 'failed'
+                                                                                                                                    });
+                                                                                                                                    connection.release();
                                                                                                                                 });
-                                                                                                                                connection.release();
-                                                                                                                            });
-                                                                                                                        }
-                                                                                                                        res.send({
-                                                                                                                            transf: 'sent'
+                                                                                                                            }
+
+                                                                                                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                                                [('' + futurDestBal),
+                                                                                                                                date[0],
+                                                                                                                                date[1],
+                                                                                                                                    Dest],
+                                                                                                                                function (error, _results, _fields) {
+                                                                                                                                    if (error) {
+                                                                                                                                        return connection.rollback(function (err) {
+                                                                                                                                            if (err) throw err;
+                                                                                                                                            res.send({
+                                                                                                                                                transf: 'failed'
+                                                                                                                                            });
+                                                                                                                                            connection.release();
+                                                                                                                                        });
+                                                                                                                                    }
+                                                                                                                                    connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
+                                                                                                                                        function (err, result) {
+                                                                                                                                            if (err) {
+
+                                                                                                                                                return connection.rollback(function (err) {
+                                                                                                                                                    if (err) throw err;
+                                                                                                                                                    res.send({
+                                                                                                                                                        transf: 'failed'
+                                                                                                                                                    });
+                                                                                                                                                    connection.release();
+                                                                                                                                                });
+                                                                                                                                            }
+                                                                                                                                            const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
+                                                                                                                                            if (typeof (Number(data[0])) == 'number') {
+                                                                                                                                                var lastStock = BigNumber(data[0]);
+                                                                                                                                                var lastPrice = Number(data[1]);
+                                                                                                                                                var backed_su = Number(data[2]);
+                                                                                                                                                var total_backed = backed_su + fees;
+                                                                                                                                                var new_stock = lastStock.plus(sharedFees); //added as Ar
+                                                                                                                                                var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
+                                                                                                                                                connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_stock.toFixed()), ('' + new_price), ('' + total_backed), date[0], date[1]], function (error, _results, _fields) {
+                                                                                                                                                    if (error) {
+                                                                                                                                                        return connection.rollback(function (err) {
+                                                                                                                                                            if (err) throw err;
+                                                                                                                                                            res.send({
+                                                                                                                                                                transf: 'failed'
+                                                                                                                                                            });
+                                                                                                                                                            connection.release();
+                                                                                                                                                        });
+                                                                                                                                                    }
+                                                                                                                                                    connection.commit(function (err) {
+                                                                                                                                                        if (err) {
+                                                                                                                                                            return connection.rollback(function (err) {
+                                                                                                                                                                if (err) throw err;
+                                                                                                                                                                res.send({
+                                                                                                                                                                    transf: 'failed'
+                                                                                                                                                                });
+                                                                                                                                                                connection.release();
+                                                                                                                                                            });
+                                                                                                                                                        }
+                                                                                                                                                        res.send({
+                                                                                                                                                            transf: 'sent'
+                                                                                                                                                        });
+
+                                                                                                                                                    });
+
+
+                                                                                                                                                });
+                                                                                                                                            } else {
+                                                                                                                                                return connection.rollback(function (err) {
+                                                                                                                                                    if (err) throw err;
+                                                                                                                                                    res.send({
+                                                                                                                                                        transf: 'failed'
+                                                                                                                                                    });
+                                                                                                                                                    connection.release();
+                                                                                                                                                });
+                                                                                                                                            }
+                                                                                                                                        });
+
+                                                                                                                                });
                                                                                                                         });
-
-                                                                                                                    });
-
-
                                                                                                                 });
-                                                                                                            } else {
-                                                                                                                return connection.rollback(function(err) {
+                                                                                                            });
+
+                                                                                                        });
+                                                                                                    }
+                                                                                                } else {
+                                                                                                    res.send({
+                                                                                                        transf: 'failed'
+                                                                                                    });
+                                                                                                }
+                                                                                            }).catch((_error) => {
+                                                                                                res.send({
+                                                                                                    transf: 'failed'
+                                                                                                });
+                                                                                            });
+                                                                                    } else {
+                                                                                        con.getConnection((err, connection) => {
+                                                                                            if (err) res.send({
+                                                                                                transf: 'failed'
+                                                                                            });
+                                                                                            connection.beginTransaction(function (err) {
+                                                                                                if (err) connection.release();
+                                                                                                connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, '' + p, fees, reference, date[0], date[1]], function (error, _results, _fields) {
+                                                                                                    if (error) {
+                                                                                                        return connection.rollback(function (err) {
+                                                                                                            if (err) throw err;
+                                                                                                            res.send({
+                                                                                                                transf: 'failed'
+                                                                                                            });
+                                                                                                            connection.release();
+                                                                                                        });
+                                                                                                    }
+
+                                                                                                    const lastbs = (senderBal - minRequiredSenderBal);
+                                                                                                    connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                        [('' + lastbs),
+                                                                                                        date[0],
+                                                                                                        date[1],
+                                                                                                            Sender],
+                                                                                                        function (error, _results, _fields) {
+                                                                                                            if (error) {
+                                                                                                                return connection.rollback(function (err) {
                                                                                                                     if (err) throw err;
                                                                                                                     res.send({
                                                                                                                         transf: 'failed'
@@ -809,209 +868,158 @@ app.post("/app/transfer", function(req, res) {
                                                                                                                     connection.release();
                                                                                                                 });
                                                                                                             }
-                                                                                                        });
 
+                                                                                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                                [('' + AsendiFuturBal),
+                                                                                                                date[0],
+                                                                                                                date[1],
+                                                                                                                    Dest],
+                                                                                                                function (error, _results, _fields) {
+                                                                                                                    if (error) {
+                                                                                                                        return connection.rollback(function (err) {
+                                                                                                                            if (err) throw err;
+                                                                                                                            res.send({
+                                                                                                                                transf: 'failed'
+                                                                                                                            });
+                                                                                                                            connection.release();
+                                                                                                                        });
+                                                                                                                    }
+                                                                                                                    connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
+                                                                                                                        function (err, result) {
+                                                                                                                            if (err) {
+
+                                                                                                                                return connection.rollback(function (err) {
+                                                                                                                                    if (err) throw err;
+                                                                                                                                    res.send({
+                                                                                                                                        transf: 'failed'
+                                                                                                                                    });
+                                                                                                                                    connection.release();
+                                                                                                                                });
+                                                                                                                            }
+                                                                                                                            const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
+                                                                                                                            if (typeof (Number(data[0])) == 'number') {
+                                                                                                                                var lastStock = BigNumber(data[0]);
+                                                                                                                                var lastPrice = Number(data[1]);
+                                                                                                                                var backed_su = Number(data[2]);
+                                                                                                                                var total_backed = Amount + backed_su + fees; // the Amount is added to the backed_su instead of updating the Asendi balance
+                                                                                                                                var new_stock = lastStock.plus(sharedFees); //added as Ar
+                                                                                                                                var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
+                                                                                                                                connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_stock.toFixed()), ('' + new_price), ('' + total_backed), date[0], date[1]], function (error, _results, _fields) {
+                                                                                                                                    if (error) {
+                                                                                                                                        return connection.rollback(function (err) {
+                                                                                                                                            if (err) throw err;
+                                                                                                                                            res.send({
+                                                                                                                                                transf: 'failed'
+                                                                                                                                            });
+                                                                                                                                            connection.release();
+                                                                                                                                        });
+                                                                                                                                    }
+                                                                                                                                    connection.commit(function (err) {
+                                                                                                                                        if (err) {
+                                                                                                                                            return connection.rollback(function (err) {
+                                                                                                                                                if (err) throw err;
+                                                                                                                                                res.send({
+                                                                                                                                                    transf: 'failed'
+                                                                                                                                                });
+                                                                                                                                                connection.release();
+                                                                                                                                            });
+                                                                                                                                        }
+                                                                                                                                        res.send({
+                                                                                                                                            transf: 'sent'
+                                                                                                                                        });
+
+                                                                                                                                    });
+
+
+                                                                                                                                });
+                                                                                                                            } else {
+                                                                                                                                return connection.rollback(function (err) {
+                                                                                                                                    if (err) throw err;
+                                                                                                                                    res.send({
+                                                                                                                                        transf: 'failed'
+                                                                                                                                    });
+                                                                                                                                    connection.release();
+                                                                                                                                });
+                                                                                                                            }
+                                                                                                                        });
+
+                                                                                                                });
+                                                                                                        });
                                                                                                 });
+                                                                                            });
+
                                                                                         });
+                                                                                    }
+                                                                                } else {
+                                                                                    res.send({
+                                                                                        transf: 'failed'
+                                                                                    });
+
+                                                                                }
+                                                                            }).catch((_error) => {
+                                                                                res.send({
+                                                                                    transf: 'no dest'
                                                                                 });
                                                                             });
-
+                                                                    } else {
+                                                                        res.send({
+                                                                            transf: 'insufficient balance'
                                                                         });
-                                                                    }} else {
+                                                                    }
+                                                                } else {
                                                                     res.send({
                                                                         transf: 'failed'
                                                                     });
+
                                                                 }
                                                             }).catch((_error) => {
                                                                 res.send({
                                                                     transf: 'failed'
                                                                 });
                                                             });
-                                                        } else {
-                                                            con.getConnection((err, connection) => {
-                                                                if (err) res.send({
-                                                                    transf: 'failed'
-                                                                });
-                                                                connection.beginTransaction(function(err) {
-                                                                    if (err) connection.release();
-                                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, ''+p, fees, reference, date[0], date[1]], function(error, _results, _fields) {
-                                                                        if (error) {
-                                                                            return connection.rollback(function(err) {
-                                                                                if (err) throw err;
-                                                                                res.send({
-                                                                                    transf: 'failed'
-                                                                                });
-                                                                                connection.release();
-                                                                            });
-                                                                        }
-
-                                                                        const lastbs = (senderBal - minRequiredSenderBal);
-                                                                        connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                            [('' + lastbs),
-                                                                                date[0],
-                                                                                date[1],
-                                                                                Sender],
-                                                                            function(error, _results, _fields) {
-                                                                                if (error) {
-                                                                                    return connection.rollback(function(err) {
-                                                                                        if (err) throw err;
-                                                                                        res.send({
-                                                                                            transf: 'failed'
-                                                                                        });
-                                                                                        connection.release();
-                                                                                    });
-                                                                                }
-
-                                                                                connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                    [('' + AsendiFuturBal),
-                                                                                        date[0],
-                                                                                        date[1],
-                                                                                        Dest],
-                                                                                    function(error, _results, _fields) {
-                                                                                        if (error) {
-                                                                                            return connection.rollback(function(err) {
-                                                                                                if (err) throw err;
-                                                                                                res.send({
-                                                                                                    transf: 'failed'
-                                                                                                });
-                                                                                                connection.release();
-                                                                                            });
-                                                                                        }
-                                                                                        connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
-                                                                                            function(err, result) {
-                                                                                                if (err) {
-
-                                                                                                    return connection.rollback(function(err) {
-                                                                                                        if (err) throw err;
-                                                                                                        res.send({
-                                                                                                            transf: 'failed'
-                                                                                                        });
-                                                                                                        connection.release();
-                                                                                                    });
-                                                                                                }
-                                                                                                const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
-                                                                                                if (typeof(Number(data[0])) == 'number') {
-                                                                                                    var lastStock = BigNumber(data[0]);
-                                                                                                    var lastPrice = Number(data[1]);
-                                                                                                    var backed_su = Number(data[2]);
-                                                                                                    var total_backed = Amount + backed_su + fees; // the Amount is added to the backed_su instead of updating the Asendi balance
-                                                                                                    var new_stock = lastStock.plus(sharedFees); //added as Ar
-                                                                                                    var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
-                                                                                                    connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price),('' + total_backed), date[0], date[1]], function(error, _results, _fields) {
-                                                                                                        if (error) {
-                                                                                                            return connection.rollback(function(err) {
-                                                                                                                if (err) throw err;
-                                                                                                                res.send({
-                                                                                                                    transf: 'failed'
-                                                                                                                });
-                                                                                                                connection.release();
-                                                                                                            });
-                                                                                                        }
-                                                                                                        connection.commit(function(err) {
-                                                                                                            if (err) {
-                                                                                                                return connection.rollback(function(err) {
-                                                                                                                    if (err) throw err;
-                                                                                                                    res.send({
-                                                                                                                        transf: 'failed'
-                                                                                                                    });
-                                                                                                                    connection.release();
-                                                                                                                });
-                                                                                                            }
-                                                                                                            res.send({
-                                                                                                                transf: 'sent'
-                                                                                                            });
-
-                                                                                                        });
-
-
-                                                                                                    });
-                                                                                                } else {
-                                                                                                    return connection.rollback(function(err) {
-                                                                                                        if (err) throw err;
-                                                                                                        res.send({
-                                                                                                            transf: 'failed'
-                                                                                                        });
-                                                                                                        connection.release();
-                                                                                                    });
-                                                                                                }
-                                                                                            });
-
-                                                                                    });
-                                                                            });
-                                                                    });
-                                                                });
-
-                                                            });
-                                                        }
                                                     } else {
                                                         res.send({
-                                                            transf: 'failed'
+                                                            transf: "failed"
                                                         });
-
                                                     }
                                                 }).catch((_error) => {
                                                     res.send({
-                                                        transf: 'no dest'
+                                                        transf: 'no exp'
                                                     });
                                                 });
-                                            } else {
-                                                res.send({
-                                                    transf: 'insufficient balance'
-                                                });
-                                            }
+
                                         } else {
                                             res.send({
                                                 transf: 'failed'
                                             });
-
                                         }
+
+
                                     }).catch((_error) => {
                                         res.send({
                                             transf: 'failed'
                                         });
                                     });
-                                } else {
-                                    res.send({
-                                        transf: "failed"
-                                    });
-                                }
-                            }).catch((_error) => {
-                                res.send({
-                                    transf: 'no exp'
-                                });
-                            });
-
+                            }
                         } else {
                             res.send({
                                 transf: 'failed'
                             });
                         }
 
-
                     }).catch((_error) => {
                         res.send({
                             transf: 'failed'
                         });
                     });
-                }
-            } else {
-                res.send({
-                    transf: 'failed'
-                });
             }
-
-        }).catch((_error) => {
-            res.send({
-                transf: 'failed'
-            });
-        });
+        } else {
+            res.send({ warning: 'abusive operation' });
+        }
     }
-}else{
-    res.send({warning: 'abusive operation'});
-}}
 });
 
-app.post("/app/signin", function(req,
+app.post("/app/signin", function (req,
     res) {
 
     const {
@@ -1021,141 +1029,143 @@ app.post("/app/signin", function(req,
         recon,
         secret_word
     } = req.body;
-    
+
     const User = ('' + user).replaceAll(' ',
         '+');
     const Pswd = ('' + pswd).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+User)){
-        if(recon == '0'){
-        res.send({msg: 'forbidden request', ua:''});
-        }else{
+    if (userAgent != DecryptText(tkn, Pswd + User)) {
+        if (recon == '0') {
+            res.send({ msg: 'forbidden request', ua: '' });
+        } else {
             con.promise("SELECT password,secret_word FROM auths WHERE username = ?",
                 [User])
-            .then((result) => [DecryptText(result[0].password, password), DecryptText(result[0].secret_word, password)])
-            .then((data) => {
-                if (data[0] == Pswd) {
-                    if(data[1] == secret_word){
-                    const encUA = EncryptText(userAgent, Pswd+User);
-                    con.promise("SELECT category FROM auths WHERE username = ?",
-                        [User])
-                    .then((result) => result[0].category)
-                    .then((data) => {
-                        if (data == 0) {
-                            con.query('UPDATE auths SET category = ? WHERE username = ?', [1, User], function(err, _result) {
-                                if (err) throw err;
-                                status = "1";
-                                res.send({
-                                    msg: status, ua: encUA
-                                });
-                                con.promise("SELECT id FROM auths WHERE username = ?",
-                                    [User])
-                                .then((result) => result[0].id)
+                .then((result) => [DecryptText(result[0].password, password), DecryptText(result[0].secret_word, password)])
+                .then((data) => {
+                    if (data[0] == Pswd) {
+                        if (data[1] == secret_word) {
+                            const encUA = EncryptText(userAgent, Pswd + User);
+                            con.promise("SELECT category FROM auths WHERE username = ?",
+                                [User])
+                                .then((result) => result[0].category)
                                 .then((data) => {
-                                    if (data <= first_welcome_clients) {
-                                        var date = getDate();
-                                        var reference = createTransactionId(Asendi);
-                                        con.query('UPDATE users_su SET balance = ? WHERE username = ?', [''+welcome_bonus, User], function(err, _result) {
+                                    if (data == 0) {
+                                        con.query('UPDATE auths SET category = ? WHERE username = ?', [1, User], function (err, _result) {
                                             if (err) throw err;
-                                            console.log('bonus shared');
-                                            con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', ''+welcome_bonus, '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
-                                                if (error) {
-                                                   
-                                                }});
+                                            status = "1";
+                                            res.send({
+                                                msg: status, ua: encUA
+                                            });
+                                            con.promise("SELECT id FROM auths WHERE username = ?",
+                                                [User])
+                                                .then((result) => result[0].id)
+                                                .then((data) => {
+                                                    if (data <= first_welcome_clients) {
+                                                        var date = getDate();
+                                                        var reference = createTransactionId(Asendi);
+                                                        con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['' + welcome_bonus, User], function (err, _result) {
+                                                            if (err) throw err;
+                                                            console.log('bonus shared');
+                                                            con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
+                                                                if (error) {
+
+                                                                }
+                                                            });
+                                                        });
+                                                    }
+                                                }).catch((error) => {
+                                                    throw error;
+                                                });
+
+                                        });
+                                    } else {
+                                        res.send({
+                                            msg: data, ua: encUA
                                         });
                                     }
                                 }).catch((error) => {
                                     throw error;
                                 });
-        
-                            });
                         } else {
                             res.send({
-                                msg: data, ua: encUA
+                                msg: "incorrect secret word", ua: ''
                             });
                         }
-                    }).catch((error) => {
-                        throw error;
-                    });
-                }else{
-                    res.send({
-                        msg: "incorrect secret word", ua:''
-                    });   
-                }
-                } else {
-                    res.send({
-                        msg: "incorrect password", ua:''
-                    });
-                }
-            }).catch((_error) => {
-                res.send({
-                    msg: 'error', ua:''
-                });
-            });  
-        }
-    }else{
-    con.promise("SELECT password FROM auths WHERE username = ?",
-        [User])
-    .then((result) => DecryptText(result[0].password, password))
-    .then((data) => {
-        if (data == Pswd) {
-            const encUA = EncryptText(userAgent, Pswd+User);
-            con.promise("SELECT category FROM auths WHERE username = ?",
-                [User])
-            .then((result) => result[0].category)
-            .then((data) => {
-                if (data == 0) {
-                    con.query('UPDATE auths SET category = ? WHERE username = ?', [1, User], function(err, _result) {
-                        if (err) throw err;
-                        status = "1";
+                    } else {
                         res.send({
-                            msg: status, ua: encUA
+                            msg: "incorrect password", ua: ''
                         });
-                        con.promise("SELECT id FROM auths WHERE username = ?",
-                            [User])
-                        .then((result) => result[0].id)
+                    }
+                }).catch((_error) => {
+                    res.send({
+                        msg: 'error', ua: ''
+                    });
+                });
+        }
+    } else {
+        con.promise("SELECT password FROM auths WHERE username = ?",
+            [User])
+            .then((result) => DecryptText(result[0].password, password))
+            .then((data) => {
+                if (data == Pswd) {
+                    const encUA = EncryptText(userAgent, Pswd + User);
+                    con.promise("SELECT category FROM auths WHERE username = ?",
+                        [User])
+                        .then((result) => result[0].category)
                         .then((data) => {
-                            if (data <= first_welcome_clients) {
-                                var date = getDate();
-                                var reference = createTransactionId(Asendi);
-                                con.query('UPDATE users_su SET balance = ? WHERE username = ?', [''+welcome_bonus, User], function(err, _result) {
+                            if (data == 0) {
+                                con.query('UPDATE auths SET category = ? WHERE username = ?', [1, User], function (err, _result) {
                                     if (err) throw err;
-                                    console.log('bonus shared');
-                                    con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', ''+welcome_bonus, '1', '0', reference, date[0], date[1]], function(error, _results, _fields) {
-                                        if (error) {
-                                           
-                                        }});
+                                    status = "1";
+                                    res.send({
+                                        msg: status, ua: encUA
+                                    });
+                                    con.promise("SELECT id FROM auths WHERE username = ?",
+                                        [User])
+                                        .then((result) => result[0].id)
+                                        .then((data) => {
+                                            if (data <= first_welcome_clients) {
+                                                var date = getDate();
+                                                var reference = createTransactionId(Asendi);
+                                                con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['' + welcome_bonus, User], function (err, _result) {
+                                                    if (err) throw err;
+                                                    console.log('bonus shared');
+                                                    con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
+                                                        if (error) {
+
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                        }).catch((error) => {
+                                            throw error;
+                                        });
+
+                                });
+                            } else {
+                                res.send({
+                                    msg: data, ua: encUA
                                 });
                             }
                         }).catch((error) => {
                             throw error;
                         });
 
-                    });
                 } else {
                     res.send({
-                        msg: data, ua: encUA
+                        msg: "incorrect auth"
                     });
                 }
-            }).catch((error) => {
-                throw error;
+            }).catch((_error) => {
+                res.send({
+                    msg: 'error'
+                });
             });
-
-        } else {
-            res.send({
-                msg: "incorrect auth"
-            });
-        }
-    }).catch((_error) => {
-        res.send({
-            msg: 'error'
-        });
-    });
     }
 });
 
-app.post("/app/mpc", function(req,
+app.post("/app/mpc", function (req,
     res) {
     const {
         user,
@@ -1170,107 +1180,107 @@ app.post("/app/mpc", function(req,
     const Pswd2 = ('' + pswd2).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd1+User)){
-        res.send({auth: 'forbidden request'});
-    }else{
-    con.promise("SELECT password FROM auths WHERE username = ?",
-        [User])
-    .then((result) => DecryptText(result[0].password, password))
-    .then((data) => {
-        if (data == Pswd1) {
-            con.query('UPDATE auths SET password = ? WHERE username = ?', [EncryptText(Pswd2, password), User], function(err, _result) {
-                if (err) throw err;
+    if (userAgent != DecryptText(tkn, Pswd1 + User)) {
+        res.send({ auth: 'forbidden request' });
+    } else {
+        con.promise("SELECT password FROM auths WHERE username = ?",
+            [User])
+            .then((result) => DecryptText(result[0].password, password))
+            .then((data) => {
+                if (data == Pswd1) {
+                    con.query('UPDATE auths SET password = ? WHERE username = ?', [EncryptText(Pswd2, password), User], function (err, _result) {
+                        if (err) throw err;
+                        res.send({
+                            auth: 'updated'
+                        });
+                    });
+                } else {
+                    res.send({
+                        auth: "incorrect"
+                    });
+                }
+            }).catch((_error) => {
                 res.send({
-                    auth: 'updated'
+                    auth: 'error'
                 });
             });
-        } else {
-            res.send({
-                auth: "incorrect"
-            });
-        }
-    }).catch((_error) => {
-        res.send({
-            auth: 'error'
-        });
-    });
-}
+    }
 });
 
-app.post("/app/dltacc", function(req,
+app.post("/app/dltacc", function (req,
     res) {
     const {
         user,
         pswd,
         tkn
     } = req.body;
-    const User = (''+user).replaceAll(' ',
+    const User = ('' + user).replaceAll(' ',
         '+');
-    const Pswd = (''+pswd).replaceAll(' ',
+    const Pswd = ('' + pswd).replaceAll(' ',
         '+');
     var price = 0;
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+User)){
-        res.send({auth: 'forbidden request'});
-    }else{
-    con.promise("SELECT password FROM auths WHERE username = ?",
-        [User])
-    .then((result) => DecryptText(result[0].password, password))
-    .then((data) => {
-        if (data == Pswd) {
-            con.promise("SELECT ppu FROM common ORDER BY id DESC LIMIT 1;",
-                [])
-            .then((result) => result[0].ppu)
+    if (userAgent != DecryptText(tkn, Pswd + User)) {
+        res.send({ auth: 'forbidden request' });
+    } else {
+        con.promise("SELECT password FROM auths WHERE username = ?",
+            [User])
+            .then((result) => DecryptText(result[0].password, password))
             .then((data) => {
-                if (typeof(Number(data)) == 'number') {
-                    price = Number(data);
-                    con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
-                    .then((result) => result[0].balance)
-                    .then((data) => {
-                        var bal = Number(data) * price;
-                        if (bal <= 1000) {
-                            //accept the delete request
-                            con.query('DELETE FROM auths WHERE username = ?', [User], function(err, _result) {
-                                if (err) throw err;
-                                res.send({
-                                    auth: "deleted"
-                                });
-                            });
+                if (data == Pswd) {
+                    con.promise("SELECT ppu FROM common ORDER BY id DESC LIMIT 1;",
+                        [])
+                        .then((result) => result[0].ppu)
+                        .then((data) => {
+                            if (typeof (Number(data)) == 'number') {
+                                price = Number(data);
+                                con.promise("SELECT balance FROM users_su WHERE username = ?;", [User])
+                                    .then((result) => result[0].balance)
+                                    .then((data) => {
+                                        var bal = Number(data) * price;
+                                        if (bal <= 1000) {
+                                            //accept the delete request
+                                            con.query('DELETE FROM auths WHERE username = ?', [User], function (err, _result) {
+                                                if (err) throw err;
+                                                res.send({
+                                                    auth: "deleted"
+                                                });
+                                            });
 
-                        } else {
+                                        } else {
+                                            res.send({
+                                                auth: 'failed, balance > 1000'
+                                            });
+                                        }
+                                    }).catch((_error) => {
+                                        res.send({
+                                            auth: 'error'
+                                        });
+                                    });
+                            } else {
+                                res.send({
+                                    auth: 'error'
+                                })
+                            }
+                        }).catch((_error) => {
                             res.send({
-                                auth: 'failed, balance > 1000'
-                            });
-                        }
-                    }).catch((_error) => {
-                        res.send({
-                            auth: 'error'
+                                auth: 'error'
+                            })
                         });
-                    });
                 } else {
                     res.send({
-                        auth: 'error'
-                    })
+                        auth: "incorrect"
+                    });
                 }
             }).catch((_error) => {
                 res.send({
                     auth: 'error'
-                })
+                });
             });
-        } else {
-            res.send({
-                auth: "incorrect"
-            });
-        }
-    }).catch((_error) => {
-        res.send({
-            auth: 'error'
-        });
-    });
-}
+    }
 });
 
-app.post("/app/reacc", function(req,
+app.post("/app/reacc", function (req,
     res) {
     const {
         user,
@@ -1282,29 +1292,29 @@ app.post("/app/reacc", function(req,
         '+');
     con.promise("SELECT secret_word FROM auths WHERE username = ?",
         [User])
-    .then((result) => DecryptText(result[0].secret_word, password))
-    .then((data) => {
-        if (data == secret_word) {
-            let newPC = EncryptText('123456', password);
-            con.query('UPDATE auths SET password = ? WHERE username = ?', [newPC, User], function(err, _result) {
-                if (err) throw err;
-                res.send({
-                    auth: 'updated'
+        .then((result) => DecryptText(result[0].secret_word, password))
+        .then((data) => {
+            if (data == secret_word) {
+                let newPC = EncryptText('123456', password);
+                con.query('UPDATE auths SET password = ? WHERE username = ?', [newPC, User], function (err, _result) {
+                    if (err) throw err;
+                    res.send({
+                        auth: 'updated'
+                    });
                 });
-            });
-        } else {
+            } else {
+                res.send({
+                    auth: "incorrect"
+                });
+            }
+        }).catch((_error) => {
             res.send({
-                auth: "incorrect"
+                auth: 'error'
             });
-        }
-    }).catch((_error) => {
-        res.send({
-            auth: 'error'
         });
-    });
 });
 
-app.post("/app/msk", function(req,
+app.post("/app/msk", function (req,
     res) {
     const {
         user,
@@ -1319,37 +1329,37 @@ app.post("/app/msk", function(req,
     const secret_word = ('' + sk).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+User)){
-        res.send({auth: 'forbidden request'});
-    }else{
-    con.promise("SELECT password FROM auths WHERE username = ?",
-        [User])
-    .then((result) => DecryptText(result[0].password, password))
-    .then((data) => {
-        if (data == Pswd) {
-            let ek = "" + EncryptText(secret_word, password);
-            con.query('UPDATE auths SET secret_word = ? WHERE username = ?', [ek, User], function(err, _result) {
-                if (err) throw err;
+    if (userAgent != DecryptText(tkn, Pswd + User)) {
+        res.send({ auth: 'forbidden request' });
+    } else {
+        con.promise("SELECT password FROM auths WHERE username = ?",
+            [User])
+            .then((result) => DecryptText(result[0].password, password))
+            .then((data) => {
+                if (data == Pswd) {
+                    let ek = "" + EncryptText(secret_word, password);
+                    con.query('UPDATE auths SET secret_word = ? WHERE username = ?', [ek, User], function (err, _result) {
+                        if (err) throw err;
+                        res.send({
+                            auth: 'updated'
+                        });
+                    });
+                } else {
+                    res.send({
+                        auth: "incorrect"
+                    });
+                }
+            }).catch((_error) => {
                 res.send({
-                    auth: 'updated'
+                    auth: 'not exists'
                 });
             });
-        } else {
-            res.send({
-                auth: "incorrect"
-            });
-        }
-    }).catch((_error) => {
-        res.send({
-            auth: 'not exists'
-        });
-    });
-}
+    }
 });
 
 
 app.post("/app/signup",
-    function(req,
+    function (req,
         res) {
         //prevent sql injection by replacing or modifying vulnerable data.
         const {
@@ -1363,79 +1373,64 @@ app.post("/app/signup",
             cinimg1,
             cinimg2
         } = req.body;
-        const userIp  = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+        const userIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
         const geo = geoip.lookup(userIp);
         if (geo) {
-        var country = geo.country;
-        if(country == 'MG' || userIp.includes('127.0.0.1')){
-        const Email = ('' + (email)).replaceAll(' ',
-            '+');
-        const Birth = ('' + (birth)).replaceAll(' ',
-            '+');
-        const Address = ('' + (addr)).replaceAll(' ',
-            '+');
-        const Name = ('' + (name)).replaceAll(' ',
-            '+');
-        const Cin = EncryptText(('' + cin).replaceAll(' ',
-            '+'), password);
-        const Pswd = EncryptText(('' + pswd).replaceAll(' ',
-            '+'), password);
-        const Secretkey = EncryptText(('' + (secret_word)).replaceAll(' ',
-            '+'), password);
-        var user_suffix_name = '' + createUserSuffixName(cin);
-        var user_prefix_name = '' + getUserPrefixName(Name);
-        username = '' + (user_prefix_name + "-" + user_suffix_name).toUpperCase();
-        const cin_img1 = '' + cinimg1;
-        const cin_img2 = '' + cinimg2;
-        const date = getDate();
-        //Check if user_prefix_name + user_suffix_name already exists.
-        //If exists, recreate again.
-        con.query("SELECT * FROM auths WHERE username = ?;",
-            [username],
-            function(error,
-                result,
-                _field) {
-                if (error) throw error;
-                if (result.length > 0) {
-                    res.send({
-                        msg: 'retry'
-                    });
-                } else {
-                    var data = [username,
-                        Pswd,
-                        Name,
-                        Email,
-                        Birth,
-                        Cin,
-                        Address,
-                        Secretkey,
-                        0,
-                        date[0],
-                        date[1]];
-                    con.getConnection((err, connection) => {
-                        if (err) res.send({
-                            msg: 'failed'
-                        });
-                        connection.beginTransaction(function(err) {
-                            if (err) connection.release();
-                            connection.query('INSERT INTO auths (username, password, name, email, birthdate, cin, address, secret_word, category, deliver_date, deliver_time) VALUES (?,?,?,?,?,?,?,?,?,?,?);', data, function(error, _results, _fields) {
-                                if (error) {
-                                    return connection.rollback(function(err) {
-                                        if (err) throw err;
-                                        res.send({
-                                            msg: 'failed'
-                                        });
-                                        connection.release();
-                                    });
-                                }
-                                connection.query('INSERT INTO users_su (username,balance,deliver_date,deliver_time) values(?,?,?,?);',
-                                    [username,
-                                        '0',
-                                        date[0],
-                                        date[1]],
-                                    function(error, _results, _fields) {
+            var country = geo.country;
+            if (country == 'MG' || userIp.includes('127.0.0.1')) {
+                const Email = ('' + (email)).replaceAll(' ',
+                    '+');
+                const Birth = ('' + (birth)).replaceAll(' ',
+                    '+');
+                const Address = ('' + (addr)).replaceAll(' ',
+                    '+');
+                const Name = ('' + (name)).replaceAll(' ',
+                    '+');
+                const Cin = EncryptText(('' + cin).replaceAll(' ',
+                    '+'), password);
+                const Pswd = EncryptText(('' + pswd).replaceAll(' ',
+                    '+'), password);
+                const Secretkey = EncryptText(('' + (secret_word)).replaceAll(' ',
+                    '+'), password);
+                var user_suffix_name = '' + createUserSuffixName(cin);
+                var user_prefix_name = '' + getUserPrefixName(Name);
+                username = '' + (user_prefix_name + "-" + user_suffix_name).toUpperCase();
+                const cin_img1 = '' + cinimg1;
+                const cin_img2 = '' + cinimg2;
+                const date = getDate();
+                //Check if user_prefix_name + user_suffix_name already exists.
+                //If exists, recreate again.
+                con.query("SELECT * FROM auths WHERE username = ?;",
+                    [username],
+                    function (error,
+                        result,
+                        _field) {
+                        if (error) throw error;
+                        if (result.length > 0) {
+                            res.send({
+                                msg: 'retry'
+                            });
+                        } else {
+                            var data = [username,
+                                Pswd,
+                                Name,
+                                Email,
+                                Birth,
+                                Cin,
+                                Address,
+                                Secretkey,
+                                0,
+                                date[0],
+                                date[1]];
+                            con.getConnection((err, connection) => {
+                                if (err) res.send({
+                                    msg: 'failed'
+                                });
+                                connection.beginTransaction(function (err) {
+                                    if (err) connection.release();
+                                    connection.query('INSERT INTO auths (username, password, name, email, birthdate, cin, address, secret_word, category, deliver_date, deliver_time) VALUES (?,?,?,?,?,?,?,?,?,?,?);', data, function (error, _results, _fields) {
                                         if (error) {
-                                            return connection.rollback(function(err) {
+                                            return connection.rollback(function (err) {
                                                 if (err) throw err;
                                                 res.send({
                                                     msg: 'failed'
@@ -1443,53 +1438,70 @@ app.post("/app/signup",
                                                 connection.release();
                                             });
                                         }
-                                        connection.commit(function(err) {
-                                            if (err) {
-                                                return connection.rollback(function(err) {
-                                                    if (err) throw err;
+                                        connection.query('INSERT INTO users_su (username,balance,deliver_date,deliver_time) values(?,?,?,?);',
+                                            [username,
+                                                '0',
+                                                date[0],
+                                                date[1]],
+                                            function (error, _results, _fields) {
+                                                if (error) {
+                                                    return connection.rollback(function (err) {
+                                                        if (err) throw err;
+                                                        res.send({
+                                                            msg: 'failed'
+                                                        });
+                                                        connection.release();
+                                                    });
+                                                }
+                                                connection.commit(function (err) {
+                                                    if (err) {
+                                                        return connection.rollback(function (err) {
+                                                            if (err) throw err;
+                                                            res.send({
+                                                                msg: 'failed'
+                                                            });
+                                                            connection.release();
+                                                        });
+                                                    }
+                                                    transporter.sendMail({
+                                                        from: server_mail,
+                                                        to: Email,
+                                                        subject: 'Nouvelle inscription',
+                                                        html: '<h2>Bienvenue cher(e) client(e),</h2><br>Vous venez de vous inscrire sur notre plateforme. Votre identifiant est :<br><b>' + username + '</b><br>Pour activer une fois votre compte, connectez-vous avec l&apos;identifiant ci-dessus dans le d&eacute;lai de 7 jours.<br><br><br>L&apos;&eacute;quipe Asendi,'
+                                                    },
+                                                        function (err, _info) {
+                                                            if (err) throw err;
+                                                        });
+                                                    sendCinImagesForVerification('' + username + '<br>' + Name + '<br>' + Birth + '<br>' + Address + '<br>' + cin,
+                                                        cin_img1,
+                                                        cin_img2);
                                                     res.send({
-                                                        msg: 'failed'
+                                                        msg: 'ok'
                                                     });
                                                     connection.release();
                                                 });
-                                            }
-                                            transporter.sendMail({
-                                                from: server_mail,
-                                                to: Email,
-                                                subject: 'Nouvelle inscription',
-                                                html: '<h2>Bienvenue cher(e) client(e),</h2><br>Vous venez de vous inscrire sur notre plateforme. Votre identifiant est :<br><b>' + username + '</b><br>Pour activer une fois votre compte, connectez-vous avec l&apos;identifiant ci-dessus dans le d&eacute;lai de 7 jours.<br><br><br>L&apos;&eacute;quipe Asendi,'
-                                            },
-                                                function(err, _info) {
-                                                    if (err) throw err;
-                                                });
-                                            sendCinImagesForVerification('' + username + '<br>' + Name + '<br>' + Birth + '<br>' + Address + '<br>' + cin,
-                                                cin_img1,
-                                                cin_img2);
-                                            res.send({
-                                                msg: 'ok'
                                             });
-                                            connection.release();
-                                        });
                                     });
+                                });
                             });
-                        });
+
+                        }
+
+
                     });
-
-                }
-
-
-            }); }else{
+            } else {
                 res.send({
                     msg: 'unsupported country'
                 });
-            }}else{
-                res.send({
-                    msg: 'what country'
-                });
             }
+        } else {
+            res.send({
+                msg: 'what country'
+            });
+        }
     });
 
-app.post("/app/transrec", function(req, res) {
+app.post("/app/transrec", function (req, res) {
     const {
         user, pswd, days, tkn
     } = req.body;
@@ -1500,36 +1512,37 @@ app.post("/app/transrec", function(req, res) {
     const Pswd = ('' + pswd).replaceAll(' ',
         '+');
     const userAgent = req.headers['user-agent'];
-    if(userAgent != DecryptText(tkn, Pswd+User)){
-        res.send({trans: 'forbidden request'});
-    }else{
-    con.promise("SELECT password FROM auths WHERE username = ?",
-        [User])
-    .then((result) => DecryptText(result[0].password, password))
-    .then((data) => {
-        if (data == Pswd) {
-            con.promise("SELECT * FROM activities WHERE (deliver_date >= ? AND (sender = ? OR receiver = ?)) ORDER BY id DESC;", [daybefore, User, User])
-            .then((result) => result)
+    if (userAgent != DecryptText(tkn, Pswd + User)) {
+        res.send({ trans: 'forbidden request' });
+    } else {
+        con.promise("SELECT password FROM auths WHERE username = ?",
+            [User])
+            .then((result) => DecryptText(result[0].password, password))
             .then((data) => {
-                const d = {
-                    trans: data
-                };
-                res.send(d);
+                if (data == Pswd) {
+                    con.promise("SELECT * FROM activities WHERE (deliver_date >= ? AND (sender = ? OR receiver = ?)) ORDER BY id DESC;", [daybefore, User, User])
+                        .then((result) => result)
+                        .then((data) => {
+                            const d = {
+                                trans: data
+                            };
+                            res.send(d);
+                        }).catch((_error) => {
+                            res.send({
+                                trans: 'error'
+                            });
+                        });
+                } else {
+                    res.send({
+                        trans: 'error'
+                    });
+                }
             }).catch((_error) => {
                 res.send({
                     trans: 'error'
                 });
             });
-        } else {
-            res.send({
-                trans: 'error'
-            });
-        }}).catch((_error)=> {
-        res.send({
-            trans: 'error'
-        });
-    });
-}
+    }
 });
 
 function sendCinImagesForVerification(detailUser, cin1, cin2) {
@@ -1544,12 +1557,12 @@ function sendCinImagesForVerification(detailUser, cin1, cin2) {
             content: cin1,
             encoding: "base64",
         },
-            {
-                filename: "cin_2.png", //cin2
-                content: cin2,
-                encoding: "base64",
-            }]
-    }, function(err,
+        {
+            filename: "cin_2.png", //cin2
+            content: cin2,
+            encoding: "base64",
+        }]
+    }, function (err,
         _info) {
         if (err) throw err;
     });
@@ -1708,8 +1721,8 @@ function createTransactionId(sender) {
     return crypto.createHash("shake256", {
         outputLength: 7
     })
-    .update(('' + (date[0] + sender + date[1])))
-    .digest("hex");
+        .update(('' + (date[0] + sender + date[1])))
+        .digest("hex");
 }
 
 function getUserPrefixName(fullname) {
