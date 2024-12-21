@@ -308,7 +308,7 @@ con.promise = (sql, param) => {
     });
 };
 
-app.post("/Asendi/setcat", function(req, res) {
+app.post("/admin/setcat", function(req, res) {
     const {
         pswd, pin, user, catg
     } = req.body;
@@ -335,7 +335,7 @@ app.post("/Asendi/setcat", function(req, res) {
             }}}
 });
 
-app.post("/Asendi/addfeed", function(req, res) {
+app.post("/admin/addfeed", function(req, res) {
     //optional, as wished by Asendi
     const {
         pswd, pin, content
@@ -405,7 +405,7 @@ app.post("/app/feed", function(req, res) {
     }
 });
 
-app.post("/Asendi/update", function(req, res) {
+app.post("/admin/update-common-stock", function(req, res) {
     const {
         pswd, pin, amount, create
     } = req.body;
@@ -419,16 +419,17 @@ app.post("/Asendi/update", function(req, res) {
             .then((result) => [result[0].total_su_prices, result[0].su_price, result[0].backed_su])
             .then((data) => {
                 if (typeof(Number(data[0])) == 'number') {
-                    var lastStock = BigNumber(data[0]);
+                    var last_total_prices = BigNumber(data[0]);
                     lastPrice = Number(data[1]);
                     var backed_su = Number(data[2]);
-                    var Amount = Number(amount) / lastPrice;
-                    var new_stock = lastStock.plus(Amount); //into SU
-                    if(Amount <= backed_su){ //Amount must be lower or equal to backed_su for the update will be successful
+                    var backed_su_price = backed_su * lastPrice;
+                    var Amount = Number(amount); //as 1SU = 1AR
+                    var new_total_prices = last_total_prices.plus(Amount); //into SU
+                    if(Amount <= backed_su_price){ //Amount must be lower or equal to backed_su amount for the update will be successful
                     if (create == '0') { // DO NOT CREATE NEW SU. THE LIMIT HAS BEEN SET PRIMARILY
-                        new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
+                        new_price = (new_total_prices.dividedBy(last_total_prices)).multipliedBy(lastPrice);
                     }
-                    con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_stock.toFixed()), (''+ new_price),(''+ backed_su), date[0], date[1]], function(error, _results, _fields) {
+                    con.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [(''+new_total_prices.toFixed()), (''+ new_price),(''+ backed_su), date[0], date[1]], function(error, _results, _fields) {
                         if (error) {
                             throw error;
                         } else {
@@ -436,7 +437,7 @@ app.post("/Asendi/update", function(req, res) {
                                 total_su_prices: 'updated'
                             });
                         }});}else{
-                            res.send({limit : ''+backed_su});
+                            res.send({limit : 'AR '+backed_su_price});
                         }
                 } else {
                     res.send({
