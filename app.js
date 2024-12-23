@@ -165,6 +165,14 @@ app.use((req, res, next) => {
     next();
 });
 
+app.get("/", function (_req, res) {
+    try {
+        res.redirect('https://' + _req.headers.host + '/latest/apk');
+    } catch (error) {
+        res.status(500).send('redirect error');
+    }
+});
+
 app.get("/app/info", function (req, res) {
     const r = req.query.r;
     const l = req.query.l;
