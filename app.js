@@ -167,13 +167,13 @@ app.use((req, res, next) => {
 
 app.get("/", function (_req, res) {
     try {
-        res.redirect('https://' + _req.headers.host + '/latest/apk');
+        res.redirect('https://' + _req.headers.host + '/app/download-latest-apk');
     } catch (error) {
-        res.status(500).send('redirect error');
+        res.status(500).send('redirection error');
     }
 });
 
-app.get("/app/info", function (req, res) {
+app.get("/app/privacy-terms-info", function (req, res) {
     const r = req.query.r;
     const l = req.query.l;
     var filepath = "privacy_" + l + ".html";
@@ -191,7 +191,7 @@ app.get("/app/info", function (req, res) {
 
 });
 
-app.get("/latest/apk", function (_req, res, next) {
+app.get("/app/download-latest-apk", function (_req, res, next) {
     res.download("./Asendi.apk", "Asendi.apk", function (err) {
         if (err) {
             next(err);
@@ -201,7 +201,7 @@ app.get("/latest/apk", function (_req, res, next) {
     });
 });
 
-app.post("/checkapp", function (_req, res) {
+app.post("/app/check-app-version", function (_req, res) {
     const fileS = getAppFileSize();
     res.send({
         version: app_version,
@@ -216,7 +216,7 @@ function getAppFileSize() {
     return '' + fileSizeInMegabytes;
 }
 
-app.post("/app/contact", function (req, res) {
+app.post("/app/contact-asendi", function (req, res) {
     const {
         user,
         pswd,
@@ -245,8 +245,7 @@ app.post("/app/contact", function (req, res) {
                         html: '<b>De</b> ' + data[1] + ' (' + User + ')' + '<br>' + msg
                     },
                         function (err, _info) {
-                            if (err) throw err;
-
+                            if (err) console.log(err);
                         });
                     res.send({
                         status: 'sent'
@@ -319,7 +318,7 @@ con.promise = (sql, param) => {
     });
 };
 
-app.post("/admin/setcat", function (req, res) {
+app.post("/admin/set-user-category", function (req, res) {
     const {
         pswd, pin, user, catg
     } = req.body;
@@ -348,8 +347,8 @@ app.post("/admin/setcat", function (req, res) {
     }
 });
 
-app.post("/admin/addfeed", function (req, res) {
-    //optional, as wished by Asendi
+app.post("/admin/add-to-feed", function (req, res) {
+    //optional, as wished by Admin
     const {
         pswd, pin, content
     } = req.body;
@@ -560,7 +559,7 @@ app.post("/admin/update-user-or-common-stock", function (req, res) {
     }
 });
 
-app.post("/app/balance", function (req, res) {
+app.post("/app/user-last-stock", function (req, res) {
     const {
         user,
         pswd, tkn
@@ -620,7 +619,7 @@ app.post("/app/balance", function (req, res) {
     }
 });
 
-app.post("/app/transfer", function (req, res) {
+app.post("/app/su-transfer", function (req, res) {
     const {
         sender,
         pswd,
@@ -1035,7 +1034,7 @@ app.post("/app/signin", function (req,
         pswd,
         tkn,
         recon,
-        secret_word
+        sk
     } = req.body;
 
     const User = ('' + user).replaceAll(' ',
@@ -1052,7 +1051,7 @@ app.post("/app/signin", function (req,
                 .then((result) => [DecryptText(result[0].password, password), DecryptText(result[0].secret_word, password)])
                 .then((data) => {
                     if (data[0] == Pswd) {
-                        if (data[1] == secret_word) {
+                        if (data[1] == sk) {
                             const encUA = EncryptText(userAgent, Pswd + User);
                             con.promise("SELECT category FROM auths WHERE username = ?",
                                 [User])
@@ -1073,17 +1072,17 @@ app.post("/app/signin", function (req,
                                                         var date = getDate();
                                                         var reference = createTransactionId(Asendi);
                                                         con.query('UPDATE users_su SET balance = ? WHERE username = ?', ['' + welcome_bonus, User], function (err, _result) {
-                                                            if (err) throw err;
+                                                            if (err) console.log(err);
                                                             console.log('bonus shared');
                                                             con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
                                                                 if (error) {
-
+                                                                    console.log(error);
                                                                 }
                                                             });
                                                         });
                                                     }
                                                 }).catch((error) => {
-                                                    throw error;
+                                                    console.log(error);
                                                 });
 
                                         });
@@ -1093,7 +1092,7 @@ app.post("/app/signin", function (req,
                                         });
                                     }
                                 }).catch((error) => {
-                                    throw error;
+                                    console.log(error);
                                 });
                         } else {
                             res.send({
@@ -1141,13 +1140,13 @@ app.post("/app/signin", function (req,
                                                     console.log('bonus shared');
                                                     con.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
                                                         if (error) {
-
+                                                            console.log(error);
                                                         }
                                                     });
                                                 });
                                             }
                                         }).catch((error) => {
-                                            throw error;
+                                            console.log(error);
                                         });
 
                                 });
@@ -1157,7 +1156,7 @@ app.post("/app/signin", function (req,
                                 });
                             }
                         }).catch((error) => {
-                            throw error;
+                            console.log(error);
                         });
 
                 } else {
@@ -1173,7 +1172,7 @@ app.post("/app/signin", function (req,
     }
 });
 
-app.post("/app/mpc", function (req,
+app.post("/app/modify-pin-or-password", function (req,
     res) {
     const {
         user,
@@ -1215,7 +1214,7 @@ app.post("/app/mpc", function (req,
     }
 });
 
-app.post("/app/dltacc", function (req,
+app.post("/app/delete-user", function (req,
     res) {
     const {
         user,
@@ -1288,7 +1287,7 @@ app.post("/app/dltacc", function (req,
     }
 });
 
-app.post("/app/reacc", function (req,
+app.post("/app/recover-account", function (req,
     res) {
     const {
         user,
@@ -1305,7 +1304,7 @@ app.post("/app/reacc", function (req,
             if (data == secret_word) {
                 let newPC = EncryptText('123456', password);
                 con.query('UPDATE auths SET password = ? WHERE username = ?', [newPC, User], function (err, _result) {
-                    if (err) throw err;
+                    if (err) console.log(err);
                     res.send({
                         auth: 'updated'
                     });
@@ -1322,7 +1321,7 @@ app.post("/app/reacc", function (req,
         });
 });
 
-app.post("/app/msk", function (req,
+app.post("/app/modify-secret-key", function (req,
     res) {
     const {
         user,
@@ -1377,7 +1376,7 @@ app.post("/app/signup",
             name,
             cin,
             pswd,
-            secret_word,
+            sk,
             cinimg1,
             cinimg2
         } = req.body;
@@ -1398,7 +1397,7 @@ app.post("/app/signup",
                     '+'), password);
                 const Pswd = EncryptText(('' + pswd).replaceAll(' ',
                     '+'), password);
-                const Secretkey = EncryptText(('' + (secret_word)).replaceAll(' ',
+                const Secretkey = EncryptText(('' + sk).replaceAll(' ',
                     '+'), password);
                 var user_suffix_name = '' + createUserSuffixName(cin);
                 var user_prefix_name = '' + getUserPrefixName(Name);
@@ -1471,6 +1470,9 @@ app.post("/app/signup",
                                                             connection.release();
                                                         });
                                                     }
+                                                    res.send({
+                                                        msg: 'ok'
+                                                    });
                                                     transporter.sendMail({
                                                         from: server_mail,
                                                         to: Email,
@@ -1478,15 +1480,12 @@ app.post("/app/signup",
                                                         html: '<h2>Bienvenue cher(e) client(e),</h2><br>Vous venez de vous inscrire sur notre plateforme. Votre identifiant est :<br><b>' + username + '</b><br>Pour activer une fois votre compte, connectez-vous avec l&apos;identifiant ci-dessus dans le d&eacute;lai de 7 jours.<br><br><br>L&apos;&eacute;quipe Asendi,'
                                                     },
                                                         function (err, _info) {
-                                                            if (err) throw err;
+                                                            if (err) console.log(err);
                                                         });
                                                     sendCinImagesForVerification('' + username + '<br>' + Name + '<br>' + Birth + '<br>' + Address + '<br>' + cin,
                                                         cin_img1,
                                                         cin_img2);
-                                                    res.send({
-                                                        msg: 'ok'
-                                                    });
-                                                    connection.release();
+
                                                 });
                                             });
                                     });
@@ -1509,7 +1508,7 @@ app.post("/app/signup",
         }
     });
 
-app.post("/app/transrec", function (req, res) {
+app.post("/app/transactions-history", function (req, res) {
     const {
         user, pswd, days, tkn
     } = req.body;
