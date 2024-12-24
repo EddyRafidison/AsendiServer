@@ -17,7 +17,8 @@ app.use(express.urlencoded({
     limit: '50mb',
     extended: true
 }));
-const Asendi = 'Asendi';
+const Asendi = 'ASENDI';
+const P2Pallowed = false; //allow transfer or not globally
 const AUTHS = `CREATE TABLE IF NOT EXISTS auths (
 id INT AUTO_INCREMENT PRIMARY KEY,
 username VARCHAR(30) NOT NULL,
@@ -627,302 +628,137 @@ app.post("/app/su-transfer", function (req, res) {
         amount,
         tkn
     } = req.body;
-    //amount must be sent or received as SU by client
-    //but received as bipolary unit by the server: SU and Ar
-    var p = 1;
-    var type = 1; //transfer between customers only
-    const Sender = ('' + sender).replaceAll(' ',
-        '+');
-    const Pswd = ('' + pswd).replaceAll(' ',
-        '+');
-    const Dest = ('' + dest).replaceAll(' ',
-        '+');
-    const userAgent = req.headers['user-agent'];
-    if (userAgent != DecryptText(tkn, Pswd + Sender)) {
-        res.send({ transf: 'forbidden request' });
-    } else {
-        var am = Number((amount).replaceAll(' ', '+'));
-        if (am >= 100) {
-            if (Sender == Dest) {
-                res.send({
-                    transf: 'failed'
-                });
-            } else {
-                con.promise("SELECT category FROM auths WHERE username = ?;",
-                    [Sender]).then((result) => result[0].category)
-                    .then((data) => {
-                        const category = Number(data);
-                        if (category > 0) {
-                            if (category == 2 && Dest == Asendi) {
-                                //Asendi is the server account name
-                                //category 2 for between customer & distributor
-                                type = 2;
-                            }
-                            if (category == 1 && Dest == Asendi) {
-                                res.send({
-                                    transf: 'unsupported'
-                                });
-                            } else {
-                                con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
-                                    [])
-                                    .then((result) => result[0].su_price)
-                                    .then((data) => {
-                                        if (typeof (Number(data)) == 'number') {
-                                            p = Number(data);
-                                            var Amount = (am / p);
-                                            var senderBal;
-                                            var destBal;
-                                            var date = getDate();
-                                            var reference = createTransactionId(Sender);
-                                            var maxStockDefault = 2000000; //client side unit
-                                            var maxStockDistr = 5000000; //client side unit                          
-                                            var fees = (Amount * tfees) / 100; // total fees to pay by client
-                                            var minRequiredSenderBal = Amount + fees;
-                                            var sharedFees = (fees * 3) / 4; //These are restocked as Ar in the common total_su_prices but shared as SU to the global users in form of interests.
-                                            var admin_fees = fees - sharedFees; //the Asendi hold the Ar real value as his. The value of SU is return to the common total_su_prices to be sold again.
-                                            //All fees cannot be burnt. They return only to the common total_su_prices before anyone buys them again.
-                                            con.promise("SELECT password FROM auths WHERE username = ?;",
-                                                [Sender])
-                                                .then((result) => DecryptText(result[0].password, password))
-                                                .then((data) => {
-                                                    if (data == Pswd) {
-                                                        con.promise("SELECT balance FROM users_su WHERE username = ?;", [Sender])
-                                                            .then((result) => result[0].balance)
-                                                            .then((data) => {
-                                                                senderBal = Number(data);
-                                                                if (typeof (senderBal) == 'number') {
-                                                                    if (senderBal >= minRequiredSenderBal) {
-                                                                        con.promise("SELECT balance FROM users_su WHERE username = ?;", [Dest])
-                                                                            .then((result) => result[0].balance)
-                                                                            .then((data) => {
-                                                                                destBal = Number(data);
-                                                                                if (typeof (destBal) == 'number') {
-                                                                                    const futurDestBal = destBal + Amount;
-                                                                                    const AsendiFuturBal = destBal + admin_fees; // Asendi receives the 1/4 of the fees as real cash and
-                                                                                    //back the equivalent SU value to the public stock to be sold again globally
-                                                                                    if (Dest != Asendi) {
-                                                                                        con.promise("SELECT category FROM auths WHERE username = ?;",
-                                                                                            [Dest]).then((result) => result[0].category)
-                                                                                            .then((data) => {
-                                                                                                const categDest = Number(data);
-                                                                                                if (categDest > 0) {
+    if (P2Pallowed == true) {
+        //amount must be sent or received as SU by client
+        //but received as bipolary unit by the server: SU and Ar
+        var p = 1;
+        var type = 1; //transfer between customers only
+        const Sender = ('' + sender).replaceAll(' ',
+            '+');
+        const Pswd = ('' + pswd).replaceAll(' ',
+            '+');
+        const Dest = ('' + dest).replaceAll(' ',
+            '+');
+        const userAgent = req.headers['user-agent'];
+        if (userAgent != DecryptText(tkn, Pswd + Sender)) {
+            res.send({ transf: 'forbidden request' });
+        } else {
+            var am = Number((amount).replaceAll(' ', '+'));
+            if (am >= 100) {
+                if (Sender == Dest) {
+                    res.send({
+                        transf: 'failed'
+                    });
+                } else {
+                    con.promise("SELECT category FROM auths WHERE username = ?;",
+                        [Sender]).then((result) => result[0].category)
+                        .then((data) => {
+                            const category = Number(data);
+                            if (category > 0) {
+                                if (category == 2 && Dest == Asendi) {
+                                    //Asendi is the server account name
+                                    //category 2 for between customer & distributor
+                                    type = 2;
+                                }
+                                if (category == 1 && Dest == Asendi) {
+                                    res.send({
+                                        transf: 'unsupported'
+                                    });
+                                } else {
+                                    con.promise("SELECT MAX(su_price+0) AS su_price FROM common;",
+                                        [])
+                                        .then((result) => result[0].su_price)
+                                        .then((data) => {
+                                            if (typeof (Number(data)) == 'number') {
+                                                p = Number(data);
+                                                var Amount = (am / p);
+                                                var senderBal;
+                                                var destBal;
+                                                var date = getDate();
+                                                var reference = createTransactionId(Sender);
+                                                var maxStockDefault = 2000000; //client side unit
+                                                var maxStockDistr = 5000000; //client side unit                          
+                                                var fees = (Amount * tfees) / 100; // total fees to pay by client
+                                                var minRequiredSenderBal = Amount + fees;
+                                                var sharedFees = (fees * 3) / 4; //These are restocked as Ar in the common total_su_prices but shared as SU to the global users in form of interests.
+                                                var admin_fees = fees - sharedFees; //the Asendi hold the Ar real value as his. The value of SU is return to the common total_su_prices to be sold again.
+                                                //All fees cannot be burnt. They return only to the common total_su_prices before anyone buys them again.
+                                                con.promise("SELECT password FROM auths WHERE username = ?;",
+                                                    [Sender])
+                                                    .then((result) => DecryptText(result[0].password, password))
+                                                    .then((data) => {
+                                                        if (data == Pswd) {
+                                                            con.promise("SELECT balance FROM users_su WHERE username = ?;", [Sender])
+                                                                .then((result) => result[0].balance)
+                                                                .then((data) => {
+                                                                    senderBal = Number(data);
+                                                                    if (typeof (senderBal) == 'number') {
+                                                                        if (senderBal >= minRequiredSenderBal) {
+                                                                            con.promise("SELECT balance FROM users_su WHERE username = ?;", [Dest])
+                                                                                .then((result) => result[0].balance)
+                                                                                .then((data) => {
+                                                                                    destBal = Number(data);
+                                                                                    if (typeof (destBal) == 'number') {
+                                                                                        const futurDestBal = destBal + Amount;
+                                                                                        const AsendiFuturBal = destBal + admin_fees; // Asendi receives the 1/4 of the fees as real cash and
+                                                                                        //back the equivalent SU value to the public stock to be sold again globally
+                                                                                        if (Dest != Asendi) {
+                                                                                            con.promise("SELECT category FROM auths WHERE username = ?;",
+                                                                                                [Dest]).then((result) => result[0].category)
+                                                                                                .then((data) => {
+                                                                                                    const categDest = Number(data);
+                                                                                                    if (categDest > 0) {
 
-                                                                                                    if (categDest == 1 && (futurDestBal * p) > maxStockDefault) {
-                                                                                                        res.send({
-                                                                                                            transf: 'unsupported'
-                                                                                                        });
-                                                                                                    } else if (categDest == 2 && (futurDestBal * p) > maxStockDistr) {
-                                                                                                        res.send({
-                                                                                                            transf: 'unsupported'
-                                                                                                        });
-                                                                                                    } else {
-                                                                                                        con.getConnection((err, connection) => {
-                                                                                                            if (err) res.send({
-                                                                                                                transf: 'failed'
-                                                                                                            });
-                                                                                                            connection.beginTransaction(function (err) {
-                                                                                                                if (err) connection.release();
-                                                                                                                connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, '' + p, fees, reference, date[0], date[1]], function (error, _results, _fields) {
-                                                                                                                    if (error) {
-                                                                                                                        return connection.rollback(function (err) {
-                                                                                                                            if (err) throw err;
-                                                                                                                            res.send({
-                                                                                                                                transf: 'failed'
-                                                                                                                            });
-                                                                                                                            connection.release();
-                                                                                                                        });
-                                                                                                                    }
-
-                                                                                                                    const lastbs = (senderBal - minRequiredSenderBal);
-                                                                                                                    connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                                                        [('' + lastbs),
-                                                                                                                        date[0],
-                                                                                                                        date[1],
-                                                                                                                            Sender],
-                                                                                                                        function (error, _results, _fields) {
-                                                                                                                            if (error) {
-                                                                                                                                return connection.rollback(function (err) {
-                                                                                                                                    if (err) throw err;
-                                                                                                                                    res.send({
-                                                                                                                                        transf: 'failed'
-                                                                                                                                    });
-                                                                                                                                    connection.release();
-                                                                                                                                });
-                                                                                                                            }
-
-                                                                                                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                                                                [('' + futurDestBal),
-                                                                                                                                date[0],
-                                                                                                                                date[1],
-                                                                                                                                    Dest],
-                                                                                                                                function (error, _results, _fields) {
-                                                                                                                                    if (error) {
-                                                                                                                                        return connection.rollback(function (err) {
-                                                                                                                                            if (err) throw err;
-                                                                                                                                            res.send({
-                                                                                                                                                transf: 'failed'
-                                                                                                                                            });
-                                                                                                                                            connection.release();
-                                                                                                                                        });
-                                                                                                                                    }
-                                                                                                                                    connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
-                                                                                                                                        function (err, result) {
-                                                                                                                                            if (err) {
-
-                                                                                                                                                return connection.rollback(function (err) {
-                                                                                                                                                    if (err) throw err;
-                                                                                                                                                    res.send({
-                                                                                                                                                        transf: 'failed'
-                                                                                                                                                    });
-                                                                                                                                                    connection.release();
-                                                                                                                                                });
-                                                                                                                                            }
-                                                                                                                                            const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
-                                                                                                                                            if (typeof (Number(data[0])) == 'number') {
-                                                                                                                                                var lastStock = BigNumber(data[0]);
-                                                                                                                                                var lastPrice = Number(data[1]);
-                                                                                                                                                var backed_su = Number(data[2]);
-                                                                                                                                                var total_backed = backed_su + fees;
-                                                                                                                                                var new_stock = lastStock.plus(sharedFees); //added as Ar
-                                                                                                                                                var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
-                                                                                                                                                connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_stock.toFixed()), ('' + new_price), ('' + total_backed), date[0], date[1]], function (error, _results, _fields) {
-                                                                                                                                                    if (error) {
-                                                                                                                                                        return connection.rollback(function (err) {
-                                                                                                                                                            if (err) throw err;
-                                                                                                                                                            res.send({
-                                                                                                                                                                transf: 'failed'
-                                                                                                                                                            });
-                                                                                                                                                            connection.release();
-                                                                                                                                                        });
-                                                                                                                                                    }
-                                                                                                                                                    connection.commit(function (err) {
-                                                                                                                                                        if (err) {
-                                                                                                                                                            return connection.rollback(function (err) {
-                                                                                                                                                                if (err) throw err;
-                                                                                                                                                                res.send({
-                                                                                                                                                                    transf: 'failed'
-                                                                                                                                                                });
-                                                                                                                                                                connection.release();
-                                                                                                                                                            });
-                                                                                                                                                        }
-                                                                                                                                                        res.send({
-                                                                                                                                                            transf: 'sent'
-                                                                                                                                                        });
-
-                                                                                                                                                    });
-
-
-                                                                                                                                                });
-                                                                                                                                            } else {
-                                                                                                                                                return connection.rollback(function (err) {
-                                                                                                                                                    if (err) throw err;
-                                                                                                                                                    res.send({
-                                                                                                                                                        transf: 'failed'
-                                                                                                                                                    });
-                                                                                                                                                    connection.release();
-                                                                                                                                                });
-                                                                                                                                            }
-                                                                                                                                        });
-
-                                                                                                                                });
-                                                                                                                        });
-                                                                                                                });
-                                                                                                            });
-
-                                                                                                        });
-                                                                                                    }
-                                                                                                } else {
-                                                                                                    res.send({
-                                                                                                        transf: 'failed'
-                                                                                                    });
-                                                                                                }
-                                                                                            }).catch((_error) => {
-                                                                                                res.send({
-                                                                                                    transf: 'failed'
-                                                                                                });
-                                                                                            });
-                                                                                    } else {
-                                                                                        con.getConnection((err, connection) => {
-                                                                                            if (err) res.send({
-                                                                                                transf: 'failed'
-                                                                                            });
-                                                                                            connection.beginTransaction(function (err) {
-                                                                                                if (err) connection.release();
-                                                                                                connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, '' + p, fees, reference, date[0], date[1]], function (error, _results, _fields) {
-                                                                                                    if (error) {
-                                                                                                        return connection.rollback(function (err) {
-                                                                                                            if (err) throw err;
+                                                                                                        if (categDest == 1 && (futurDestBal * p) > maxStockDefault) {
                                                                                                             res.send({
-                                                                                                                transf: 'failed'
+                                                                                                                transf: 'unsupported'
                                                                                                             });
-                                                                                                            connection.release();
-                                                                                                        });
-                                                                                                    }
-
-                                                                                                    const lastbs = (senderBal - minRequiredSenderBal);
-                                                                                                    connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                                        [('' + lastbs),
-                                                                                                        date[0],
-                                                                                                        date[1],
-                                                                                                            Sender],
-                                                                                                        function (error, _results, _fields) {
-                                                                                                            if (error) {
-                                                                                                                return connection.rollback(function (err) {
-                                                                                                                    if (err) throw err;
-                                                                                                                    res.send({
-                                                                                                                        transf: 'failed'
-                                                                                                                    });
-                                                                                                                    connection.release();
+                                                                                                        } else if (categDest == 2 && (futurDestBal * p) > maxStockDistr) {
+                                                                                                            res.send({
+                                                                                                                transf: 'unsupported'
+                                                                                                            });
+                                                                                                        } else {
+                                                                                                            con.getConnection((err, connection) => {
+                                                                                                                if (err) res.send({
+                                                                                                                    transf: 'failed'
                                                                                                                 });
-                                                                                                            }
-
-                                                                                                            connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                                                [('' + AsendiFuturBal),
-                                                                                                                date[0],
-                                                                                                                date[1],
-                                                                                                                    Dest],
-                                                                                                                function (error, _results, _fields) {
-                                                                                                                    if (error) {
-                                                                                                                        return connection.rollback(function (err) {
-                                                                                                                            if (err) throw err;
-                                                                                                                            res.send({
-                                                                                                                                transf: 'failed'
-                                                                                                                            });
-                                                                                                                            connection.release();
-                                                                                                                        });
-                                                                                                                    }
-                                                                                                                    connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
-                                                                                                                        function (err, result) {
-                                                                                                                            if (err) {
-
-                                                                                                                                return connection.rollback(function (err) {
-                                                                                                                                    if (err) throw err;
-                                                                                                                                    res.send({
-                                                                                                                                        transf: 'failed'
-                                                                                                                                    });
-                                                                                                                                    connection.release();
+                                                                                                                connection.beginTransaction(function (err) {
+                                                                                                                    if (err) connection.release();
+                                                                                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, '' + p, fees, reference, date[0], date[1]], function (error, _results, _fields) {
+                                                                                                                        if (error) {
+                                                                                                                            return connection.rollback(function (err) {
+                                                                                                                                if (err) throw err;
+                                                                                                                                res.send({
+                                                                                                                                    transf: 'failed'
                                                                                                                                 });
-                                                                                                                            }
-                                                                                                                            const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
-                                                                                                                            if (typeof (Number(data[0])) == 'number') {
-                                                                                                                                var lastStock = BigNumber(data[0]);
-                                                                                                                                var lastPrice = Number(data[1]);
-                                                                                                                                var backed_su = Number(data[2]);
-                                                                                                                                var total_backed = Amount + backed_su + fees; // the Amount is added to the backed_su instead of updating the Asendi balance
-                                                                                                                                var new_stock = lastStock.plus(sharedFees); //added as Ar
-                                                                                                                                var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
-                                                                                                                                connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_stock.toFixed()), ('' + new_price), ('' + total_backed), date[0], date[1]], function (error, _results, _fields) {
-                                                                                                                                    if (error) {
-                                                                                                                                        return connection.rollback(function (err) {
-                                                                                                                                            if (err) throw err;
-                                                                                                                                            res.send({
-                                                                                                                                                transf: 'failed'
-                                                                                                                                            });
-                                                                                                                                            connection.release();
+                                                                                                                                connection.release();
+                                                                                                                            });
+                                                                                                                        }
+
+                                                                                                                        const lastbs = (senderBal - minRequiredSenderBal);
+                                                                                                                        connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                                            [('' + lastbs),
+                                                                                                                            date[0],
+                                                                                                                            date[1],
+                                                                                                                                Sender],
+                                                                                                                            function (error, _results, _fields) {
+                                                                                                                                if (error) {
+                                                                                                                                    return connection.rollback(function (err) {
+                                                                                                                                        if (err) throw err;
+                                                                                                                                        res.send({
+                                                                                                                                            transf: 'failed'
                                                                                                                                         });
-                                                                                                                                    }
-                                                                                                                                    connection.commit(function (err) {
-                                                                                                                                        if (err) {
+                                                                                                                                        connection.release();
+                                                                                                                                    });
+                                                                                                                                }
+
+                                                                                                                                connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                                                    [('' + futurDestBal),
+                                                                                                                                    date[0],
+                                                                                                                                    date[1],
+                                                                                                                                        Dest],
+                                                                                                                                    function (error, _results, _fields) {
+                                                                                                                                        if (error) {
                                                                                                                                             return connection.rollback(function (err) {
                                                                                                                                                 if (err) throw err;
                                                                                                                                                 res.send({
@@ -931,98 +767,267 @@ app.post("/app/su-transfer", function (req, res) {
                                                                                                                                                 connection.release();
                                                                                                                                             });
                                                                                                                                         }
+                                                                                                                                        connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
+                                                                                                                                            function (err, result) {
+                                                                                                                                                if (err) {
+
+                                                                                                                                                    return connection.rollback(function (err) {
+                                                                                                                                                        if (err) throw err;
+                                                                                                                                                        res.send({
+                                                                                                                                                            transf: 'failed'
+                                                                                                                                                        });
+                                                                                                                                                        connection.release();
+                                                                                                                                                    });
+                                                                                                                                                }
+                                                                                                                                                const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
+                                                                                                                                                if (typeof (Number(data[0])) == 'number') {
+                                                                                                                                                    var lastStock = BigNumber(data[0]);
+                                                                                                                                                    var lastPrice = Number(data[1]);
+                                                                                                                                                    var backed_su = Number(data[2]);
+                                                                                                                                                    var total_backed = backed_su + fees;
+                                                                                                                                                    var new_stock = lastStock.plus(sharedFees); //added as Ar
+                                                                                                                                                    var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
+                                                                                                                                                    connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_stock.toFixed()), ('' + new_price), ('' + total_backed), date[0], date[1]], function (error, _results, _fields) {
+                                                                                                                                                        if (error) {
+                                                                                                                                                            return connection.rollback(function (err) {
+                                                                                                                                                                if (err) throw err;
+                                                                                                                                                                res.send({
+                                                                                                                                                                    transf: 'failed'
+                                                                                                                                                                });
+                                                                                                                                                                connection.release();
+                                                                                                                                                            });
+                                                                                                                                                        }
+                                                                                                                                                        connection.commit(function (err) {
+                                                                                                                                                            if (err) {
+                                                                                                                                                                return connection.rollback(function (err) {
+                                                                                                                                                                    if (err) throw err;
+                                                                                                                                                                    res.send({
+                                                                                                                                                                        transf: 'failed'
+                                                                                                                                                                    });
+                                                                                                                                                                    connection.release();
+                                                                                                                                                                });
+                                                                                                                                                            }
+                                                                                                                                                            res.send({
+                                                                                                                                                                transf: 'sent'
+                                                                                                                                                            });
+
+                                                                                                                                                        });
+
+
+                                                                                                                                                    });
+                                                                                                                                                } else {
+                                                                                                                                                    return connection.rollback(function (err) {
+                                                                                                                                                        if (err) throw err;
+                                                                                                                                                        res.send({
+                                                                                                                                                            transf: 'failed'
+                                                                                                                                                        });
+                                                                                                                                                        connection.release();
+                                                                                                                                                    });
+                                                                                                                                                }
+                                                                                                                                            });
+
+                                                                                                                                    });
+                                                                                                                            });
+                                                                                                                    });
+                                                                                                                });
+
+                                                                                                            });
+                                                                                                        }
+                                                                                                    } else {
+                                                                                                        res.send({
+                                                                                                            transf: 'failed'
+                                                                                                        });
+                                                                                                    }
+                                                                                                }).catch((_error) => {
+                                                                                                    res.send({
+                                                                                                        transf: 'failed'
+                                                                                                    });
+                                                                                                });
+                                                                                        } else {
+                                                                                            con.getConnection((err, connection) => {
+                                                                                                if (err) res.send({
+                                                                                                    transf: 'failed'
+                                                                                                });
+                                                                                                connection.beginTransaction(function (err) {
+                                                                                                    if (err) connection.release();
+                                                                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,su_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Sender, Dest, type, '' + Amount, '' + p, fees, reference, date[0], date[1]], function (error, _results, _fields) {
+                                                                                                        if (error) {
+                                                                                                            return connection.rollback(function (err) {
+                                                                                                                if (err) throw err;
+                                                                                                                res.send({
+                                                                                                                    transf: 'failed'
+                                                                                                                });
+                                                                                                                connection.release();
+                                                                                                            });
+                                                                                                        }
+
+                                                                                                        const lastbs = (senderBal - minRequiredSenderBal);
+                                                                                                        connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                            [('' + lastbs),
+                                                                                                            date[0],
+                                                                                                            date[1],
+                                                                                                                Sender],
+                                                                                                            function (error, _results, _fields) {
+                                                                                                                if (error) {
+                                                                                                                    return connection.rollback(function (err) {
+                                                                                                                        if (err) throw err;
+                                                                                                                        res.send({
+                                                                                                                            transf: 'failed'
+                                                                                                                        });
+                                                                                                                        connection.release();
+                                                                                                                    });
+                                                                                                                }
+
+                                                                                                                connection.query('UPDATE users_su SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
+                                                                                                                    [('' + AsendiFuturBal),
+                                                                                                                    date[0],
+                                                                                                                    date[1],
+                                                                                                                        Dest],
+                                                                                                                    function (error, _results, _fields) {
+                                                                                                                        if (error) {
+                                                                                                                            return connection.rollback(function (err) {
+                                                                                                                                if (err) throw err;
+                                                                                                                                res.send({
+                                                                                                                                    transf: 'failed'
+                                                                                                                                });
+                                                                                                                                connection.release();
+                                                                                                                            });
+                                                                                                                        }
+                                                                                                                        connection.query("SELECT total_su_prices,su_price,backed_su FROM common ORDER BY id DESC LIMIT 1;",
+                                                                                                                            function (err, result) {
+                                                                                                                                if (err) {
+
+                                                                                                                                    return connection.rollback(function (err) {
+                                                                                                                                        if (err) throw err;
                                                                                                                                         res.send({
-                                                                                                                                            transf: 'sent'
+                                                                                                                                            transf: 'failed'
+                                                                                                                                        });
+                                                                                                                                        connection.release();
+                                                                                                                                    });
+                                                                                                                                }
+                                                                                                                                const data = [result[0].total_su_prices, result[0].su_price, result[0].backed_su];
+                                                                                                                                if (typeof (Number(data[0])) == 'number') {
+                                                                                                                                    var lastStock = BigNumber(data[0]);
+                                                                                                                                    var lastPrice = Number(data[1]);
+                                                                                                                                    var backed_su = Number(data[2]);
+                                                                                                                                    var total_backed = Amount + backed_su + fees; // the Amount is added to the backed_su instead of updating the Asendi balance
+                                                                                                                                    var new_stock = lastStock.plus(sharedFees); //added as Ar
+                                                                                                                                    var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
+                                                                                                                                    connection.query(`INSERT INTO common (total_su_prices,su_price,backed_su,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_stock.toFixed()), ('' + new_price), ('' + total_backed), date[0], date[1]], function (error, _results, _fields) {
+                                                                                                                                        if (error) {
+                                                                                                                                            return connection.rollback(function (err) {
+                                                                                                                                                if (err) throw err;
+                                                                                                                                                res.send({
+                                                                                                                                                    transf: 'failed'
+                                                                                                                                                });
+                                                                                                                                                connection.release();
+                                                                                                                                            });
+                                                                                                                                        }
+                                                                                                                                        connection.commit(function (err) {
+                                                                                                                                            if (err) {
+                                                                                                                                                return connection.rollback(function (err) {
+                                                                                                                                                    if (err) throw err;
+                                                                                                                                                    res.send({
+                                                                                                                                                        transf: 'failed'
+                                                                                                                                                    });
+                                                                                                                                                    connection.release();
+                                                                                                                                                });
+                                                                                                                                            }
+                                                                                                                                            res.send({
+                                                                                                                                                transf: 'sent'
+                                                                                                                                            });
+
                                                                                                                                         });
 
+
                                                                                                                                     });
-
-
-                                                                                                                                });
-                                                                                                                            } else {
-                                                                                                                                return connection.rollback(function (err) {
-                                                                                                                                    if (err) throw err;
-                                                                                                                                    res.send({
-                                                                                                                                        transf: 'failed'
+                                                                                                                                } else {
+                                                                                                                                    return connection.rollback(function (err) {
+                                                                                                                                        if (err) throw err;
+                                                                                                                                        res.send({
+                                                                                                                                            transf: 'failed'
+                                                                                                                                        });
+                                                                                                                                        connection.release();
                                                                                                                                     });
-                                                                                                                                    connection.release();
-                                                                                                                                });
-                                                                                                                            }
-                                                                                                                        });
+                                                                                                                                }
+                                                                                                                            });
 
-                                                                                                                });
-                                                                                                        });
+                                                                                                                    });
+                                                                                                            });
+                                                                                                    });
                                                                                                 });
+
                                                                                             });
-
+                                                                                        }
+                                                                                    } else {
+                                                                                        res.send({
+                                                                                            transf: 'failed'
                                                                                         });
-                                                                                    }
-                                                                                } else {
-                                                                                    res.send({
-                                                                                        transf: 'failed'
-                                                                                    });
 
-                                                                                }
-                                                                            }).catch((_error) => {
-                                                                                res.send({
-                                                                                    transf: 'no dest'
+                                                                                    }
+                                                                                }).catch((_error) => {
+                                                                                    res.send({
+                                                                                        transf: 'no dest'
+                                                                                    });
                                                                                 });
+                                                                        } else {
+                                                                            res.send({
+                                                                                transf: 'insufficient balance'
                                                                             });
+                                                                        }
                                                                     } else {
                                                                         res.send({
-                                                                            transf: 'insufficient balance'
+                                                                            transf: 'failed'
                                                                         });
+
                                                                     }
-                                                                } else {
+                                                                }).catch((_error) => {
                                                                     res.send({
                                                                         transf: 'failed'
                                                                     });
-
-                                                                }
-                                                            }).catch((_error) => {
-                                                                res.send({
-                                                                    transf: 'failed'
                                                                 });
+                                                        } else {
+                                                            res.send({
+                                                                transf: "failed"
                                                             });
-                                                    } else {
+                                                        }
+                                                    }).catch((_error) => {
                                                         res.send({
-                                                            transf: "failed"
+                                                            transf: 'no exp'
                                                         });
-                                                    }
-                                                }).catch((_error) => {
-                                                    res.send({
-                                                        transf: 'no exp'
                                                     });
-                                                });
 
-                                        } else {
+                                            } else {
+                                                res.send({
+                                                    transf: 'failed'
+                                                });
+                                            }
+
+
+                                        }).catch((_error) => {
                                             res.send({
                                                 transf: 'failed'
                                             });
-                                        }
-
-
-                                    }).catch((_error) => {
-                                        res.send({
-                                            transf: 'failed'
                                         });
-                                    });
+                                }
+                            } else {
+                                res.send({
+                                    transf: 'failed'
+                                });
                             }
-                        } else {
+
+                        }).catch((_error) => {
                             res.send({
                                 transf: 'failed'
                             });
-                        }
-
-                    }).catch((_error) => {
-                        res.send({
-                            transf: 'failed'
                         });
-                    });
+                }
+            } else {
+                res.send({ warning: 'abusive operation' });
             }
-        } else {
-            res.send({ warning: 'abusive operation' });
         }
+    } else {
+        res.send({ warning: 'not yet allowed' });
     }
 });
 
