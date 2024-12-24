@@ -628,7 +628,7 @@ app.post("/app/su-transfer", function (req, res) {
         amount,
         tkn
     } = req.body;
-    if (P2Pallowed == true) {
+    
         //amount must be sent or received as SU by client
         //but received as bipolary unit by the server: SU and Ar
         var p = 1;
@@ -643,6 +643,7 @@ app.post("/app/su-transfer", function (req, res) {
         if (userAgent != DecryptText(tkn, Pswd + Sender)) {
             res.send({ transf: 'forbidden request' });
         } else {
+            if (P2Pallowed == true) {
             var am = Number((amount).replaceAll(' ', '+'));
             if (am >= 100) {
                 if (Sender == Dest) {
@@ -1025,9 +1026,9 @@ app.post("/app/su-transfer", function (req, res) {
             } else {
                 res.send({ warning: 'abusive operation' });
             }
+        } else {
+            res.send({ transf: 'not yet allowed' });
         }
-    } else {
-        res.send({ warning: 'not yet allowed' });
     }
 });
 
