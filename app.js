@@ -17,7 +17,7 @@ app.use(express.urlencoded({
     limit: '50mb',
     extended: true
 }));
-const OneVal = 'ONEVAL';
+const OneVal = 'ONE-VAL';
 const P2Pallowed = false; //allow transfer or not globally
 const AUTHS = `CREATE TABLE IF NOT EXISTS auths (
 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -85,7 +85,7 @@ function initiateDbIfEmpty() {
                 console.log('OneVal id: ' + data);
             }
         }).catch((_error) => {
-            console.log('OneVal not ready, create db data now');
+            console.log('One-Val not ready, create db data now');
             let tables = [AUTHS,
                 ACTIVITIES,
                 COMMON,
@@ -97,8 +97,8 @@ function initiateDbIfEmpty() {
                     if (err) console.log(table + ' NOT CREATED');
                     if (table == USERS_STOCK) {
                         con.query(OneValStock, [OneVal, '0', date[0], date[1]], function (err, _result) {
-                            if (err) console.log('cannot add user OneVal');
-                            console.log('OneVal is ready');
+                            if (err) console.log('cannot add user One-Val');
+                            console.log('One-Val is ready');
                             con.query(`INSERT INTO common (total_unit_prices,unit_price,backed_units,deliver_date,deliver_time) values(?,?,?,?,?);`, ['' + stock_limit, '1', '0', date[0], date[1]], function (error, _results, _fields) {
                                 //total_unit_prices is set to stock_limit. That means 1 AE = 1 Ar.
                                 if (error) {
