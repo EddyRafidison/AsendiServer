@@ -17,7 +17,7 @@ app.use(express.urlencoded({
     limit: '50mb',
     extended: true
 }));
-const Asendi = 'ASENDI';
+const OneVal = 'ONEVAL';
 const P2Pallowed = false; //allow transfer or not globally
 const AUTHS = `CREATE TABLE IF NOT EXISTS auths (
 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -30,7 +30,7 @@ const USERS_STOCK = `CREATE TABLE IF NOT EXISTS users_stock (
 id INT AUTO_INCREMENT PRIMARY KEY,
 username VARCHAR(30) NOT NULL, balance VARCHAR(255) DEFAULT '0', deliver_date INT, deliver_time VARCHAR (10)
 );`;
-const AsendiStock = `INSERT INTO users_stock (username, balance, deliver_date, deliver_time) VALUES (?,?,?,?);`;
+const OneValStock = `INSERT INTO users_stock (username, balance, deliver_date, deliver_time) VALUES (?,?,?,?);`;
 const ACTIVITIES = `CREATE TABLE IF NOT EXISTS activities (
 id INT AUTO_INCREMENT PRIMARY KEY,
 sender VARCHAR(30) NOT NULL, receiver VARCHAR(30) NOT NULL,
@@ -74,18 +74,18 @@ const server = app.listen(SERV_PORT, function () {
 });
 server.setTimeout(120000);
 function initiateDbIfEmpty() {
-    //check if Asendi exists
+    //check if One-Val exists
     const date = getDate();
-    con.promise("SELECT id FROM users_stock WHERE username = ?;", [Asendi])
+    con.promise("SELECT id FROM users_stock WHERE username = ?;", [OneVal])
         .then((result) => result[0].id)
         .then((data) => {
             if (typeof (Number(data)) != 'number') {
                 console.log('id is not a number');
             } else {
-                console.log('Asendi id: ' + data);
+                console.log('OneVal id: ' + data);
             }
         }).catch((_error) => {
-            console.log('Asendi not ready, create db data now');
+            console.log('OneVal not ready, create db data now');
             let tables = [AUTHS,
                 ACTIVITIES,
                 COMMON,
@@ -96,9 +96,9 @@ function initiateDbIfEmpty() {
                 con.query(table, function (err, _result) {
                     if (err) console.log(table + ' NOT CREATED');
                     if (table == USERS_STOCK) {
-                        con.query(AsendiStock, [Asendi, '0', date[0], date[1]], function (err, _result) {
-                            if (err) console.log('cannot add user Asendi');
-                            console.log('Asendi is ready');
+                        con.query(OneValStock, [OneVal, '0', date[0], date[1]], function (err, _result) {
+                            if (err) console.log('cannot add user OneVal');
+                            console.log('OneVal is ready');
                             con.query(`INSERT INTO common (total_unit_prices,unit_price,backed_units,deliver_date,deliver_time) values(?,?,?,?,?);`, ['' + stock_limit, '1', '0', date[0], date[1]], function (error, _results, _fields) {
                                 //total_unit_prices is set to stock_limit. That means 1 AE = 1 Ar.
                                 if (error) {
@@ -193,7 +193,7 @@ app.get("/app/privacy-terms-info", function (req, res) {
 });
 
 app.get("/app/download-latest-apk", function (_req, res, next) {
-    res.download("./Asendi.apk", "Asendi.apk", function (err) {
+    res.download("./One-Val.apk", "One-Val.apk", function (err) {
         if (err) {
             next(err);
         } else {
@@ -211,13 +211,13 @@ app.post("/app/check-app-version", function (_req, res) {
 });
 
 function getAppFileSize() {
-    const stats = fs.statSync("./Asendi.apk")
+    const stats = fs.statSync("./One-Val.apk")
     const fileSizeInBytes = stats.size;
     const fileSizeInMegabytes = fileSizeInBytes / (1024 * 1024);
     return '' + fileSizeInMegabytes;
 }
 
-app.post("/app/contact-asendi", function (req, res) {
+app.post("/app/contact-one-val", function (req, res) {
     const {
         user,
         pswd,
@@ -375,7 +375,7 @@ app.post("/admin/add-to-feed", function (req, res) {
 });
 
 app.post("/app/feed", function (req, res) {
-    //optional, as wished by Asendi
+    //optional, as wished by One-Val
     const {
         user,
         pswd,
@@ -446,7 +446,7 @@ app.post("/admin/update-user-or-common-stock", function (req, res) {
                             var remained_backed_units = backed_units - (Amount / lastPrice);
                             if (User.includes('-')) { //top up client's account
                                 var date = getDate();
-                                var reference = createTransactionId(Asendi);
+                                var reference = createTransactionId(OneVal);
                                 con.promise("SELECT balance FROM users_stock WHERE username = ?;", [User])
                                     .then((result) => result[0].balance)
                                     .then((data) => {
@@ -459,7 +459,7 @@ app.post("/admin/update-user-or-common-stock", function (req, res) {
                                                 });
                                                 connection.beginTransaction(function (err) {
                                                     if (err) connection.release();
-                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,unit_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + Amount, '' + lastPrice, '0', reference, date[0], date[1]], function (error, _results, _fields) {
+                                                    connection.query(`INSERT INTO activities (sender,receiver,type,amount,unit_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [OneVal, User, '2', '' + Amount, '' + lastPrice, '0', reference, date[0], date[1]], function (error, _results, _fields) {
                                                         if (error) {
                                                             return connection.rollback(function (err) {
                                                                 if (err) throw err;
@@ -656,12 +656,12 @@ app.post("/app/transfer", function (req, res) {
                         .then((data) => {
                             const category = Number(data);
                             if (category > 0) {
-                                if (category == 2 && Dest == Asendi) {
-                                    //Asendi is the server account name
+                                if (category == 2 && Dest == OneVal) {
+                                    //One-Val is the server account name
                                     //category 2 for between customer & distributor
                                     type = 2;
                                 }
-                                if (category == 1 && Dest == Asendi) {
+                                if (category == 1 && Dest == OneVal) {
                                     res.send({
                                         transf: 'unsupported'
                                     });
@@ -682,7 +682,7 @@ app.post("/app/transfer", function (req, res) {
                                                 var fees = (Amount * tfees) / 100; // total fees to pay by client
                                                 var minRequiredSenderBal = Amount + fees;
                                                 var sharedFees = (fees * 3) / 4; //These are restocked as Ar in the common total_unit_prices but shared as AE to the global users in form of interests.
-                                                var admin_fees = fees - sharedFees; //the Asendi hold the Ar real value as his. The value of AE is return to the common total_unit_prices to be sold again.
+                                                var admin_fees = fees - sharedFees; //the One-Val hold the Ar real value as his. The value of AE is return to the common total_unit_prices to be sold again.
                                                 //All fees cannot be burnt. They return only to the common total_unit_prices before anyone buys them again.
                                                 con.promise("SELECT password FROM auths WHERE username = ?;",
                                                     [Sender])
@@ -701,9 +701,9 @@ app.post("/app/transfer", function (req, res) {
                                                                                     destBal = Number(data);
                                                                                     if (typeof (destBal) == 'number') {
                                                                                         const futurDestBal = destBal + Amount;
-                                                                                        const AsendiFuturBal = destBal + admin_fees; // Asendi receives the 1/4 of the fees as real cash and
+                                                                                        const OneValFuturBal = destBal + admin_fees; // One-Val receives the 1/4 of the fees as real cash and
                                                                                         //back the equivalent AE value to the public stock to be sold again globally
-                                                                                        if (Dest != Asendi) {
+                                                                                        if (Dest != OneVal) {
                                                                                             con.promise("SELECT category FROM auths WHERE username = ?;",
                                                                                                 [Dest]).then((result) => result[0].category)
                                                                                                 .then((data) => {
@@ -880,7 +880,7 @@ app.post("/app/transfer", function (req, res) {
                                                                                                                 }
 
                                                                                                                 connection.query('UPDATE users_stock SET balance = ?, deliver_date = ?, deliver_time = ? WHERE username = ?;',
-                                                                                                                    [('' + AsendiFuturBal),
+                                                                                                                    [('' + OneValFuturBal),
                                                                                                                     date[0],
                                                                                                                     date[1],
                                                                                                                         Dest],
@@ -911,7 +911,7 @@ app.post("/app/transfer", function (req, res) {
                                                                                                                                     var lastStock = BigNumber(data[0]);
                                                                                                                                     var lastPrice = Number(data[1]);
                                                                                                                                     var backed_units = Number(data[2]);
-                                                                                                                                    var total_backed = Amount + backed_units + fees; // the Amount is added to the backed_units instead of updating the Asendi balance
+                                                                                                                                    var total_backed = Amount + backed_units + fees; // the Amount is added to the backed_units instead of updating the One-Val balance
                                                                                                                                     var new_stock = lastStock.plus(sharedFees); //added as Ar
                                                                                                                                     var new_price = (new_stock.dividedBy(lastStock)).multipliedBy(lastPrice);
                                                                                                                                     connection.query(`INSERT INTO common (total_unit_prices,unit_price,backed_units,deliver_date,deliver_time) values(?,?,?,?,?);`, [('' + new_stock.toFixed()), ('' + new_price), ('' + total_backed), date[0], date[1]], function (error, _results, _fields) {
@@ -1076,11 +1076,11 @@ app.post("/app/signin", function (req,
                                                 .then((data) => {
                                                     if (data <= first_welcome_clients) {
                                                         var date = getDate();
-                                                        var reference = createTransactionId(Asendi);
+                                                        var reference = createTransactionId(OneVal);
                                                         con.query('UPDATE users_stock SET balance = ? WHERE username = ?', ['' + welcome_bonus, User], function (err, _result) {
                                                             if (err) console.log(err);
                                                             console.log('bonus shared');
-                                                            con.query(`INSERT INTO activities (sender,receiver,type,amount,unit_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
+                                                            con.query(`INSERT INTO activities (sender,receiver,type,amount,unit_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [OneVal, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
                                                                 if (error) {
                                                                     console.log(error);
                                                                 }
@@ -1140,11 +1140,11 @@ app.post("/app/signin", function (req,
                                         .then((data) => {
                                             if (data <= first_welcome_clients) {
                                                 var date = getDate();
-                                                var reference = createTransactionId(Asendi);
+                                                var reference = createTransactionId(OneVal);
                                                 con.query('UPDATE users_stock SET balance = ? WHERE username = ?', ['' + welcome_bonus, User], function (err, _result) {
                                                     if (err) throw err;
                                                     console.log('bonus shared');
-                                                    con.query(`INSERT INTO activities (sender,receiver,type,amount,unit_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [Asendi, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
+                                                    con.query(`INSERT INTO activities (sender,receiver,type,amount,unit_price,fees,reference,deliver_date,deliver_time) values(?,?,?,?,?,?,?,?,?);`, [OneVal, User, '2', '' + welcome_bonus, '1', '0', reference, date[0], date[1]], function (error, _results, _fields) {
                                                         if (error) {
                                                             console.log(error);
                                                         }
@@ -1483,7 +1483,7 @@ app.post("/app/signup",
                                                         from: server_mail,
                                                         to: Email,
                                                         subject: 'Nouvelle inscription',
-                                                        html: '<h2>Bienvenue cher(e) client(e),</h2><br>Vous venez de vous inscrire sur notre plateforme. Votre identifiant est :<br><b>' + username + '</b><br>Pour activer une fois votre compte, connectez-vous avec l&apos;identifiant ci-dessus dans le d&eacute;lai de 7 jours.<br><br><br>L&apos;&eacute;quipe Asendi,'
+                                                        html: '<h2>Bienvenue cher(e) client(e),</h2><br>Vous venez de vous inscrire sur notre plateforme. Votre identifiant est :<br><b>' + username + '</b><br>Pour activer une fois votre compte, connectez-vous avec l&apos;identifiant ci-dessus dans le d&eacute;lai de 7 jours.<br><br><br>L&apos;&eacute;quipe One-Val,'
                                                     },
                                                         function (err, _info) {
                                                             if (err) console.log(err);
