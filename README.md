@@ -3,7 +3,7 @@
 ## Features
 - Fast
 - Low transaction fee
-- Ascending rate value
+- Profit generator
 
 [Based on ](https://google.com)
 [Based on ](https://google.com)
