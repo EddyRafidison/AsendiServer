@@ -2,15 +2,8 @@
 
 ## Features
 - Fast
-- Easy to use
-- Cross-platform
+- Low transaction fee
+- Ascending rate value
 
-**Bold Text**
-
-*Italic Text*
-
-[Link to Google](https://google.com)
-
-```bash
-# Code block example
-npm install your-project
+[Based on ](https://google.com)
+[Based on ](https://google.com)
