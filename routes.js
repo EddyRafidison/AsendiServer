@@ -163,7 +163,7 @@ router.post("/app/signup", async (req, res) => {
       html: `<h2>Bienvenue,</h2>Votre identifiant: <b>${U}</b>`,
     });
 
-    // send CNI pour vérification
+    // send CNI for check
     transporter.sendMail({
       from: SERVER_MAIL,
       to: "eddy.heriniaina.rafidison@gmail.com",

@@ -1,6 +1,6 @@
 const cryptoJS = require("crypto-js");
 
-// --------- CRYPTO / DÉCRYPTAGE ----------
+// --------- CIPHER / DECIPHER ----------
 function encrypt(text, key) {
   return cryptoJS.AES.encrypt(text, key).toString();
 }
@@ -8,7 +8,7 @@ function decrypt(cipher, key) {
   return cryptoJS.AES.decrypt(cipher, key).toString(cryptoJS.enc.Utf8);
 }
 
-// --------- DATES & HEURE -------------
+// --------- DATES & TIMES -------------
 function parseDateTime(iso) {
   const d = iso.slice(0, 10).replace(/-/g, "");
   const t = iso.slice(11, 19).replace(/:/g, "");
@@ -23,7 +23,7 @@ function getDateBefore(days) {
   );
 }
 
-// --------- GÉNÉRATION D’ID & NOMS --------
+// --------- TRANS ID & USERNAME GEN --------
 function createTxId(sender) {
   const [d, t] = getDate();
   return require("crypto")
