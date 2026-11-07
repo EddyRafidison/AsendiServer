@@ -1,4 +1,76 @@
 const cryptoJS = require("crypto-js");
+const crypto = require("crypto");
+const argon2 = require("argon2");
+const { transliterate } = require("transliteration");
+
+const ARGON2_OPTIONS = {
+  type: argon2.argon2id,
+  memoryCost: 19456,
+  timeCost: 2,
+  parallelism: 1,
+};
+
+const configuredArgonConcurrency = Number(process.env.ARGON2_MAX_PARALLEL || 4);
+const ARGON2_MAX_PARALLEL = Number.isInteger(configuredArgonConcurrency)
+  ? Math.max(1, Math.min(configuredArgonConcurrency, 16))
+  : 4;
+const configuredArgonQueue = Number(process.env.ARGON2_MAX_QUEUE || 100);
+const ARGON2_MAX_QUEUE = Number.isInteger(configuredArgonQueue)
+  ? Math.max(1, Math.min(configuredArgonQueue, 1000))
+  : 100;
+
+let activeArgonOperations = 0;
+const argonWaitQueue = [];
+
+async function withArgonSlot(operation) {
+  if (activeArgonOperations < ARGON2_MAX_PARALLEL && argonWaitQueue.length === 0) {
+    activeArgonOperations += 1;
+  } else {
+    if (argonWaitQueue.length >= ARGON2_MAX_QUEUE) {
+      throw new Error("Argon2 operation queue is full");
+    }
+    await new Promise((resolve) => argonWaitQueue.push(resolve));
+  }
+
+  try {
+    return await operation();
+  } finally {
+    const next = argonWaitQueue.shift();
+    if (next) {
+      // Transfer the occupied slot directly to the next waiter.
+      next();
+    } else {
+      activeArgonOperations -= 1;
+    }
+  }
+}
+
+function assertSecretInput(secret) {
+  if (typeof secret !== "string" || secret.length === 0) {
+    throw new TypeError("Secret must be a non-empty string");
+  }
+  if (Buffer.byteLength(secret, "utf8") > 4096) {
+    throw new RangeError("Secret exceeds the maximum supported size");
+  }
+}
+
+function isArgon2Hash(value) {
+  return typeof value === "string" && value.startsWith("$argon2id$");
+}
+
+async function hashSecret(secret) {
+  assertSecretInput(secret);
+  return withArgonSlot(() => argon2.hash(secret, ARGON2_OPTIONS));
+}
+
+async function verifySecret(storedHash, candidate) {
+  if (!isArgon2Hash(storedHash) || typeof candidate !== "string") {
+    return false;
+  }
+  if (Buffer.byteLength(candidate, "utf8") > 4096) return false;
+
+  return withArgonSlot(() => argon2.verify(storedHash, candidate));
+}
 
 // --------- CIPHER / DECIPHER ----------
 function encrypt(text, key) {
@@ -8,25 +80,49 @@ function decrypt(cipher, key) {
   return cryptoJS.AES.decrypt(cipher, key).toString(cryptoJS.enc.Utf8);
 }
 
-// --------- DATES & TIMES -------------
+// --------- DATES & TIMES (UTC / GMT+0) -------------
+function formatUtcDateTime(date) {
+  if (!(date instanceof Date) || !Number.isFinite(date.getTime())) {
+    throw new TypeError("A valid Date is required");
+  }
+
+  const yyyy = date.getUTCFullYear();
+  const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(date.getUTCDate()).padStart(2, "0");
+  const hh = String(date.getUTCHours()).padStart(2, "0");
+  const mi = String(date.getUTCMinutes()).padStart(2, "0");
+  const ss = String(date.getUTCSeconds()).padStart(2, "0");
+
+  return [Number(`${yyyy}${mm}${dd}`), `${hh}${mi}${ss}`];
+}
+
 function parseDateTime(iso) {
-  const d = iso.slice(0, 10).replace(/-/g, "");
-  const t = iso.slice(11, 19).replace(/:/g, "");
-  return [parseInt(d), t];
+  if (typeof iso !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(iso)) {
+    throw new TypeError("Invalid ISO date-time");
+  }
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) throw new TypeError("Invalid ISO date-time");
+  return formatUtcDateTime(date);
 }
+
 function getDate() {
-  return parseDateTime(require("moment")().utcOffset(3).toISOString(true));
+  return formatUtcDateTime(new Date());
 }
+
 function getDateBefore(days) {
-  return parseDateTime(
-    require("moment")().utcOffset(3).subtract(days, "days").toISOString(true),
-  );
+  const numberOfDays = Number(days);
+  if (!Number.isInteger(numberOfDays) || numberOfDays < 0) {
+    throw new RangeError("days must be a non-negative integer");
+  }
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() - numberOfDays);
+  return formatUtcDateTime(date);
 }
 
 // --------- TRANS ID & USERNAME GEN --------
 function createTxId(sender) {
   const [d, t] = getDate();
-  return require("crypto")
+  return crypto
     .createHash("shake256", { outputLength: 7 })
     .update(d + sender + t)
     .digest("hex");
@@ -38,45 +134,33 @@ function getUserPrefixName(fullname) {
       ? fullname.split("%20").pop()
       : fullname;
 }
-function createUserSuffixName(cni) {
-  try {
-    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ9876543210".split("");
-    const ts = Date.now(),
-      dt = new Date(ts);
-    const fD = new Intl.DateTimeFormat("fr-FR", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-    }).format(dt);
-    const fT = new Intl.DateTimeFormat("fr-FR", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      fractionalSecondDigits: 2,
-    }).format(dt);
-    const nums = [...fD.replace(/\D/g, ""), ...fT.replace(/\D/g, "")].map(
-      Number,
-    );
-    const cnid = [7, 8, 9, 10].map((i) => parseInt(cni.charAt(i)));
-    const g = [
-      nums[0] + nums[1] + nums[2] + nums[3] + cnid[1],
-      nums[4] + nums[5] + nums[6] + nums[7] + cnid[3],
-      nums[8] + nums[9] + nums[10] + nums[11] + cnid[0],
-      nums[12] + nums[13] + nums[14] + nums[15] + cnid[2],
-    ];
-    for (let i = 0; i < 4; i++) {
-      if (g[i] > 36) g[i] -= cnid[[1, 3, 0, 2][i]];
-      if (g[i] < 1) g[i] = 1;
-    }
-    return (
-      letters[g[2] - 1] +
-      letters[g[1] - 1] +
-      letters[g[3] - 1] +
-      letters[g[0] - 1]
-    );
-  } catch (e) {
-    console.error("cni error");
+function transliterateUserText(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("User text must be a string");
   }
+
+  const source = value.normalize("NFC");
+  const result = transliterate(source, {
+    trim: true,
+    unknown: "",
+    fixChineseSpacing: true,
+  })
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (source.trim() && !result) {
+    throw new Error("Input contains no characters supported by transliteration");
+  }
+
+  return result;
+}
+function createUserSuffixName() {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ9876543210";
+
+  return Array.from({ length: 6 }, () =>
+    alphabet[crypto.randomInt(alphabet.length)],
+  ).join("");
 }
 
 // --------- MIDDLEWARE HTTPS ----------
@@ -91,11 +175,15 @@ function httpsRedirect(req, res, next) {
 module.exports = {
   encrypt,
   decrypt,
+  hashSecret,
+  verifySecret,
+  isArgon2Hash,
   parseDateTime,
   getDate,
   getDateBefore,
   createTxId,
   getUserPrefixName,
+  transliterateUserText,
   createUserSuffixName,
   httpsRedirect,
 };

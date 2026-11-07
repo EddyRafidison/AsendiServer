@@ -5,18 +5,22 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.1",
     "geoip-country": "^5.0.202412032342",
-    "moment": "^2.30.1",
     "mysql2": "^3.11.4",
     "nodemailer": "^6.9.16",
     "script-runner": "^0.1.8",
-    "transliteration": "^2.3.5"
+    "transliteration": "^2.3.5",
+    "argon2": "0.41.1",
+    "ethers": "^6.17.0"
   },
   "name": "onex",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js"
+    "test": "npm run check && node --test tests/*.test.js",
+    "start": "node index.js",
+    "sweep": "node sweep-worker.js",
+    "check": "node --check index.js && node --check routes.js && node --check pay.js && node --check sweep.js && node --check sweep-worker.js && node --check db.js && node --check recharge-policy.js && node --check utils.js && node --check stock-accounting.js && node --check disbursement-policy.js && node --check disbursement.js && node --check disbursement-worker.js",
+    "disburse": "node disbursement-worker.js"
   },
   "keywords": [],
   "author": "Eddy Rafidison",
@@ -26,5 +30,8 @@
   "bugs": {
     "url": "https://github.com/EddyRafidison/AsendiServer/issues"
   },
-  "homepage": "https://github.com/EddyRafidison/AsendiServer#readme"
+  "homepage": "https://github.com/EddyRafidison/AsendiServer#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
