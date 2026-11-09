@@ -7,6 +7,7 @@ const {
   calculateTopUpReserveAllocation,
   deriveUnitPrice,
   deriveInitAsset,
+  addReceivedInitAsset,
 } = require("../stock-accounting");
 const {
   calculateSystemDisbursement,
@@ -70,10 +71,51 @@ test("reserve allocation refuses a top-up above combined reserve value", () => {
   assert.equal(fixed(result.newBacked), "10");
 });
 
-test("P2P account price and initial-asset basis use the current account balance", () => {
+test("P2P price is derived from the sender and sender basis is recalculated", () => {
   assert.equal(fixed(deriveUnitPrice("300", "150")), "2");
   assert.equal(fixed(deriveInitAsset("250", "2")), "125");
   assert.throws(() => deriveUnitPrice("300", "0"), /init_asset/);
+});
+
+test("P2P recipient preserves its existing initial-asset basis and adds the net received basis", () => {
+  // The recipient owns 100 One-Val backed by 80 initial assets.
+  // A 50 One-Val transfer at price 2 contributes 25 initial assets.
+  assert.equal(fixed(addReceivedInitAsset("80", "25")), "105");
+  assert.throws(() => addReceivedInitAsset("-1", "25"), /cannot be negative/);
+  assert.throws(() => addReceivedInitAsset("80", "0"), /greater than zero/);
+});
+
+test("P2P fee allocation conserves initial assets across sender, recipient and common reserves", () => {
+  const senderBalance = new BigNumber("300");
+  const senderInitAsset = new BigNumber("150");
+  const receiverInitAsset = new BigNumber("80");
+  const requestedAmount = new BigNumber("50");
+  const priceValue = deriveUnitPrice(senderBalance, senderInitAsset);
+  const amountUnits = requestedAmount.dividedBy(priceValue);
+  const fees = amountUnits.multipliedBy(3).dividedBy(100);
+  const senderFee = fees.dividedBy(2);
+  const receiverFee = fees.dividedBy(2);
+  const receiverNetBasis = amountUnits.minus(receiverFee);
+  const commonInactiveFee = fees.dividedBy(4);
+  const commonBackedFee = fees.multipliedBy(3).dividedBy(4);
+
+  const newSenderBalance = senderBalance.minus(
+    amountUnits.plus(senderFee).multipliedBy(priceValue),
+  );
+  const newSenderInitAsset = deriveInitAsset(newSenderBalance, priceValue);
+  const newReceiverInitAsset = addReceivedInitAsset(receiverInitAsset, receiverNetBasis);
+
+  const initialBasisDelta = newSenderInitAsset
+    .minus(senderInitAsset)
+    .plus(newReceiverInitAsset.minus(receiverInitAsset))
+    .plus(commonInactiveFee)
+    .plus(commonBackedFee);
+
+  assert.equal(fixed(amountUnits), "25");
+  assert.equal(fixed(fees), "0.75");
+  assert.equal(fixed(newSenderInitAsset), "124.625");
+  assert.equal(fixed(newReceiverInitAsset), "104.625");
+  assert.equal(fixed(initialBasisDelta), "0");
 });
 
 test("disbursement uses model A: sell gross balance and deduct fees", () => {

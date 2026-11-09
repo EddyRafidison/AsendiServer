@@ -58,6 +58,29 @@ function deriveInitAsset(balanceValue, priceValue) {
 }
 
 /**
+ * Add the initial-asset basis received by a P2P destination account.
+ * The recipient keeps its existing historical basis; only the net basis
+ * transferred at the sender's transaction price is added.
+ */
+function addReceivedInitAsset(currentInitAssetValue, receivedInitAssetValue) {
+  const current = asBigNumber(currentInitAssetValue, "recipient init_asset");
+  const received = asBigNumber(receivedInitAssetValue, "received initial assets");
+
+  if (current.isNegative()) {
+    throw new RangeError("The recipient init_asset cannot be negative");
+  }
+  if (!received.isFinite() || !received.isGreaterThan(0)) {
+    throw new RangeError("Received initial assets must be greater than zero");
+  }
+
+  const result = current.plus(received);
+  if (!result.isFinite() || result.isNegative()) {
+    throw new RangeError("The resulting recipient init_asset is invalid");
+  }
+  return result;
+}
+
+/**
  * Allocate a One-Val top-up against common reserves, consuming inactive
  * initial assets first and backed initial assets only for any shortfall.
  * When backed assets are untouched, the common unit price remains unchanged.
@@ -141,5 +164,6 @@ function calculateTopUpReserveAllocation(
 module.exports = {
   deriveUnitPrice,
   deriveInitAsset,
+  addReceivedInitAsset,
   calculateTopUpReserveAllocation,
 };

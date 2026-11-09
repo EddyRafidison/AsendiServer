@@ -17,6 +17,15 @@ Node.js backend for the OneX platform. The current payment rail accepts **Binanc
 - A system sale liquidates the user's entire One-Val balance, deducts the configured fee, and pays the net amount in BSC-USD. A successfully confirmed disbursement counts toward the 90-day rolling cooldown.
 - UTC (+0) is used for all new database timestamps and worker scheduling.
 
+## P2P accounting
+
+- `priceValue = sender.balance / sender.init_asset` is derived from the sender only.
+- `amountUnits = requestedAmount / priceValue` and `receiverAmountUnits = amountUnits - receiverFee` are measured in initial-asset units.
+- The sender's new `init_asset` is recalculated from the sender's new One-Val balance divided by `priceValue`.
+- The recipient retains its existing `init_asset`; the recipient's new basis is `old_init_asset + receiverAmountUnits`. Do not reprice the recipient's historical balance at the sender's price.
+- The recipient's One-Val balance increases by `receiverAmountUnits * priceValue`.
+- The P2P initial-asset conservation check is: sender basis change + recipient basis change + fees allocated to common reserves = 0, subject only to database precision rounding.
+
 ## Database
 
 This version defines the **final schema for a first deployment**. It intentionally does not migrate or backfill legacy tables. Create a new, empty MySQL database before starting this version. `initDbIfEmpty()` creates the required tables and verifies required columns; it does not alter an existing legacy schema.

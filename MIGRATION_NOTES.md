@@ -71,7 +71,10 @@ Pour le P2P :
 - Les frais totaux sont calculés en actifs initiaux, avec 50 % supportés par chaque utilisateur.
 - `activities.amount = (requestedAmount / priceValue) - receiverFee`.
 - `activities.fees` enregistre les frais totaux en actifs initiaux.
-- Après mise à jour des soldes, les `init_asset` expéditeur et destinataire sont recalculés comme nouveau solde / `priceValue`.
+- Après le transfert, le `init_asset` de l'expéditeur est recalculé comme nouveau solde / `priceValue`.
+- Le `init_asset` du destinataire conserve sa base historique et augmente uniquement de `receiverAmountUnits`, exprimé en actifs initiaux. Il ne doit pas être recalculé à partir du nouveau solde destinataire divisé par le prix de l'expéditeur.
+- Cette règle conserve les actifs initiaux : la diminution de base chez l'expéditeur, l'augmentation nette chez le destinataire et les frais affectés aux réserves doivent avoir une variation totale nulle, à l'arrondi près.
+- Le crédit One-Val du destinataire reste `receiverAmount * priceValue`; seul son `init_asset` est mis à jour de manière additive. Si son `balance` et son `init_asset` sont incohérents (un seul des deux est nul), le P2P est refusé plutôt que de reconstituer sa base au prix de l'expéditeur.
 - 75 % des frais initiaux vont à `common.backed_units`; 25 % vont à `common.inactive_init_asset`.
 - La valeur commune augmente de la part de frais adossée convertie au `priceValue`.
 - Le destinataire ne peut pas dépasser 300 One-Val.

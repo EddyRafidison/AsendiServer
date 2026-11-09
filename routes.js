@@ -5,7 +5,12 @@ const fs = require("fs");
 const geoip = require("geoip-country");
 const nodemailer = require("nodemailer");
 const BigNumber = require("bignumber.js");
-const { deriveUnitPrice, deriveInitAsset, calculateTopUpReserveAllocation } = require("./stock-accounting");
+const {
+  deriveUnitPrice,
+  deriveInitAsset,
+  addReceivedInitAsset,
+  calculateTopUpReserveAllocation,
+} = require("./stock-accounting");
 const {
   MIN_RECHARGE_AMOUNT,
   MAX_RECHARGE_AMOUNT,
@@ -1599,24 +1604,32 @@ router.post("/app/near-transfer", async (req, res) => {
         !senderInitAsset.isFinite() ||
         senderInitAsset.isNegative() ||
         !destinationBalance.isFinite() ||
+        destinationBalance.isNegative() ||
         !destinationInitAsset.isFinite() ||
         destinationInitAsset.isNegative()
       ) {
         throw new Error("Invalid balances or reserve values in the database");
       }
 
-      // P2P input amounts are One-Val; activity amounts retain the initial-asset unit.
+      // A recipient must have a consistent balance/basis pair. A positive
+      // balance without an initial-asset basis cannot be safely re-based using
+      // the sender's price, and a zero balance must not retain a stale basis.
+      if (destinationBalance.isZero() !== destinationInitAsset.isZero()) {
+        throw new Error("Recipient balance and init_asset are inconsistent");
+      }
+
+      // P2P input amounts are One-Val; receiverAmountUnits and activity.amount use initial-asset units.
       const amountUnits = requestedAmount.dividedBy(priceValue);
       const fees = amountUnits.multipliedBy(tfees).dividedBy(100);
       const senderFee = fees.dividedBy(2);
       const receiverFee = fees.dividedBy(2);
       const totalDebit = amountUnits.plus(senderFee);
-      const receiverAmount = amountUnits.minus(receiverFee);
+      const receiverAmountUnits = amountUnits.minus(receiverFee);
       const sharedFees = fees.multipliedBy(3).dividedBy(4);
       const adminFees = fees.minus(sharedFees);
 
       const senderStockDebit = totalDebit.multipliedBy(priceValue);
-      const receiverStockCredit = receiverAmount.multipliedBy(priceValue);
+      const receiverStockCredit = receiverAmountUnits.multipliedBy(priceValue);
       const futureSenderBalance = senderBalance.minus(senderStockDebit);
       const futureDestinationBalance = destinationBalance.plus(receiverStockCredit);
 
@@ -1630,7 +1643,7 @@ router.post("/app/near-transfer", async (req, res) => {
       ) {
         throw new Error("Invalid calculated transfer amounts");
       }
-      if (!receiverAmount.isFinite() || !receiverAmount.isGreaterThan(0)) {
+      if (!receiverAmountUnits.isFinite() || !receiverAmountUnits.isGreaterThan(0)) {
         return { transf: "unsupported" };
       }
       if (senderBalance.isLessThan(senderStockDebit)) {
@@ -1654,7 +1667,12 @@ router.post("/app/near-transfer", async (req, res) => {
       const reference = createFinancialReference(`P2P${S}`);
 
       const senderInitAssetAfter = deriveInitAsset(futureSenderBalance, priceValue);
-      const destinationInitAssetAfter = deriveInitAsset(futureDestinationBalance, priceValue);
+      // Preserve the recipient's historical basis and add only the net
+      // initial-asset amount transferred at the sender's transaction price.
+      const destinationInitAssetAfter = addReceivedInitAsset(
+        destinationInitAsset,
+        receiverAmountUnits,
+      );
 
       await tx.query(
         "INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -1662,7 +1680,7 @@ router.post("/app/near-transfer", async (req, res) => {
           S,
           D,
           1,
-          receiverAmount.toFixed(),
+          receiverAmountUnits.toFixed(),
           priceValue.toFixed(),
           fees.toFixed(),
           reference,
