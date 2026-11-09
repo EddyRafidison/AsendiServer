@@ -1,3 +1,5 @@
+process.env.TZ = "UTC";
+
 "use strict";
 
 require("dotenv").config();
@@ -13,7 +15,7 @@ const path = require("path");
 const envFile = process.env.USDT_DISBURSEMENT_ENV_FILE || ".env.disbursement";
 const envResult = require("dotenv").config({
   path: path.resolve(process.cwd(), envFile),
-  override: false,
+  override: true,
 });
 
 if (envResult.error) {

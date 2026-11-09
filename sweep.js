@@ -213,7 +213,6 @@ async function getUnSweptEvents(db, walletAddress, snapshotBlock) {
     `SELECT id,amount_raw,block_timestamp_ms,block_number
      FROM users_usdt_transfer_events
      WHERE deposit_address=? AND swept_at_ms IS NULL
-       AND status IN ('credited','pending_support')
        AND CAST(block_number AS UNSIGNED)<=?
      ORDER BY block_number ASC,log_index ASC`,
     [walletAddress, String(snapshotBlock)],
@@ -404,30 +403,38 @@ async function getOrBroadcast(runtime, rawTransaction, expectedHash, confirmatio
     }
   }
 
-  if (!receipt || Number(receipt.status) !== 1) {
-    if (receipt && Number(receipt.status) !== 1) {
-      throw new Error(`Sweep transaction ${expectedHash} failed on-chain.`);
-    }
+  if (!receipt) {
     receipt = await runtime.provider.waitForTransaction(expectedHash, confirmations, 120000);
-  } else {
-    const latestBlock = await runtime.provider.getBlockNumber();
-    const confirmationDepth = latestBlock - receipt.blockNumber + 1;
-    if (confirmationDepth < confirmations) {
-      receipt = await runtime.provider.waitForTransaction(expectedHash, confirmations, 120000);
-    }
   }
-
   if (!receipt) return null;
-  if (Number(receipt.status) !== 1) {
-    throw new Error(`Sweep transaction ${expectedHash} failed on-chain.`);
+
+  // Failed and successful receipts both require canonicality and the configured
+  // confirmation depth before the sweep job can be treated as terminal.
+  let canonicalBlock = await runtime.provider.getBlock(receipt.blockNumber);
+  let latestBlock = await runtime.provider.getBlockNumber();
+  let canonical = canonicalBlock &&
+    String(canonicalBlock.hash || "").toLowerCase() === String(receipt.blockHash || "").toLowerCase();
+  let depth = latestBlock - Number(receipt.blockNumber) + 1;
+
+  if (!canonical || depth < confirmations) {
+    const finalizedReceipt = await runtime.provider.waitForTransaction(
+      expectedHash,
+      confirmations,
+      120000,
+    );
+    if (!finalizedReceipt) return null;
+    receipt = finalizedReceipt;
+    canonicalBlock = await runtime.provider.getBlock(receipt.blockNumber);
+    latestBlock = await runtime.provider.getBlockNumber();
+    canonical = canonicalBlock &&
+      String(canonicalBlock.hash || "").toLowerCase() === String(receipt.blockHash || "").toLowerCase();
+    depth = latestBlock - Number(receipt.blockNumber) + 1;
   }
 
-  const canonicalBlock = await runtime.provider.getBlock(receipt.blockNumber);
-  if (!canonicalBlock || canonicalBlock.hash.toLowerCase() !== receipt.blockHash.toLowerCase()) {
-    return null;
+  if (!canonical || depth < confirmations) return null;
+  if (Number(receipt.status) !== 1) {
+    throw new Error(`Sweep transaction ${expectedHash} failed on-chain after canonical finality.`);
   }
-  const latestBlock = await runtime.provider.getBlockNumber();
-  if (latestBlock - receipt.blockNumber + 1 < confirmations) return null;
   return receipt;
 }
 
@@ -467,7 +474,6 @@ async function resumeSweep(db, walletRow, sweepRow, runtime) {
         `UPDATE users_usdt_transfer_events
          SET swept_at_ms=?
          WHERE deposit_address=? AND swept_at_ms IS NULL
-           AND status IN ('credited','pending_support')
            AND CAST(block_number AS UNSIGNED)<=?`,
         [now, walletRow.wallet_address, String(sweepRow.snapshot_block)],
       );
@@ -546,7 +552,7 @@ function startDepositSweeper(db) {
                 MIN(e.block_timestamp_ms) AS oldest_unswept_at_ms
          FROM users_usdt_deposit_wallets w
          JOIN users_usdt_transfer_events e ON e.deposit_address=w.wallet_address
-         WHERE e.swept_at_ms IS NULL AND e.status IN ('credited','pending_support')
+         WHERE e.swept_at_ms IS NULL
          GROUP BY w.id,w.username,w.wallet_address,w.derivation_index,w.sweep_lock_until_ms
          ORDER BY oldest_unswept_at_ms ASC
          LIMIT ?`,

@@ -19,13 +19,13 @@
     "test": "npm run check && node --test tests/*.test.js",
     "start": "node index.js",
     "sweep": "node sweep-worker.js",
-    "check": "node --check index.js && node --check routes.js && node --check pay.js && node --check sweep.js && node --check sweep-worker.js && node --check db.js && node --check recharge-policy.js && node --check utils.js && node --check stock-accounting.js && node --check disbursement-policy.js && node --check disbursement.js && node --check disbursement-worker.js",
+    "check": "node --check index.js && node --check routes.js && node --check pay.js && node --check sweep.js && node --check sweep-worker.js && node --check db.js && node --check recharge-policy.js && node --check utils.js && node --check stock-accounting.js && node --check disbursement-policy.js && node --check disbursement.js && node --check disbursement-worker.js && node --check tests/business-rules.test.js",
     "disburse": "node disbursement-worker.js"
   },
   "keywords": [],
   "author": "Eddy Rafidison",
   "license": "UNLICENSED",
-  "description": "## Features - Fast - Low transaction fee - Profit maker",
+  "description": "OneX backend: BNB Smart Chain deposit, P2P accounting, treasury disbursement and reconciliation.",
   "repository": "git+https://github.com/EddyRafidison/AsendiServer.git",
   "bugs": {
     "url": "https://github.com/EddyRafidison/AsendiServer/issues"

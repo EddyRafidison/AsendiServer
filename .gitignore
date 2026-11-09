@@ -1,6 +1,9 @@
 .env
+.env.*
+!.env.example
+!.env.disbursement.example
+!.env.sweeper.example
 node_modules/
 npm-debug.log*
 .DS_Store
-.env.sweeper
-.env.disbursement
+coverage/

@@ -1,4 +1,6 @@
 const express = require("express");
+const crypto = require("crypto");
+const { getAddress: checksumEvmAddress } = require("ethers");
 const fs = require("fs");
 const geoip = require("geoip-country");
 const nodemailer = require("nodemailer");
@@ -8,12 +10,16 @@ const {
   MIN_RECHARGE_AMOUNT,
   MAX_RECHARGE_AMOUNT,
   MAX_DEFAULT_STOCK,
+  RECHARGE_BATCH_WINDOW_MS,
+  RECHARGE_COOLDOWN_MS,
   getLastOnexRecharge,
   assessRechargeCooldown,
   formatUtcRecordDateTime,
+  getWeeklyReleaseAt,
 } = require("./recharge-policy");
 const {
   DISBURSEMENT_COOLDOWN_MS,
+  DISBURSEMENT_RESERVATION_MS,
   calculateSystemDisbursement,
   isRequestedPayoutWithinTolerance,
 } = require("./disbursement-policy");
@@ -41,7 +47,6 @@ const {
   decrypt,
   getDate,
   getDateBefore,
-  createTxId,
   getUserPrefixName,
   transliterateUserText,
   createUserSuffixName,
@@ -51,19 +56,22 @@ const {
 
 const {
   initializePaymentProvider,
-  createPaymentRequest,
   getOrCreateUserDepositAddress,
-  getPaymentStatus,
   startPaymentWatcher: startUsdtPaymentWatcher,
   getPaymentPublicConfig,
   isAddress: isEvmAddress,
 } = require("./pay");
 const { startDepositSweeper } = require("./sweep");
+const { checkTreasuryLiquidity } = require("./disbursement");
 
 const router = express.Router();
 
 function normalizeFormValue(value) {
   return typeof value === "string" ? value.replaceAll(" ", "+") : "";
+}
+
+function createFinancialReference(prefix = "ONEX") {
+  return `${String(prefix).replace(/[^A-Za-z0-9]/g, "").slice(0, 12)}${crypto.randomBytes(16).toString("hex")}`;
 }
 
 function requestTokenIsValid(req, token, password, username) {
@@ -275,7 +283,11 @@ async function applyUserTopUp(
   if (newBalance.isGreaterThan(maxStock)) {
     return { error: "maximum user balance exceeded" };
   }
-  const newInitAsset = deriveInitAsset(newBalance, lastPrice);
+  const currentInitAsset = new BigNumber(userRows[0].init_asset);
+  if (!currentInitAsset.isFinite() || currentInitAsset.isNegative()) {
+    throw new Error("Invalid user initial-asset basis during top-up");
+  }
+  const newInitAsset = currentInitAsset.plus(activityAmount);
 
   if (!newBalance.isFinite() || !newInitAsset.isFinite()) {
     throw new Error("Invalid user top-up calculations");
@@ -344,15 +356,21 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   }
 
   const now = Date.now();
-  const [monthlyRows] = await tx.query(
-    `SELECT id,status FROM users_usdt_disbursements
-     WHERE username=? AND CAST(created_at_ms AS UNSIGNED)>=?
-     ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+  const [successfulRows] = await tx.query(
+    `SELECT id FROM users_usdt_disbursements
+     WHERE username=? AND status='confirmed' AND CAST(confirmed_at_ms AS UNSIGNED)>=?
+     ORDER BY confirmed_at_ms DESC LIMIT 1 FOR UPDATE`,
     [username, String(now - DISBURSEMENT_COOLDOWN_MS)],
   );
-  if (monthlyRows.length > 0) {
-    return { transf: "monthly disbursement limit reached" };
+  if (successfulRows.length > 0) {
+    return { transf: "disbursement limit reached", cooldown_days: 90 };
   }
+  const [activeRows] = await tx.query(
+    `SELECT id FROM users_usdt_disbursements
+     WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
+     ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
+  );
+  if (activeRows.length > 0) return { transf: "disbursement pending" };
 
   const userBalance = new BigNumber(stockRows[0].balance);
   const userInitAsset = new BigNumber(stockRows[0].init_asset);
@@ -428,14 +446,14 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     return { transf: "insufficient disbursement reserve" };
   }
 
-  const reference = createTxId(`DISB${username}`);
+  const reference = createFinancialReference(`DISB${username}`);
   const amountRaw = calculation.amountRaw;
   const [date, time] = getDate();
   await tx.query(
     `INSERT INTO users_usdt_disbursements
      (username,payout_address,requested_amount,payout_amount,amount_raw,gross_balance,gross_init_asset,
-      sold_init_asset,fee_amount,fee_init_asset,price_value,reference,status,created_at_ms,updated_at_ms)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)`,
+      sold_init_asset,fee_amount,fee_init_asset,price_value,reference,status,created_at_ms,reservation_expires_at_ms,updated_at_ms)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)`,
     [
       username,
       payoutAddress,
@@ -450,6 +468,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
       calculation.priceValue.toFixed(),
       reference,
       String(now),
+      String(now + DISBURSEMENT_RESERVATION_MS),
       String(now),
     ],
   );
@@ -477,30 +496,21 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
 }
 
 const RECHARGE_HOLD_REASON_TEXT = {
-  no_active_request: "Aucune commande de recharge valide n'était ouverte au moment du transfert.",
-  late_payment: "Le transfert a été reçu après l'expiration du délai d'une heure.",
-  request_already_used: "La commande avait déjà été utilisée ou clôturée par un autre transfert.",
-  below_minimum: "Le montant reçu est inférieur au minimum autorisé de 70 BSC-USD.",
-  above_maximum: "Le montant reçu dépasse le maximum autorisé de 140 BSC-USD.",
-  amount_mismatch: "Le montant reçu ne correspond pas au montant indiqué dans la commande de recharge.",
-  weekly_limit: "Une recharge OneX a déjà été créditée sur ce compte au cours des sept derniers jours.",
+  below_minimum: "Le montant total reçu pendant la session est inférieur au minimum de 70 BSC-USD.",
+  above_maximum: "Le montant total reçu pendant la session dépasse le maximum de 140 BSC-USD.",
+  weekly_limit: "Une recharge a déjà été créditée sur ce compte au cours des sept derniers jours. Le crédit sera réessayé automatiquement à la date prévue.",
   maximum_user_balance: "Le crédit ferait dépasser le solde maximal autorisé de 300 One-Val.",
-  account_unavailable: "Le compte OneX n'est pas actif ou n'est plus disponible pour recevoir un crédit.",
-  system_reserve: "La réserve système ne permet pas actuellement de créditer automatiquement ce montant.",
+  account_unavailable: "Le compte OneX est désactivé, supprimé ou indisponible.",
+  system_reserve: "Les réserves du système ne permettent pas encore de créditer ce paiement.",
+  previous_batch_unresolved: "Un précédent paiement de ce compte attend encore une résolution.",
 };
 
 function getReasonText(reasonCodes) {
-  return reasonCodes
-    .map((code) => RECHARGE_HOLD_REASON_TEXT[code] || "Le transfert nécessite une vérification manuelle.")
-    .filter(Boolean);
+  return reasonCodes.map((code) => RECHARGE_HOLD_REASON_TEXT[code] || "Le transfert nécessite une vérification manuelle.");
 }
 
 function safeJson(value) {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return "{}";
-  }
+  try { return JSON.stringify(value); } catch { return "[]"; }
 }
 
 async function processConfirmedUsdtPayment(event) {
@@ -510,49 +520,23 @@ async function processConfirmedUsdtPayment(event) {
   }
 
   return withTransaction(async (tx) => {
-    // Read the mapping first without a lock, then acquire user/account locks in
-    // the same order as createPaymentRequest and administrative top-ups.
-    const [mappedWalletRows] = await tx.query(
-      `SELECT id,username,wallet_address,payout_address
+    const [walletRows] = await tx.query(
+      `SELECT id,username,wallet_address,account_status
        FROM users_usdt_deposit_wallets
-       WHERE id=? AND wallet_address=?
-       LIMIT 1`,
+       WHERE id=? AND wallet_address=? LIMIT 1 FOR UPDATE`,
       [event.depositWalletId, event.depositAddress],
     );
-    if (mappedWalletRows.length === 0) {
-      throw new Error("The confirmed transfer does not match a registered OneX deposit wallet.");
+    if (!walletRows.length) {
+      throw new Error("The confirmed transfer does not match a registered OneX deposit address.");
     }
 
-    const username = mappedWalletRows[0].username;
-    const [accountRows] = await tx.query(
-      "SELECT status FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
-      [username],
-    );
-    const [stockRows] = await tx.query(
-      "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
-      [username],
-    );
-    const lastRecharge = await getLastOnexRecharge(tx, username, OneX);
-    const cooldown = assessRechargeCooldown(lastRecharge, event.blockTimestampMs);
-
-    const [walletRows] = await tx.query(
-      `SELECT id,username,wallet_address,payout_address
-       FROM users_usdt_deposit_wallets
-       WHERE id=? AND wallet_address=? AND username=?
-       LIMIT 1 FOR UPDATE`,
-      [event.depositWalletId, event.depositAddress, username],
-    );
-    if (walletRows.length === 0) {
-      throw new Error("The OneX deposit-wallet mapping changed during payment processing.");
-    }
-
-    const now = Date.now();
+    const wallet = walletRows[0];
+    const username = wallet.username;
     const [eventInsert] = await tx.query(
       `INSERT IGNORE INTO users_usdt_transfer_events
-       (username,deposit_wallet_id,deposit_address,from_address,amount,amount_raw,tx_hash,log_index,
-        block_number,block_hash,block_timestamp_ms,request_id,status,reason_codes,email_status,
-        email_attempts,email_last_attempt_ms,created_at_ms)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,'processing',NULL,'not_required',0,NULL,?)`,
+       (username,deposit_wallet_id,batch_id,deposit_address,from_address,amount,amount_raw,tx_hash,log_index,
+        block_number,block_hash,block_timestamp_ms,status,reason_codes,email_status,created_at_ms)
+       VALUES(?,?,NULL,?,?,?,?,?,?,?,?,?,'detected',NULL,'not_required',?)`,
       [
         username,
         event.depositWalletId,
@@ -565,246 +549,311 @@ async function processConfirmedUsdtPayment(event) {
         event.blockNumber,
         event.blockHash,
         String(event.blockTimestampMs),
-        String(now),
+        String(Date.now()),
       ],
     );
-    if (eventInsert.affectedRows !== 1) {
-      return { duplicate: true };
-    }
+    if (eventInsert.affectedRows !== 1) return { duplicate: true };
 
-    const [requestRows] = await tx.query(
-      `SELECT id,requested_amount,status,created_at_ms,expires_at_ms
-       FROM users_usdt_tx
-       WHERE username=? AND tx_addr=? AND CAST(created_at_ms AS UNSIGNED)<=?
-       ORDER BY CAST(created_at_ms AS UNSIGNED) DESC,id DESC
-       LIMIT 1 FOR UPDATE`,
-      [username, event.depositAddress, String(event.blockTimestampMs)],
+    const [authRows] = await tx.query(
+      "SELECT status FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
     );
-    const request = requestRows[0] || null;
-    const reasonCodes = [];
+    const [stockRows] = await tx.query(
+      "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [username],
+    );
 
-    if (!request) {
-      reasonCodes.push("no_active_request");
-    } else {
-      const createdAt = Number(request.created_at_ms);
-      const expiresAt = Number(request.expires_at_ms);
-      if (
-        !Number.isFinite(createdAt) ||
-        !Number.isFinite(expiresAt) ||
-        event.blockTimestampMs < createdAt
-      ) {
-        reasonCodes.push("no_active_request");
-      } else if (event.blockTimestampMs > expiresAt) {
-        reasonCodes.push("late_payment");
-      } else if (!['pending', 'expired'].includes(String(request.status))) {
-        reasonCodes.push("request_already_used");
-      }
-    }
+    const now = Date.now();
+    const [activeBatchRows] = await tx.query(
+      `SELECT * FROM users_usdt_deposit_batches
+       WHERE username=? AND status='collecting'
+       ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+      [username],
+    );
 
-    if (amountValue.isLessThan(MIN_RECHARGE_AMOUNT)) {
-      reasonCodes.push("below_minimum");
-    }
-    if (amountValue.isGreaterThan(MAX_RECHARGE_AMOUNT)) {
-      reasonCodes.push("above_maximum");
-    }
-    if (request && !amountValue.isEqualTo(new BigNumber(request.requested_amount))) {
-      reasonCodes.push("amount_mismatch");
-    }
-
-    if (!cooldown.allowed) reasonCodes.push("weekly_limit");
-
-    if (
-      !accountRows.length ||
-      Number(accountRows[0].status) <= 0 ||
-      !stockRows.length
-    ) {
-      reasonCodes.push("account_unavailable");
-    } else {
-      const currentBalance = new BigNumber(stockRows[0].balance);
-      if (
-        !currentBalance.isFinite() ||
-        currentBalance.isNegative() ||
-        currentBalance.plus(amountValue).isGreaterThan(new BigNumber(MAX_DEFAULT_STOCK))
-      ) {
-        reasonCodes.push("maximum_user_balance");
-      }
-    }
-
-    const distinctReasons = [...new Set(reasonCodes)];
-    const [recordDate, recordTime] = formatUtcRecordDateTime(event.blockTimestampMs);
-    const reference = createTxId(OneX);
-    let creditResult = null;
-
-    if (distinctReasons.length === 0) {
-      creditResult = await applyUserTopUp(
-        tx,
-        username,
-        amountValue,
-        reference,
-        recordDate,
-        recordTime,
-        event.blockTimestampMs,
-      );
-      if (creditResult.transf !== "sent") {
-        if (creditResult.error === "weekly recharge limit reached") {
-          distinctReasons.push("weekly_limit");
-        } else if (creditResult.error === "maximum user balance exceeded") {
-          distinctReasons.push("maximum_user_balance");
-        } else if (creditResult.error === "user not found") {
-          distinctReasons.push("account_unavailable");
-        } else if (creditResult.limit) {
-          distinctReasons.push("system_reserve");
-        } else {
-          throw new Error(`Unexpected automatic recharge credit result: ${safeJson(creditResult)}`);
-        }
-      }
-    }
-
-    if (distinctReasons.length === 0 && creditResult?.transf === "sent") {
-      // Only a direct ERC-20 transfer initiated by the logged sender can seed
-      // the user's BSC payout destination. It is never overwritten automatically.
-      if (event.directWalletTransfer) {
-        await tx.query(
-          `UPDATE users_usdt_deposit_wallets
-           SET payout_address=COALESCE(NULLIF(payout_address,''),?)
-           WHERE id=? AND username=?`,
-          [event.fromAddress, event.depositWalletId, username],
-        );
-      }
-
-      const response = {
-        transf: "sent",
-        amount: amountValue.toFixed(18),
-        tx_hash: event.txHash,
-        deposit_address: event.depositAddress,
-      };
+    let batch = activeBatchRows[0] || null;
+    if (batch && now >= Number(batch.expires_at_ms)) {
       await tx.query(
-        `UPDATE users_usdt_transfer_events
-         SET request_id=?,status='credited',reason_codes=NULL,email_status='not_required'
-         WHERE tx_hash=? AND log_index=?`,
-        [request ? request.id : null, event.txHash, event.logIndex],
+        "UPDATE users_usdt_deposit_batches SET status='ready',updated_at_ms=? WHERE id=? AND status='collecting'",
+        [String(now), batch.id],
       );
-      if (request) {
-        await tx.query(
-          `UPDATE users_usdt_tx
-           SET amount=?,tx_hash=?,status='completed',pending_username=NULL,pending_tx_addr=NULL,record_date=?,record_time=?
-           WHERE id=?`,
-          [amountValue.toFixed(18), event.txHash, recordDate, recordTime, request.id],
-        );
-        await tx.query(
-          `UPDATE users_usdt_recharge_status
-           SET status='completed',response_json=?,updated_at_ms=?
-           WHERE request_id=? AND username=?`,
-          [safeJson(response), String(now), request.id, username],
-        );
-      }
-
-      // A delayed scan can confirm an older in-window payment after the user
-      // has already opened a newer request. The successful credit starts the
-      // seven-day cooldown, so close any other still-pending request atomically.
-      const cancellationResponse = {
-        transf: "cancelled",
-        message: "Une recharge précédente a été confirmée. Le délai de sept jours est maintenant appliqué.",
-      };
-      await tx.query(
-        `UPDATE users_usdt_tx
-         SET status='cancelled',pending_username=NULL,pending_tx_addr=NULL
-         WHERE username=? AND status='pending' AND id<>?`,
-        [username, request ? request.id : 0],
-      );
-      await tx.query(
-        `UPDATE users_usdt_recharge_status s
-         JOIN users_usdt_tx p ON p.id=s.request_id
-         SET s.status='cancelled',s.response_json=?,s.updated_at_ms=?
-         WHERE p.username=? AND p.status='cancelled' AND s.status='pending'`,
-        [safeJson(cancellationResponse), String(now), username],
-      );
-      return { credited: true, username, amount: amountValue.toFixed(18), txHash: event.txHash };
+      batch = null;
     }
 
-    const response = {
-      transf: "pending_support",
-      amount: amountValue.toFixed(18),
-      tx_hash: event.txHash,
-      deposit_address: event.depositAddress,
-      reason_codes: distinctReasons,
-      reasons: getReasonText(distinctReasons),
-      message: "Le transfert a été reçu, mais il nécessite une vérification par le support OneX.",
-    };
+    let initialStatus = "collecting";
+    let initialReasons = [];
+    if (wallet.account_status !== "active" || !authRows.length || Number(authRows[0].status) <= 0 || !stockRows.length) {
+      initialStatus = "pending_support";
+      initialReasons.push("account_unavailable");
+    }
+
+    if (!batch) {
+      const [unresolvedRows] = await tx.query(
+        `SELECT id FROM users_usdt_deposit_batches
+         WHERE username=? AND status IN ('pending_support','finalizing','refund_queued')
+         ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+        [username],
+      );
+      if (unresolvedRows.length) {
+        initialStatus = "pending_support";
+        initialReasons.push("previous_batch_unresolved");
+      }
+      // Start the collection window when OneX first processes the finalized event.
+      const openedAt = now;
+      const expiresAt = openedAt + RECHARGE_BATCH_WINDOW_MS;
+      const [batchInsert] = await tx.query(
+        `INSERT INTO users_usdt_deposit_batches
+         (username,deposit_wallet_id,deposit_address,opened_at_ms,expires_at_ms,total_amount,total_amount_raw,
+          transfer_count,status,reason_codes,created_at_ms,updated_at_ms,email_status)
+         VALUES(?,?,?,?,?,0,0,1,?,?,?,?,?)`,
+        [
+          username,
+          event.depositWalletId,
+          event.depositAddress,
+          String(openedAt),
+          String(expiresAt),
+          initialStatus,
+          initialReasons.length ? safeJson(initialReasons) : null,
+          String(now),
+          String(now),
+          initialStatus === "pending_support" ? "pending" : "not_required",
+        ],
+      );
+      const [createdRows] = await tx.query(
+        "SELECT * FROM users_usdt_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE",
+        [batchInsert.insertId],
+      );
+      batch = createdRows[0];
+    }
+
+    const nextStatus = batch.status === "collecting" ? "batched" : "pending_support";
+    let reasonCodes = initialReasons;
+    if (batch.reason_codes) {
+      try {
+        const parsedReasons = JSON.parse(batch.reason_codes);
+        if (Array.isArray(parsedReasons)) reasonCodes = parsedReasons;
+      } catch {
+        reasonCodes = ["invalid_stored_reason_data"];
+      }
+    }
     await tx.query(
-      `UPDATE users_usdt_transfer_events
-       SET request_id=?,status='pending_support',reason_codes=?,email_status='pending'
-       WHERE tx_hash=? AND log_index=?`,
-      [request ? request.id : null, safeJson(distinctReasons), event.txHash, event.logIndex],
+      `UPDATE users_usdt_deposit_batches
+       SET total_amount=total_amount+?,total_amount_raw=total_amount_raw+?,transfer_count=transfer_count+1,updated_at_ms=?
+       WHERE id=?`,
+      [amountValue.toFixed(18), event.amountRaw, String(now), batch.id],
     );
-
-    if (request && ["pending", "expired"].includes(String(request.status))) {
-      await tx.query(
-        `UPDATE users_usdt_tx
-         SET amount=?,tx_hash=IF(tx_hash IS NULL,?,tx_hash),status='pending_support',
-             pending_username=NULL,pending_tx_addr=NULL,record_date=?,record_time=?
-         WHERE id=?`,
-        [amountValue.toFixed(18), event.txHash, recordDate, recordTime, request.id],
-      );
-      await tx.query(
-        `UPDATE users_usdt_recharge_status
-         SET status='pending_support',response_json=?,updated_at_ms=?
-         WHERE request_id=? AND username=?`,
-        [safeJson(response), String(now), request.id, username],
-      );
-    }
+    await tx.query(
+      `UPDATE users_usdt_transfer_events SET batch_id=?,status=?,reason_codes=? WHERE tx_hash=? AND log_index=?`,
+      [batch.id, nextStatus, reasonCodes.length ? safeJson(reasonCodes) : null, event.txHash, event.logIndex],
+    );
 
     return {
-      held: true,
+      accepted: true,
       username,
-      amount: amountValue.toFixed(18),
-      txHash: event.txHash,
-      reasonCodes: distinctReasons,
+      batchId: String(batch.id),
+      status: nextStatus,
+      expiresAtMs: Number(batch.expires_at_ms),
     };
   });
 }
 
+async function updateBatchEventStatus(tx, batchId, status, reasonCodes = null) {
+  await tx.query(
+    `UPDATE users_usdt_transfer_events
+     SET status=?,reason_codes=?,email_status=IF(? IN ('pending_support','pending_weekly'),'pending','not_required')
+     WHERE batch_id=? AND status IN ('batched','pending_weekly','pending_reserve','pending_support')`,
+    [status, reasonCodes ? safeJson(reasonCodes) : null, status, batchId],
+  );
+}
+
+async function processOneRechargeBatch(batchId) {
+  return withTransaction(async (tx) => {
+    const [snapshotRows] = await tx.query(
+      "SELECT username,deposit_wallet_id FROM users_usdt_deposit_batches WHERE id=? LIMIT 1",
+      [batchId],
+    );
+    if (!snapshotRows.length) return { skipped: true };
+
+    const [walletRows] = await tx.query(
+      "SELECT id FROM users_usdt_deposit_wallets WHERE id=? LIMIT 1 FOR UPDATE",
+      [snapshotRows[0].deposit_wallet_id],
+    );
+    const [authRows] = await tx.query(
+      "SELECT status FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
+      [snapshotRows[0].username],
+    );
+    const [stockRows] = await tx.query(
+      "SELECT balance,init_asset FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
+      [snapshotRows[0].username],
+    );
+    const [batchRows] = await tx.query(
+      "SELECT * FROM users_usdt_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE",
+      [batchId],
+    );
+    if (!batchRows.length) return { skipped: true };
+    const batch = batchRows[0];
+    const now = Date.now();
+    if (batch.status === "collecting") {
+      if (now < Number(batch.expires_at_ms)) return { waiting: true };
+      await tx.query(
+        "UPDATE users_usdt_deposit_batches SET status='ready',updated_at_ms=? WHERE id=?",
+        [String(now), batchId],
+      );
+      batch.status = "ready";
+    }
+    if (!['ready','pending_weekly','pending_reserve'].includes(batch.status)) return { skipped: true };
+    if (batch.status === "pending_weekly" && Number(batch.release_at_ms || 0) > now) return { waiting: true };
+    if (batch.status === "pending_reserve" && Number(batch.next_attempt_at_ms || 0) > now) return { waiting: true };
+
+    const amount = new BigNumber(batch.total_amount);
+    const reasons = [];
+    if (!amount.isFinite() || amount.isLessThan(MIN_RECHARGE_AMOUNT)) reasons.push("below_minimum");
+    if (amount.isFinite() && amount.isGreaterThan(MAX_RECHARGE_AMOUNT)) reasons.push("above_maximum");
+    if (reasons.length) {
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches
+         SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),email_status='pending',updated_at_ms=?
+         WHERE id=?`,
+        [safeJson(reasons), String(batch.expires_at_ms || now), String(now), batchId],
+      );
+      await updateBatchEventStatus(tx, batchId, "pending_support", reasons);
+      return { held: true, reasons };
+    }
+
+    if (!authRows.length || Number(authRows[0].status) <= 0 || !stockRows.length) {
+      reasons.push("account_unavailable");
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),email_status='pending',updated_at_ms=? WHERE id=?`,
+        [safeJson(reasons), String(now), String(now), batchId],
+      );
+      await updateBatchEventStatus(tx, batchId, "pending_support", reasons);
+      return { held: true, reasons };
+    }
+
+    const lastRecharge = await getLastOnexRecharge(tx, batch.username, OneX);
+    const cooldown = assessRechargeCooldown(lastRecharge, now);
+    if (!cooldown.allowed) {
+      const pendingSince = Number(batch.pending_since_ms || now);
+      const releaseAt = getWeeklyReleaseAt(pendingSince, cooldown.lastRechargeMs);
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches
+         SET status='pending_weekly',pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,next_attempt_at_ms=?,reason_codes=?,email_status='pending',updated_at_ms=?
+         WHERE id=?`,
+        [String(pendingSince), String(releaseAt), String(releaseAt), safeJson(["weekly_limit"]), String(now), batchId],
+      );
+      await updateBatchEventStatus(tx, batchId, "pending_weekly", ["weekly_limit"]);
+      return { waiting: true, releaseAtMs: releaseAt };
+    }
+
+    const userBalance = new BigNumber(stockRows[0].balance);
+    if (!userBalance.isFinite() || userBalance.isNegative() || userBalance.plus(amount).isGreaterThan(MAX_DEFAULT_STOCK)) {
+      reasons.push("maximum_user_balance");
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),email_status='pending',updated_at_ms=? WHERE id=?`,
+        [safeJson(reasons), String(now), String(now), batchId],
+      );
+      await updateBatchEventStatus(tx, batchId, "pending_support", reasons);
+      return { held: true, reasons };
+    }
+
+    const [date, time] = formatUtcRecordDateTime(now);
+    const reference = createFinancialReference(`TOP${batch.username}`);
+    const creditResult = await applyUserTopUp(
+      tx,
+      batch.username,
+      amount,
+      reference,
+      date,
+      time,
+      now,
+    );
+    if (creditResult?.transf !== "sent") {
+      if (creditResult?.limit || creditResult?.error === "reserve unavailable") {
+        const retryAt = now + 5 * 60 * 1000;
+        await tx.query(
+          `UPDATE users_usdt_deposit_batches SET status='pending_reserve',next_attempt_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
+          [String(retryAt), safeJson(["system_reserve"]), String(now), batchId],
+        );
+        await updateBatchEventStatus(tx, batchId, "pending_reserve", ["system_reserve"]);
+        return { waiting: true, retryAtMs: retryAt };
+      }
+      if (creditResult?.error === "weekly recharge limit reached") {
+        const pendingSince = Number(batch.pending_since_ms || now);
+        const releaseAt = getWeeklyReleaseAt(pendingSince, cooldown.lastRechargeMs);
+        await tx.query(
+          `UPDATE users_usdt_deposit_batches SET status='pending_weekly',pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,next_attempt_at_ms=?,reason_codes=?,email_status='pending',updated_at_ms=? WHERE id=?`,
+          [String(pendingSince), String(releaseAt), String(releaseAt), safeJson(["weekly_limit"]), String(now), batchId],
+        );
+        await updateBatchEventStatus(tx, batchId, "pending_weekly", ["weekly_limit"]);
+        return { waiting: true, releaseAtMs: releaseAt };
+      }
+      throw new Error(`Recharge batch credit failed: ${JSON.stringify(creditResult)}`);
+    }
+
+    await tx.query(
+      `UPDATE users_usdt_deposit_batches
+       SET status='credited',reason_codes=NULL,credited_at_ms=?,updated_at_ms=?,email_status='not_required'
+       WHERE id=? AND status IN ('ready','pending_weekly','pending_reserve')`,
+      [String(now), String(now), batchId],
+    );
+    await updateBatchEventStatus(tx, batchId, "credited", null);
+    return { credited: true, batchId: String(batchId), amount: amount.toFixed(18) };
+  });
+}
+
+async function processRechargeBatchQueue() {
+  const now = Date.now();
+  const rows = await db.queryAsync(
+    `SELECT id FROM users_usdt_deposit_batches
+     WHERE (status='collecting' AND expires_at_ms<=?)
+        OR (status='ready')
+        OR (status='pending_weekly' AND release_at_ms<=?)
+        OR (status='pending_reserve' AND next_attempt_at_ms<=?)
+     ORDER BY id ASC LIMIT 50`,
+    [String(now), String(now), String(now)],
+  );
+  for (const row of rows) {
+    try {
+      await processOneRechargeBatch(row.id);
+    } catch (error) {
+      console.error(`Recharge batch ${row.id} failed:`, error.message);
+    }
+  }
+}
+
 async function notifyPendingRechargeCases() {
+  await processRechargeBatchQueue();
   const now = Date.now();
   await db.queryAsync(
-    `UPDATE users_usdt_transfer_events
+    `UPDATE users_usdt_deposit_batches
      SET email_status=IF(email_attempts>=5,'failed','retry')
-     WHERE email_status='sending' AND email_last_attempt_ms<?`,
+     WHERE status IN ('pending_support','pending_weekly') AND email_status='sending' AND email_last_attempt_ms<?`,
     [String(now - 10 * 60 * 1000)],
   );
-
   const rows = await db.queryAsync(
-    `SELECT e.id,e.username,e.deposit_address,e.from_address,e.amount,e.tx_hash,e.block_timestamp_ms,
-            e.reason_codes,e.email_attempts,a.email
-     FROM users_usdt_transfer_events e
-     LEFT JOIN auths a ON a.username=e.username
-     WHERE e.status='pending_support'
-       AND (
-         e.email_status='pending'
-         OR (e.email_status='retry' AND e.email_last_attempt_ms<=?)
-       )
-       AND e.email_attempts<5
-     ORDER BY e.id ASC
-     LIMIT 20`,
+    `SELECT b.id,b.username,b.deposit_address,b.total_amount,b.reason_codes,b.email_attempts,a.email
+     FROM users_usdt_deposit_batches b
+     LEFT JOIN auths a ON a.username=b.username
+     WHERE b.status IN ('pending_support','pending_weekly')
+       AND (b.email_status='pending' OR (b.email_status='retry' AND b.email_last_attempt_ms<=?))
+       AND b.email_attempts<5
+     ORDER BY b.id ASC LIMIT 20`,
     [String(now - 60 * 1000)],
   );
 
   for (const row of rows) {
     const claim = await db.queryAsync(
-      `UPDATE users_usdt_transfer_events
+      `UPDATE users_usdt_deposit_batches
        SET email_status='sending',email_attempts=email_attempts+1,email_last_attempt_ms=?
        WHERE id=? AND email_status IN ('pending','retry') AND email_attempts<5`,
       [String(now), row.id],
     );
-    if (!claim || claim.affectedRows !== 1) continue;
+    if (claim.affectedRows !== 1) continue;
 
     const email = String(row.email || "").trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       await db.queryAsync(
-        "UPDATE users_usdt_transfer_events SET email_status='failed',email_last_error=? WHERE id=?",
+        "UPDATE users_usdt_deposit_batches SET email_status='failed',email_last_error=? WHERE id=?",
         ["The user has no valid email address in auths.email.", row.id],
       );
-      console.error(`Cannot notify OneX user ${row.username}: missing or invalid auths.email.`);
       continue;
     }
 
@@ -815,35 +864,27 @@ async function notifyPendingRechargeCases() {
     } catch {
       reasonCodes = [];
     }
-    const reasons = getReasonText(reasonCodes);
+    const eventRows = await db.queryAsync(
+      `SELECT tx_hash,log_index,from_address,amount,block_timestamp_ms
+       FROM users_usdt_transfer_events WHERE batch_id=? ORDER BY block_timestamp_ms,id`,
+      [row.id],
+    );
     const supportEmail = String(process.env.ONEX_SUPPORT_EMAIL || SERVER_MAIL || "").trim();
     const supportPhone = String(process.env.ONEX_SUPPORT_PHONE || "").trim();
-    const when = new Date(Number(row.block_timestamp_ms)).toISOString();
-    const supportLines = [
-      supportEmail ? `E-mail du support : ${supportEmail}` : "Répondez directement à cet e-mail pour contacter le support OneX.",
-      supportPhone ? `Téléphone du support : ${supportPhone}` : "Téléphone : utilisez le numéro de contact publié dans votre application OneX.",
-    ];
+    const paymentLines = eventRows.map((item) =>
+      `- ${item.amount} BSC-USD | ${item.tx_hash} (log ${item.log_index}) | expéditeur ${item.from_address} | ${new Date(Number(item.block_timestamp_ms)).toISOString()}`,
+    );
+    const reasonLines = getReasonText(reasonCodes).map((reason) => `- ${reason}`);
     const text = [
-      `Bonjour ${row.username},`,
-      "",
-      "OneX a détecté et confirmé un transfert BSC-USD vers votre adresse de dépôt, mais ce paiement n'a pas pu être crédité automatiquement.",
-      "",
-      "Motif(s) exact(s) :",
-      ...reasons.map((reason) => `- ${reason}`),
-      "",
-      `Montant reçu : ${row.amount} BSC-USD`,
-      `Adresse de dépôt : ${row.deposit_address}`,
-      `Adresse expéditrice observée : ${row.from_address}`,
-      `Transaction BNB Smart Chain : ${row.tx_hash}`,
-      `Date de confirmation : ${when}`,
-      "",
-      "Votre paiement est conservé dans le registre de rapprochement OneX et nécessite une vérification manuelle. Ne renvoyez pas le paiement avant d'avoir contacté le support.",
-      "",
-      "Veuillez contacter OneX par e-mail ou par téléphone :",
-      ...supportLines,
-      "",
-      "Cordialement,",
-      "Support OneX",
+      `Bonjour ${row.username},`, "",
+      "OneX a reçu un ou plusieurs transferts BSC-USD sur votre adresse de dépôt, mais le montant n'a pas pu être crédité automatiquement.", "",
+      "Motif(s) :", ...reasonLines, "",
+      `Montant cumulé : ${row.total_amount} BSC-USD`,
+      `Adresse de dépôt : ${row.deposit_address}`, "Transactions :", ...paymentLines, "",
+      "Les fonds restent enregistrés dans le registre de rapprochement OneX. Ne renvoyez pas le paiement avant d'avoir contacté le support.", "",
+      `E-mail du support : ${supportEmail || "répondez à ce message"}`,
+      `Téléphone : ${supportPhone || "consultez les coordonnées dans l'application OneX"}`, "",
+      "Cordialement,", "Support OneX",
     ].join("\n");
 
     try {
@@ -851,23 +892,20 @@ async function notifyPendingRechargeCases() {
         from: SERVER_MAIL,
         to: email,
         replyTo: supportEmail || SERVER_MAIL,
-        subject: "OneX – Votre transfert BSC-USD nécessite une vérification",
+        subject: "OneX – Votre recharge BSC-USD nécessite une vérification",
         text,
       });
       await db.queryAsync(
-        `UPDATE users_usdt_transfer_events
-         SET email_status='sent',email_sent_at_ms=?,email_last_error=NULL
-         WHERE id=?`,
+        "UPDATE users_usdt_deposit_batches SET email_status='sent',email_sent_at_ms=?,email_last_error=NULL WHERE id=?",
         [String(Date.now()), row.id],
       );
     } catch (error) {
       await db.queryAsync(
-        `UPDATE users_usdt_transfer_events
-         SET email_status=IF(email_attempts>=5,'failed','retry'),email_last_error=?
-         WHERE id=?`,
+        `UPDATE users_usdt_deposit_batches
+         SET email_status=IF(email_attempts>=5,'failed','retry'),email_last_error=? WHERE id=?`,
         [String(error.message || error).slice(0, 2000), row.id],
       );
-      console.error(`Unable to send recharge hold notice to ${email}:`, error.message);
+      console.error(`Unable to notify recharge support case ${row.id}:`, error.message);
     }
   }
 }
@@ -1032,8 +1070,13 @@ router.post("/app/signup", async (req, res) => {
       U = `${prefix}-${suffix}`.toUpperCase();
 
       const collisions = await db.queryAsync(
-        "SELECT 1 FROM auths WHERE username=? LIMIT 1",
-        [U],
+        `SELECT 1 AS collision FROM auths WHERE username=?
+         UNION ALL
+         SELECT 1 AS collision FROM users_usdt_deposit_wallets WHERE username=?
+         UNION ALL
+         SELECT 1 AS collision FROM activities WHERE sender=? OR receiver=?
+         LIMIT 1`,
+        [U, U, U, U],
       );
       if (collisions.length) continue;
 
@@ -1144,34 +1187,57 @@ router.post("/app/signin", async (req, res) => {
     const encUA = encrypt(ua, P + U);
     let status = Number(row.status);
     if (status === 0) {
-      await db.queryAsync("UPDATE auths SET status=1 WHERE username=?", [U]);
-      status = 1;
+      const activation = await withTransaction(async (tx) => {
+        const [authRows] = await tx.query(
+          "SELECT id,status FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
+          [U],
+        );
+        if (!authRows.length) throw new Error("Account disappeared during activation");
+        if (Number(authRows[0].status) !== 0) return { status: Number(authRows[0].status) };
 
-      if (Number(row.id) <= Number(first_welcome_clients)) {
-        const configuredBonus = new BigNumber(welcome_bonus);
-        const maximumBonus = new BigNumber(maxStockDefault);
-        if (
-          !configuredBonus.isFinite() ||
-          configuredBonus.isNegative() ||
-          !maximumBonus.isFinite() ||
-          maximumBonus.isNegative()
-        ) {
-          throw new Error("Invalid welcome bonus or maximum stock configuration");
+        await tx.query("UPDATE auths SET status=1 WHERE username=?", [U]);
+        if (Number(authRows[0].id) <= Number(first_welcome_clients)) {
+          const configuredBonus = new BigNumber(welcome_bonus);
+          const maximumStock = new BigNumber(maxStockDefault);
+          if (
+            !configuredBonus.isFinite() || configuredBonus.isNegative() ||
+            !maximumStock.isFinite() || maximumStock.isNegative()
+          ) {
+            throw new Error("Invalid welcome bonus or maximum stock configuration");
+          }
+
+          const [stockRows] = await tx.query(
+            "SELECT balance,init_asset FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
+            [U],
+          );
+          if (!stockRows.length) throw new Error("User stock row is missing during activation");
+          const currentBalance = new BigNumber(stockRows[0].balance);
+          const currentInitAsset = new BigNumber(stockRows[0].init_asset);
+          if (
+            !currentBalance.isFinite() || currentBalance.isNegative() ||
+            !currentInitAsset.isFinite() || currentInitAsset.isNegative()
+          ) throw new Error("Invalid stock values during welcome bonus activation");
+
+          const availableCapacity = BigNumber.maximum(new BigNumber(0), maximumStock.minus(currentBalance));
+          const welcomeBonusAmount = BigNumber.minimum(configuredBonus, availableCapacity);
+          if (welcomeBonusAmount.isGreaterThan(0)) {
+            const newBalance = currentBalance.plus(welcomeBonusAmount);
+            const newInitAsset = currentInitAsset.plus(welcomeBonusAmount);
+            const [d, t] = getDate();
+            const reference = createFinancialReference(`BONUS${U}`);
+            await tx.query(
+              "UPDATE users_stock SET balance=?,init_asset=?,record_date=?,record_time=? WHERE username=?",
+              [newBalance.toFixed(), newInitAsset.toFixed(), d, t, U],
+            );
+            await tx.query(
+              "INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?)",
+              ["XBONUS", U, 2, welcomeBonusAmount.toFixed(), 1, 0, reference, d, t],
+            );
+          }
         }
-
-        // The welcome bonus is already in One-Val and cannot exceed the user stock cap.
-        const welcomeBonus = BigNumber.minimum(configuredBonus, maximumBonus);
-        const reference = createTxId(OneX);
-        const [d, t] = getDate();
-        await db.queryAsync(
-          "UPDATE users_stock SET balance=?,init_asset=?,record_date=?,record_time=? WHERE username=?",
-          [welcomeBonus.toFixed(), welcomeBonus.toFixed(), d, t, U],
-        );
-        await db.queryAsync(
-          "INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?)",
-          [OneX, U, 2, welcomeBonus.toFixed(), 1, 0, reference, d, t],
-        );
-      }
+        return { status: 1 };
+      });
+      status = activation.status;
     }
 
     res.send({ msg: status, ua: encUA });
@@ -1246,69 +1312,115 @@ router.post("/app/user-last-stock", async (req, res) => {
   }
 });
 
-// USDT BEP-20 recharge
+// BEP-20 recharge information. Payment sessions are opened automatically after a finalized transfer is detected.
 router.post("/app/recharge", async (req, res) => {
-  const { user, pswd, amount, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const { user, pswd, tkn } = req.body || {};
+  const U = normalizeFormValue(user).toUpperCase();
   const P = normalizeFormValue(pswd);
-  const requestedAmount = typeof amount === "string" ? amount.trim() : String(amount ?? "").trim();
-
-  if (!requestTokenIsValid(req, tkn, P, U)) {
-    return res.send({ msg: "not allowed" });
-  }
-  if (
-    !/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(requestedAmount) ||
-    !new BigNumber(requestedAmount).isFinite() ||
-    new BigNumber(requestedAmount).isLessThan(MIN_RECHARGE_AMOUNT) ||
-    new BigNumber(requestedAmount).isGreaterThan(MAX_RECHARGE_AMOUNT)
-  ) {
-    return res.send({ msg: "not allowed" });
-  }
-
+  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
-    if (!(await verifyUserPassword(U, P))) {
-      return res.send({ msg: "not allowed" });
-    }
-
-    const paymentConfig = getPaymentPublicConfig();
-    if (!paymentConfig.enabled) {
-      return res.send({ msg: "not allowed" });
-    }
-
-    const request = await createPaymentRequest(db, U, requestedAmount);
-    if (request.error) {
-      return res.send({ msg: "not allowed" });
-    }
-
-    return res.send({ msg: "ok", ...request.response });
+    if (!(await verifyUserPassword(U, P))) return res.send({ msg: "not allowed" });
+    const config = getPaymentPublicConfig();
+    if (!config.enabled) return res.send({ msg: "not allowed" });
+    const depositAddress = await getOrCreateUserDepositAddress(db, U);
+    if (!depositAddress) return res.send({ msg: "not allowed" });
+    return res.send({
+      msg: "ok",
+      deposit_addr: depositAddress,
+      network: config.network,
+      chain_id: config.chainId,
+      token: config.tokenName,
+      token_contract: config.tokenContract,
+      minimum_amount: MIN_RECHARGE_AMOUNT.toFixed(0),
+      maximum_amount: MAX_RECHARGE_AMOUNT.toFixed(0),
+      batch_window_minutes: 60,
+      automatic_detection: true,
+    });
   } catch (error) {
-    console.error("BEP-20 recharge request failed:", error);
+    console.error("BEP-20 recharge information failed:", error.message);
     return res.send({ msg: "not allowed" });
   }
 });
 
-// USDT BEP-20 recharge status
 router.post("/app/recharge/status", async (req, res) => {
-  const { user, pswd, request_id, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const { user, pswd, batch_id, tkn } = req.body || {};
+  const U = normalizeFormValue(user).toUpperCase();
   const P = normalizeFormValue(pswd);
-  const requestId = String(request_id ?? "");
-
-  if (!requestTokenIsValid(req, tkn, P, U)) {
-    return res.send({ transf: "forbidden request" });
-  }
-  if (!/^\d{1,20}$/.test(requestId)) {
-    return res.status(400).send({ transf: "invalid request" });
-  }
-
+  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ transf: "forbidden request" });
+  if (!(await verifyUserPassword(U, P))) return res.send({ auth: "incorrect" });
+  const id = String(batch_id ?? "").trim();
+  if (id && !/^\d{1,20}$/.test(id)) return res.status(400).send({ transf: "invalid request" });
   try {
-    if (!(await verifyUserPassword(U, P))) {
-      return res.send({ auth: "incorrect" });
-    }
-    return res.send(await getPaymentStatus(db, U, requestId));
+    const rows = id
+      ? await db.queryAsync(
+          `SELECT id,status,total_amount,opened_at_ms,expires_at_ms,release_at_ms,reason_codes,credited_at_ms
+           FROM users_usdt_deposit_batches WHERE id=? AND username=? LIMIT 1`, [id, U],
+        )
+      : await db.queryAsync(
+          `SELECT id,status,total_amount,opened_at_ms,expires_at_ms,release_at_ms,reason_codes,credited_at_ms
+           FROM users_usdt_deposit_batches WHERE username=? ORDER BY id DESC LIMIT 1`, [U],
+        );
+    if (!rows.length) return res.send({ transf: "not_found" });
+    const row = rows[0];
+    let reasons = [];
+    try { reasons = JSON.parse(row.reason_codes || "[]"); } catch { reasons = []; }
+    return res.send({
+      transf: row.status,
+      batch_id: String(row.id),
+      amount: String(row.total_amount),
+      opened_at_ms: Number(row.opened_at_ms),
+      expires_at_ms: Number(row.expires_at_ms),
+      release_at_ms: row.release_at_ms == null ? null : Number(row.release_at_ms),
+      reason_codes: reasons,
+      credited_at_ms: row.credited_at_ms == null ? null : Number(row.credited_at_ms),
+    });
   } catch (error) {
-    console.error("USDT recharge status lookup failed:", error);
+    console.error("Recharge batch status lookup failed:", error.message);
     return res.send({ transf: "error" });
+  }
+});
+
+// Users declare their BSC payout address themselves. OneX does not claim to verify address ownership.
+router.post("/app/set-payout-address", async (req, res) => {
+  const { user, pswd, address, tkn } = req.body || {};
+  const U = normalizeFormValue(user).toUpperCase();
+  const P = normalizeFormValue(pswd);
+  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
+  if (!isEvmAddress(address) || /^0x0{40}$/i.test(String(address))) {
+    return res.send({ auth: "invalid address" });
+  }
+  try {
+    if (!(await verifyUserPassword(U, P))) return res.send({ auth: "incorrect" });
+    const depositAddress = await getOrCreateUserDepositAddress(db, U);
+    if (!depositAddress) return res.send({ auth: "error" });
+    const payoutAddress = checksumEvmAddress(address);
+    if (
+      payoutAddress.toLowerCase() === depositAddress.toLowerCase() ||
+      payoutAddress.toLowerCase() === String(process.env.USDT_BEP20_TREASURY_ADDRESS || "").toLowerCase()
+    ) return res.send({ auth: "invalid address" });
+    const depositCollision = await db.queryAsync(
+      "SELECT id FROM users_usdt_deposit_wallets WHERE wallet_address=? LIMIT 1",
+      [payoutAddress],
+    );
+    if (depositCollision.length) return res.send({ auth: "invalid address" });
+    const result = await withTransaction(async (tx) => {
+      const [authRows] = await tx.query("SELECT username FROM auths WHERE username=? FOR UPDATE", [U]);
+      if (!authRows.length) return { auth: "error" };
+      const [pendingRows] = await tx.query(
+        `SELECT id FROM users_usdt_disbursements
+         WHERE username=? AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`, [U],
+      );
+      if (pendingRows.length) return { auth: "disbursement pending" };
+      await tx.query(
+        "UPDATE users_usdt_deposit_wallets SET payout_address=? WHERE username=? AND account_status='active'",
+        [payoutAddress, U],
+      );
+      return { auth: "updated", payout_address: payoutAddress };
+    });
+    return res.send(result);
+  } catch (error) {
+    console.error("Payout-address update failed:", error.message);
+    return res.send({ auth: "error" });
   }
 });
 
@@ -1354,6 +1466,9 @@ router.post("/app/near-transfer", async (req, res) => {
   const D = destinationInput.toUpperCase();
   if (!S || !P || !D || !amountText || S === D) {
     return res.status(400).send({ transf: "invalid request" });
+  }
+  if (S === OneX) {
+    return res.send({ transf: "failed" });
   }
 
   const requestedAmount = new BigNumber(amountText);
@@ -1430,7 +1545,7 @@ router.post("/app/near-transfer", async (req, res) => {
         return { transf: "disbursement pending" };
       }
 
-      const stockNames = [...new Set([S, D, OneX])].sort();
+      const stockNames = [...new Set([S, D])].sort();
       const stockByName = new Map();
       for (const username of stockNames) {
         const [rows] = await tx.query(
@@ -1439,7 +1554,7 @@ router.post("/app/near-transfer", async (req, res) => {
         );
         if (rows.length > 0) stockByName.set(rows[0].username, rows[0]);
       }
-      if (!stockByName.has(S) || !stockByName.has(D) || !stockByName.has(OneX)) {
+      if (!stockByName.has(S) || !stockByName.has(D)) {
         return { transf: "failed" };
       }
 
@@ -1462,13 +1577,10 @@ router.post("/app/near-transfer", async (req, res) => {
       const common = commonRows[0];
       const senderStock = stockByName.get(S);
       const destinationStock = stockByName.get(D);
-      const systemStock = stockByName.get(OneX);
       const senderBalance = new BigNumber(senderStock.balance);
       const senderInitAsset = new BigNumber(senderStock.init_asset);
       const destinationBalance = new BigNumber(destinationStock.balance);
       const destinationInitAsset = new BigNumber(destinationStock.init_asset);
-      const systemBalance = new BigNumber(systemStock.balance);
-      const systemInitAsset = new BigNumber(systemStock.init_asset);
       const priceValue = deriveUnitPrice(senderBalance, senderInitAsset);
       const lastTotal = new BigNumber(common.total_units_price);
       const backedUnits = new BigNumber(common.backed_units);
@@ -1488,10 +1600,7 @@ router.post("/app/near-transfer", async (req, res) => {
         senderInitAsset.isNegative() ||
         !destinationBalance.isFinite() ||
         !destinationInitAsset.isFinite() ||
-        destinationInitAsset.isNegative() ||
-        !systemBalance.isFinite() ||
-        !systemInitAsset.isFinite() ||
-        systemInitAsset.isNegative()
+        destinationInitAsset.isNegative()
       ) {
         throw new Error("Invalid balances or reserve values in the database");
       }
@@ -1508,20 +1617,16 @@ router.post("/app/near-transfer", async (req, res) => {
 
       const senderStockDebit = totalDebit.multipliedBy(priceValue);
       const receiverStockCredit = receiverAmount.multipliedBy(priceValue);
-      const adminStockCredit = adminFees.multipliedBy(priceValue);
       const futureSenderBalance = senderBalance.minus(senderStockDebit);
       const futureDestinationBalance = destinationBalance.plus(receiverStockCredit);
-      const futureSystemBalance = systemBalance.plus(adminStockCredit);
 
       if (
         !fees.isFinite() ||
         fees.isNegative() ||
         !senderStockDebit.isFinite() ||
         !receiverStockCredit.isFinite() ||
-        !adminStockCredit.isFinite() ||
         !futureSenderBalance.isFinite() ||
-        !futureDestinationBalance.isFinite() ||
-        !futureSystemBalance.isFinite()
+        !futureDestinationBalance.isFinite()
       ) {
         throw new Error("Invalid calculated transfer amounts");
       }
@@ -1540,15 +1645,16 @@ router.post("/app/near-transfer", async (req, res) => {
         return { transf: "unsupported" };
       }
 
+      const inactiveFees = adminFees;
       const newTotal = lastTotal.plus(sharedFees.multipliedBy(priceValue));
       const newPrice = newTotal.dividedBy(lastTotal).multipliedBy(priceValue);
-      const newBackedUnits = backedUnits.plus(fees);
+      const newBackedUnits = backedUnits.plus(sharedFees);
+      const newInactiveAssets = inactiveInitAsset.plus(inactiveFees);
       const [date, time] = getDate();
-      const reference = createTxId(S);
+      const reference = createFinancialReference(`P2P${S}`);
 
       const senderInitAssetAfter = deriveInitAsset(futureSenderBalance, priceValue);
       const destinationInitAssetAfter = deriveInitAsset(futureDestinationBalance, priceValue);
-      const systemInitAssetAfter = deriveInitAsset(futureSystemBalance, priceValue);
 
       await tx.query(
         "INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -1573,13 +1679,9 @@ router.post("/app/near-transfer", async (req, res) => {
         [futureDestinationBalance.toFixed(), destinationInitAssetAfter.toFixed(), date, time, D],
       );
       await tx.query(
-        "UPDATE users_stock SET balance=?,init_asset=?,record_date=?,record_time=? WHERE username=?",
-        [futureSystemBalance.toFixed(), systemInitAssetAfter.toFixed(), date, time, OneX],
-      );
-      await tx.query(
         `INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,record_date,record_time)
          VALUES(?,?,?,?,?,?)`,
-        [newTotal.toFixed(), newPrice.toFixed(), newBackedUnits.toFixed(), inactiveInitAsset.toFixed(), date, time],
+        [newTotal.toFixed(), newPrice.toFixed(), newBackedUnits.toFixed(), newInactiveAssets.toFixed(), date, time],
       );
 
       return { transf: "sent" };
@@ -1635,6 +1737,290 @@ router.post("/app/disbursement/status", async (req, res) => {
   }
 });
 
+// Exceptional administrative credit of a support-held recharge batch.
+// Normal weekly cooldown, 300 One-Val stock cap and common reserve checks remain enforced.
+// Only the 70-140 BSC-USD per-batch range is bypassed after an administrator decision.
+router.post("/admin/recharge/credit", async (req, res) => {
+  const { pswd, pin, username, batch_id, reason } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ transf: "incorrect admin credentials" });
+
+  const U = normalizeFormValue(username).toUpperCase();
+  const batchId = String(batch_id ?? "").trim();
+  const resolutionReason = typeof reason === "string" ? reason.trim() : "";
+  if (!U || !/^\d{1,20}$/.test(batchId) || resolutionReason.length < 5 || resolutionReason.length > 1000) {
+    return res.status(400).send({ transf: "invalid request" });
+  }
+
+  try {
+    const result = await withTransaction(async (tx) => {
+      const [batchRows] = await tx.query(
+        `SELECT id,username,total_amount,status FROM users_usdt_deposit_batches
+         WHERE id=? AND username=? LIMIT 1 FOR UPDATE`,
+        [batchId, U],
+      );
+      if (!batchRows.length || batchRows[0].status !== "pending_support") {
+        return { transf: "batch not available for manual credit" };
+      }
+
+      const [resolutionRows] = await tx.query(
+        `SELECT id FROM admin_payment_resolutions
+         WHERE batch_id=? AND action IN ('manual_credit','partial_credit_refund','refund_queued','refund_confirmed','refund_manual_review')
+         LIMIT 1 FOR UPDATE`,
+        [batchId],
+      );
+      if (resolutionRows.length) return { transf: "batch already has an administrative resolution" };
+      const [refundRows] = await tx.query(
+        `SELECT id FROM users_usdt_refunds
+         WHERE batch_id=? AND status IN ('queued','signed','submitted','confirmed','manual_review')
+         LIMIT 1 FOR UPDATE`,
+        [batchId],
+      );
+      if (refundRows.length) return { transf: "refund operation is unresolved" };
+
+      const amount = new BigNumber(batchRows[0].total_amount);
+      if (!amount.isFinite() || !amount.isGreaterThan(0)) {
+        return { transf: "invalid batch amount" };
+      }
+      const now = Date.now();
+      const [date, time] = formatUtcRecordDateTime(now);
+      const reference = createFinancialReference(`ADMCREDIT${U}`);
+      const creditResult = await applyUserTopUp(
+        tx,
+        U,
+        amount,
+        reference,
+        date,
+        time,
+        now,
+        { enforceRechargeRange: false },
+      );
+      if (creditResult?.transf !== "sent") {
+        return {
+          transf: "manual credit not completed",
+          reason: creditResult?.error || creditResult?.limit || "accounting validation failed",
+        };
+      }
+
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches
+         SET status='credited',reason_codes=NULL,credited_at_ms=?,updated_at_ms=?,email_status='not_required'
+         WHERE id=? AND status='pending_support'`,
+        [String(now), String(now), batchId],
+      );
+      await tx.query(
+        "UPDATE users_usdt_transfer_events SET status='credited',reason_codes=NULL,email_status='not_required' WHERE batch_id=?",
+        [batchId],
+      );
+      await tx.query(
+        `INSERT INTO admin_payment_resolutions
+         (admin_username,username,batch_id,action,gross_amount,fee_amount,net_amount,payout_address,tx_hash,reason,created_at_ms)
+         VALUES('configured_admin',?,?,'manual_credit',?,'0',?,NULL,NULL,?,?)`,
+        [U, batchId, amount.toFixed(18), amount.toFixed(18), resolutionReason, String(now)],
+      );
+      return {
+        transf: "credited",
+        batch_id: batchId,
+        amount: amount.toFixed(18),
+        reference,
+      };
+    });
+    return res.send(result);
+  } catch (error) {
+    console.error("Administrative recharge credit failed:", error.message);
+    return res.send({ transf: "error" });
+  }
+});
+
+// Administrative refund of a recharge batch held for support.
+// The refund is queued for the isolated treasury worker; gas is paid separately in BNB.
+router.post("/admin/recharge/refund", async (req, res) => {
+  const { pswd, pin, username, batch_id, reason } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ transf: "incorrect admin credentials" });
+
+  const U = normalizeFormValue(username).toUpperCase();
+  const batchId = String(batch_id ?? "").trim();
+  const resolutionReason = typeof reason === "string" ? reason.trim() : "";
+  if (!U || !/^\d{1,20}$/.test(batchId) || resolutionReason.length < 5 || resolutionReason.length > 1000) {
+    return res.status(400).send({ transf: "invalid request" });
+  }
+
+  try {
+    if (String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() !== "true") {
+      return res.send({ transf: "treasury payout service disabled" });
+    }
+    const snapshotRows = await db.queryAsync(
+      `SELECT b.id,b.username,b.total_amount,b.status,w.payout_address
+       FROM users_usdt_deposit_batches b
+       JOIN users_usdt_deposit_wallets w ON w.id=b.deposit_wallet_id
+       WHERE b.id=? AND b.username=? LIMIT 1`,
+      [batchId, U],
+    );
+    if (!snapshotRows.length) return res.send({ transf: "not found" });
+    const snapshot = snapshotRows[0];
+    if (snapshot.status !== "pending_support") return res.send({ transf: "batch not refundable" });
+    if (!isEvmAddress(snapshot.payout_address) || /^0x0{40}$/i.test(snapshot.payout_address)) {
+      return res.send({ transf: "payout wallet not registered" });
+    }
+
+    const amount = new BigNumber(snapshot.total_amount);
+    if (!amount.isFinite() || amount.isLessThan(10)) {
+      return res.send({ transf: "minimum refund is 10 BSC-USD" });
+    }
+    const amountRawDecimal = amount.shiftedBy(18);
+    if (!amountRawDecimal.isInteger() || amountRawDecimal.isLessThanOrEqualTo(0)) {
+      return res.send({ transf: "invalid refund amount" });
+    }
+    const amountRaw = amountRawDecimal.toFixed(0);
+    const liquidity = await checkTreasuryLiquidity(amountRaw);
+    if (!liquidity.available) {
+      return res.send({ transf: "insufficient treasury liquidity", liquidity });
+    }
+
+    const result = await withTransaction(async (tx) => {
+      const [walletRows] = await tx.query(
+        "SELECT payout_address,account_status FROM users_usdt_deposit_wallets WHERE username=? LIMIT 1 FOR UPDATE",
+        [U],
+      );
+      const [batchRows] = await tx.query(
+        "SELECT id,username,total_amount,status,deposit_wallet_id FROM users_usdt_deposit_batches WHERE id=? AND username=? LIMIT 1 FOR UPDATE",
+        [batchId, U],
+      );
+      if (!batchRows.length || batchRows[0].status !== "pending_support") return { transf: "batch not refundable" };
+      if (!walletRows.length || walletRows[0].account_status !== "active" ||
+          String(walletRows[0].payout_address || "").toLowerCase() !== String(snapshot.payout_address).toLowerCase()) {
+        return { transf: "payout wallet changed or account unavailable" };
+      }
+
+      const [existingRows] = await tx.query(
+        "SELECT id FROM users_usdt_refunds WHERE batch_id=? AND status IN ('queued','signed','submitted','confirmed','manual_review') LIMIT 1 FOR UPDATE",
+        [batchId],
+      );
+      if (existingRows.length) return { transf: "refund already exists", refund_id: String(existingRows[0].id) };
+
+      const reference = createFinancialReference(`REF${U}`);
+      const now = String(Date.now());
+      const [refundInsert] = await tx.query(
+        `INSERT INTO users_usdt_refunds
+         (username,batch_id,payout_address,amount,amount_raw,reference,status,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,?,?,'queued',?,?)`,
+        [U, batchId, snapshot.payout_address, amount.toFixed(18), amountRaw, reference, now, now],
+      );
+      await tx.query(
+        "UPDATE users_usdt_deposit_batches SET status='refund_queued',updated_at_ms=? WHERE id=?",
+        [now, batchId],
+      );
+      await tx.query(
+        "UPDATE users_usdt_transfer_events SET status='refund_queued' WHERE batch_id=?",
+        [batchId],
+      );
+      await tx.query(
+        `INSERT INTO admin_payment_resolutions
+         (admin_username,username,batch_id,action,gross_amount,fee_amount,net_amount,payout_address,tx_hash,reason,created_at_ms)
+         VALUES('configured_admin',?,?,'refund_queued',?,'0',?,?,NULL,?,?)`,
+        [U, batchId, amount.toFixed(18), amount.toFixed(18), snapshot.payout_address, resolutionReason, now],
+      );
+      return {
+        transf: "refund_processing",
+        refund_id: String(refundInsert.insertId),
+        amount: amount.toFixed(18),
+        payout_address: snapshot.payout_address,
+      };
+    });
+    return res.send(result);
+  } catch (error) {
+    console.error("Administrative recharge refund failed:", error.message);
+    return res.send({ transf: "error" });
+  }
+});
+
+// Requeue an unsubmitted disbursement after its 60-minute reservation has expired.
+// The worker still performs the signed BSC-USD transfer; this endpoint never signs transactions.
+router.post("/admin/unlock-disbursement", async (req, res) => {
+  const { pswd, pin, user, disbursement_id } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ transf: "incorrect admin credentials" });
+
+  const username = normalizeFormValue(user).toUpperCase();
+  const id = String(disbursement_id ?? "").trim();
+  if (!username || !/^\d{1,20}$/.test(id)) {
+    return res.status(400).send({ transf: "invalid request" });
+  }
+
+  try {
+    if (String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() !== "true") {
+      return res.send({ transf: "disbursement service disabled" });
+    }
+    const snapshotRows = await db.queryAsync(
+      `SELECT id,username,payout_amount,amount_raw,payout_address,status,raw_tx,tx_hash,reservation_expires_at_ms
+       FROM users_usdt_disbursements WHERE id=? AND username=? LIMIT 1`,
+      [id, username],
+    );
+    if (!snapshotRows.length) return res.send({ transf: "not found" });
+    const snapshot = snapshotRows[0];
+    if (
+      snapshot.status !== "manual_review" || snapshot.raw_tx || snapshot.tx_hash ||
+      Number(snapshot.reservation_expires_at_ms) > Date.now()
+    ) return res.send({ transf: "not eligible for unlock" });
+    if (!new BigNumber(snapshot.payout_amount).isFinite() || new BigNumber(snapshot.payout_amount).isLessThan(10)) {
+      return res.send({ transf: "minimum payout is 10 BSC-USD" });
+    }
+    if (!isEvmAddress(snapshot.payout_address)) return res.send({ transf: "invalid payout address" });
+
+    // The HTTP process checks balances only; the isolated worker owns the signing key.
+    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw);
+    if (!liquidity.available) {
+      return res.send({ transf: "insufficient treasury liquidity", liquidity });
+    }
+
+    const result = await withTransaction(async (tx) => {
+      const [authRows] = await tx.query(
+        "SELECT status FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
+      );
+      const [stockRows] = await tx.query(
+        "SELECT balance,init_asset FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [username],
+      );
+      const [jobRows] = await tx.query(
+        `SELECT id,status,raw_tx,tx_hash,payout_amount,amount_raw,payout_address,reservation_expires_at_ms
+         FROM users_usdt_disbursements WHERE id=? AND username=? LIMIT 1 FOR UPDATE`,
+        [id, username],
+      );
+      if (!authRows.length || Number(authRows[0].status) <= 0 || !stockRows.length || jobRows.length === 0) {
+        return { transf: "account unavailable" };
+      }
+      const job = jobRows[0];
+      if (
+        job.status !== "manual_review" || job.raw_tx || job.tx_hash ||
+        Number(job.reservation_expires_at_ms) > Date.now() ||
+        new BigNumber(job.payout_amount).isLessThan(10)
+      ) return { transf: "not eligible for unlock" };
+      const balance = new BigNumber(stockRows[0].balance);
+      const initAsset = new BigNumber(stockRows[0].init_asset);
+      if (!balance.isZero() || !initAsset.isZero()) return { transf: "reserved balance changed" };
+      const now = Date.now();
+      const update = await tx.query(
+        `UPDATE users_usdt_disbursements
+         SET status='queued',reservation_expires_at_ms=?,updated_at_ms=?,last_error=NULL
+         WHERE id=? AND status='manual_review' AND raw_tx IS NULL AND tx_hash IS NULL`,
+        [String(now + DISBURSEMENT_RESERVATION_MS), String(now), id],
+      );
+      if (update[0].affectedRows !== 1) return { transf: "not eligible for unlock" };
+      return { transf: "processing", disbursement_id: id };
+    });
+    return res.send(result);
+  } catch (error) {
+    console.error("Admin disbursement unlock failed:", error.message);
+    return res.send({ transf: "error" });
+  }
+});
+
 // modify-pin-or-password
 router.post("/app/modify-pin-or-password", async (req, res) => {
   const { user, pswd1, pswd2, tkn } = req.body || {};
@@ -1667,50 +2053,55 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
 // delete-user
 router.post("/app/delete-user", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeFormValue(user).toUpperCase();
   const P = normalizeFormValue(pswd);
-
-  if (!requestTokenIsValid(req, tkn, P, U)) {
-    return res.send({ auth: "forbidden request" });
-  }
-
+  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
   try {
-    if (!(await verifyUserPassword(U, P))) {
-      return res.send({ auth: "incorrect" });
-    }
+    if (!(await verifyUserPassword(U, P))) return res.send({ auth: "incorrect" });
+    const result = await withTransaction(async (tx) => {
+      const [authRows] = await tx.query("SELECT username FROM auths WHERE username=? FOR UPDATE", [U]);
+      if (!authRows.length) return { auth: "error" };
+      const [stockRows] = await tx.query("SELECT balance FROM users_stock WHERE username=? FOR UPDATE", [U]);
+      if (!stockRows.length) return { auth: "error" };
+      const stockBalance = new BigNumber(stockRows[0].balance);
+      if (!stockBalance.isFinite() || stockBalance.isNegative()) throw new Error("Invalid user stock balance");
+      if (stockBalance.isGreaterThan(2)) return { auth: "failed, balance > 2" };
 
-    const stocks = await db.queryAsync(
-      "SELECT balance FROM users_stock WHERE username=? LIMIT 1",
-      [U],
-    );
-    if (stocks.length === 0) {
-      return res.send({ auth: "error" });
-    }
+      const [pendingDisbursements] = await tx.query(
+        `SELECT id FROM users_usdt_disbursements
+         WHERE username=? AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`, [U],
+      );
+      const [pendingBatches] = await tx.query(
+        `SELECT id FROM users_usdt_deposit_batches
+         WHERE username=? AND status IN ('collecting','ready','finalizing','pending_weekly','pending_reserve','pending_support','refund_queued')
+         LIMIT 1 FOR UPDATE`, [U],
+      );
+      const [pendingEvents] = await tx.query(
+        `SELECT id FROM users_usdt_transfer_events
+         WHERE username=? AND status IN ('detected','batched','pending_weekly','pending_reserve','pending_support','refund_queued')
+         LIMIT 1 FOR UPDATE`, [U],
+      );
+      const [pendingRefunds] = await tx.query(
+        `SELECT id FROM users_usdt_refunds
+         WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
+         LIMIT 1 FOR UPDATE`, [U],
+      );
+      if (pendingDisbursements.length) return { auth: "failed, disbursement pending" };
+      if (pendingBatches.length || pendingEvents.length || pendingRefunds.length) return { auth: "failed, recharge pending" };
 
-    const stockBalance = new BigNumber(stocks[0].balance);
-    if (!stockBalance.isFinite() || stockBalance.isNegative()) {
-      throw new Error("Invalid user stock balance");
-    }
-    const pendingDisbursements = await db.queryAsync(
-      `SELECT id FROM users_usdt_disbursements
-       WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
-       LIMIT 1`,
-      [U],
-    );
-    if (pendingDisbursements.length > 0) {
-      return res.send({ auth: "failed, disbursement pending" });
-    }
-
-    // The stored stock balance is already denominated in One-Val.
-    if (stockBalance.isGreaterThan(2)) {
-      return res.send({ auth: "failed, balance > 2" });
-    }
-
-    await db.queryAsync("DELETE FROM auths WHERE username=?", [U]);
-    res.send({ auth: "deleted" });
+      // Keep the deposit address reserved forever; remove personal account data and disable payout.
+      await tx.query(
+        `UPDATE users_usdt_deposit_wallets
+         SET account_status='deleted',payout_address=NULL WHERE username=?`, [U],
+      );
+      await tx.query("DELETE FROM users_stock WHERE username=?", [U]);
+      await tx.query("DELETE FROM auths WHERE username=?", [U]);
+      return { auth: "deleted" };
+    });
+    return res.send(result);
   } catch (error) {
-    console.error("User deletion failed:", error);
-    res.send({ auth: "error" });
+    console.error("User deletion failed:", error.message);
+    return res.send({ auth: "error" });
   }
 });
 
@@ -1838,7 +2229,7 @@ router.post("/admin/update-user-or-common-stock", async (req, res) => {
   try {
     const result = await withTransaction(async (tx) => {
       if (isUserTopUp) {
-        const reference = createTxId(OneX);
+        const reference = createFinancialReference(`TOP${U}`);
         return applyUserTopUp(tx, U, amountValue, reference, date, time, Date.now(), { enforceRechargeRange: false });
       }
 
