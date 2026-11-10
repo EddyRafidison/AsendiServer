@@ -12,6 +12,7 @@ const BigNumber = require("bignumber.js");
 const { deriveInitAsset } = require("./stock-accounting");
 const { calculateDisbursementReserveSettlement } = require("./disbursement-policy");
 const { getDate } = require("./utils");
+const { queueTelegramMessageTx } = require("./telegram");
 
 const CHAIN_ID = 56n;
 const TOKEN_DECIMALS = 18n;
@@ -312,12 +313,36 @@ async function markSubmitted(db, jobId, transactionHash) {
 }
 
 async function markManualReview(db, jobId, message) {
-  await db.queryAsync(
-    `UPDATE users_usdt_disbursements
-     SET status='manual_review',last_error=?,updated_at_ms=?
-     WHERE id=? AND status IN ('queued','signed','submitted')`,
-    [String(message).slice(0, 2000), String(Date.now()), jobId],
-  );
+  return withTransaction(db, async (tx) => {
+    const [rows] = await tx.query(
+      "SELECT username,status FROM users_usdt_disbursements WHERE id=? LIMIT 1 FOR UPDATE",
+      [jobId],
+    );
+    if (!rows.length || rows[0].status === "manual_review") return;
+    const username = rows[0].username;
+    const now = String(Date.now());
+    const [update] = await tx.query(
+      `UPDATE users_usdt_disbursements
+       SET status='manual_review',last_error=?,updated_at_ms=?
+       WHERE id=? AND status IN ('queued','signed','submitted')`,
+      [String(message).slice(0, 2000), now, jobId],
+    );
+    if (update.affectedRows === 1) {
+      await queueTelegramMessageTx(
+        tx,
+        username,
+        `disbursement:${jobId}:manual_review`,
+        [
+          "OneX Disbursement Update",
+          "Your disbursement requires a review by OneX support.",
+          `Disbursement ID: ${jobId}`,
+          `Reason: ${String(message).slice(0, 500)}`,
+          "Your reserved balance has not been released automatically.",
+          "Status: MANUAL REVIEW",
+        ].join("\n"),
+      );
+    }
+  });
 }
 
 async function restoreUserBalanceAfterFailedPayout(db, jobId, message) {
@@ -346,20 +371,36 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message) {
     const job = jobRows[0];
     if (job.status === "failed") return;
     if (!authRows.length || !stockRows.length) {
+      const reviewReason = `Cannot restore user stock after failed payout: account or stock row is missing. ${message}`;
       await tx.query(
         "UPDATE users_usdt_disbursements SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
-        [`Cannot restore user stock after failed payout: account or stock row is missing. ${message}`, String(Date.now()), jobId],
+        [reviewReason, String(Date.now()), jobId],
       );
+      await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:manual_review`, [
+        "OneX Disbursement Update",
+        "Your disbursement could not be restored automatically and requires support review.",
+        `Disbursement ID: ${jobId}`,
+        `Reason: ${reviewReason.slice(0, 500)}`,
+        "Status: MANUAL REVIEW",
+      ].join("\n"));
       return;
     }
 
     const currentBalance = new BigNumber(stockRows[0].balance);
     const currentInitAsset = new BigNumber(stockRows[0].init_asset);
     if (!currentBalance.isZero() || !currentInitAsset.isZero()) {
+      const reviewReason = `Cannot safely restore reserved stock because the user balance changed. ${message}`;
       await tx.query(
         "UPDATE users_usdt_disbursements SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
-        [`Cannot safely restore reserved stock because the user balance changed. ${message}`, String(Date.now()), jobId],
+        [reviewReason, String(Date.now()), jobId],
       );
+      await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:manual_review`, [
+        "OneX Disbursement Update",
+        "Your disbursement could not be restored automatically and requires support review.",
+        `Disbursement ID: ${jobId}`,
+        `Reason: ${reviewReason.slice(0, 500)}`,
+        "Status: MANUAL REVIEW",
+      ].join("\n"));
       return;
     }
 
@@ -373,6 +414,13 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message) {
        SET status='failed',last_error=?,updated_at_ms=? WHERE id=?`,
       [String(message).slice(0, 2000), String(Date.now()), jobId],
     );
+    await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:failed`, [
+      "OneX Disbursement Update",
+      "Your disbursement transaction failed after blockchain finality. Your reserved One-Val balance has been restored.",
+      `Disbursement ID: ${jobId}`,
+      `Reason: ${String(message).slice(0, 500)}`,
+      "Status: FAILED - BALANCE RESTORED",
+    ].join("\n"));
   });
 }
 
@@ -403,20 +451,36 @@ async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
     if (job.status === "confirmed") return { confirmed: true };
 
     if (!authRows.length || !userStockRows.length) {
+      const reviewReason = "The payout was confirmed on-chain, but the OneX account or stock row is missing.";
       await tx.query(
         `UPDATE users_usdt_disbursements SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?`,
-        ["The payout was confirmed on-chain, but the OneX account or stock row is missing.", String(Date.now()), jobId],
+        [reviewReason, String(Date.now()), jobId],
       );
+      await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:manual_review`, [
+        "OneX Disbursement Update",
+        "Your BSC-USD payout was confirmed, but OneX accounting requires manual review.",
+        `Disbursement ID: ${jobId}`,
+        `Reason: ${reviewReason}`,
+        "Status: MANUAL REVIEW",
+      ].join("\n"));
       return { manualReview: true };
     }
 
     const userBalance = new BigNumber(userStockRows[0].balance);
     const userInitAsset = new BigNumber(userStockRows[0].init_asset);
     if (!userBalance.isZero() || !userInitAsset.isZero()) {
+      const reviewReason = "The payout was confirmed on-chain, but the reserved user balance changed before accounting finalization.";
       await tx.query(
         `UPDATE users_usdt_disbursements SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?`,
-        ["The payout was confirmed on-chain, but the reserved user balance changed before accounting finalization.", String(Date.now()), jobId],
+        [reviewReason, String(Date.now()), jobId],
       );
+      await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:manual_review`, [
+        "OneX Disbursement Update",
+        "Your BSC-USD payout was confirmed, but OneX accounting requires manual review.",
+        `Disbursement ID: ${jobId}`,
+        `Reason: ${reviewReason}`,
+        "Status: MANUAL REVIEW",
+      ].join("\n"));
       return { manualReview: true };
     }
 
@@ -522,12 +586,23 @@ async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
       );
     }
 
+    const confirmedAt = String(Date.now());
     await tx.query(
       `UPDATE users_usdt_disbursements
        SET status='confirmed',block_number=?,last_error=NULL,confirmed_at_ms=?,updated_at_ms=?
        WHERE id=?`,
-      [String(blockNumber), String(Date.now()), String(Date.now()), jobId],
+      [String(blockNumber), confirmedAt, confirmedAt, jobId],
     );
+    await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:confirmed`, [
+      "OneX Disbursement Update",
+      "Your sale to OneX has been completed and the BSC-USD payment is confirmed.",
+      `Gross amount: ${grossBalance.toFixed(8)} One-Val`,
+      `Fees: ${new BigNumber(job.fee_amount).toFixed(8)} One-Val`,
+      `Amount paid: ${payoutAmount.toFixed(8)} BSC-USD`,
+      `Destination: ${job.payout_address}`,
+      `Transaction: ${job.tx_hash}`,
+      "Status: CONFIRMED",
+    ].join("\n"));
     return { confirmed: true };
   });
 }
@@ -682,10 +757,18 @@ async function finalizeRefund(db, refundId, blockNumber) {
     const refund = refundRows[0];
     if (refund.status === "confirmed") return { confirmed: true };
     if (!batchRows.length || batchRows[0].status !== "refund_queued") {
+      const reviewReason = "The refund was confirmed on-chain but its recharge batch is not in refund_queued state.";
       await tx.query(
         "UPDATE users_usdt_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
-        ["The refund was confirmed on-chain but its recharge batch is not in refund_queued state.", String(Date.now()), refundId],
+        [reviewReason, String(Date.now()), refundId],
       );
+      await queueTelegramMessageTx(tx, refund.username, `refund:${refundId}:manual_review`, [
+        "OneX Refund Update",
+        "Your refund transaction was confirmed on-chain, but the refund requires manual review.",
+        `Refund ID: ${refundId}`,
+        `Reason: ${reviewReason}`,
+        "Status: MANUAL REVIEW",
+      ].join("\n"));
       return { manualReview: true };
     }
     const now = String(Date.now());
@@ -709,6 +792,15 @@ async function finalizeRefund(db, refundId, blockNumber) {
        WHERE batch_id=? AND action='refund_queued' AND tx_hash IS NULL`,
       [refund.tx_hash, batchId],
     );
+    await queueTelegramMessageTx(tx, refund.username, `refund:${refundId}:confirmed`, [
+      "OneX Refund Update",
+      "Your BSC-USD refund has been transferred successfully.",
+      `Amount: ${new BigNumber(refund.amount).toFixed(8)} BSC-USD`,
+      `Destination: ${refund.payout_address}`,
+      `Transaction: ${refund.tx_hash}`,
+      `Refund ID: ${refundId}`,
+      "Status: CONFIRMED",
+    ].join("\n"));
     return { confirmed: true };
   });
 }
@@ -808,6 +900,12 @@ async function processOneRefundJob(db, job, activeRuntime) {
         "UPDATE admin_payment_resolutions SET action='refund_failed' WHERE batch_id=? AND action='refund_queued'",
         [job.batch_id],
       );
+      await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:failed`, [
+        "OneX Refund Update",
+        "Your refund transaction failed after blockchain finality. The support case has been reopened.",
+        `Refund ID: ${job.id}`,
+        "Status: FAILED - SUPPORT REQUIRED",
+      ].join("\n"));
     });
     return;
   }
@@ -827,6 +925,12 @@ async function processOneRefundJob(db, job, activeRuntime) {
         "UPDATE admin_payment_resolutions SET action='refund_manual_review' WHERE batch_id=? AND action='refund_queued'",
         [job.batch_id],
       );
+      await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:manual_review`, [
+        "OneX Refund Update",
+        "The refund transaction requires manual review because its receipt does not match the expected transfer.",
+        `Refund ID: ${job.id}`,
+        "Status: MANUAL REVIEW",
+      ].join("\n"));
     });
     return;
   }
@@ -859,15 +963,20 @@ async function runDisbursementCycle(db, activeRuntime) {
     if (!releaseLock) return;
 
     const now = String(Date.now());
-    await db.queryAsync(
-      `UPDATE users_usdt_disbursements
-       SET status='manual_review',
-           last_error='Reservation expired before transaction submission; administrator review is required.',
-           updated_at_ms=?
+    const expiredReservations = await db.queryAsync(
+      `SELECT id FROM users_usdt_disbursements
        WHERE status='queued' AND raw_tx IS NULL AND tx_hash IS NULL
-         AND CAST(reservation_expires_at_ms AS UNSIGNED)<=?`,
-      [now, now],
+         AND CAST(reservation_expires_at_ms AS UNSIGNED)<=?
+       ORDER BY id ASC LIMIT 50`,
+      [now],
     );
+    for (const expired of expiredReservations) {
+      await markManualReview(
+        db,
+        expired.id,
+        "Reservation expired before transaction submission; administrator review is required.",
+      );
+    }
     const jobs = await db.queryAsync(
       `SELECT * FROM users_usdt_disbursements
        WHERE status IN ('queued','signed','submitted')

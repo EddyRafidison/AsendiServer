@@ -34,7 +34,7 @@ Le batch regroupe les transferts reçus pendant les 60 minutes qui suivent le pr
 - Recharge créditée : statut `credited`; seules ces opérations déclenchent le cooldown de sept jours.
 - Cooldown actif : `pending_weekly`, avec relance automatique au plus tôt sept jours après la première mise en attente et sept jours après la dernière recharge réussie. Les contrôles sont réexécutés à la relance.
 - Réserves insuffisantes : `pending_reserve`, avec nouvelle tentative automatique.
-- Litige ou anomalie : `pending_support` et notification par Nodemailer à `auths.email` lorsque disponible.
+- Litige ou anomalie : `pending_support` et notification Telegram en anglais lorsque le compte a associé le bot. Aucune notification transactionnelle par SMTP n'est envoyée.
 
 Une seule session `collecting` est ouverte par utilisateur à la fois. Des batches déjà `pending_weekly` ou `pending_reserve` peuvent coexister avec une nouvelle session; un dossier `pending_support` non résolu empêche une nouvelle attribution automatique et place les nouveaux paiements en support.
 
@@ -133,3 +133,24 @@ Les vrais fichiers `.env` ne doivent jamais être inclus dans une archive ou un 
 - `npm run check` : syntaxe JavaScript.
 - `npm test` : tests des fonctions comptables/politiques.
 - Avant mainnet : tests d'intégration sur une base MySQL neuve, BNB Smart Chain testnet lorsque possible, SMTP et tests de reprise après redémarrage. Les tests de syntaxe/unitaires ne prouvent pas la disponibilité réelle des services externes.
+
+## Authentification, récupération et notifications Telegram
+
+- `auths.consec_failed_auth` est créé avec `DEFAULT 0`. Chaque mot de passe incorrect soumis à `/app/signin` incrémente le compteur jusqu'à 3. À partir de 3, le mot de passe permanent ne permet plus de se connecter. Une connexion normale réussie ne remet pas le compteur à zéro.
+- `/app/recover-account` vérifie le seed de récupération, génère un code numérique aléatoire de 7 chiffres, le hache avec Argon2id, le stocke avec une échéance de 10 minutes et l'envoie par SMTP à `auths.email`. L'envoi ne réinitialise pas `consec_failed_auth`.
+- `/admin/send-temp-pswd` est une voie administrative indépendante. Elle vérifie le mot de passe et le PIN administrateur, envoie le même type de code à 7 chiffres valable 10 minutes à l'adresse email enregistrée, et ne réinitialise pas le compteur d'échecs.
+- Un code temporaire valide autorise `/app/signin` même si le compteur est à 3, avec `password_change_required=true`. Dès que la connexion avec ce code et les vérifications additionnelles éventuelles (seed) réussissent, `consec_failed_auth` est remis à `0` dans la transaction de connexion. Le marqueur `password_temp_expires_at_ms` reste défini et toutes les autres activités protégées par mot de passe répondent exactement `{ "auth": "not allowed" }` jusqu'au changement du mot de passe temporaire. `/app/modify-pin-or-password` est l'exception autorisée : elle vérifie que le code temporaire est encore valide, exige un nouveau mot de passe différent, puis efface le marqueur et conserve le compteur à `0` dans une transaction SQL.
+- Un code temporaire expiré ne permet pas de se connecter et ne lève pas le verrouillage des activités : le marqueur de récupération reste présent jusqu'à l'émission d'un nouveau code valide puis au changement du mot de passe permanent. Une nouvelle demande de récupération ou une nouvelle émission administrative peut générer un code après expiration. Une émission simultanée alors qu'un code est encore valide est refusée afin d'éviter plusieurs codes concurrents.
+- Le mot de passe temporaire n'est jamais retourné dans une réponse API ni écrit dans les journaux applicatifs. Le message email en donne la valeur une seule fois.
+- Telegram est facultatif. `/app/signin` retourne `tg_botLink`, soit le lien du bot si l'utilisateur est déjà associé, soit un lien profond `/start` avec un token temporaire de 10 minutes. L'association est faite uniquement dans une conversation privée.
+- `telegram-worker.js` utilise `getUpdates` en long polling, traite `/start` et `my_chat_member`, et envoie `telegram_outbox`. Il faut lancer un seul worker avec `npm run telegram`. Les messages transactionnels sont en anglais. Un blocage du bot efface uniquement les identifiants Telegram.
+- Nodemailer reste utilisé pour l'envoi du username à l'inscription, le mot de passe temporaire de récupération, `/app/contact-onex`, ainsi que le courriel administratif existant de vérification des pièces d'identité lors de l'inscription. Les notifications transactionnelles ne sont plus envoyées par email.
+- La table `notifs`, `/app/feed` et `/admin/add-to-feed` sont exclus du schéma et des routes. `telegram_outbox` est une file de livraison technique, pas un historique de notification.
+
+
+Telegram delivery note: the outbox provides at-least-once delivery. If Telegram accepts a message but the worker stops before recording `sent`, the message can be delivered again after restart. Transaction references in messages make such a duplicate recognizable; Telegram `sendMessage` does not provide a general exactly-once idempotency key.
+
+## Encodage des requêtes
+
+- Le serveur conserve les valeurs reçues et ne remplace plus les espaces par des signes `+`. Express décode normalement `application/x-www-form-urlencoded`.
+- Le client Android doit utiliser un encodeur standard. Un `+` littéral doit être envoyé sous la forme `%2B`; ne jamais modifier manuellement une valeur après encodage. Les requêtes JSON préservent les espaces et les signes `+`.

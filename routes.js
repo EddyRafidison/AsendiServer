@@ -68,11 +68,25 @@ const {
 } = require("./pay");
 const { startDepositSweeper } = require("./sweep");
 const { checkTreasuryLiquidity } = require("./disbursement");
+const { createTelegramBotLinkTx, queueTelegramMessageTx } = require("./telegram");
+const {
+  generateTemporaryPassword,
+  TEMP_PASSWORD_TTL_MS,
+  isTemporaryPasswordActive,
+  isPasswordProtectedActivityLocked,
+  evaluatePasswordAuthentication,
+} = require("./auth-recovery");
 
 const router = express.Router();
 
 function normalizeFormValue(value) {
-  return typeof value === "string" ? value.replaceAll(" ", "+") : "";
+  // URL-encoded form decoding is handled by Express. Preserve the submitted
+  // value exactly; spaces must never be rewritten as literal plus signs.
+  return typeof value === "string" ? value : "";
+}
+
+function normalizeUsername(value) {
+  return normalizeFormValue(value).trim().toUpperCase();
 }
 
 function createFinancialReference(prefix = "ONEX") {
@@ -97,14 +111,24 @@ function requestTokenIsValid(req, token, password, username) {
   }
 }
 
-async function verifyUserPassword(username, submittedPassword) {
-  if (!username || typeof submittedPassword !== "string") return false;
+async function getUserActivityPasswordState(username, submittedPassword) {
+  if (!username || typeof submittedPassword !== "string") return "incorrect";
   const rows = await db.queryAsync(
-    "SELECT password FROM auths WHERE username=? LIMIT 1",
+    `SELECT password,consec_failed_auth,password_temp_expires_at_ms
+     FROM auths WHERE username=? LIMIT 1`,
     [username],
   );
-  if (rows.length === 0) return false;
-  return verifySecret(rows[0].password, submittedPassword);
+  if (rows.length === 0) return "incorrect";
+
+  const row = rows[0];
+  // The lock persists after a temporary-password login. Only changing the
+  // temporary password clears the marker and restores normal account activity.
+  if (isPasswordProtectedActivityLocked({
+    failedCount: Number(row.consec_failed_auth || 0),
+    temporaryPasswordExpiresAtMs: row.password_temp_expires_at_ms,
+  })) return "not_allowed";
+
+  return (await verifySecret(row.password, submittedPassword)) ? "ok" : "incorrect";
 }
 
 async function verifyUserSeed(username, submittedSeed) {
@@ -115,6 +139,76 @@ async function verifyUserSeed(username, submittedSeed) {
   );
   if (rows.length === 0) return false;
   return verifySecret(rows[0].seed, submittedSeed);
+}
+
+async function issueTemporaryPassword(username, email, subject, warningText) {
+  const normalizedEmail = String(email || "").trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return { ok: false, reason: "email_unavailable" };
+  }
+
+  const temporaryPassword = generateTemporaryPassword();
+  const passwordHash = await hashSecret(temporaryPassword);
+  const now = Date.now();
+  const expiresAt = now + TEMP_PASSWORD_TTL_MS;
+  let previousPassword = null;
+  let previousExpiry = null;
+
+  const reservation = await withTransaction(async (tx) => {
+    const [rows] = await tx.query(
+      `SELECT password,password_temp_expires_at_ms,email
+       FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
+      [username],
+    );
+    if (!rows.length) return { ok: false, reason: "account_not_found" };
+
+    const row = rows[0];
+    if (String(row.email || "").trim().toLowerCase() !== normalizedEmail.toLowerCase()) {
+      return { ok: false, reason: "email_changed" };
+    }
+    if (isTemporaryPasswordActive(row.password_temp_expires_at_ms, now)) {
+      return { ok: false, reason: "temporary_password_active" };
+    }
+
+    previousPassword = row.password;
+    previousExpiry = row.password_temp_expires_at_ms;
+    await tx.query(
+      `UPDATE auths SET password=?,password_temp_expires_at_ms=?
+       WHERE username=?`,
+      [passwordHash, String(expiresAt), username],
+    );
+    return { ok: true };
+  });
+
+  if (!reservation.ok) return reservation;
+
+  try {
+    await transporter.sendMail({
+      from: SERVER_MAIL,
+      to: normalizedEmail,
+      subject,
+      text: [
+        `Your OneX temporary password is: ${temporaryPassword}`,
+        "",
+        "It contains 7 digits and is valid for 10 minutes.",
+        "Use it to sign in, then change your password immediately.",
+        warningText || "If you did not request this, contact OneX support immediately.",
+      ].join("\n"),
+    });
+  } catch (error) {
+    // Restore the previous credential only if this temporary credential is still current.
+    await db.queryAsync(
+      `UPDATE auths
+       SET password=?,password_temp_expires_at_ms=?
+       WHERE username=? AND password=? AND password_temp_expires_at_ms=?`,
+      [previousPassword, previousExpiry, username, passwordHash, String(expiresAt)],
+    ).catch((restoreError) => {
+      console.error("Unable to restore credentials after temporary-password email failure:", restoreError.message);
+    });
+    throw error;
+  }
+
+  return { ok: true, expiresInSeconds: 600 };
 }
 
 async function getConnection() {
@@ -164,6 +258,28 @@ async function withTransaction(work, maxAttempts = 3) {
   throw new Error("Transaction retry limit reached");
 }
 
+
+async function queueUserTransactionStatus(username, eventType, status, details = []) {
+  const eventReference = createFinancialReference("ALERT");
+  try {
+    await withTransaction(async (tx) => {
+      await queueTelegramMessageTx(
+        tx,
+        username,
+        `transaction:${eventType}:${eventReference}:${status}`,
+        [
+          "OneX Transaction Update",
+          ...details,
+          `Status: ${String(status).toUpperCase()}`,
+          `Reference: ${eventReference}`,
+        ].join("\n"),
+      );
+    });
+  } catch (error) {
+    // Notification delivery must never roll back or alter the financial operation.
+    console.error("Unable to queue transaction status notification:", error.message);
+  }
+}
 
 async function applyUserTopUp(
   tx,
@@ -310,6 +426,19 @@ async function applyUserTopUp(
     "INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,record_date,record_time) VALUES(?,?,?,?,?,?)",
     [newTotal.toFixed(), newPrice.toFixed(), remainedBacked.toFixed(), newInactive.toFixed(), date, time],
   );
+  await queueTelegramMessageTx(
+    tx,
+    username,
+    `recharge:${reference}:credited`,
+    [
+      "OneX Recharge Update",
+      "Your recharge has been credited successfully.",
+      `Amount received: ${amountValue.toFixed(8)} BSC-USD`,
+      `Amount credited: ${amountValue.toFixed(8)} One-Val`,
+      `Reference: ${reference}`,
+      "Status: SUCCESS",
+    ].join("\n"),
+  );
 
   return {
     transf: "sent",
@@ -327,9 +456,13 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   }
 
   const [authRows] = await tx.query(
-    "SELECT status,password FROM auths WHERE username=? FOR UPDATE",
+    "SELECT status,password,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
     [username],
   );
+  if (authRows.length && (
+    Number(authRows[0].consec_failed_auth || 0) >= 3 ||
+    authRows[0].password_temp_expires_at_ms != null
+  )) return { auth: "not allowed" };
   if (
     authRows.length === 0 ||
     Number(authRows[0].status) <= 0 ||
@@ -490,6 +623,20 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     "UPDATE users_stock SET balance='0',init_asset='0',record_date=?,record_time=? WHERE username=?",
     [date, time, username],
   );
+  await queueTelegramMessageTx(
+    tx,
+    username,
+    `disbursement:${idRows[0].id}:queued`,
+    [
+      "OneX Disbursement Update",
+      "Your sale request has been accepted and the balance is reserved.",
+      `Gross amount: ${calculation.grossBalance.toFixed(8)} One-Val`,
+      `Fees: ${calculation.feeAmount.toFixed(8)} One-Val`,
+      `Expected payment: ${calculation.payoutAmount.toFixed(8)} BSC-USD`,
+      `Reference: ${reference}`,
+      "Status: PROCESSING",
+    ].join("\n"),
+  );
 
   return {
     transf: "processing",
@@ -501,17 +648,39 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
 }
 
 const RECHARGE_HOLD_REASON_TEXT = {
-  below_minimum: "Le montant total reçu pendant la session est inférieur au minimum de 70 BSC-USD.",
-  above_maximum: "Le montant total reçu pendant la session dépasse le maximum de 140 BSC-USD.",
-  weekly_limit: "Une recharge a déjà été créditée sur ce compte au cours des sept derniers jours. Le crédit sera réessayé automatiquement à la date prévue.",
-  maximum_user_balance: "Le crédit ferait dépasser le solde maximal autorisé de 300 One-Val.",
-  account_unavailable: "Le compte OneX est désactivé, supprimé ou indisponible.",
-  system_reserve: "Les réserves du système ne permettent pas encore de créditer ce paiement.",
-  previous_batch_unresolved: "Un précédent paiement de ce compte attend encore une résolution.",
+  below_minimum: "The total received during the 60-minute session is below 70 BSC-USD.",
+  above_maximum: "The total received during the 60-minute session exceeds 140 BSC-USD.",
+  weekly_limit: "A recharge was credited to this account within the last seven days. The system will retry automatically at the displayed release time.",
+  maximum_user_balance: "Crediting this recharge would exceed the maximum account balance of 300 One-Val.",
+  account_unavailable: "The OneX account is disabled, deleted or unavailable.",
+  system_reserve: "The system reserves are not currently sufficient to credit this payment.",
+  previous_batch_unresolved: "A previous payment for this account still requires support review.",
 };
 
 function getReasonText(reasonCodes) {
-  return reasonCodes.map((code) => RECHARGE_HOLD_REASON_TEXT[code] || "Le transfert nécessite une vérification manuelle.");
+  return reasonCodes.map((code) => RECHARGE_HOLD_REASON_TEXT[code] || "This transfer requires manual review.");
+}
+
+function formatTelegramUtc(ms) {
+  const value = Number(ms);
+  return Number.isFinite(value) ? new Date(value).toISOString() : "Unavailable";
+}
+
+async function queueRechargeBatchStatusTx(tx, username, batchId, status, reasonCodes = [], releaseAtMs = null) {
+  const eventKey = `recharge:batch:${batchId}:${status}`;
+  const lines = [
+    "OneX Recharge Update",
+    `Batch: ${batchId}`,
+    `Status: ${String(status).toUpperCase()}`,
+  ];
+  if (reasonCodes.length) {
+    lines.push("Reason:", ...getReasonText(reasonCodes));
+  }
+  if (releaseAtMs != null) lines.push(`Expected automatic retry (UTC): ${formatTelegramUtc(releaseAtMs)}`);
+  if (status === "pending_support") lines.push("Please contact OneX support by email or phone.");
+  if (status === "pending_reserve") lines.push("The system will retry when reserve availability is restored.");
+  if (status === "pending_weekly") lines.push("Your payment is kept safely pending; no recharge has been credited yet.");
+  await queueTelegramMessageTx(tx, username, eventKey, lines.join("\n"));
 }
 
 function safeJson(value) {
@@ -540,8 +709,8 @@ async function processConfirmedUsdtPayment(event) {
     const [eventInsert] = await tx.query(
       `INSERT IGNORE INTO users_usdt_transfer_events
        (username,deposit_wallet_id,batch_id,deposit_address,from_address,amount,amount_raw,tx_hash,log_index,
-        block_number,block_hash,block_timestamp_ms,status,reason_codes,email_status,created_at_ms)
-       VALUES(?,?,NULL,?,?,?,?,?,?,?,?,?,'detected',NULL,'not_required',?)`,
+        block_number,block_hash,block_timestamp_ms,status,reason_codes,created_at_ms)
+       VALUES(?,?,NULL,?,?,?,?,?,?,?,?,?,'detected',NULL,?)`,
       [
         username,
         event.depositWalletId,
@@ -607,8 +776,8 @@ async function processConfirmedUsdtPayment(event) {
       const [batchInsert] = await tx.query(
         `INSERT INTO users_usdt_deposit_batches
          (username,deposit_wallet_id,deposit_address,opened_at_ms,expires_at_ms,total_amount,total_amount_raw,
-          transfer_count,status,reason_codes,created_at_ms,updated_at_ms,email_status)
-         VALUES(?,?,?,?,?,0,0,1,?,?,?,?,?)`,
+          transfer_count,status,reason_codes,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,?,0,0,1,?,?,?,?)`,
         [
           username,
           event.depositWalletId,
@@ -619,7 +788,6 @@ async function processConfirmedUsdtPayment(event) {
           initialReasons.length ? safeJson(initialReasons) : null,
           String(now),
           String(now),
-          initialStatus === "pending_support" ? "pending" : "not_required",
         ],
       );
       const [createdRows] = await tx.query(
@@ -650,6 +818,25 @@ async function processConfirmedUsdtPayment(event) {
       [batch.id, nextStatus, reasonCodes.length ? safeJson(reasonCodes) : null, event.txHash, event.logIndex],
     );
 
+    const batchTotal = new BigNumber(batch.total_amount || 0).plus(amountValue);
+    await queueTelegramMessageTx(
+      tx,
+      username,
+      `deposit:${event.txHash}:${event.logIndex}:received`,
+      [
+        "OneX Deposit Update",
+        "A BSC-USD transfer to your OneX deposit address has been finalized.",
+        `Amount received: ${amountValue.toFixed(8)} BSC-USD`,
+        `Session total: ${batchTotal.toFixed(8)} BSC-USD`,
+        `Batch: ${batch.id}`,
+        `Transaction: ${event.txHash}`,
+        `Status: ${String(nextStatus).toUpperCase()}`,
+      ].join("\n"),
+    );
+    if (nextStatus === "pending_support") {
+      await queueRechargeBatchStatusTx(tx, username, batch.id, nextStatus, reasonCodes);
+    }
+
     return {
       accepted: true,
       username,
@@ -663,9 +850,9 @@ async function processConfirmedUsdtPayment(event) {
 async function updateBatchEventStatus(tx, batchId, status, reasonCodes = null) {
   await tx.query(
     `UPDATE users_usdt_transfer_events
-     SET status=?,reason_codes=?,email_status=IF(? IN ('pending_support','pending_weekly'),'pending','not_required')
+     SET status=?,reason_codes=?
      WHERE batch_id=? AND status IN ('batched','pending_weekly','pending_reserve','pending_support')`,
-    [status, reasonCodes ? safeJson(reasonCodes) : null, status, batchId],
+    [status, reasonCodes ? safeJson(reasonCodes) : null, batchId],
   );
 }
 
@@ -715,21 +902,23 @@ async function processOneRechargeBatch(batchId) {
     if (reasons.length) {
       await tx.query(
         `UPDATE users_usdt_deposit_batches
-         SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),email_status='pending',updated_at_ms=?
+         SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),updated_at_ms=?
          WHERE id=?`,
         [safeJson(reasons), String(batch.expires_at_ms || now), String(now), batchId],
       );
       await updateBatchEventStatus(tx, batchId, "pending_support", reasons);
+      await queueRechargeBatchStatusTx(tx, batch.username, batchId, "pending_support", reasons);
       return { held: true, reasons };
     }
 
     if (!authRows.length || Number(authRows[0].status) <= 0 || !stockRows.length) {
       reasons.push("account_unavailable");
       await tx.query(
-        `UPDATE users_usdt_deposit_batches SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),email_status='pending',updated_at_ms=? WHERE id=?`,
+        `UPDATE users_usdt_deposit_batches SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),updated_at_ms=? WHERE id=?`,
         [safeJson(reasons), String(now), String(now), batchId],
       );
       await updateBatchEventStatus(tx, batchId, "pending_support", reasons);
+      await queueRechargeBatchStatusTx(tx, batch.username, batchId, "pending_support", reasons);
       return { held: true, reasons };
     }
 
@@ -740,11 +929,12 @@ async function processOneRechargeBatch(batchId) {
       const releaseAt = getWeeklyReleaseAt(pendingSince, cooldown.lastRechargeMs);
       await tx.query(
         `UPDATE users_usdt_deposit_batches
-         SET status='pending_weekly',pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,next_attempt_at_ms=?,reason_codes=?,email_status='pending',updated_at_ms=?
+         SET status='pending_weekly',pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,next_attempt_at_ms=?,reason_codes=?,updated_at_ms=?
          WHERE id=?`,
         [String(pendingSince), String(releaseAt), String(releaseAt), safeJson(["weekly_limit"]), String(now), batchId],
       );
       await updateBatchEventStatus(tx, batchId, "pending_weekly", ["weekly_limit"]);
+      await queueRechargeBatchStatusTx(tx, batch.username, batchId, "pending_weekly", ["weekly_limit"], releaseAt);
       return { waiting: true, releaseAtMs: releaseAt };
     }
 
@@ -752,10 +942,11 @@ async function processOneRechargeBatch(batchId) {
     if (!userBalance.isFinite() || userBalance.isNegative() || userBalance.plus(amount).isGreaterThan(MAX_DEFAULT_STOCK)) {
       reasons.push("maximum_user_balance");
       await tx.query(
-        `UPDATE users_usdt_deposit_batches SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),email_status='pending',updated_at_ms=? WHERE id=?`,
+        `UPDATE users_usdt_deposit_batches SET status='pending_support',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),updated_at_ms=? WHERE id=?`,
         [safeJson(reasons), String(now), String(now), batchId],
       );
       await updateBatchEventStatus(tx, batchId, "pending_support", reasons);
+      await queueRechargeBatchStatusTx(tx, batch.username, batchId, "pending_support", reasons);
       return { held: true, reasons };
     }
 
@@ -778,16 +969,18 @@ async function processOneRechargeBatch(batchId) {
           [String(retryAt), safeJson(["system_reserve"]), String(now), batchId],
         );
         await updateBatchEventStatus(tx, batchId, "pending_reserve", ["system_reserve"]);
+        await queueRechargeBatchStatusTx(tx, batch.username, batchId, "pending_reserve", ["system_reserve"], retryAt);
         return { waiting: true, retryAtMs: retryAt };
       }
       if (creditResult?.error === "weekly recharge limit reached") {
         const pendingSince = Number(batch.pending_since_ms || now);
         const releaseAt = getWeeklyReleaseAt(pendingSince, cooldown.lastRechargeMs);
         await tx.query(
-          `UPDATE users_usdt_deposit_batches SET status='pending_weekly',pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,next_attempt_at_ms=?,reason_codes=?,email_status='pending',updated_at_ms=? WHERE id=?`,
+          `UPDATE users_usdt_deposit_batches SET status='pending_weekly',pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,next_attempt_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
           [String(pendingSince), String(releaseAt), String(releaseAt), safeJson(["weekly_limit"]), String(now), batchId],
         );
         await updateBatchEventStatus(tx, batchId, "pending_weekly", ["weekly_limit"]);
+        await queueRechargeBatchStatusTx(tx, batch.username, batchId, "pending_weekly", ["weekly_limit"], releaseAt);
         return { waiting: true, releaseAtMs: releaseAt };
       }
       throw new Error(`Recharge batch credit failed: ${JSON.stringify(creditResult)}`);
@@ -795,7 +988,7 @@ async function processOneRechargeBatch(batchId) {
 
     await tx.query(
       `UPDATE users_usdt_deposit_batches
-       SET status='credited',reason_codes=NULL,credited_at_ms=?,updated_at_ms=?,email_status='not_required'
+       SET status='credited',reason_codes=NULL,credited_at_ms=?,updated_at_ms=?
        WHERE id=? AND status IN ('ready','pending_weekly','pending_reserve')`,
       [String(now), String(now), batchId],
     );
@@ -824,97 +1017,6 @@ async function processRechargeBatchQueue() {
   }
 }
 
-async function notifyPendingRechargeCases() {
-  await processRechargeBatchQueue();
-  const now = Date.now();
-  await db.queryAsync(
-    `UPDATE users_usdt_deposit_batches
-     SET email_status=IF(email_attempts>=5,'failed','retry')
-     WHERE status IN ('pending_support','pending_weekly') AND email_status='sending' AND email_last_attempt_ms<?`,
-    [String(now - 10 * 60 * 1000)],
-  );
-  const rows = await db.queryAsync(
-    `SELECT b.id,b.username,b.deposit_address,b.total_amount,b.reason_codes,b.email_attempts,a.email
-     FROM users_usdt_deposit_batches b
-     LEFT JOIN auths a ON a.username=b.username
-     WHERE b.status IN ('pending_support','pending_weekly')
-       AND (b.email_status='pending' OR (b.email_status='retry' AND b.email_last_attempt_ms<=?))
-       AND b.email_attempts<5
-     ORDER BY b.id ASC LIMIT 20`,
-    [String(now - 60 * 1000)],
-  );
-
-  for (const row of rows) {
-    const claim = await db.queryAsync(
-      `UPDATE users_usdt_deposit_batches
-       SET email_status='sending',email_attempts=email_attempts+1,email_last_attempt_ms=?
-       WHERE id=? AND email_status IN ('pending','retry') AND email_attempts<5`,
-      [String(now), row.id],
-    );
-    if (claim.affectedRows !== 1) continue;
-
-    const email = String(row.email || "").trim();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      await db.queryAsync(
-        "UPDATE users_usdt_deposit_batches SET email_status='failed',email_last_error=? WHERE id=?",
-        ["The user has no valid email address in auths.email.", row.id],
-      );
-      continue;
-    }
-
-    let reasonCodes = [];
-    try {
-      reasonCodes = JSON.parse(row.reason_codes || "[]");
-      if (!Array.isArray(reasonCodes)) reasonCodes = [];
-    } catch {
-      reasonCodes = [];
-    }
-    const eventRows = await db.queryAsync(
-      `SELECT tx_hash,log_index,from_address,amount,block_timestamp_ms
-       FROM users_usdt_transfer_events WHERE batch_id=? ORDER BY block_timestamp_ms,id`,
-      [row.id],
-    );
-    const supportEmail = String(process.env.ONEX_SUPPORT_EMAIL || SERVER_MAIL || "").trim();
-    const supportPhone = String(process.env.ONEX_SUPPORT_PHONE || "").trim();
-    const paymentLines = eventRows.map((item) =>
-      `- ${item.amount} BSC-USD | ${item.tx_hash} (log ${item.log_index}) | expéditeur ${item.from_address} | ${new Date(Number(item.block_timestamp_ms)).toISOString()}`,
-    );
-    const reasonLines = getReasonText(reasonCodes).map((reason) => `- ${reason}`);
-    const text = [
-      `Bonjour ${row.username},`, "",
-      "OneX a reçu un ou plusieurs transferts BSC-USD sur votre adresse de dépôt, mais le montant n'a pas pu être crédité automatiquement.", "",
-      "Motif(s) :", ...reasonLines, "",
-      `Montant cumulé : ${row.total_amount} BSC-USD`,
-      `Adresse de dépôt : ${row.deposit_address}`, "Transactions :", ...paymentLines, "",
-      "Les fonds restent enregistrés dans le registre de rapprochement OneX. Ne renvoyez pas le paiement avant d'avoir contacté le support.", "",
-      `E-mail du support : ${supportEmail || "répondez à ce message"}`,
-      `Téléphone : ${supportPhone || "consultez les coordonnées dans l'application OneX"}`, "",
-      "Cordialement,", "Support OneX",
-    ].join("\n");
-
-    try {
-      await transporter.sendMail({
-        from: SERVER_MAIL,
-        to: email,
-        replyTo: supportEmail || SERVER_MAIL,
-        subject: "OneX – Votre recharge BSC-USD nécessite une vérification",
-        text,
-      });
-      await db.queryAsync(
-        "UPDATE users_usdt_deposit_batches SET email_status='sent',email_sent_at_ms=?,email_last_error=NULL WHERE id=?",
-        [String(Date.now()), row.id],
-      );
-    } catch (error) {
-      await db.queryAsync(
-        `UPDATE users_usdt_deposit_batches
-         SET email_status=IF(email_attempts>=5,'failed','retry'),email_last_error=? WHERE id=?`,
-        [String(error.message || error).slice(0, 2000), row.id],
-      );
-      console.error(`Unable to notify recharge support case ${row.id}:`, error.message);
-    }
-  }
-}
-
 // ----- MAILER -----
 const configuredMailPort = Number(MAIL_PORT || 587);
 const transporter = nodemailer.createTransport({
@@ -928,20 +1030,21 @@ const transporter = nodemailer.createTransport({
 });
 
 if (!SERVER_MAIL || !SERVER_MAIL_PSWD) {
-  console.warn("Recharge email notifications are not configured: set SERV_MAIL and SERV_MAIL_PSWD.");
+  console.warn("Email delivery is not configured: set SERV_MAIL and SERV_MAIL_PSWD.");
 }
 
 // ----- PUBLIC GET -----
 router.get("/", (_r, s) => s.redirect("/app/download-latest-apk"));
 
 router.get("/app/privacy-terms-info", async (req, res) => {
-  const file = `./${req.query.r === "terms" ? "terms" : "privacy"}_${
-    req.query.l
-  }.html`;
+  const language = typeof req.query.l === "string" ? req.query.l.toLowerCase() : "";
+  if (!["en", "fr"].includes(language)) return res.status(400).send("unsupported language");
+  const documentType = req.query.r === "terms" ? "terms" : "privacy";
+  const file = `./${documentType}_${language}.html`;
   try {
     res.send(await fs.promises.readFile(file, "utf8"));
   } catch {
-    res.send("error");
+    res.status(404).send("document not found");
   }
 });
 
@@ -959,7 +1062,7 @@ router.post("/app/check-app-version", (_r, res) => {
 // contact
 router.post("/app/contact-onex", async (req, res) => {
   const { user, pswd, subj, msg, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
 
   if (!requestTokenIsValid(req, tkn, P, U)) {
@@ -967,19 +1070,25 @@ router.post("/app/contact-onex", async (req, res) => {
   }
 
   try {
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ status: "error" });
     const rows = await db.queryAsync(
-      "SELECT password,email FROM auths WHERE username=? LIMIT 1",
+      "SELECT email FROM auths WHERE username=? LIMIT 1",
       [U],
     );
-    if (rows.length === 0 || !(await verifySecret(rows[0].password, P))) {
-      return res.send({ status: "error" });
-    }
+    if (rows.length === 0) return res.send({ status: "error" });
 
+    const safeSubject = (typeof subj === "string" ? subj : "OneX contact")
+      .replace(/[\r\n\u0000-\u001f\u007f]/g, " ")
+      .trim()
+      .slice(0, 160) || "OneX contact";
+    const safeMessage = typeof msg === "string" ? msg.slice(0, 10_000) : "";
     await transporter.sendMail({
       from: SERVER_MAIL,
       to: SERVER_MAIL,
-      subject: typeof subj === "string" ? subj : "OneX contact",
-      html: `<b>From</b> ${rows[0].email} (${U})<br>${String(msg ?? "")}`,
+      subject: safeSubject,
+      text: `From: ${rows[0].email} (${U})\n\n${safeMessage}`,
     });
     res.send({ status: "sent" });
   } catch (error) {
@@ -1033,13 +1142,13 @@ router.post("/app/signup", async (req, res) => {
     return res.status(400).send({ msg: "invalid name" });
   }
 
-  const Email = email.replaceAll(" ", "+");
-  const Birth = birth.replaceAll(" ", "+");
-  const Address = latinAddress.replaceAll(" ", "+");
-  const Name = latinName.replaceAll(" ", "+");
-  const CNI = encrypt(cni.replaceAll(" ", "+"), DB_CONFIG.password);
-  const passwordValue = normalizeFormValue(pswd);
-  const seedValue = normalizeFormValue(seed);
+  const Email = email.trim();
+  const Birth = birth.trim();
+  const Address = latinAddress;
+  const Name = latinName;
+  const CNI = encrypt(cni.trim(), DB_CONFIG.password);
+  const passwordValue = pswd;
+  const seedValue = seed;
   let PWD;
   let SEED;
   try {
@@ -1130,7 +1239,7 @@ router.post("/app/signup", async (req, res) => {
       from: SERVER_MAIL,
       to: Email,
       subject: "New member",
-      html: `<h2>Welcome,</h2>Your ID: <b>${U}</b>`,
+      text: `Welcome to OneX.\nYour username: ${U}`,
     }).catch((mailError) => {
       console.error("Welcome email failed:", mailError);
     });
@@ -1140,7 +1249,7 @@ router.post("/app/signup", async (req, res) => {
       from: SERVER_MAIL,
       to: "eddy.heriniaina.rafidison@gmail.com",
       subject: "Account Verification",
-      html: `${U}<br>${Name}<br>${Birth}<br>${Address}<br>${cni}`,
+      text: [U, Name, Birth, Address, cni].join("\n"),
       attachments: [
         { filename: "cni_1.png", content: cniimg1, encoding: "base64" },
         { filename: "cni_2.png", content: cniimg2, encoding: "base64" },
@@ -1157,51 +1266,76 @@ router.post("/app/signup", async (req, res) => {
 // signin
 router.post("/app/signin", async (req, res) => {
   const { user, pswd, tkn, recon, seed } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   const submittedSeed = normalizeFormValue(seed);
   const needsSeed = String(recon) === "0";
 
-  if (!U || !P) return res.status(400).send({ msg: "invalid request", ua: "" });
+  if (!U || !P) return res.status(400).send({ msg: "invalid request", ua: "", tg_botLink: null });
   if (needsSeed && !requestTokenIsValid(req, tkn, P, U)) {
-    return res.send({ msg: "forbidden request", ua: "" });
+    return res.send({ msg: "forbidden request", ua: "", tg_botLink: null });
+  }
+
+  const ua = req.headers["user-agent"];
+  if (typeof ua !== "string") {
+    return res.send({ msg: "error", ua: "", tg_botLink: null });
   }
 
   try {
-    const rows = await db.queryAsync(
-      "SELECT id,password,seed,status FROM auths WHERE username=? LIMIT 1",
-      [U],
-    );
-    if (rows.length === 0) {
-      return res.send({ msg: "incorrect password", ua: "" });
-    }
+    const result = await withTransaction(async (tx) => {
+      const [rows] = await tx.query(
+        `SELECT id,password,seed,status,consec_failed_auth,password_temp_expires_at_ms,tg_userId,tg_chat_id
+         FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
+        [U],
+      );
+      if (!rows.length) {
+        return { response: { msg: "incorrect password", ua: "", tg_botLink: null } };
+      }
 
-    const row = rows[0];
-    if (!(await verifySecret(row.password, P))) {
-      return res.send({ msg: "incorrect password", ua: "" });
-    }
-    if (needsSeed && !(await verifySecret(row.seed, submittedSeed))) {
-      return res.send({ msg: "incorrect seed", ua: "" });
-    }
+      const row = rows[0];
+      const authDecision = evaluatePasswordAuthentication({
+        failedCount: Number(row.consec_failed_auth || 0),
+        temporaryPasswordExpiresAtMs: row.password_temp_expires_at_ms,
+        passwordMatches: await verifySecret(row.password, P),
+        nowMs: Date.now(),
+      });
 
-    const ua = req.headers["user-agent"];
-    if (typeof ua !== "string") {
-      return res.send({ msg: "error", ua: "" });
-    }
+      if (!authDecision.allowed) {
+        let currentFailureCount = Number(row.consec_failed_auth || 0);
+        if (authDecision.incrementFailureCount) {
+          currentFailureCount = nextFailedAuthCount(currentFailureCount);
+          await tx.query(
+            "UPDATE auths SET consec_failed_auth=? WHERE username=?",
+            [currentFailureCount, U],
+          );
+        }
+        const locked = authDecision.recoveryRequired || currentFailureCount >= 3;
+        return {
+          response: {
+            msg: locked ? "account recovery required" : "incorrect password",
+            ua: "",
+            tg_botLink: null,
+            recovery_required: locked,
+          },
+        };
+      }
 
-    const encUA = encrypt(ua, P + U);
-    let status = Number(row.status);
-    if (status === 0) {
-      const activation = await withTransaction(async (tx) => {
-        const [authRows] = await tx.query(
-          "SELECT id,status FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
+      if (needsSeed && !(await verifySecret(row.seed, submittedSeed))) {
+        return { response: { msg: "incorrect seed", ua: "", tg_botLink: null } };
+      }
+
+      const isTemporaryPassword = authDecision.passwordChangeRequired;
+      if (authDecision.resetFailedAuthCount) {
+        await tx.query(
+          "UPDATE auths SET consec_failed_auth=0 WHERE username=?",
           [U],
         );
-        if (!authRows.length) throw new Error("Account disappeared during activation");
-        if (Number(authRows[0].status) !== 0) return { status: Number(authRows[0].status) };
+      }
 
+      let status = Number(row.status);
+      if (status === 0) {
         await tx.query("UPDATE auths SET status=1 WHERE username=?", [U]);
-        if (Number(authRows[0].id) <= Number(first_welcome_clients)) {
+        if (Number(row.id) <= Number(first_welcome_clients)) {
           const configuredBonus = new BigNumber(welcome_bonus);
           const maximumStock = new BigNumber(maxStockDefault);
           if (
@@ -1240,52 +1374,40 @@ router.post("/app/signin", async (req, res) => {
             );
           }
         }
-        return { status: 1 };
-      });
-      status = activation.status;
-    }
+        status = 1;
+      }
 
-    res.send({ msg: status, ua: encUA });
+      const encUA = encrypt(ua, P + U);
+      const tgBotLink = await createTelegramBotLinkTx(tx, U, row);
+      return {
+        response: {
+          msg: status,
+          ua: encUA,
+          tg_botLink: tgBotLink,
+          password_change_required: isTemporaryPassword,
+        },
+      };
+    });
+
+    return res.send(result.response);
   } catch (error) {
     console.error("Sign-in failed:", error);
-    res.send({ msg: "error", ua: "" });
-  }
-});
-
-// feed
-router.post("/app/feed", async (req, res) => {
-  const { user, pswd, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
-  const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U))
-    return res.send({ feed: "forbidden request" });
-
-  try {
-    const passOK = await verifyUserPassword(U, P);
-    if (!passOK) return res.send({ feed: "incorrect auth" });
-
-    const [date] = getDate();
-    const notifs = await db.queryAsync(
-      "SELECT * FROM notifs WHERE record_date=? ORDER BY id DESC",
-      [date],
-    );
-    res.send({ feed: notifs });
-  } catch {
-    res.send({ feed: "error" });
+    return res.send({ msg: "error", ua: "", tg_botLink: null });
   }
 });
 
 // user-last-stock
 router.post("/app/user-last-stock", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U))
     return res.send({ msg: "forbidden request" });
 
   try {
-    const passOK = await verifyUserPassword(U, P);
-    if (!passOK) return res.send({ msg: "error" });
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ msg: "error" });
 
     const stockRows = await db.queryAsync(
       "SELECT balance FROM users_stock WHERE username=? LIMIT 1",
@@ -1320,11 +1442,13 @@ router.post("/app/user-last-stock", async (req, res) => {
 // BEP-20 recharge information. Payment sessions are opened automatically after a finalized transfer is detected.
 router.post("/app/recharge", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
-  const U = normalizeFormValue(user).toUpperCase();
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
-    if (!(await verifyUserPassword(U, P))) return res.send({ msg: "not allowed" });
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ msg: "not allowed" });
     const config = getPaymentPublicConfig();
     if (!config.enabled) return res.send({ msg: "not allowed" });
     const depositAddress = await getOrCreateUserDepositAddress(db, U);
@@ -1349,13 +1473,15 @@ router.post("/app/recharge", async (req, res) => {
 
 router.post("/app/recharge/status", async (req, res) => {
   const { user, pswd, batch_id, tkn } = req.body || {};
-  const U = normalizeFormValue(user).toUpperCase();
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ transf: "forbidden request" });
-  if (!(await verifyUserPassword(U, P))) return res.send({ auth: "incorrect" });
   const id = String(batch_id ?? "").trim();
   if (id && !/^\d{1,20}$/.test(id)) return res.status(400).send({ transf: "invalid request" });
   try {
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ auth: "incorrect" });
     const rows = id
       ? await db.queryAsync(
           `SELECT id,status,total_amount,opened_at_ms,expires_at_ms,release_at_ms,reason_codes,credited_at_ms
@@ -1388,14 +1514,16 @@ router.post("/app/recharge/status", async (req, res) => {
 // Users declare their BSC payout address themselves. OneX does not claim to verify address ownership.
 router.post("/app/set-payout-address", async (req, res) => {
   const { user, pswd, address, tkn } = req.body || {};
-  const U = normalizeFormValue(user).toUpperCase();
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
   if (!isEvmAddress(address) || /^0x0{40}$/i.test(String(address))) {
     return res.send({ auth: "invalid address" });
   }
   try {
-    if (!(await verifyUserPassword(U, P))) return res.send({ auth: "incorrect" });
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ auth: "incorrect" });
     const depositAddress = await getOrCreateUserDepositAddress(db, U);
     if (!depositAddress) return res.send({ auth: "error" });
     const payoutAddress = checksumEvmAddress(address);
@@ -1409,8 +1537,15 @@ router.post("/app/set-payout-address", async (req, res) => {
     );
     if (depositCollision.length) return res.send({ auth: "invalid address" });
     const result = await withTransaction(async (tx) => {
-      const [authRows] = await tx.query("SELECT username FROM auths WHERE username=? FOR UPDATE", [U]);
+      const [authRows] = await tx.query(
+        "SELECT username,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
+        [U],
+      );
       if (!authRows.length) return { auth: "error" };
+      if (isPasswordProtectedActivityLocked({
+        failedCount: Number(authRows[0].consec_failed_auth || 0),
+        temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
+      })) return { auth: "not allowed" };
       const [pendingRows] = await tx.query(
         `SELECT id FROM users_usdt_disbursements
          WHERE username=? AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`, [U],
@@ -1432,14 +1567,15 @@ router.post("/app/set-payout-address", async (req, res) => {
 // transactions-history
 router.post("/app/transactions-history", async (req, res) => {
   const { user, pswd, days, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U))
     return res.send({ trans: "forbidden request" });
 
   try {
-    const passOK = await verifyUserPassword(U, P);
-    if (!passOK) return res.send({ trans: "error" });
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ trans: "error" });
 
     const before = getDateBefore(Number(days))[0];
     const trans = await db.queryAsync(
@@ -1455,12 +1591,12 @@ router.post("/app/transactions-history", async (req, res) => {
 // near-transfer
 router.post("/app/near-transfer", async (req, res) => {
   const { sender, pswd, dest, amount, tkn } = req.body || {};
-  const senderInput = normalizeFormValue(sender);
+  const senderInput = normalizeUsername(sender);
   const P = normalizeFormValue(pswd);
-  const destinationInput = normalizeFormValue(dest);
+  const destinationInput = normalizeUsername(dest);
   const amountText =
     typeof amount === "string" || typeof amount === "number"
-      ? normalizeFormValue(String(amount))
+      ? String(amount).trim()
       : "";
 
   if (!requestTokenIsValid(req, tkn, P, senderInput)) {
@@ -1483,13 +1619,15 @@ router.post("/app/near-transfer", async (req, res) => {
 
   try {
     const senderAuthRows = await db.queryAsync(
-      "SELECT password FROM auths WHERE username=? LIMIT 1",
+      "SELECT password,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1",
       [S],
     );
+    if (senderAuthRows.length === 0) return res.send({ transf: "failed" });
     if (
-      senderAuthRows.length === 0 ||
-      !(await verifySecret(senderAuthRows[0].password, P))
-    ) {
+      Number(senderAuthRows[0].consec_failed_auth || 0) >= 3 ||
+      senderAuthRows[0].password_temp_expires_at_ms != null
+    ) return res.send({ auth: "not allowed" });
+    if (!(await verifySecret(senderAuthRows[0].password, P))) {
       return res.send({ transf: "failed" });
     }
     const verifiedPasswordHash = senderAuthRows[0].password;
@@ -1504,15 +1642,24 @@ router.post("/app/near-transfer", async (req, res) => {
       const result = await withTransaction((tx) =>
         queueSystemDisbursement(tx, S, verifiedPasswordHash, requestedAmount),
       );
+      if (result?.transf && result.transf !== "processing" && result.auth !== "not allowed") {
+        await queueUserTransactionStatus(S, "disbursement", "failed", [
+          `Your sale-to-OneX request was not accepted: ${String(result.transf).slice(0, 160)}.`,
+        ]);
+      }
       return res.send(result);
     }
 
     // P2P_ALLOWED controls user-to-user transfers only. Selling to the system
     // is governed independently by USDT_DISBURSEMENTS_ENABLED.
-    if (!P2Pallowed) return res.send({ transf: "not yet allowed" });
+    if (!P2Pallowed) {
+      await queueUserTransactionStatus(S, "p2p", "failed", ["Your P2P transfer could not be completed because P2P transfers are currently unavailable."]);
+      return res.send({ transf: "not yet allowed" });
+    }
 
     // The legacy P2P minimum applies only to transfers between users.
     if (requestedAmount.isLessThan(10000)) {
+      await queueUserTransactionStatus(S, "p2p", "failed", ["Your P2P transfer could not be completed because the requested amount is below the minimum."]);
       return res.send({ warning: "abusive operation" });
     }
 
@@ -1521,7 +1668,7 @@ router.post("/app/near-transfer", async (req, res) => {
       const authByName = new Map();
       for (const username of authNames) {
         const [rows] = await tx.query(
-          "SELECT username,status,password FROM auths WHERE username=? FOR UPDATE",
+          "SELECT username,status,password,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
           [username],
         );
         if (rows.length > 0) authByName.set(username, rows[0]);
@@ -1529,6 +1676,10 @@ router.post("/app/near-transfer", async (req, res) => {
 
       const senderAuth = authByName.get(S);
       const destinationAuth = authByName.get(D);
+      if (senderAuth && (
+        Number(senderAuth.consec_failed_auth || 0) >= 3 ||
+        senderAuth.password_temp_expires_at_ms != null
+      )) return { auth: "not allowed" };
       if (
         !senderAuth ||
         Number(senderAuth.status) <= 0 ||
@@ -1702,12 +1853,45 @@ router.post("/app/near-transfer", async (req, res) => {
         [newTotal.toFixed(), newPrice.toFixed(), newBackedUnits.toFixed(), newInactiveAssets.toFixed(), date, time],
       );
 
+      await queueTelegramMessageTx(
+        tx,
+        S,
+        `p2p:${reference}:sender`,
+        [
+          "OneX Transaction Update",
+          "Your P2P transfer was completed successfully.",
+          `Recipient: ${D}`,
+          `Amount debited: ${senderStockDebit.toFixed(8)} One-Val`,
+          `Reference: ${reference}`,
+          "Status: SUCCESS",
+        ].join("\n"),
+      );
+      await queueTelegramMessageTx(
+        tx,
+        D,
+        `p2p:${reference}:receiver`,
+        [
+          "OneX Transaction Update",
+          "You have received a P2P transfer.",
+          `Sender: ${S}`,
+          `Amount received: ${receiverStockCredit.toFixed(8)} One-Val`,
+          `Reference: ${reference}`,
+          "Status: SUCCESS",
+        ].join("\n"),
+      );
+
       return { transf: "sent" };
     });
 
+    if (result?.transf && result.transf !== "sent" && result.auth !== "not allowed") {
+      await queueUserTransactionStatus(S, "p2p", "failed", [
+        `Your P2P transfer could not be completed: ${String(result.transf).slice(0, 160)}.`,
+      ]);
+    }
     return res.send(result);
   } catch (error) {
     console.error("Near-transfer failed:", error);
+    await queueUserTransactionStatus(S, "p2p", "failed", ["Your P2P transfer could not be completed because of a server or database error. Please contact OneX support if your balance appears inconsistent."]);
     return res.send({ transf: "failed" });
   }
 });
@@ -1715,7 +1899,7 @@ router.post("/app/near-transfer", async (req, res) => {
 // Disbursement status
 router.post("/app/disbursement/status", async (req, res) => {
   const { user, pswd, disbursement_id, tkn } = req.body || {};
-  const userInput = normalizeFormValue(user);
+  const userInput = normalizeUsername(user);
   const U = userInput.toUpperCase();
   const P = normalizeFormValue(pswd);
   const id = String(disbursement_id ?? "");
@@ -1728,9 +1912,9 @@ router.post("/app/disbursement/status", async (req, res) => {
   }
 
   try {
-    if (!(await verifyUserPassword(U, P))) {
-      return res.send({ transf: "failed" });
-    }
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ transf: "failed" });
     const rows = await db.queryAsync(
       `SELECT id,payout_address,payout_amount,status,tx_hash,last_error,created_at_ms,confirmed_at_ms
        FROM users_usdt_disbursements WHERE id=? AND username=? LIMIT 1`,
@@ -1765,7 +1949,7 @@ router.post("/admin/recharge/credit", async (req, res) => {
     pin !== decrypt(admin_pin, DB_CONFIG.password)
   ) return res.send({ transf: "incorrect admin credentials" });
 
-  const U = normalizeFormValue(username).toUpperCase();
+  const U = normalizeUsername(username);
   const batchId = String(batch_id ?? "").trim();
   const resolutionReason = typeof reason === "string" ? reason.trim() : "";
   if (!U || !/^\d{1,20}$/.test(batchId) || resolutionReason.length < 5 || resolutionReason.length > 1000) {
@@ -1824,12 +2008,12 @@ router.post("/admin/recharge/credit", async (req, res) => {
 
       await tx.query(
         `UPDATE users_usdt_deposit_batches
-         SET status='credited',reason_codes=NULL,credited_at_ms=?,updated_at_ms=?,email_status='not_required'
+         SET status='credited',reason_codes=NULL,credited_at_ms=?,updated_at_ms=?
          WHERE id=? AND status='pending_support'`,
         [String(now), String(now), batchId],
       );
       await tx.query(
-        "UPDATE users_usdt_transfer_events SET status='credited',reason_codes=NULL,email_status='not_required' WHERE batch_id=?",
+        "UPDATE users_usdt_transfer_events SET status='credited',reason_codes=NULL WHERE batch_id=?",
         [batchId],
       );
       await tx.query(
@@ -1861,7 +2045,7 @@ router.post("/admin/recharge/refund", async (req, res) => {
     pin !== decrypt(admin_pin, DB_CONFIG.password)
   ) return res.send({ transf: "incorrect admin credentials" });
 
-  const U = normalizeFormValue(username).toUpperCase();
+  const U = normalizeUsername(username);
   const batchId = String(batch_id ?? "").trim();
   const resolutionReason = typeof reason === "string" ? reason.trim() : "";
   if (!U || !/^\d{1,20}$/.test(batchId) || resolutionReason.length < 5 || resolutionReason.length > 1000) {
@@ -1943,6 +2127,19 @@ router.post("/admin/recharge/refund", async (req, res) => {
          VALUES('configured_admin',?,?,'refund_queued',?,'0',?,?,NULL,?,?)`,
         [U, batchId, amount.toFixed(18), amount.toFixed(18), snapshot.payout_address, resolutionReason, now],
       );
+      await queueTelegramMessageTx(
+        tx,
+        U,
+        `refund:${refundInsert.insertId}:queued`,
+        [
+          "OneX Refund Update",
+          "Your BSC-USD refund has been accepted and queued for processing.",
+          `Amount: ${amount.toFixed(8)} BSC-USD`,
+          `Refund ID: ${refundInsert.insertId}`,
+          `Destination: ${snapshot.payout_address}`,
+          "Status: PROCESSING",
+        ].join("\n"),
+      );
       return {
         transf: "refund_processing",
         refund_id: String(refundInsert.insertId),
@@ -1966,7 +2163,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
     pin !== decrypt(admin_pin, DB_CONFIG.password)
   ) return res.send({ transf: "incorrect admin credentials" });
 
-  const username = normalizeFormValue(user).toUpperCase();
+  const username = normalizeUsername(user);
   const id = String(disbursement_id ?? "").trim();
   if (!username || !/^\d{1,20}$/.test(id)) {
     return res.status(400).send({ transf: "invalid request" });
@@ -2030,6 +2227,17 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
         [String(now + DISBURSEMENT_RESERVATION_MS), String(now), id],
       );
       if (update[0].affectedRows !== 1) return { transf: "not eligible for unlock" };
+      await queueTelegramMessageTx(
+        tx,
+        username,
+        `disbursement:${id}:requeued`,
+        [
+          "OneX Disbursement Update",
+          "Your disbursement request has been re-queued by OneX support.",
+          `Disbursement ID: ${id}`,
+          "Status: PROCESSING",
+        ].join("\n"),
+      );
       return { transf: "processing", disbursement_id: id };
     });
     return res.send(result);
@@ -2042,7 +2250,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
 // modify-pin-or-password
 router.post("/app/modify-pin-or-password", async (req, res) => {
   const { user, pswd1, pswd2, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeUsername(user);
   const P1 = normalizeFormValue(pswd1);
   const P2 = normalizeFormValue(pswd2);
 
@@ -2052,16 +2260,47 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
   if (!P2) return res.status(400).send({ auth: "invalid password" });
 
   try {
-    if (!(await verifyUserPassword(U, P1))) {
-      return res.send({ auth: "incorrect" });
-    }
+    const result = await withTransaction(async (tx) => {
+      const [rows] = await tx.query(
+        `SELECT password,password_temp_expires_at_ms,consec_failed_auth
+         FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
+        [U],
+      );
+      if (!rows.length) return { auth: "incorrect" };
 
-    const passwordHash = await hashSecret(P2);
-    await db.queryAsync("UPDATE auths SET password=? WHERE username=?", [
-      passwordHash,
-      U,
-    ]);
-    res.send({ auth: "updated" });
+      const current = rows[0];
+      const isRecoveryPassword = current.password_temp_expires_at_ms != null;
+      const accountLocked = Number(current.consec_failed_auth || 0) >= 3;
+      if (accountLocked && !isRecoveryPassword) {
+        return { auth: "not allowed" };
+      }
+      if (isRecoveryPassword) {
+        const expiresAt = Number(current.password_temp_expires_at_ms);
+        if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+          return { auth: "temporary password expired" };
+        }
+      }
+      if (!(await verifySecret(current.password, P1))) {
+        return { auth: "incorrect" };
+      }
+      if (P2 === P1) return { auth: "new password must be different" };
+
+      const passwordHash = await hashSecret(P2);
+      if (isRecoveryPassword) {
+        await tx.query(
+          `UPDATE auths SET password=?,password_temp_expires_at_ms=NULL,consec_failed_auth=0
+           WHERE username=?`,
+          [passwordHash, U],
+        );
+      } else {
+        await tx.query(
+          "UPDATE auths SET password=?,password_temp_expires_at_ms=NULL WHERE username=?",
+          [passwordHash, U],
+        );
+      }
+      return { auth: "updated", recovery_completed: isRecoveryPassword };
+    });
+    res.send(result);
   } catch (error) {
     console.error("Password update failed:", error);
     res.send({ auth: "error" });
@@ -2071,14 +2310,23 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
 // delete-user
 router.post("/app/delete-user", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
-  const U = normalizeFormValue(user).toUpperCase();
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
   try {
-    if (!(await verifyUserPassword(U, P))) return res.send({ auth: "incorrect" });
+    const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
+    if (passwordState !== "ok") return res.send({ auth: "incorrect" });
     const result = await withTransaction(async (tx) => {
-      const [authRows] = await tx.query("SELECT username FROM auths WHERE username=? FOR UPDATE", [U]);
+      const [authRows] = await tx.query(
+        "SELECT username,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
+        [U],
+      );
       if (!authRows.length) return { auth: "error" };
+      if (isPasswordProtectedActivityLocked({
+        failedCount: Number(authRows[0].consec_failed_auth || 0),
+        temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
+      })) return { auth: "not allowed" };
       const [stockRows] = await tx.query("SELECT balance FROM users_stock WHERE username=? FOR UPDATE", [U]);
       if (!stockRows.length) return { auth: "error" };
       const stockBalance = new BigNumber(stockRows[0].balance);
@@ -2126,31 +2374,45 @@ router.post("/app/delete-user", async (req, res) => {
 // recover-account
 router.post("/app/recover-account", async (req, res) => {
   const { user, seed } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeUsername(user);
   const S = normalizeFormValue(seed);
   if (!U || !S) return res.status(400).send({ auth: "invalid request" });
 
   try {
-    if (!(await verifyUserSeed(U, S))) {
+    const rows = await db.queryAsync(
+      "SELECT email,seed FROM auths WHERE username=? LIMIT 1",
+      [U],
+    );
+    if (!rows.length || !(await verifySecret(rows[0].seed, S))) {
       return res.send({ auth: "incorrect" });
     }
 
-    const newPasswordHash = await hashSecret("123456");
-    await db.queryAsync("UPDATE auths SET password=? WHERE username=?", [
-      newPasswordHash,
+    const issue = await issueTemporaryPassword(
       U,
-    ]);
-    res.send({ auth: "updated" });
+      rows[0].email,
+      "OneX account recovery – temporary password",
+      "If you did not request this recovery, contact OneX support immediately.",
+    );
+    if (!issue.ok) {
+      const messages = {
+        email_unavailable: "recovery email unavailable",
+        account_not_found: "account not found",
+        email_changed: "recovery email unavailable",
+        temporary_password_active: "recovery already in progress",
+      };
+      return res.send({ auth: messages[issue.reason] || "error" });
+    }
+    return res.send({ auth: "recovery email sent", expires_in: issue.expiresInSeconds });
   } catch (error) {
-    console.error("Account recovery failed:", error);
-    res.send({ auth: "error" });
+    console.error("Account recovery failed:", error.message);
+    return res.send({ auth: "error" });
   }
 });
 
 // modify-seed
 router.post("/app/modify-seed", async (req, res) => {
   const { user, pswd, seed, tkn } = req.body || {};
-  const U = normalizeFormValue(user);
+  const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   const S = normalizeFormValue(seed);
 
@@ -2160,16 +2422,24 @@ router.post("/app/modify-seed", async (req, res) => {
   if (!S) return res.status(400).send({ auth: "invalid seed" });
 
   try {
-    if (!(await verifyUserPassword(U, P))) {
-      return res.send({ auth: "incorrect" });
-    }
+    const result = await withTransaction(async (tx) => {
+      const [rows] = await tx.query(
+        `SELECT password,consec_failed_auth,password_temp_expires_at_ms
+         FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
+        [U],
+      );
+      if (!rows.length) return { auth: "incorrect" };
+      if (isPasswordProtectedActivityLocked({
+        failedCount: Number(rows[0].consec_failed_auth || 0),
+        temporaryPasswordExpiresAtMs: rows[0].password_temp_expires_at_ms,
+      })) return { auth: "not allowed" };
+      if (!(await verifySecret(rows[0].password, P))) return { auth: "incorrect" };
 
-    const seedHash = await hashSecret(S);
-    await db.queryAsync("UPDATE auths SET seed=? WHERE username=?", [
-      seedHash,
-      U,
-    ]);
-    res.send({ auth: "updated" });
+      const seedHash = await hashSecret(S);
+      await tx.query("UPDATE auths SET seed=? WHERE username=?", [seedHash, U]);
+      return { auth: "updated" };
+    });
+    res.send(result);
   } catch (error) {
     console.error("Seed update failed:", error);
     res.send({ auth: "not exists" });
@@ -2177,6 +2447,49 @@ router.post("/app/modify-seed", async (req, res) => {
 });
 
 // ----- ADMIN POSTS -----
+// send-temp-pswd
+router.post("/admin/send-temp-pswd", async (req, res) => {
+  const { pswd, pin, user } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) {
+    return res.send({ auth: "incorrect" });
+  }
+
+  const U = normalizeUsername(user);
+  if (!U) return res.status(400).send({ auth: "invalid user" });
+
+  try {
+    const rows = await db.queryAsync(
+      "SELECT email FROM auths WHERE username=? LIMIT 1",
+      [U],
+    );
+    if (!rows.length) return res.send({ auth: "user not found" });
+
+    const issue = await issueTemporaryPassword(
+      U,
+      rows[0].email,
+      "OneX temporary account password",
+      "This temporary password was issued by OneX support. If you did not request assistance, contact OneX support immediately.",
+    );
+    if (!issue.ok) {
+      const messages = {
+        email_unavailable: "email unavailable",
+        account_not_found: "user not found",
+        email_changed: "email changed; retry with the current account email",
+        temporary_password_active: "temporary password already active",
+      };
+      return res.send({ auth: messages[issue.reason] || "error" });
+    }
+
+    return res.send({ auth: "temporary password sent", expires_in: issue.expiresInSeconds });
+  } catch (error) {
+    console.error("Admin temporary-password issuance failed:", error.message);
+    return res.send({ auth: "error" });
+  }
+});
+
 // set-user-status
 router.post("/admin/set-user-status", async (req, res) => {
   const { pswd, pin, user, status } = req.body;
@@ -2195,27 +2508,6 @@ router.post("/admin/set-user-status", async (req, res) => {
       user,
     ]);
     res.send({ account: "updated" });
-  } catch {
-    res.send({ error: "error" });
-  }
-});
-
-// add-to-feed
-router.post("/admin/add-to-feed", async (req, res) => {
-  const { pswd, pin, content } = req.body;
-  if (
-    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
-    pin !== decrypt(admin_pin, DB_CONFIG.password)
-  )
-    return res.send({ auth: "incorrect" });
-
-  const [date, time] = getDate();
-  try {
-    await db.queryAsync(
-      "INSERT INTO notifs(content,record_date,record_time) VALUES(?,?,?)",
-      [content.replaceAll(" ", "&nbsp;"), date, time],
-    );
-    res.send({ notif: "added" });
   } catch {
     res.send({ error: "error" });
   }
@@ -2242,7 +2534,7 @@ router.post("/admin/update-user-or-common-stock", async (req, res) => {
 
   const [date, time] = getDate();
   const isUserTopUp = user.includes("-");
-  const U = isUserTopUp ? user.toUpperCase().replaceAll(" ", "+") : null;
+  const U = isUserTopUp ? normalizeUsername(user) : null;
 
   try {
     const result = await withTransaction(async (tx) => {
@@ -2314,7 +2606,7 @@ async function initializeRechargePayments() {
     if (String(process.env.USDT_SWEEP_IN_MAIN_PROCESS || "false").toLowerCase() === "true") {
       startDepositSweeper(db);
     }
-    startUsdtPaymentWatcher(db, processConfirmedUsdtPayment, notifyPendingRechargeCases);
+    startUsdtPaymentWatcher(db, processConfirmedUsdtPayment, processRechargeBatchQueue);
   }
   return providerInfo;
 }

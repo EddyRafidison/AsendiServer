@@ -128,11 +128,9 @@ function createTxId(sender) {
     .digest("hex");
 }
 function getUserPrefixName(fullname) {
-  return fullname.includes("+")
-    ? fullname.split("+").pop()
-    : fullname.includes("%20")
-      ? fullname.split("%20").pop()
-      : fullname;
+  if (typeof fullname !== "string") return "";
+  const parts = fullname.trim().split(/\s+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
 }
 function transliterateUserText(value) {
   if (typeof value !== "string") {

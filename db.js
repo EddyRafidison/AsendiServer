@@ -64,9 +64,16 @@ const TABLES = [
     address VARCHAR(100) NOT NULL,
     seed TEXT NOT NULL,
     status INT NOT NULL DEFAULT 1,
+    consec_failed_auth INT UNSIGNED NOT NULL DEFAULT 0,
+    password_temp_expires_at_ms BIGINT UNSIGNED NULL,
+    tg_userId VARCHAR(32) NULL,
+    tg_chat_id VARCHAR(32) NULL,
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL,
-    UNIQUE KEY uq_auths_username(username)
+    UNIQUE KEY uq_auths_username(username),
+    UNIQUE KEY uq_auths_tg_user_id(tg_userId),
+    UNIQUE KEY uq_auths_tg_chat_id(tg_chat_id),
+    KEY idx_auths_failed_auth(consec_failed_auth)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_stock(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -92,12 +99,6 @@ const TABLES = [
     KEY idx_activities_recharge_user(sender,receiver,type,record_date,record_time,id),
     KEY idx_activities_sender_type(sender,type,id)
   ) ENGINE=InnoDB`,
-  `CREATE TABLE IF NOT EXISTS notifs(
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    content TEXT,
-    record_date INT,
-    record_time CHAR(6)
-  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS common(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     total_units_price DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -109,6 +110,38 @@ const TABLES = [
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS system_locks(
     lock_name VARCHAR(64) PRIMARY KEY
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS telegram_link_challenges(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(30) NOT NULL,
+    token_hash CHAR(64) NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    expires_at_ms BIGINT UNSIGNED NOT NULL,
+    used_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_telegram_link_token_hash(token_hash),
+    KEY idx_telegram_link_user(username,expires_at_ms,used_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS telegram_outbox(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    event_key VARCHAR(191) NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    chat_id VARCHAR(32) NOT NULL,
+    message_text TEXT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    next_attempt_at_ms BIGINT UNSIGNED NOT NULL,
+    claimed_at_ms BIGINT UNSIGNED NULL,
+    last_error TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    sent_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_telegram_outbox_event(event_key),
+    KEY idx_telegram_outbox_due(status,next_attempt_at_ms,id),
+    KEY idx_telegram_outbox_user(username,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS telegram_bot_state(
+    state_key VARCHAR(64) PRIMARY KEY,
+    state_value BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    updated_at_ms BIGINT UNSIGNED NOT NULL
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_deposit_wallets(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -146,11 +179,6 @@ const TABLES = [
     credited_at_ms BIGINT UNSIGNED NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
-    email_status VARCHAR(16) NOT NULL DEFAULT 'not_required',
-    email_attempts INT UNSIGNED NOT NULL DEFAULT 0,
-    email_last_attempt_ms BIGINT UNSIGNED NULL,
-    email_last_error TEXT NULL,
-    email_sent_at_ms BIGINT UNSIGNED NULL,
     KEY idx_deposit_batches_user_status(username,status,id),
     KEY idx_deposit_batches_due(status,expires_at_ms,release_at_ms,next_attempt_at_ms),
     KEY idx_deposit_batches_wallet(deposit_wallet_id,opened_at_ms)
@@ -171,17 +199,11 @@ const TABLES = [
     block_timestamp_ms BIGINT UNSIGNED NOT NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'detected',
     reason_codes TEXT NULL,
-    email_status VARCHAR(16) NOT NULL DEFAULT 'not_required',
-    email_attempts INT UNSIGNED NOT NULL DEFAULT 0,
-    email_last_attempt_ms BIGINT UNSIGNED NULL,
-    email_last_error TEXT NULL,
-    email_sent_at_ms BIGINT UNSIGNED NULL,
     swept_at_ms BIGINT UNSIGNED NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     UNIQUE KEY uq_usdt_transfer_event(tx_hash,log_index),
     KEY idx_usdt_transfer_user_status(username,status,id),
     KEY idx_usdt_transfer_batch(batch_id,status,id),
-    KEY idx_usdt_transfer_email(status,email_status,email_attempts,id),
     KEY idx_usdt_transfer_sweep(deposit_address,swept_at_ms,status),
     KEY idx_usdt_transfer_block(block_number)
   ) ENGINE=InnoDB`,
@@ -281,7 +303,8 @@ async function assertLatestSchema() {
   const requiredColumns = {
     auths: [
       "username", "password", "name", "email", "birthdate", "cni", "address",
-      "seed", "status", "record_date", "record_time",
+      "seed", "status", "consec_failed_auth", "password_temp_expires_at_ms",
+      "tg_userId", "tg_chat_id", "record_date", "record_time",
     ],
     users_stock: [
       "username", "balance", "init_asset", "record_date", "record_time",
@@ -290,7 +313,14 @@ async function assertLatestSchema() {
       "sender", "receiver", "type", "amount", "unit_price", "fees", "reference",
       "record_date", "record_time",
     ],
-    notifs: ["content", "record_date", "record_time"],
+    telegram_link_challenges: [
+      "username", "token_hash", "created_at_ms", "expires_at_ms", "used_at_ms",
+    ],
+    telegram_outbox: [
+      "event_key", "username", "chat_id", "message_text", "status", "attempts",
+      "next_attempt_at_ms", "claimed_at_ms", "last_error", "created_at_ms", "sent_at_ms",
+    ],
+    telegram_bot_state: ["state_key", "state_value", "updated_at_ms"],
     common: [
       "total_units_price", "unit_price", "backed_units", "inactive_init_asset",
       "record_date", "record_time",
@@ -304,14 +334,12 @@ async function assertLatestSchema() {
       "username", "deposit_wallet_id", "deposit_address", "opened_at_ms", "expires_at_ms",
       "total_amount", "total_amount_raw", "transfer_count", "status", "pending_since_ms",
       "release_at_ms", "next_attempt_at_ms", "reason_codes", "credited_at_ms", "created_at_ms",
-      "updated_at_ms", "email_status", "email_attempts", "email_last_attempt_ms",
-      "email_last_error", "email_sent_at_ms",
+      "updated_at_ms",
     ],
     users_usdt_transfer_events: [
       "username", "deposit_wallet_id", "batch_id", "deposit_address", "from_address", "amount",
       "amount_raw", "tx_hash", "log_index", "block_number", "block_hash", "block_timestamp_ms",
-      "status", "reason_codes", "email_status", "email_attempts", "email_last_attempt_ms",
-      "email_last_error", "email_sent_at_ms", "swept_at_ms", "created_at_ms",
+      "status", "reason_codes", "swept_at_ms", "created_at_ms",
     ],
     users_usdt_sweeps: [
       "deposit_wallet_id", "deposit_address", "snapshot_block", "amount_raw", "fund_raw_tx",
@@ -367,6 +395,10 @@ async function initDbIfEmpty() {
     "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?),(?),(?)",
     ["common_state", "deposit_wallet_index", "onex_bsc_disbursement_worker", "onex_bsc_sweeper_global"],
   );
+  await db.queryAsync(
+    "INSERT IGNORE INTO telegram_bot_state(state_key,state_value,updated_at_ms) VALUES('update_offset',0,?)",
+    [String(Date.now())],
+  );
 
   const stockRows = await db.queryAsync("SELECT id FROM users_stock WHERE username=? LIMIT 1", [OneX]);
   if (!stockRows.length) {
@@ -391,7 +423,15 @@ async function cleanup() {
   const [cutoffDate] = getDateBefore(90);
   try {
     // Financial ledgers and blockchain evidence are never deleted by routine cleanup.
-    await db.queryAsync("DELETE FROM notifs WHERE record_date < ?", [cutoffDate]);
+    // Sent Telegram delivery rows are transient queue records, not notification history.
+    await db.queryAsync(
+      "DELETE FROM telegram_outbox WHERE status IN ('sent','skipped','failed') AND created_at_ms<?",
+      [String(Date.now() - 14 * 24 * 60 * 60 * 1000)],
+    );
+    await db.queryAsync(
+      "DELETE FROM telegram_link_challenges WHERE expires_at_ms<? OR used_at_ms IS NOT NULL",
+      [String(Date.now() - 24 * 60 * 60 * 1000)],
+    );
   } catch (error) {
     console.error("Database cleanup failed:", error.message);
   }
