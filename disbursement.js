@@ -13,6 +13,14 @@ const { deriveInitAsset } = require("./stock-accounting");
 const { calculateDisbursementReserveSettlement } = require("./disbursement-policy");
 const { getDate } = require("./utils");
 const { queueTelegramMessageTx } = require("./telegram");
+const { getLatestCommonTx, insertCommonSnapshotTx } = require("./common-accounting");
+const {
+  getConfiguredBnbUsdPrice,
+  calculateEstimatedGasFee,
+  recordEstimatedBscFeeTx,
+  recordActualBscFeeTx,
+} = require("./bsc-fee-accounting");
+const { calculateSellerPayoutNet } = require("./seller-accounting");
 
 const CHAIN_ID = 56n;
 const TOKEN_DECIMALS = 18n;
@@ -44,8 +52,11 @@ function requiredAddress(value, label) {
 function makeRuntime() {
   if (runtime) return runtime;
 
-  if (String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() !== "true") {
-    return null;
+  const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
+  const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
+  if (!disbursementsEnabled && !sellerPayoutsEnabled) return null;
+  if (!getConfiguredBnbUsdPrice().isGreaterThan(0)) {
+    throw new Error("BNB_USD_PRICE must be set to a positive captured BNB/USD quote before treasury payouts are enabled.");
   }
 
   const privateKey = String(process.env.BSC_DISBURSEMENT_PRIVATE_KEY || "").trim();
@@ -154,12 +165,21 @@ async function checkTreasuryLiquidity(amountRaw) {
     const gasPrice = feeData.gasPrice || BigInt(await provider.send("eth_gasPrice", []));
     const bnbBalance = await provider.getBalance(treasuryAddress);
     const gasRequired = gasLimit * gasPrice;
+    const bnbUsdPrice = getConfiguredBnbUsdPrice();
+    if (!bnbUsdPrice.isGreaterThan(0)) {
+      throw new Error("BNB_USD_PRICE must be positive so BSC gas recovery can be calculated.");
+    }
+    const estimatedFee = calculateEstimatedGasFee(gasLimit.toString(), gasPrice.toString(), bnbUsdPrice);
     return {
       available: tokenBalance >= amount && bnbBalance >= gasRequired,
       tokenBalanceRaw: tokenBalance.toString(),
       requiredTokenRaw: amount.toString(),
       bnbBalanceWei: bnbBalance.toString(),
       requiredBnbWei: gasRequired.toString(),
+      gasPriceWei: gasPrice.toString(),
+      estimatedFeeBnb: estimatedFee.feeBnb.toFixed(30),
+      estimatedFeeUsd: estimatedFee.feeUsd.toFixed(18),
+      bnbUsdPrice: bnbUsdPrice.toFixed(12),
     };
   } finally {
     await provider.destroy();
@@ -300,6 +320,24 @@ async function signQueuedJob(db, job, activeRuntime) {
   if (result.affectedRows !== 1) {
     throw new Error("The disbursement job was claimed or updated concurrently.");
   }
+  const estimate = calculateEstimatedGasFee(
+    activeRuntime.gasLimit.toString(),
+    gasPrice.toString(),
+    getConfiguredBnbUsdPrice(),
+  );
+  await withTransaction(db, async (tx) => {
+    await recordEstimatedBscFeeTx(tx, {
+      txHash: transactionHash,
+      operation: "system_disbursement",
+      gasLimit: activeRuntime.gasLimit.toString(),
+      gasPriceWei: gasPrice.toString(),
+      bnbUsdPrice: estimate.bnbUsdPrice,
+    });
+    await tx.query(
+      "UPDATE users_usdt_disbursements SET estimated_fee_bnb=?,estimated_fee_usd=? WHERE id=? AND tx_hash=?",
+      [estimate.feeBnb.toFixed(30), estimate.feeUsd.toFixed(18), job.id, transactionHash],
+    );
+  });
   return true;
 }
 
@@ -312,14 +350,25 @@ async function markSubmitted(db, jobId, transactionHash) {
   );
 }
 
-async function markManualReview(db, jobId, message) {
+async function markManualReview(db, jobId, message, receipt = null) {
   return withTransaction(db, async (tx) => {
     const [rows] = await tx.query(
-      "SELECT username,status FROM users_usdt_disbursements WHERE id=? LIMIT 1 FOR UPDATE",
+      "SELECT username,status,tx_hash FROM users_usdt_disbursements WHERE id=? LIMIT 1 FOR UPDATE",
       [jobId],
     );
     if (!rows.length || rows[0].status === "manual_review") return;
     const username = rows[0].username;
+    if (receipt && rows[0].tx_hash) {
+      const actualFee = await recordActualBscFeeTx(tx, {
+        txHash: rows[0].tx_hash,
+        operation: "system_disbursement",
+        receipt,
+      });
+      await tx.query(
+        "UPDATE users_usdt_disbursements SET actual_fee_bnb=?,actual_fee_usd=? WHERE id=?",
+        [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), jobId],
+      );
+    }
     const now = String(Date.now());
     const [update] = await tx.query(
       `UPDATE users_usdt_disbursements
@@ -345,14 +394,26 @@ async function markManualReview(db, jobId, message) {
   });
 }
 
-async function restoreUserBalanceAfterFailedPayout(db, jobId, message) {
+async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) {
   return withTransaction(db, async (tx) => {
     const [preRows] = await tx.query(
-      "SELECT username FROM users_usdt_disbursements WHERE id=? LIMIT 1",
+      "SELECT * FROM users_usdt_disbursements WHERE id=? LIMIT 1",
       [jobId],
     );
     if (preRows.length === 0) return;
-    const username = preRows[0].username;
+    const payoutSnapshot = preRows[0];
+    const username = payoutSnapshot.username;
+    if (receipt && payoutSnapshot.tx_hash) {
+      const actualFee = await recordActualBscFeeTx(tx, {
+        txHash: payoutSnapshot.tx_hash,
+        operation: "system_disbursement",
+        receipt,
+      });
+      await tx.query(
+        "UPDATE users_usdt_disbursements SET actual_fee_bnb=?,actual_fee_usd=? WHERE id=?",
+        [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), jobId],
+      );
+    }
 
     const [authRows] = await tx.query(
       "SELECT username FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
@@ -424,7 +485,7 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message) {
   });
 }
 
-async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
+async function finalizeSuccessfulPayout(db, jobId, receipt) {
   return withTransaction(db, async (tx) => {
     const [preRows] = await tx.query(
       "SELECT username FROM users_usdt_disbursements WHERE id=? LIMIT 1",
@@ -449,6 +510,15 @@ async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
     if (jobRows.length === 0) throw new Error(`Disbursement ${jobId} disappeared.`);
     const job = jobRows[0];
     if (job.status === "confirmed") return { confirmed: true };
+    const actualFee = await recordActualBscFeeTx(tx, {
+      txHash: job.tx_hash,
+      operation: "system_disbursement",
+      receipt,
+    });
+    await tx.query(
+      "UPDATE users_usdt_disbursements SET actual_fee_bnb=?,actual_fee_usd=? WHERE id=?",
+      [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), jobId],
+    );
 
     if (!authRows.length || !userStockRows.length) {
       const reviewReason = "The payout was confirmed on-chain, but the OneX account or stock row is missing.";
@@ -494,13 +564,7 @@ async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
     );
     if (commonLockRows.length === 0) throw new Error("The common-state lock row is missing.");
 
-    const [commonRows] = await tx.query(
-      `SELECT total_units_price,unit_price,backed_units,inactive_init_asset
-       FROM common ORDER BY id DESC LIMIT 1 FOR UPDATE`,
-    );
-    if (commonRows.length === 0) throw new Error("The common reserve is missing.");
-
-    const common = commonRows[0];
+    const common = await getLatestCommonTx(tx, true);
     const total = new BigNumber(common.total_units_price);
     const unitPrice = new BigNumber(common.unit_price);
     const backed = new BigNumber(common.backed_units);
@@ -545,8 +609,8 @@ async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
       {
         payoutAmount,
         soldInitAsset: soldInitialAssets,
-        feeInactiveInitAsset: feeInitialAssets.dividedBy(4),
-        feeBackedInitAsset: feeInitialAssets.multipliedBy(3).dividedBy(4),
+        feeInactiveInitAsset: feeInitialAssets.dividedBy(2),
+        feeBackedInitAsset: feeInitialAssets.dividedBy(2),
       },
     );
     const newTotal = reserveSettlement.newTotalUnitsPrice;
@@ -568,11 +632,16 @@ async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
       "UPDATE users_stock SET balance=?,init_asset=?,record_date=?,record_time=? WHERE username='ONEX'",
       [newSystemBalance.toFixed(), newSystemInitAsset.toFixed(), date, time],
     );
-    await tx.query(
-      `INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,record_date,record_time)
-       VALUES(?,?,?,?,?,?)`,
-      [newTotal.toFixed(), unitPrice.toFixed(), newBacked.toFixed(), newInactive.toFixed(), date, time],
-    );
+    const commonShareTotal = new BigNumber(common.total_common_share || "0");
+    const adminFeesTotal = new BigNumber(common.total_admin_fees || "0");
+    await insertCommonSnapshotTx(tx, common, {
+      total_units_price: newTotal.toFixed(),
+      unit_price: unitPrice.toFixed(),
+      backed_units: newBacked.toFixed(),
+      inactive_init_asset: newInactive.toFixed(),
+      total_common_share: commonShareTotal.plus(new BigNumber(job.fee_amount).dividedBy(2)).toFixed(),
+      total_admin_fees: adminFeesTotal.plus(new BigNumber(job.fee_amount).dividedBy(2)).toFixed(),
+    }, date, time);
 
     const [existingActivityRows] = await tx.query(
       "SELECT id FROM activities WHERE reference=? LIMIT 1",
@@ -591,11 +660,12 @@ async function finalizeSuccessfulPayout(db, jobId, blockNumber) {
       `UPDATE users_usdt_disbursements
        SET status='confirmed',block_number=?,last_error=NULL,confirmed_at_ms=?,updated_at_ms=?
        WHERE id=?`,
-      [String(blockNumber), confirmedAt, confirmedAt, jobId],
+      [String(receipt.blockNumber), confirmedAt, confirmedAt, jobId],
     );
     await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:confirmed`, [
       "OneX Disbursement Update",
       "Your sale to OneX has been completed and the BSC-USD payment is confirmed.",
+      `Actual BSC gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD).`,
       `Gross amount: ${grossBalance.toFixed(8)} One-Val`,
       `Fees: ${new BigNumber(job.fee_amount).toFixed(8)} One-Val`,
       `Amount paid: ${payoutAmount.toFixed(8)} BSC-USD`,
@@ -699,6 +769,7 @@ async function processOneJob(db, job, activeRuntime) {
       db,
       job.id,
       "The BSC-USD transfer transaction was mined, remained canonical and failed after the configured finality depth.",
+      receipt,
     );
     return;
   }
@@ -708,6 +779,7 @@ async function processOneJob(db, job, activeRuntime) {
       db,
       job.id,
       "The transaction succeeded on-chain but its receipt does not contain the expected BSC-USD Transfer event.",
+      receipt,
     );
     return;
   }
@@ -728,7 +800,248 @@ async function processOneJob(db, job, activeRuntime) {
     return;
   }
 
-  await finalizeSuccessfulPayout(db, job.id, receipt.blockNumber);
+  await finalizeSuccessfulPayout(db, job.id, receipt);
+}
+
+
+async function signQueuedSellerPayout(db, job, activeRuntime) {
+  const payoutAddress = requiredAddress(job.payout_address, "Seller payout address");
+  if (payoutAddress.toLowerCase() === activeRuntime.treasuryAddress.toLowerCase()) {
+    throw new Error("A seller payout cannot be sent to the OneX treasury address.");
+  }
+  const gross = new BigNumber(job.gross_amount);
+  if (!gross.isFinite() || !gross.isGreaterThan(0)) throw new Error("Invalid seller payout gross amount.");
+
+  const feeData = await activeRuntime.provider.getFeeData();
+  const gasPrice = feeData.gasPrice || BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
+  const bnbUsdPrice = getConfiguredBnbUsdPrice();
+  if (!bnbUsdPrice.isGreaterThan(0)) {
+    throw new Error("BNB_USD_PRICE must be configured to recover the seller's BSC gas cost.");
+  }
+  const estimatedFee = calculateEstimatedGasFee(
+    activeRuntime.gasLimit.toString(),
+    gasPrice.toString(),
+    bnbUsdPrice,
+  );
+  const { payoutAmount } = calculateSellerPayoutNet(gross, estimatedFee.feeUsd);
+  const amountRawDecimal = payoutAmount.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN);
+  if (!amountRawDecimal.isGreaterThan(0)) throw new Error("Seller payout is too small after BSC gas recovery.");
+  const amountRaw = BigInt(amountRawDecimal.toFixed(0));
+  const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
+  if (tokenBalance < amountRaw) throw new Error("The OneX treasury has insufficient BSC-USD for seller payouts.");
+  const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
+  if (nativeBalance < activeRuntime.gasLimit * gasPrice) {
+    throw new Error("The OneX treasury has insufficient BNB for the seller payout gas.");
+  }
+
+  const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
+  const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
+  const rawTransaction = await activeRuntime.signer.signTransaction({
+    type: 0,
+    chainId: Number(CHAIN_ID),
+    nonce,
+    to: activeRuntime.tokenAddress,
+    value: 0n,
+    data,
+    gasLimit: activeRuntime.gasLimit,
+    gasPrice,
+  });
+  const transactionHash = keccak256(rawTransaction);
+  const update = await db.queryAsync(
+    `UPDATE users_usdt_seller_payouts
+     SET raw_tx=?,tx_hash=?,nonce=?,gas_fee_estimated=?,payout_amount=?,amount_raw=?,bnb_usd_price=?,
+         status='signed',last_error=NULL,updated_at_ms=?
+     WHERE id=? AND status='queued' AND raw_tx IS NULL AND tx_hash IS NULL`,
+    [
+      rawTransaction,
+      transactionHash,
+      String(nonce),
+      estimatedFee.feeUsd.toFixed(18),
+      payoutAmount.toFixed(18),
+      amountRaw.toString(),
+      bnbUsdPrice.toFixed(12),
+      String(Date.now()),
+      job.id,
+    ],
+  );
+  if (update.affectedRows !== 1) return false;
+
+  await withTransaction(db, async (tx) => {
+    await recordEstimatedBscFeeTx(tx, {
+      txHash: transactionHash,
+      operation: "seller_payout",
+      gasLimit: activeRuntime.gasLimit.toString(),
+      gasPriceWei: gasPrice.toString(),
+      bnbUsdPrice,
+    });
+  });
+  return true;
+}
+
+async function finalizeSellerPayout(db, jobId, receipt, activeRuntime) {
+  return withTransaction(db, async (tx) => {
+    const [payoutRows] = await tx.query(
+      "SELECT * FROM users_usdt_seller_payouts WHERE id=? LIMIT 1 FOR UPDATE",
+      [jobId],
+    );
+    if (!payoutRows.length) throw new Error(`Seller payout ${jobId} does not exist.`);
+    const payout = payoutRows[0];
+    if (payout.status === "confirmed") return { confirmed: true };
+
+    const actualFee = await recordActualBscFeeTx(tx, {
+      txHash: payout.tx_hash,
+      operation: "seller_payout",
+      receipt,
+    });
+
+    if (Number(receipt.status) !== 1 || !receiptConfirmsExpectedTransfer(receipt, {
+      amount_raw: payout.amount_raw,
+      payout_address: payout.payout_address,
+    }, activeRuntime)) {
+      const reason = Number(receipt.status) !== 1
+        ? "The seller payout transaction was finalized but reverted on BNB Smart Chain."
+        : "The seller payout transaction succeeded but did not contain the expected BSC-USD Transfer event.";
+      await tx.query(
+        "UPDATE users_usdt_seller_payouts SET status='manual_review',last_error=?,block_number=?,updated_at_ms=? WHERE id=?",
+        [reason, String(receipt.blockNumber), String(Date.now()), jobId],
+      );
+      await tx.query(
+        "UPDATE users_usdt_seller_payout_batches SET status='manual_review',updated_at_ms=? WHERE id=?",
+        [String(Date.now()), payout.batch_id],
+      );
+      await queueTelegramMessageTx(tx, payout.username, `seller-payout:${jobId}:manual_review`, [
+        "OneX Seller Update",
+        "Your seller payout requires a support review after the BSC transaction reached finality.",
+        `Payout ID: ${jobId}`,
+        `Actual BSC gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD)`,
+        `Reason: ${reason}`,
+        "The reserved seller amount remains pending and has not been marked as paid.",
+        "Status: MANUAL REVIEW",
+      ].join("\n"));
+      return { manualReview: true };
+    }
+
+    const [allocations] = await tx.query(
+      `SELECT a.id,a.lot_id,a.amount,l.payout_pending_units,l.payout_reserved_units,l.paid_units
+       FROM users_seller_payout_allocations a
+       JOIN users_seller_reserve_lots l ON l.id=a.lot_id
+       WHERE a.payout_id=? AND a.status='reserved'
+       ORDER BY l.activated_at_ms ASC,l.id ASC
+       FOR UPDATE`,
+      [jobId],
+    );
+    if (!allocations.length) throw new Error(`Seller payout ${jobId} has no reserved lot allocations.`);
+    for (const allocation of allocations) {
+      const amount = new BigNumber(allocation.amount);
+      const pending = new BigNumber(allocation.payout_pending_units);
+      const reserved = new BigNumber(allocation.payout_reserved_units);
+      const paid = new BigNumber(allocation.paid_units);
+      if (
+        !amount.isFinite() || !amount.isGreaterThan(0) ||
+        pending.isLessThan(amount) || reserved.isLessThan(amount)
+      ) {
+        throw new Error(`Seller payout allocation ${allocation.id} exceeds its lot liability.`);
+      }
+      await tx.query(
+        `UPDATE users_seller_reserve_lots
+         SET payout_pending_units=?,payout_reserved_units=?,paid_units=?,updated_at_ms=? WHERE id=?`,
+        [pending.minus(amount).toFixed(), reserved.minus(amount).toFixed(), paid.plus(amount).toFixed(), String(Date.now()), allocation.lot_id],
+      );
+      await tx.query(
+        "UPDATE users_seller_payout_allocations SET status='paid' WHERE id=? AND status='reserved'",
+        [allocation.id],
+      );
+    }
+
+    const now = String(Date.now());
+    await tx.query(
+      `UPDATE users_usdt_seller_payouts
+       SET status='confirmed',block_number=?,actual_fee_bnb=?,actual_fee_usd=?,last_error=NULL,confirmed_at_ms=?,updated_at_ms=?
+       WHERE id=?`,
+      [String(receipt.blockNumber), actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), now, now, jobId],
+    );
+    const [openRows] = await tx.query(
+      "SELECT id FROM users_usdt_seller_payouts WHERE batch_id=? AND status<>'confirmed' LIMIT 1 FOR UPDATE",
+      [payout.batch_id],
+    );
+    if (!openRows.length) {
+      await tx.query(
+        "UPDATE users_usdt_seller_payout_batches SET status='completed',completed_at_ms=?,updated_at_ms=? WHERE id=?",
+        [now, now, payout.batch_id],
+      );
+    } else {
+      await tx.query(
+        "UPDATE users_usdt_seller_payout_batches SET status='processing',updated_at_ms=? WHERE id=?",
+        [now, payout.batch_id],
+      );
+    }
+    await queueTelegramMessageTx(tx, payout.username, `seller-payout:${jobId}:confirmed`, [
+      "OneX Seller Update",
+      "Your seller reserve payout has been transferred successfully.",
+      `Gross amount: ${new BigNumber(payout.gross_amount).toFixed(8)} BSC-USD`,
+      `BSC gas recovery: ${new BigNumber(payout.gas_fee_estimated).toFixed(8)} BSC-USD`,
+      `Net amount paid: ${new BigNumber(payout.payout_amount).toFixed(8)} BSC-USD`,
+      `Actual gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD)`,
+      `Destination: ${payout.payout_address}`,
+      `Transaction: ${payout.tx_hash}`,
+      `Payout ID: ${jobId}`,
+      "Status: CONFIRMED",
+    ].join("\n"));
+    return { confirmed: true };
+  });
+}
+
+async function processOneSellerPayout(db, job, activeRuntime) {
+  if (job.status === "queued") {
+    try {
+      await signQueuedSellerPayout(db, job, activeRuntime);
+    } catch (error) {
+      await db.queryAsync(
+        "UPDATE users_usdt_seller_payouts SET last_error=?,updated_at_ms=? WHERE id=? AND status='queued'",
+        [String(error.message || error).slice(0, 2000), String(Date.now()), job.id],
+      );
+      return;
+    }
+    const freshRows = await db.queryAsync("SELECT * FROM users_usdt_seller_payouts WHERE id=? LIMIT 1", [job.id]);
+    if (!freshRows.length) return;
+    job = freshRows[0];
+  }
+  if (!job.raw_tx || !job.tx_hash) return;
+
+  let receipt = await activeRuntime.provider.getTransactionReceipt(job.tx_hash);
+  if (!receipt) {
+    const known = await activeRuntime.provider.getTransaction(job.tx_hash);
+    if (!known) {
+      try {
+        const broadcast = await activeRuntime.provider.broadcastTransaction(job.raw_tx);
+        if (broadcast.hash.toLowerCase() !== job.tx_hash.toLowerCase()) {
+          throw new Error("Seller payout broadcast hash differs from the persisted transaction hash.");
+        }
+      } catch (error) {
+        const afterError = await activeRuntime.provider.getTransaction(job.tx_hash);
+        if (!afterError) {
+          await db.queryAsync(
+            "UPDATE users_usdt_seller_payouts SET last_error=?,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')",
+            [String(error.message || error).slice(0, 2000), String(Date.now()), job.id],
+          );
+          return;
+        }
+      }
+    }
+    await db.queryAsync(
+      "UPDATE users_usdt_seller_payouts SET status='submitted',last_error=NULL,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')",
+      [String(Date.now()), job.id],
+    );
+    receipt = await activeRuntime.provider.getTransactionReceipt(job.tx_hash);
+    if (!receipt) return;
+  }
+  const canonicalBlock = await activeRuntime.provider.getBlock(receipt.blockNumber);
+  const latestBlock = await activeRuntime.provider.getBlockNumber();
+  const confirmations = latestBlock - Number(receipt.blockNumber) + 1;
+  if (!canonicalBlock || String(canonicalBlock.hash || "").toLowerCase() !== String(receipt.blockHash || "").toLowerCase() || confirmations < activeRuntime.confirmations) {
+    return;
+  }
+  await finalizeSellerPayout(db, job.id, receipt, activeRuntime);
 }
 
 async function markRefundError(db, refundId, error) {
@@ -740,7 +1053,7 @@ async function markRefundError(db, refundId, error) {
   );
 }
 
-async function finalizeRefund(db, refundId, blockNumber) {
+async function finalizeRefund(db, refundId, receipt) {
   return withTransaction(db, async (tx) => {
     const [preRows] = await tx.query(
       "SELECT batch_id FROM users_usdt_refunds WHERE id=? LIMIT 1", [refundId],
@@ -756,6 +1069,15 @@ async function finalizeRefund(db, refundId, blockNumber) {
     if (!refundRows.length) throw new Error(`Refund ${refundId} disappeared.`);
     const refund = refundRows[0];
     if (refund.status === "confirmed") return { confirmed: true };
+    const actualFee = await recordActualBscFeeTx(tx, {
+      txHash: refund.tx_hash,
+      operation: "refund",
+      receipt,
+    });
+    await tx.query(
+      "UPDATE users_usdt_refunds SET actual_fee_bnb=?,actual_fee_usd=? WHERE id=?",
+      [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), refundId],
+    );
     if (!batchRows.length || batchRows[0].status !== "refund_queued") {
       const reviewReason = "The refund was confirmed on-chain but its recharge batch is not in refund_queued state.";
       await tx.query(
@@ -776,7 +1098,7 @@ async function finalizeRefund(db, refundId, blockNumber) {
       `UPDATE users_usdt_refunds
        SET status='confirmed',block_number=?,last_error=NULL,confirmed_at_ms=?,updated_at_ms=?
        WHERE id=?`,
-      [String(blockNumber), now, now, refundId],
+      [String(receipt.blockNumber), now, now, refundId],
     );
     await tx.query(
       "UPDATE users_usdt_deposit_batches SET status='refunded',updated_at_ms=? WHERE id=? AND status='refund_queued'",
@@ -795,7 +1117,10 @@ async function finalizeRefund(db, refundId, blockNumber) {
     await queueTelegramMessageTx(tx, refund.username, `refund:${refundId}:confirmed`, [
       "OneX Refund Update",
       "Your BSC-USD refund has been transferred successfully.",
-      `Amount: ${new BigNumber(refund.amount).toFixed(8)} BSC-USD`,
+      `Gross amount: ${new BigNumber(refund.gross_amount || refund.amount).toFixed(8)} BSC-USD`,
+      `BSC gas recovery: ${new BigNumber(refund.fee_amount || 0).toFixed(8)} BSC-USD`,
+      `Net amount: ${new BigNumber(refund.amount).toFixed(8)} BSC-USD`,
+      `Actual gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD)`,
       `Destination: ${refund.payout_address}`,
       `Transaction: ${refund.tx_hash}`,
       `Refund ID: ${refundId}`,
@@ -841,6 +1166,24 @@ async function processOneRefundJob(db, job, activeRuntime) {
       [rawTransaction, transactionHash, String(nonce), String(Date.now()), job.id],
     );
     if (update.affectedRows !== 1) return;
+    const estimate = calculateEstimatedGasFee(
+      activeRuntime.gasLimit.toString(),
+      gasPrice.toString(),
+      getConfiguredBnbUsdPrice(),
+    );
+    await withTransaction(db, async (tx) => {
+      await recordEstimatedBscFeeTx(tx, {
+        txHash: transactionHash,
+        operation: "refund",
+        gasLimit: activeRuntime.gasLimit.toString(),
+        gasPriceWei: gasPrice.toString(),
+        bnbUsdPrice: estimate.bnbUsdPrice,
+      });
+      await tx.query(
+        "UPDATE users_usdt_refunds SET estimated_fee_bnb=?,estimated_fee_usd=?,bnb_usd_price=? WHERE id=? AND tx_hash=?",
+        [estimate.feeBnb.toFixed(30), estimate.feeUsd.toFixed(18), estimate.bnbUsdPrice.toFixed(12), job.id, transactionHash],
+      );
+    });
     job = { ...job, raw_tx: rawTransaction, tx_hash: transactionHash, status: "signed" };
   }
 
@@ -884,9 +1227,14 @@ async function processOneRefundJob(db, job, activeRuntime) {
   if (Number(receipt.status) !== 1) {
     await withTransaction(db, async (tx) => {
       const now = String(Date.now());
+      const actualFee = await recordActualBscFeeTx(tx, {
+        txHash: job.tx_hash,
+        operation: "refund",
+        receipt,
+      });
       await tx.query(
-        "UPDATE users_usdt_refunds SET status='failed',last_error=?,updated_at_ms=? WHERE id=?",
-        ["The refund transaction was finalized but reverted on BNB Smart Chain.", now, job.id],
+        "UPDATE users_usdt_refunds SET status='failed',actual_fee_bnb=?,actual_fee_usd=?,last_error=?,updated_at_ms=? WHERE id=?",
+        [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), "The refund transaction was finalized but reverted on BNB Smart Chain.", now, job.id],
       );
       await tx.query(
         "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=? AND status='refund_queued'",
@@ -913,9 +1261,14 @@ async function processOneRefundJob(db, job, activeRuntime) {
   if (!receiptConfirmsExpectedTransfer(receipt, job, activeRuntime)) {
     await withTransaction(db, async (tx) => {
       const now = String(Date.now());
+      const actualFee = await recordActualBscFeeTx(tx, {
+        txHash: job.tx_hash,
+        operation: "refund",
+        receipt,
+      });
       await tx.query(
-        "UPDATE users_usdt_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
-        ["The refund transaction succeeded but did not contain the expected BSC-USD Transfer event.", now, job.id],
+        "UPDATE users_usdt_refunds SET status='manual_review',actual_fee_bnb=?,actual_fee_usd=?,last_error=?,updated_at_ms=? WHERE id=?",
+        [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), "The refund transaction succeeded but did not contain the expected BSC-USD Transfer event.", now, job.id],
       );
       await tx.query(
         "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=?",
@@ -935,7 +1288,7 @@ async function processOneRefundJob(db, job, activeRuntime) {
     return;
   }
 
-  await finalizeRefund(db, job.id, receipt.blockNumber);
+  await finalizeRefund(db, job.id, receipt);
 }
 
 async function processRefundQueue(db, activeRuntime) {
@@ -962,8 +1315,11 @@ async function runDisbursementCycle(db, activeRuntime) {
     releaseLock = await acquireWorkerLock(db);
     if (!releaseLock) return;
 
-    const now = String(Date.now());
-    const expiredReservations = await db.queryAsync(
+    const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
+    const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
+    if (disbursementsEnabled) {
+      const now = String(Date.now());
+      const expiredReservations = await db.queryAsync(
       `SELECT id FROM users_usdt_disbursements
        WHERE status='queued' AND raw_tx IS NULL AND tx_hash IS NULL
          AND CAST(reservation_expires_at_ms AS UNSIGNED)<=?
@@ -990,7 +1346,22 @@ async function runDisbursementCycle(db, activeRuntime) {
         await updateJobError(db, job.id, error).catch(() => {});
       }
     }
-    await processRefundQueue(db, activeRuntime);
+      await processRefundQueue(db, activeRuntime);
+    }
+    if (sellerPayoutsEnabled) {
+      const sellerPayouts = await db.queryAsync(
+      `SELECT * FROM users_usdt_seller_payouts
+       WHERE status IN ('queued','signed','submitted')
+       ORDER BY id ASC LIMIT 20`,
+    );
+      for (const payout of sellerPayouts) {
+        try {
+          await processOneSellerPayout(db, payout, activeRuntime);
+        } catch (error) {
+          console.error(`Seller payout ${payout.id} processing failed:`, error.message);
+        }
+      }
+    }
   } catch (error) {
     console.error("OneX BSC disbursement worker failed:", error);
   } finally {
@@ -1006,8 +1377,10 @@ async function runDisbursementCycle(db, activeRuntime) {
 }
 
 async function startDisbursementWorker(db) {
-  if (String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() !== "true") {
-    console.log("OneX BSC disbursements are disabled.");
+  const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
+  const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
+  if (!disbursementsEnabled && !sellerPayoutsEnabled) {
+    console.log("OneX BSC treasury payouts are disabled.");
     return { enabled: false };
   }
   if (timer) return { enabled: true };

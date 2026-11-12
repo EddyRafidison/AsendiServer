@@ -19,7 +19,7 @@
     "test": "npm run check && node --test tests/*.test.js",
     "start": "node index.js",
     "sweep": "node sweep-worker.js",
-    "check": "node --check index.js && node --check routes.js && node --check pay.js && node --check sweep.js && node --check sweep-worker.js && node --check db.js && node --check recharge-policy.js && node --check utils.js && node --check stock-accounting.js && node --check disbursement-policy.js && node --check disbursement.js && node --check disbursement-worker.js && node --check telegram.js && node --check telegram-worker.js && node --check auth-recovery.js && node --check tests/business-rules.test.js && node --check tests/auth-recovery.test.js",
+    "check": "node --check index.js && node --check routes.js && node --check pay.js && node --check sweep.js && node --check sweep-worker.js && node --check db.js && node --check recharge-policy.js && node --check fee-policy.js && node --check common-accounting.js && node --check bsc-fee-accounting.js && node --check seller-accounting.js && node --check seller-worker.js && node --check utils.js && node --check stock-accounting.js && node --check disbursement-policy.js && node --check disbursement.js && node --check disbursement-worker.js && node --check telegram.js && node --check telegram-worker.js && node --check auth-recovery.js && node --check tests/business-rules.test.js && node --check tests/auth-recovery.test.js && node --check tests/disbursement-policy.test.js && node --check tests/reserve-allocation.test.js && node --check tests/seller-accounting.test.js && node --check tests/bsc-fee-accounting.test.js",
     "disburse": "node disbursement-worker.js",
     "telegram": "node telegram-worker.js"
   },

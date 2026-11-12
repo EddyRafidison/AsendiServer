@@ -1,156 +1,144 @@
-# OneX — règles et schéma de première mise en production
+# OneX — schéma cible et règles de première mise en production
 
-## Statut du projet
+## Statut du schéma
 
-Cette version est destinée à un projet OneX **pas encore déployé**. Elle définit directement le schéma cible. Elle ne doit pas exécuter de migration de données historiques, de `ALTER TABLE` correctif ni de backfill d'anciennes valeurs.
+Cette version est destinée à un projet OneX non encore déployé. Elle définit directement le schéma cible. Elle ne migre pas et ne remplit pas les anciennes tables. Créer une base MySQL neuve et vide. `db.js` crée les tables avec `CREATE TABLE IF NOT EXISTS`, puis vérifie les colonnes requises. Une ancienne structure ne correspondant pas au schéma cible provoque volontairement une erreur au démarrage.
 
-Créer une base MySQL neuve et vide. `db.js` crée les tables cibles avec `CREATE TABLE IF NOT EXISTS`, puis vérifie les colonnes requises. Si une ancienne structure existe déjà, le démarrage échoue avec un message indiquant que le schéma n'est pas le schéma courant.
+`STOCK_LIMIT` initialise `common.total_units_price`. `INITIAL_BACKED_UNITS` initialise `common.backed_units` uniquement lors de la création initiale. La valeur par défaut est zéro. Ne renseigner que les actifs initiaux réellement disponibles. La réserve système non distribuable est fixée à `STOCK_LIMIT * SYSTEM_RESERVE_RATIO` (20 % par défaut). Aucune réserve n'est provisionnée automatiquement.
 
-`STOCK_LIMIT` initialise `common.total_units_price`. `INITIAL_BACKED_UNITS` initialise `common.backed_units` lors du premier démarrage uniquement. La valeur par défaut est zéro : configure uniquement la réserve initiale réellement disponible avant d'activer les paiements. Elle ne peut pas dépasser `STOCK_LIMIT`. Aucune réserve n'est inventée ou automatiquement provisionnée.
+## Conventions comptables
 
-## Actif et conventions
-
-- Token réseau accepté : Binance-Peg BSC-USD, contrat `0x55d398326f99059fF775485246999027B3197955`, BNB Smart Chain mainnet, chain ID 56, 18 décimales.
-- Ce token n'est pas un USDt directement émis par Tether.
-- Équivalence opérationnelle : 1 One-Val = 1 BSC-USD reçu/payé.
-- `users_stock.balance` : One-Val direct.
+- Réseau : BNB Smart Chain mainnet, chain ID 56.
+- Token : Binance-Peg BSC-USD, contrat `0x55d398326f99059fF775485246999027B3197955`, 18 décimales. Ce n'est pas un USDt directement émis par Tether.
+- Équivalence opérationnelle : 1 One-Val = 1 BSC-USD.
+- `users_stock.balance` : solde One-Val direct.
 - `users_stock.init_asset` : base en actifs initiaux.
-- `activities.amount` et `activities.fees` : actifs initiaux, selon la convention de chaque opération.
-- `activities.unit_price` : prix retenu pour l'opération.
+- `users_stock` ne possède pas de `unit_price` individuel.
+- `activities.amount` et `activities.fees` suivent la dénomination définie par l'opération; `activities.unit_price` enregistre le prix de conversion utilisé.
 - `common.total_units_price` : valeur en One-Val.
-- `common.unit_price` : prix courant de l'actif initial.
-- `common.backed_units` et `common.inactive_init_asset` : réserves en actifs initiaux.
-- Plafond de stock utilisateur : 300 One-Val.
+- `common.backed_units`, `common.inactive_init_asset` et `common.sellers_init_asset` : actifs initiaux.
+- `common.sellers_res` : One-Val réservé aux vendeurs.
+- Les calculs financiers utilisent `BigNumber`, jamais l'arithmétique flottante JavaScript.
+- Toutes les dates et heures nouvellement écrites par le serveur sont en UTC.
 
-## Recharges automatiques
+## Recharges et dépôts
 
-L'utilisateur n'ouvre pas de commande avant d'envoyer les tokens. Le scanner détecte un événement `Transfer` finalisé sur l'adresse de dépôt OneX unique de l'utilisateur et ouvre automatiquement un batch.
+Chaque compte possède une adresse individuelle de dépôt BSC-USD. Le scanner détecte les événements `Transfer` finalisés, attribue le paiement à l'adresse du compte et ouvre automatiquement un batch. Les transferts sont identifiés par transaction hash et log index. Un batch regroupe tous les transferts reçus pendant les 60 minutes suivant le premier événement finalisé; aucun maximum arbitraire de deux transferts ne s'applique.
 
-Le batch regroupe les transferts reçus pendant les 60 minutes qui suivent le premier événement finalisé. Les transferts sont identifiés par le couple transaction hash + log index. Après clôture :
+Règles de montant :
 
-- Total inférieur à 70 BSC-USD : `pending_support`.
-- Total supérieur à 140 BSC-USD : `pending_support`.
-- Total entre 70 et 140 : contrôle de compte, cooldown, plafond de stock et réserves.
-- Recharge créditée : statut `credited`; seules ces opérations déclenchent le cooldown de sept jours.
-- Cooldown actif : `pending_weekly`, avec relance automatique au plus tôt sept jours après la première mise en attente et sept jours après la dernière recharge réussie. Les contrôles sont réexécutés à la relance.
-- Réserves insuffisantes : `pending_reserve`, avec nouvelle tentative automatique.
-- Litige ou anomalie : `pending_support` et notification Telegram en anglais lorsque le compte a associé le bot. Aucune notification transactionnelle par SMTP n'est envoyée.
+- Minimum automatique : 12 BSC-USD par batch.
+- Maximum 140 BSC-USD et cooldown de sept jours : uniquement pour la portion financée par les réserves système ONEX.
+- Les montants financés par la réserve vendeurs ne sont pas soumis à cette limite hebdomadaire.
+- Le solde de l'utilisateur après crédit ne peut pas dépasser 300 One-Val.
+- Le seuil de 70 BSC-USD concerne la consolidation d'une adresse de dépôt vers le treasury, pas le minimum de recharge.
 
-Une seule session `collecting` est ouverte par utilisateur à la fois. Des batches déjà `pending_weekly` ou `pending_reserve` peuvent coexister avec une nouvelle session; un dossier `pending_support` non résolu empêche une nouvelle attribution automatique et place les nouveaux paiements en support.
+Le montant crédité est :
 
-Une recharge est créditée dans une transaction SQL atomique qui met à jour `activities`, `users_stock`, `common` et le batch. Le contrôle de stock/réserve est refait immédiatement avant crédit.
+`net = brut reçu - tfees - récupération estimée des frais BSC assumés par OneX`
 
-## Réserves lors d'une recharge
+La récupération BSC est configurable par `RECHARGE_BSC_FEE_RECOVERY_USD`. Elle concerne uniquement les opérations sortantes payées par OneX (par exemple la consolidation). Le gas payé par l'utilisateur pour envoyer son dépôt n'est jamais facturé une seconde fois.
 
-La réserve disponible en valeur One-Val est :
+Ordre de financement :
 
-`(common.inactive_init_asset + common.backed_units) * common.unit_price`
+1. `common.sellers_res` (FIFO par date d'activation des lots vendeurs).
+2. `common.inactive_init_asset`.
+3. `common.backed_units` pour le complément uniquement.
 
-Consommation :
+Le financement système respecte le plancher non distribuable de 20 % (`STOCK_LIMIT * SYSTEM_RESERVE_RATIO`). La consommation des réserves système prend les actifs inactifs avant les actifs adossés. Si le financement vendeur couvre toute la recharge, aucune réserve système ni cooldown ONEX n'est consommé. Si une recharge est bloquée par le cooldown et que les vendeurs ne peuvent pas financer intégralement le montant net, aucun crédit partiel n'est réalisé. Le batch est conservé en attente et réévalué périodiquement; il peut être financé dès que la réserve vendeurs devient suffisante ou lorsque le cooldown expire.
 
-1. `inactive_init_asset` d'abord.
-2. `backed_units` pour compléter uniquement.
+Seule une recharge réellement créditée via `ONEX` démarre le cooldown hebdomadaire. Un crédit financé par les vendeurs utilise `XUSER` comme expéditeur comptable. Les crédits utilisent une transaction SQL atomique et revérifient solde, source, cooldown et réserves immédiatement avant leur application.
 
-Si la réserve inactive suffit, `unit_price` reste inchangé. Si `backed_units` est consommé, `unit_price` est recalculé selon la formule de valorisation existante dans `stock-accounting.js`. Le montant complet du top-up augmente `common.total_units_price`.
+Les adresses individuelles sont consolidées vers le treasury lorsque les événements finalisés non balayés atteignent 70 BSC-USD, ou lorsque le plus ancien dépôt non balayé atteint 30 jours. Cette consolidation est un mouvement de trésorerie distinct de la validation comptable.
 
-## Bonus et cooldown
+## Campagnes et réserve vendeurs
 
-Le bonus de bienvenue est enregistré avec `sender='XBONUS'`; il ne déclenche pas le cooldown des recharges. Une recharge OneX réellement créditée utilise `sender='ONEX'`, `receiver=username`, `type=2`. Les recharges administratives qui utilisent le même chemin de crédit comptent dans le cooldown.
+`POST /app/join-system-sellers` permet de demander une campagne vendeur. Conditions : solde strictement supérieur à 12 One-Val; `run_balance` choisi au moins égal à 50 % du solde et à 12 One-Val, sans dépasser le solde; `pending_bonus` au moins égal à 10 % de `run_balance`.
 
-## Consolidation des dépôts
+`run_balance` est une référence fixe de campagne. À l'activation, 50 % de `run_balance` (hors bonus) est affecté à `common.sellers_res`, avec sa base initiale proportionnelle dans `common.sellers_init_asset`. Le solde principal affiché n'est pas diminué à la simple activation.
 
-Chaque adresse est consolidée individuellement vers le treasury OneX lorsque son total d'événements finalisés non encore balayés atteint 70 BSC-USD, ou lorsque son plus ancien transfert non balayé atteint 30 jours. Les événements sont conservés, y compris les paiements en attente ou remboursés. La consolidation est un mouvement de trésorerie distinct de la validation comptable. Le gas est payé en BNB.
+Pendant une campagne active ou en annulation en attente, le montant maximal sortant en P2P est :
 
-## P2P
+`balance - 0.5 * run_balance`
 
-`/app/near-transfer` accepte les transferts utilisateur-vers-utilisateur et la vente utilisateur-vers-ONEX. `ONEX` est refusé comme expéditeur.
+Les transferts entrants restent autorisés. `/app/cancel-system-sellers` demande l'annulation, mais ne libère pas directement la réserve. `POST /admin/unlock-system-seller` libère uniquement la portion non consommée après authentification et justification administratives. La campagne expire après sept jours; le worker vendeur clôture les campagnes expirées et libère les lots inutilisés. Les montants déjà consommés demeurent des dettes de paiement envers le vendeur.
 
-Pour le P2P :
+Les lots sont suivis individuellement dans `users_seller_reserve_lots`, puis consommés en FIFO. Lorsqu'un lot finance une recharge, la base et le solde One-Val du vendeur sont diminués proportionnellement à la consommation; une dette de paiement vendeur est créée. Les dettes atteignant ensemble 300 One-Val sont regroupées en lots de paiement, chacun plafonné à 300 One-Val et ventilé par vendeur vers son adresse de paiement enregistrée.
+
+Le paiement vendeur est envoyé depuis le treasury en BSC-USD. Il n'y a pas de `tfees`; seul le coût estimé du gas BSC payé par OneX est récupéré sur le paiement du vendeur. Le coût réel est comptabilisé séparément après finalité. Les lots non payés restent une dette tant qu'une transaction n'est pas confirmée.
+
+**Bonus non implémenté :** le stockage de `pending_bonus` et le contrôle du seuil d'éligibilité sont présents. L'origine, la génération, l'accumulation, le calcul, le délai de grâce de 24 heures, la réinitialisation liée à l'inactivité et le crédit automatique du bonus ne sont pas implémentés tant que le cycle complet n'est pas défini. Aucun montant de bonus n'est créé par cette version.
+
+## Transferts P2P et frais
+
+`/app/near-transfer` refuse `ONEX` comme expéditeur. Pour un transfert utilisateur-vers-utilisateur :
 
 - `priceValue = sender.balance / sender.init_asset`.
-- Les frais totaux sont calculés en actifs initiaux, avec 50 % supportés par chaque utilisateur.
-- `activities.amount = (requestedAmount / priceValue) - receiverFee`.
-- `activities.fees` enregistre les frais totaux en actifs initiaux.
-- Après le transfert, le `init_asset` de l'expéditeur est recalculé comme nouveau solde / `priceValue`.
-- Le `init_asset` du destinataire conserve sa base historique et augmente uniquement de `receiverAmountUnits`, exprimé en actifs initiaux. Il ne doit pas être recalculé à partir du nouveau solde destinataire divisé par le prix de l'expéditeur.
-- Cette règle conserve les actifs initiaux : la diminution de base chez l'expéditeur, l'augmentation nette chez le destinataire et les frais affectés aux réserves doivent avoir une variation totale nulle, à l'arrondi près.
-- Le crédit One-Val du destinataire reste `receiverAmount * priceValue`; seul son `init_asset` est mis à jour de manière additive. Si son `balance` et son `init_asset` sont incohérents (un seul des deux est nul), le P2P est refusé plutôt que de reconstituer sa base au prix de l'expéditeur.
-- 75 % des frais initiaux vont à `common.backed_units`; 25 % vont à `common.inactive_init_asset`.
-- La valeur commune augmente de la part de frais adossée convertie au `priceValue`.
-- Le destinataire ne peut pas dépasser 300 One-Val.
+- L'expéditeur est débité uniquement du montant brut demandé en One-Val.
+- Le destinataire supporte l'intégralité de `tfees` et reçoit le montant net.
+- Aucun gas BSC n'est facturé à un transfert P2P.
+- Les frais sont répartis à 50 % `CommonShare` et 50 % `AdminFees`.
+- La base initiale du destinataire est augmentée uniquement de la base correspondant au montant net reçu; son historique n'est pas repricé au prix de l'expéditeur.
+- La base initiale de l'expéditeur est mise à jour selon son nouveau solde et le prix de l'opération.
+- La limite de 300 One-Val et le verrouillage vendeur sont contrôlés dans la transaction SQL.
 
-## Disbursement
+## Vente à ONEX (disbursement)
 
-La vente à ONEX liquide le solde entier. Les frais sont déduits du brut :
+La vente système est distincte du P2P. Conditions : solde d'au moins 290 One-Val, adresse de paiement enregistrée, aucune demande non résolue, et une vente réussie au maximum tous les 90 jours. Le solde entier est vendu; `tfees` est appliqué au brut :
 
 `fee = gross_balance * FEES / 100`
 
 `payout = gross_balance - fee`
 
-Conditions : solde initial au moins 290 One-Val, adresse de versement déclarée par l'utilisateur, montant attendu correspondant au net calculé, et aucune demande en cours. Une demande réussie n'est autorisée qu'une fois par période glissante de 90 jours. Seuls les disbursements `confirmed` comptent.
+La demande réserve le montant pendant 60 minutes, puis est signée et envoyée par le worker isolé du treasury. Les campagnes vendeurs actives ou en annulation en attente interdisent la liquidation à ONEX. Les demandes en attente sont déduites de la liquidité disponible et le plancher système de 20 % ne peut pas être utilisé pour les ventes.
 
-Après confirmation du transfert on-chain :
+Après transfert BSC-USD canonique et finalisé : `common.total_units_price` diminue du montant net effectivement payé; la base initiale correspondant au net payé est ajoutée à `inactive_init_asset`; la base initiale des frais est répartie à 50 % dans `backed_units` (CommonShare) et à 50 % dans `inactive_init_asset` (AdminFees). Seules les ventes confirmées démarrent le cooldown de 90 jours.
 
-- la base initiale du montant net envoyé augmente `inactive_init_asset`;
-- la base initiale des frais est répartie à 25 % dans `inactive_init_asset` et à 75 % dans `backed_units`;
-- `common.total_units_price` diminue exactement du payout net envoyé en BSC-USD; la répartition des réserves de frais est suivie séparément et n'est pas ajoutée une seconde fois à ce total;
-- les écritures comptables et le passage au statut confirmé sont atomiques.
+Un échec on-chain ne restaure pas le solde avant confirmation de la canonicalité et 15 confirmations (ou la profondeur configurée). Une transaction signée/soumise est suivie par son hash; aucun nouveau paiement ne doit être signé simplement parce qu'un délai est dépassé.
 
-Une réservation non soumise expire après 60 minutes et passe en `manual_review`. Elle n'est pas restaurée automatiquement tant qu'il n'est pas établi qu'aucune transaction n'a été soumise. Une transaction signée ou soumise est suivie par son hash existant; jamais de nouvelle signature ou de restauration sur simple timeout.
+## Remboursements
 
-`POST /admin/unlock-disbursement` ne signe pas la transaction dans le serveur HTTP. Il vérifie admin, job, expiration, montant minimal 10 BSC-USD et liquidité (BSC-USD + BNB), puis remet le job dans la file du worker séparé.
+Un remboursement de recharge n'applique aucun `tfees`. Seule la récupération estimée du gas BSC supporté par OneX est déduite du brut. Le net remboursé doit être au moins de 10 BSC-USD. Le transfert sortant est traité par le worker du treasury, et la finalisation exige canonicalité et profondeur de confirmation configurée. Toute situation non résolue reste en revue manuelle.
 
-## Résolution administrative des paiements support
+## Frais BSC et agrégats
 
-Un batch `pending_support` peut être crédité exceptionnellement par `POST /admin/recharge/credit`. Cette action bypass uniquement la plage automatique 70–140; elle conserve le contrôle du cooldown hebdomadaire, du plafond de 300 One-Val, du compte et des réserves. L'action nécessite des identifiants administrateur et une justification, et crée un journal dans `admin_payment_resolutions`.
+`BNB_USD_PRICE` doit être une cotation positive capturée et configurée au moment du déploiement pour les workers BSC sortants. Ce n'est pas un flux de prix en direct. Le même prix de référence doit être renseigné dans `.env` et `.env.sweeper`, ce dernier étant chargé avec priorité par le worker de consolidation.
 
-Le remboursement d'une recharge est différent d'un disbursement de vente. `POST /admin/recharge/refund` met en file un remboursement complet d'un batch `pending_support`, vers l'adresse de versement déclarée, si montant >= 10 BSC-USD et liquidité disponible.
+Les estimations et les coûts réels ne sont jamais confondus :
 
-Les frais de gas du transfert sortant sont payés en BNB par le treasury. Aucun frais blockchain n'est déduit du montant BSC-USD par cette route. Le remboursement est finalisé seulement après transaction canonique et nombre de confirmations configuré. Les erreurs non résolues restent en revue manuelle.
+- `total_bnb_fee_estimated` : BNB estimé.
+- `total_bnb_fee_estimated_value` : équivalent BSC-USD estimé.
+- `total_bnb_fee_actual` : BNB réel issu du reçu.
+- `total_bnb_fee_actual_value` : équivalent BSC-USD réel au prix capturé.
+- `total_common_share` et `total_admin_fees` : montants cumulés One-Val.
 
-## Suppression de compte
+Le coût réel est `gasUsed * effectiveGasPrice`. Chaque transaction est journalisée dans `bsc_fee_ledger` et ne doit être comptabilisée qu'une fois. Les snapshots `common` préservent tous les cumuls.
 
-Le solde doit être <= 2 One-Val et aucune recharge, aucun paiement, remboursement ou disbursement ne doit rester non résolu. Les données d'authentification et le stock sont supprimés, mais les activités et l'historique financier sont conservés. L'adresse de dépôt reste réservée avec `account_status='deleted'`; elle ne doit jamais être réattribuée. Les paiements ultérieurs vers cette adresse sont mis en support, jamais crédités à un autre compte.
+## Telegram et SMTP
 
-## Adresses et preuve de propriété
+Telegram est facultatif. `/app/signin` renvoie `tg_botLink`; l'association se fait dans une conversation privée avec un token temporaire de dix minutes. Un seul worker `npm run telegram` doit exécuter le long polling. Les messages transactionnels sont en anglais et envoyés via `telegram_outbox`, uniquement lorsque le compte est associé. La file offre une livraison au moins une fois; un doublon reste possible après arrêt du worker entre l'envoi et l'enregistrement du statut `sent`.
 
-OneX ne vérifie pas cryptographiquement que l'adresse source d'un paiement appartient à l'utilisateur. Aucun EIP-191 ou WalletConnect n'est requis pour cette fonction. L'attribution repose sur l'adresse de dépôt OneX destinataire. L'utilisateur est responsable de fournir une adresse personnelle correcte pour recevoir les disbursements et remboursements; la propriété de cette adresse n'est pas prouvée par le serveur.
+SMTP reste réservé à l'inscription, la récupération de compte, `/app/contact-onex` et au flux administratif de vérification d'identité déjà existant. Les notifications transactionnelles ne sont pas envoyées par email. `notifs`, `/app/feed` et `/admin/add-to-feed` restent supprimés.
 
-## UTC, worker et secrets
+## Secrets et workers
 
-Toutes les nouvelles dates/horaires et timestamps sont en UTC (+0). Aucune conversion des anciennes données n'est prévue puisque le projet n'est pas encore déployé.
+Les fichiers `.env` réels ne doivent jamais être distribués. Fournir uniquement `.env.example`, `.env.sweeper.example` et `.env.disbursement.example`.
 
-Trois processus indépendants :
+- HTTP + scanner : aucune clé privée de wallet.
+- `npm run sweep` : clé HD des adresses de dépôt et clé du financeur gas dans `.env.sweeper`.
+- `npm run disburse` : clé du treasury dans `.env.disbursement`; les flags et `BNB_USD_PRICE` viennent du `.env` principal.
+- Le worker de cycle de vie vendeur et de préparation des lots de paiement est lancé par `npm start`; il nécessite uniquement la base de données, sans clé privée. Il utilise un verrou MySQL pour éviter le double traitement.
 
-- HTTP + scanner des dépôts : aucune clé privée de portefeuille.
-- `npm run sweep` : XPRV HD des dépôts et clé du wallet de financement gas, dans `.env.sweeper`.
-- `npm run disburse` : clé du treasury, dans `.env.disbursement`.
+## Authentification et récupération
 
-Les vrais fichiers `.env` ne doivent jamais être inclus dans une archive ou un dépôt de code. Distribuer uniquement les fichiers `.env.example`, `.env.sweeper.example` et `.env.disbursement.example`.
+- Après trois mots de passe incorrects, le compte est verrouillé pour l'authentification par mot de passe permanent.
+- La récupération par seed ou l'émission administrative envoie par SMTP un mot de passe temporaire de sept chiffres, valable dix minutes.
+- La connexion avec un mot de passe temporaire remet le compteur d'échecs à zéro, mais les activités protégées restent bloquées jusqu'à modification du mot de passe temporaire en mot de passe permanent.
+- Un mot de passe temporaire expiré ne débloque pas les activités.
 
-## Vérifications
+## Vérifications et limites
 
-- `npm run check` : syntaxe JavaScript.
-- `npm test` : tests des fonctions comptables/politiques.
-- Avant mainnet : tests d'intégration sur une base MySQL neuve, BNB Smart Chain testnet lorsque possible, SMTP et tests de reprise après redémarrage. Les tests de syntaxe/unitaires ne prouvent pas la disponibilité réelle des services externes.
-
-## Authentification, récupération et notifications Telegram
-
-- `auths.consec_failed_auth` est créé avec `DEFAULT 0`. Chaque mot de passe incorrect soumis à `/app/signin` incrémente le compteur jusqu'à 3. À partir de 3, le mot de passe permanent ne permet plus de se connecter. Une connexion normale réussie ne remet pas le compteur à zéro.
-- `/app/recover-account` vérifie le seed de récupération, génère un code numérique aléatoire de 7 chiffres, le hache avec Argon2id, le stocke avec une échéance de 10 minutes et l'envoie par SMTP à `auths.email`. L'envoi ne réinitialise pas `consec_failed_auth`.
-- `/admin/send-temp-pswd` est une voie administrative indépendante. Elle vérifie le mot de passe et le PIN administrateur, envoie le même type de code à 7 chiffres valable 10 minutes à l'adresse email enregistrée, et ne réinitialise pas le compteur d'échecs.
-- Un code temporaire valide autorise `/app/signin` même si le compteur est à 3, avec `password_change_required=true`. Dès que la connexion avec ce code et les vérifications additionnelles éventuelles (seed) réussissent, `consec_failed_auth` est remis à `0` dans la transaction de connexion. Le marqueur `password_temp_expires_at_ms` reste défini et toutes les autres activités protégées par mot de passe répondent exactement `{ "auth": "not allowed" }` jusqu'au changement du mot de passe temporaire. `/app/modify-pin-or-password` est l'exception autorisée : elle vérifie que le code temporaire est encore valide, exige un nouveau mot de passe différent, puis efface le marqueur et conserve le compteur à `0` dans une transaction SQL.
-- Un code temporaire expiré ne permet pas de se connecter et ne lève pas le verrouillage des activités : le marqueur de récupération reste présent jusqu'à l'émission d'un nouveau code valide puis au changement du mot de passe permanent. Une nouvelle demande de récupération ou une nouvelle émission administrative peut générer un code après expiration. Une émission simultanée alors qu'un code est encore valide est refusée afin d'éviter plusieurs codes concurrents.
-- Le mot de passe temporaire n'est jamais retourné dans une réponse API ni écrit dans les journaux applicatifs. Le message email en donne la valeur une seule fois.
-- Telegram est facultatif. `/app/signin` retourne `tg_botLink`, soit le lien du bot si l'utilisateur est déjà associé, soit un lien profond `/start` avec un token temporaire de 10 minutes. L'association est faite uniquement dans une conversation privée.
-- `telegram-worker.js` utilise `getUpdates` en long polling, traite `/start` et `my_chat_member`, et envoie `telegram_outbox`. Il faut lancer un seul worker avec `npm run telegram`. Les messages transactionnels sont en anglais. Un blocage du bot efface uniquement les identifiants Telegram.
-- Nodemailer reste utilisé pour l'envoi du username à l'inscription, le mot de passe temporaire de récupération, `/app/contact-onex`, ainsi que le courriel administratif existant de vérification des pièces d'identité lors de l'inscription. Les notifications transactionnelles ne sont plus envoyées par email.
-- La table `notifs`, `/app/feed` et `/admin/add-to-feed` sont exclus du schéma et des routes. `telegram_outbox` est une file de livraison technique, pas un historique de notification.
-
-
-Telegram delivery note: the outbox provides at-least-once delivery. If Telegram accepts a message but the worker stops before recording `sent`, the message can be delivered again after restart. Transaction references in messages make such a duplicate recognizable; Telegram `sendMessage` does not provide a general exactly-once idempotency key.
-
-## Encodage des requêtes
-
-- Le serveur conserve les valeurs reçues et ne remplace plus les espaces par des signes `+`. Express décode normalement `application/x-www-form-urlencoded`.
-- Le client Android doit utiliser un encodeur standard. Un `+` littéral doit être envoyé sous la forme `%2B`; ne jamais modifier manuellement une valeur après encodage. Les requêtes JSON préservent les espaces et les signes `+`.
+- `npm run check` : contrôle de syntaxe des fichiers JavaScript.
+- `npm test` : tests unitaires des politiques et fonctions comptables.
+- Les tests unitaires ne remplacent pas les tests d'intégration sur une base MySQL neuve, le testnet BSC, les tests SMTP/Telegram et la répétition des scénarios de reprise après redémarrage.
+- Bonus : aucune génération, accumulation ou formule de crédit n'est implémentée dans cette version.

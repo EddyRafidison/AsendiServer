@@ -16,6 +16,10 @@ test("calculates seller-net BSC-USD payout and records the complete sold stock b
   assert.equal(result.soldInitAsset.toFixed(), "29.1");
   assert.equal(result.feeAmount.toFixed(), "9");
   assert.equal(result.feeInitAsset.toFixed(), "0.9");
+  assert.equal(result.commonShare.toFixed(), "4.5");
+  assert.equal(result.adminFees.toFixed(), "4.5");
+  assert.equal(result.feeBackedInitAsset.toFixed(), "0.45");
+  assert.equal(result.feeInactiveInitAsset.toFixed(), "0.45");
   assert.equal(result.amountRaw, "291000000000000000000");
 });
 

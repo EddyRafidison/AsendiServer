@@ -30,7 +30,7 @@ function fixed(value) {
 }
 
 test("current OneX business limits are centralized", () => {
-  assert.equal(fixed(MIN_RECHARGE_AMOUNT), "70");
+  assert.equal(fixed(MIN_RECHARGE_AMOUNT), "12");
   assert.equal(fixed(MAX_RECHARGE_AMOUNT), "140");
   assert.equal(MAX_DEFAULT_STOCK, "300");
   assert.equal(RECHARGE_BATCH_WINDOW_MS, 60 * 60 * 1000);
@@ -85,7 +85,7 @@ test("P2P recipient preserves its existing initial-asset basis and adds the net 
   assert.throws(() => addReceivedInitAsset("80", "0"), /greater than zero/);
 });
 
-test("P2P fee allocation conserves initial assets across sender, recipient and common reserves", () => {
+test("P2P beneficiary pays all transfer fees while CommonShare and AdminFees split 50/50", () => {
   const senderBalance = new BigNumber("300");
   const senderInitAsset = new BigNumber("150");
   const receiverInitAsset = new BigNumber("80");
@@ -93,28 +93,26 @@ test("P2P fee allocation conserves initial assets across sender, recipient and c
   const priceValue = deriveUnitPrice(senderBalance, senderInitAsset);
   const amountUnits = requestedAmount.dividedBy(priceValue);
   const fees = amountUnits.multipliedBy(3).dividedBy(100);
-  const senderFee = fees.dividedBy(2);
-  const receiverFee = fees.dividedBy(2);
-  const receiverNetBasis = amountUnits.minus(receiverFee);
-  const commonInactiveFee = fees.dividedBy(4);
-  const commonBackedFee = fees.multipliedBy(3).dividedBy(4);
+  const receiverNetBasis = amountUnits.minus(fees);
+  const commonShare = fees.dividedBy(2);
+  const adminFees = fees.minus(commonShare);
 
-  const newSenderBalance = senderBalance.minus(
-    amountUnits.plus(senderFee).multipliedBy(priceValue),
-  );
+  const newSenderBalance = senderBalance.minus(amountUnits.multipliedBy(priceValue));
   const newSenderInitAsset = deriveInitAsset(newSenderBalance, priceValue);
   const newReceiverInitAsset = addReceivedInitAsset(receiverInitAsset, receiverNetBasis);
-
   const initialBasisDelta = newSenderInitAsset
     .minus(senderInitAsset)
     .plus(newReceiverInitAsset.minus(receiverInitAsset))
-    .plus(commonInactiveFee)
-    .plus(commonBackedFee);
+    .plus(commonShare)
+    .plus(adminFees);
 
   assert.equal(fixed(amountUnits), "25");
   assert.equal(fixed(fees), "0.75");
-  assert.equal(fixed(newSenderInitAsset), "124.625");
-  assert.equal(fixed(newReceiverInitAsset), "104.625");
+  assert.equal(fixed(newSenderBalance), "250");
+  assert.equal(fixed(newSenderInitAsset), "125");
+  assert.equal(fixed(newReceiverInitAsset), "104.25");
+  assert.equal(fixed(commonShare), "0.375");
+  assert.equal(fixed(adminFees), "0.375");
   assert.equal(fixed(initialBasisDelta), "0");
 });
 
@@ -126,16 +124,16 @@ test("disbursement uses model A: sell gross balance and deduct fees", () => {
   assert.equal(fixed(result.payoutAmount), "291");
   assert.equal(fixed(result.soldInitAsset), "145.5");
   assert.equal(fixed(result.feeInitAsset), "4.5");
-  assert.equal(fixed(result.feeInactiveInitAsset), "1.125");
-  assert.equal(fixed(result.feeBackedInitAsset), "3.375");
+  assert.equal(fixed(result.feeInactiveInitAsset), "2.25");
+  assert.equal(fixed(result.feeBackedInitAsset), "2.25");
 });
 
-test("disbursement reduces common total by exact net payout and allocates retained fees 25/75", () => {
+test("disbursement reduces common total by exact net payout and allocates fees 50/50", () => {
   const disbursement = calculateSystemDisbursement("300", "150", "2", 3);
   const settlement = calculateDisbursementReserveSettlement("300", "10", "20", disbursement);
   assert.equal(fixed(settlement.newTotalUnitsPrice), "9");
-  assert.equal(fixed(settlement.newInactiveInitAsset), "166.625");
-  assert.equal(fixed(settlement.newBackedUnits), "13.375");
+  assert.equal(fixed(settlement.newInactiveInitAsset), "167.75");
+  assert.equal(fixed(settlement.newBackedUnits), "12.25");
 });
 
 test("weekly pending release is at least seven days after first pending and last successful recharge", () => {

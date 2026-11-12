@@ -13,6 +13,11 @@ const {
   DEPOSIT_SWEEP_THRESHOLD,
   DEPOSIT_SWEEP_MAX_AGE_MS,
 } = require("./recharge-policy");
+const {
+  getConfiguredBnbUsdPrice,
+  recordEstimatedBscFeeTx,
+  recordActualBscFeeTx,
+} = require("./bsc-fee-accounting");
 
 const CHAIN_ID = 56;
 const CHAIN_ID_BIGINT = 56n;
@@ -46,6 +51,9 @@ function getSweepRuntime() {
   const minConfirmations = Number(process.env.USDT_MIN_CONFIRMATIONS || 15);
   const tokenGasLimit = BigInt(process.env.USDT_SWEEP_TOKEN_GAS_LIMIT || "100000");
 
+  if (!getConfiguredBnbUsdPrice().isGreaterThan(0)) {
+    throw new Error("BNB_USD_PRICE must be set to a positive captured BNB/USD quote before deposit sweeping is enabled.");
+  }
   if (!xprv || !xpub || !funderPrivateKey || !rpcUrl || !treasuryAddress) {
     throw new Error(
       "USDT_SWEEP_ENABLED requires BSC_DEPOSIT_XPRV, BSC_DEPOSIT_XPUB, BSC_SWEEP_FUNDER_PRIVATE_KEY, BSC_RPC_URL and the treasury address.",
@@ -367,6 +375,25 @@ async function prepareSweep(db, walletRow, runtime) {
         String(now),
       ],
     );
+    await withTransaction(db, async (tx) => {
+      const bnbUsdPrice = getConfiguredBnbUsdPrice();
+      if (fundTxHash) {
+        await recordEstimatedBscFeeTx(tx, {
+          txHash: fundTxHash,
+          operation: "deposit_sweep_funding",
+          gasLimit: "21000",
+          gasPriceWei: gasPrice.toString(),
+          bnbUsdPrice,
+        });
+      }
+      await recordEstimatedBscFeeTx(tx, {
+        txHash: tokenTxHash,
+        operation: "deposit_sweep_token",
+        gasLimit: gasLimit.toString(),
+        gasPriceWei: gasPrice.toString(),
+        bnbUsdPrice,
+      });
+    });
     return {
       id: insertResult.insertId,
       status: "prepared",
@@ -432,9 +459,6 @@ async function getOrBroadcast(runtime, rawTransaction, expectedHash, confirmatio
   }
 
   if (!canonical || depth < confirmations) return null;
-  if (Number(receipt.status) !== 1) {
-    throw new Error(`Sweep transaction ${expectedHash} failed on-chain after canonical finality.`);
-  }
   return receipt;
 }
 
@@ -446,9 +470,19 @@ async function resumeSweep(db, walletRow, sweepRow, runtime) {
         runtime,
         sweepRow.fund_raw_tx,
         sweepRow.fund_tx_hash,
-        1,
+        runtime.minConfirmations,
       );
       if (!fundReceipt) return;
+      await withTransaction(db, async (tx) => {
+        await recordActualBscFeeTx(tx, {
+          txHash: sweepRow.fund_tx_hash,
+          operation: "deposit_sweep_funding",
+          receipt: fundReceipt,
+        });
+      });
+      if (Number(fundReceipt.status) !== 1) {
+        throw new Error(`Sweep funding transaction ${sweepRow.fund_tx_hash} failed on-chain after canonical finality.`);
+      }
       await db.queryAsync(
         "UPDATE users_usdt_sweeps SET status='funded',updated_at_ms=? WHERE id=? AND status IN ('prepared','funded')",
         [now, sweepRow.id],
@@ -462,6 +496,16 @@ async function resumeSweep(db, walletRow, sweepRow, runtime) {
       runtime.minConfirmations,
     );
     if (!tokenReceipt) return;
+    await withTransaction(db, async (tx) => {
+      await recordActualBscFeeTx(tx, {
+        txHash: sweepRow.token_tx_hash,
+        operation: "deposit_sweep_token",
+        receipt: tokenReceipt,
+      });
+    });
+    if (Number(tokenReceipt.status) !== 1) {
+      throw new Error(`Sweep token transaction ${sweepRow.token_tx_hash} failed on-chain after canonical finality.`);
+    }
 
     await withTransaction(db, async (tx) => {
       await tx.query(

@@ -4,10 +4,10 @@ process.env.TZ = "UTC";
 
 require("dotenv").config();
 
-if (
-  String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() !== "true"
-) {
-  console.log("OneX BSC disbursements are disabled. Set USDT_DISBURSEMENTS_ENABLED=true to start the worker.");
+const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
+const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
+if (!disbursementsEnabled && !sellerPayoutsEnabled) {
+  console.log("OneX BSC treasury payouts are disabled. Enable USDT_DISBURSEMENTS_ENABLED or USDT_SELLER_PAYOUTS_ENABLED.");
   process.exit(0);
 }
 
@@ -15,7 +15,7 @@ const path = require("path");
 const envFile = process.env.USDT_DISBURSEMENT_ENV_FILE || ".env.disbursement";
 const envResult = require("dotenv").config({
   path: path.resolve(process.cwd(), envFile),
-  override: true,
+  // Keep policy flags and BNB_USD_PRICE from the main environment; this file contains signing secrets.
 });
 
 if (envResult.error) {

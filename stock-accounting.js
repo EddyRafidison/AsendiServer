@@ -91,13 +91,16 @@ function calculateTopUpReserveAllocation(
   backedValue,
   inactiveValue,
   totalUnitsPriceValue,
+  nonDistributableFloorValue = 0,
 ) {
   const amount = asBigNumber(amountValue, "top-up amount");
   const unitPrice = asBigNumber(unitPriceValue, "common.unit_price");
   const backed = asBigNumber(backedValue, "common.backed_units");
   const inactive = asBigNumber(inactiveValue, "common.inactive_init_asset");
   const totalUnitsPrice = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
+  const nonDistributableFloor = asBigNumber(nonDistributableFloorValue, "system reserve floor");
 
+  if (nonDistributableFloor.isNegative()) throw new RangeError("System reserve floor cannot be negative");
   if (!amount.isGreaterThan(0)) throw new RangeError("Top-up amount must be positive");
   if (!unitPrice.isGreaterThan(0)) throw new RangeError("common.unit_price must be positive");
   if (backed.isNegative() || inactive.isNegative()) {
@@ -109,11 +112,18 @@ function calculateTopUpReserveAllocation(
 
   const activityAmount = amount.dividedBy(unitPrice);
   const totalAvailableInitialAssets = inactive.plus(backed);
-  const availableValue = totalAvailableInitialAssets.multipliedBy(unitPrice);
+  const distributableInitialAssets = BigNumber.maximum(
+    new BigNumber(0),
+    totalAvailableInitialAssets.minus(nonDistributableFloor),
+  );
+  const availableValue = distributableInitialAssets.multipliedBy(unitPrice);
   if (amount.isGreaterThan(availableValue)) {
     return {
       available: false,
       availableValue,
+      totalAvailableInitialAssets,
+      distributableInitialAssets,
+      protectedFloor: nonDistributableFloor,
       activityAmount,
       consumedInactive: new BigNumber(0),
       consumedBacked: new BigNumber(0),
@@ -150,6 +160,9 @@ function calculateTopUpReserveAllocation(
   return {
     available: true,
     availableValue,
+    totalAvailableInitialAssets,
+    distributableInitialAssets,
+    protectedFloor: nonDistributableFloor,
     activityAmount,
     consumedInactive,
     consumedBacked,

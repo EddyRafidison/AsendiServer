@@ -2,6 +2,7 @@
 
 const BigNumber = require("bignumber.js");
 const { DISBURSEMENT_COOLDOWN_MS } = require("./recharge-policy");
+const { COMMON_SHARE_RATIO } = require("./fee-policy");
 
 const TOKEN_DECIMALS = 18;
 const DISBURSEMENT_TOLERANCE = new BigNumber("0.00000001");
@@ -47,8 +48,10 @@ function calculateSystemDisbursement(balanceValue, initAssetValue, priceValue, f
     soldInitAsset,
     feeAmount,
     feeInitAsset,
-    feeInactiveInitAsset: feeInitAsset.dividedBy(4),
-    feeBackedInitAsset: feeInitAsset.multipliedBy(3).dividedBy(4),
+    commonShare: feeAmount.multipliedBy(COMMON_SHARE_RATIO),
+    adminFees: feeAmount.minus(feeAmount.multipliedBy(COMMON_SHARE_RATIO)),
+    feeBackedInitAsset: feeInitAsset.multipliedBy(COMMON_SHARE_RATIO),
+    feeInactiveInitAsset: feeInitAsset.minus(feeInitAsset.multipliedBy(COMMON_SHARE_RATIO)),
     amountRaw: amountRawDecimal.toFixed(0),
   };
 }
@@ -82,7 +85,8 @@ function calculateDisbursementReserveSettlement(
   }
 
   // The common One-Val total is reduced by the exact BSC-USD payout.
-  // The retained fee is accounted for separately in inactive/backed initial assets.
+  // The retained fee is split 50/50: CommonShare enters backed assets and
+  // AdminFees enters inactive initial assets.
   const newTotalUnitsPrice = totalUnitsPrice.minus(payoutAmount);
   const newInactiveInitAsset = inactiveInitAsset
     .plus(soldInitAsset)

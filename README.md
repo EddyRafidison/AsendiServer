@@ -4,28 +4,42 @@ Node.js backend for the OneX platform. The current payment rail accepts **Binanc
 
 ## Current core rules
 
-- User stock is recorded in One-Val; `users_stock.balance` is not converted by `unit_price`.
-- `users_stock.init_asset` records the user's initial-asset basis.
-- P2P unit price is derived from the sender's current `balance / init_asset`.
-- New user deposit addresses are derived from the configured HD public key and permanently assigned to a user.
-- No ownership proof is requested for the source wallet. Deposits are attributed by the OneX deposit address that receives the tokens.
-- Incoming finalized transfers are grouped into a 60-minute batch. Multiple transfers may complete the same batch.
-- A batch is eligible for credit only when its total is between 70 and 140 BSC-USD, the user will remain at or below 300 One-Val, the weekly rule is satisfied, and common reserves are sufficient.
-- A valid batch held by the seven-day rule is automatically retried after its release time. Every retry rechecks current stock and reserves.
-- Recharges consume `common.inactive_init_asset` first and `common.backed_units` only for the remainder.
-- Deposit addresses are consolidated individually at 70 BSC-USD or when the oldest unswept finalized deposit reaches 30 days.
-- A system sale liquidates the user's entire One-Val balance, deducts the configured fee, and pays the net amount in BSC-USD. A successfully confirmed disbursement counts toward the 90-day rolling cooldown.
-- UTC (+0) is used for all new database timestamps and worker scheduling.
+- User stock is recorded in One-Val; `users_stock.balance` is not converted by `unit_price`. `users_stock.init_asset` stores the corresponding initial-asset basis.
+- P2P price is derived from the sender's current `balance / init_asset`. The sender pays only the gross requested amount; the recipient bears the full `tfees` deduction and receives the net amount. No BSC gas fee applies to P2P transfers.
+- P2P fees are split equally: 50% `CommonShare` and 50% `AdminFees`. The cumulative totals are stored in `common.total_common_share` and `common.total_admin_fees`.
+- Each user has an individual BSC-USD deposit address. Finalized deposits are grouped into 60-minute batches; a batch can contain any number of transfers.
+- The automatic recharge minimum is 12 BSC-USD per batch. The 140 BSC-USD limit and seven-day cooldown apply only to the portion funded by ONEX system reserves. Seller-funded amounts are exempt from that weekly restriction. The user's resulting balance must not exceed 300 One-Val.
+- Recharge credit is `gross received - tfees - configured BSC gas recovery`. The configured gas recovery is an estimate for OneX-paid outgoing deposit operations; the sender's own deposit gas is never charged again.
+- Recharge funding priority is `common.sellers_res`, then `common.inactive_init_asset`, then `common.backed_units`. The last two are limited by the non-distributable 20% system reserve floor (`STOCK_LIMIT * SYSTEM_RESERVE_RATIO`). A weekly-ineligible user receives no partial system-funded credit. A pending batch is retried every five minutes so it can be funded later by sellers or after the weekly window.
+- Deposit addresses are consolidated individually at 70 BSC-USD or when the oldest unswept finalized deposit reaches 30 days. The 70 BSC-USD value is a sweep threshold, not the recharge minimum.
+- A system sale to ONEX requires at least 290 One-Val, sells the full balance and deducts `FEES` from the gross balance. The net BSC-USD is reserved and paid by the isolated treasury worker. A successful sale starts a 90-day cooldown. A user with an active or cancellation-pending seller campaign cannot liquidate the account through this path.
+- System disbursements and refunds respect a 60-minute reservation, canonical-chain checks and the configured finality depth (15 confirmations by default). A refund has no `tfees`; only the estimated BSC gas recovery is deducted, and the net refund must be at least 10 BSC-USD.
+- All new database timestamps and worker scheduling use UTC.
+
+## Priority seller reserve
+
+- A seller campaign starts through `POST /app/join-system-sellers`. The user must have a balance greater than 12 One-Val, choose `run_balance` of at least 50% of the current balance and at least 12 One-Val, and have `pending_bonus >= 10% * run_balance`.
+- `run_balance` is a fixed campaign reference. The system reserves 50% of it in `common.sellers_res` and moves the corresponding initial-asset basis to `common.sellers_init_asset`; the user's displayed balance is not reduced when joining.
+- While `seller_status` is active or cancellation-pending, the sender cannot transfer more than `balance - 0.5 * run_balance` through P2P. Incoming transfers remain allowed.
+- Seller reserve lots are tracked individually and consumed FIFO. When a lot is consumed to fund a recharge, its seller's One-Val balance and initial-asset basis are reduced, and the amount becomes a seller payout liability.
+- Seller payouts are grouped when the outstanding amount reaches 300 One-Val; each treasury batch is capped at 300 One-Val. The treasury pays each seller's registered payout address in BSC-USD. The seller bears only the estimated BSC gas recovery; no `tfees` is charged on seller payouts.
+- Seller status expires after seven days. A user may request cancellation through `POST /app/cancel-system-sellers`; the unused reserve remains locked until an administrator uses `POST /admin/unlock-system-seller`. Amounts already sold remain in the payout queue.
+- `pending_bonus` is stored and checked for eligibility, but bonus accrual, origin, calculation, the 24-hour bonus inactivity lifecycle, automatic credit and campaign-bonus generation are intentionally not implemented until those rules are specified. The code does not invent a bonus formula.
+
+## Reserve and BSC fee accounting
+
+- Common snapshots preserve all cumulative fields. `common.total_bnb_fee_estimated` and `common.total_bnb_fee_actual` are BNB amounts; their `_value` counterparts are BSC-USD equivalents. `total_common_share` and `total_admin_fees` are One-Val amounts.
+- Each outgoing BSC transaction is recorded in `bsc_fee_ledger` by transaction hash. Estimates are recorded when the transaction is prepared; actual fees are recorded only after the receipt is canonical and reaches finality. Actual BNB cost is `gasUsed * effectiveGasPrice`.
+- `BNB_USD_PRICE` must be a positive, manually captured BNB/USD quote before enabling the sweeper or treasury payout workers. The captured value is stored with the fee ledger entry; it is not presented as a live price feed.
 
 ## P2P accounting
 
 - `priceValue = sender.balance / sender.init_asset` is derived from the sender only.
-- `amountUnits = requestedAmount / priceValue` and `receiverAmountUnits = amountUnits - receiverFee` are measured in initial-asset units.
+- `amountUnits = requestedAmount / priceValue` and the net received basis are measured in initial-asset units.
 - The sender's new `init_asset` is recalculated from the sender's new One-Val balance divided by `priceValue`.
-- The recipient retains its existing `init_asset`; the recipient's new basis is `old_init_asset + receiverAmountUnits`. Do not reprice the recipient's historical balance at the sender's price.
-- The recipient's One-Val balance increases by `receiverAmountUnits * priceValue`.
-- The P2P initial-asset conservation check is: sender basis change + recipient basis change + fees allocated to common reserves = 0, subject only to database precision rounding.
-
+- The recipient retains its existing `init_asset`; its new basis is `old_init_asset + net_received_initial_asset`. Historical recipient balance is never repriced at the sender's transaction price.
+- The recipient's One-Val balance increases by the net initial-asset amount multiplied by the sender's `priceValue`.
+- The fee is included in the basis conservation check and split 50/50 between CommonShare and AdminFees.
 
 ## Authentication and account recovery
 
@@ -58,10 +72,11 @@ Do not run this code against a database containing older OneX table definitions 
 
 1. Copy `.env.example` to `.env` and configure MySQL, SMTP, admin credentials, BSC RPC endpoints, treasury address, token contract, public deposit HD key, and the initial reserve.
 2. `STOCK_LIMIT` initializes `common.total_units_price`; `INITIAL_BACKED_UNITS` initializes `common.backed_units` on the first database creation. It defaults to `0`, so set it to the initial-asset reserve that is actually available before enabling recharge credits. It must not exceed `STOCK_LIMIT`. No reserve is auto-invented.
-3. Copy `.env.disbursement.example` to `.env.disbursement`. Keep the treasury private key in this separate file, accessible only to the disbursement worker account.
-4. Copy `.env.sweeper.example` to `.env.sweeper`. Keep the deposit HD private extended key and the separate gas-funder private key in this file, accessible only to the sweeper account.
-5. Never commit or distribute real `.env` files, extended private keys, seed phrases, or wallet private keys.
-6. Configure `BSC_DEPOSIT_XPUB` and its corresponding `BSC_DEPOSIT_XPRV` for the same non-hardened derivation branch. Keep the XPRV out of the HTTP server process.
+3. Set `COMMON_SHARE_RATIO=0.50`, `SYSTEM_RESERVE_RATIO=0.20`, and `RECHARGE_BSC_FEE_RECOVERY_USD` in `.env`. Set `BNB_USD_PRICE` to a captured positive BNB/USD quote before enabling any outgoing BSC worker.
+4. Copy `.env.disbursement.example` to `.env.disbursement`. Keep the treasury private key in this separate file, accessible only to the disbursement worker account. Policy flags and `BNB_USD_PRICE` remain in the main `.env`.
+5. Copy `.env.sweeper.example` to `.env.sweeper`. Set the same captured `BNB_USD_PRICE` there because this worker loads its dedicated environment with override enabled. Keep the deposit HD private extended key and the separate gas-funder private key in this file, accessible only to the sweeper account.
+6. Never commit or distribute real `.env` files, extended private keys, seed phrases, or wallet private keys.
+7. Configure `BSC_DEPOSIT_XPUB` and its corresponding `BSC_DEPOSIT_XPRV` for the same non-hardened derivation branch. Keep the XPRV out of the HTTP server process.
 
 The treasury must hold sufficient BSC-USD for payouts/refunds and BNB for transaction gas. The gas-funding wallet must hold BNB to fund individual deposit addresses before consolidation.
 
@@ -81,10 +96,10 @@ Start each process under a service supervisor (PM2, systemd, or equivalent):
 npm start        # HTTP API and BEP-20 deposit scanner
 npm run telegram  # Telegram linking, block events and transactional outbox
 npm run sweep     # Separate deposit-address consolidation worker
-npm run disburse  # Separate treasury disbursement/refund worker
+npm run disburse  # Separate treasury disbursement/refund and seller payout worker
 ```
 
-Enable each blockchain process only after its environment file, RPC, wallet addresses, and balances have been verified. Do not enable mainnet sends while testing business logic.
+Set `USDT_SELLER_PAYOUTS_ENABLED=true` only when seller treasury payouts are ready. Enable each blockchain process only after its environment file, RPC, wallet addresses, and balances have been verified. Do not enable mainnet sends while testing business logic.
 
 ## Request encoding
 
@@ -94,17 +109,20 @@ Enable each blockchain process only after its environment file, RPC, wallet addr
 
 ## Important endpoints
 
-- `POST /app/user-last-stock`: returns One-Val balance, P2P fee rate, and the user's OneX deposit address.
+- `POST /app/user-last-stock`: returns One-Val balance, P2P fee rate, deposit address and seller campaign fields.
 - `POST /app/recharge`: returns deposit instructions and limits. It does not create a pre-payment order.
 - `POST /app/recharge/status`: returns the user's latest or specified deposit batch status.
 - `POST /app/set-payout-address`: lets the user declare the address that will receive a system-sale payout. OneX does not prove source-wallet ownership.
-- `POST /app/near-transfer`: user-to-user P2P or a user sale to OneX. OneX cannot be the sender.
+- `POST /app/near-transfer`: user-to-user P2P or a user sale to OneX. OneX cannot be the sender. P2P fees are paid entirely by the recipient.
 - `POST /app/disbursement/status`: returns the status of a user's system-sale request.
 - `POST /admin/unlock-disbursement`: requeues an expired, unsigned disbursement for the isolated worker after admin authentication and liquidity checks.
-- `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces weekly cooldown, stock cap and common reserves.
-- `POST /admin/recharge/refund`: queues a full administrative refund of a support-held recharge batch. Network gas is paid in BNB separately; no BSC-USD network fee is deducted by this route.
+- `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces the 140 BSC-USD system-funded cap, weekly cooldown when ONEX reserves are needed, 300 One-Val stock cap and reserve availability; seller funding remains first priority.
+- `POST /admin/recharge/refund`: queues a refund of a support-held recharge batch. No `tfees` is charged; a configured estimate of OneX's BSC gas cost is deducted, and the net refund must be at least 10 BSC-USD.
 - `POST /admin/send-temp-pswd`: issues a seven-digit temporary password by email; valid for 10 minutes and usable only to sign in and change the permanent password.
+- `POST /app/join-system-sellers`: requests activation of a priority seller campaign.
+- `POST /app/cancel-system-sellers`: requests cancellation; the unused seller reserve remains locked pending admin review.
+- `POST /admin/unlock-system-seller`: releases the unused portion of a seller lot after administrative authorization.
 
 ## Tests and production readiness
 
-`npm run check` validates JavaScript syntax. `npm test` runs the business-rule unit tests. These checks do not replace MySQL integration tests, BNB Smart Chain testnet exercises, SMTP tests, or a full reconciliation rehearsal before production.
+`npm start` also launches the seller lifecycle worker in-process; its MySQL advisory lock prevents concurrent processing by duplicate instances. `npm run check` validates JavaScript syntax. `npm test` runs the business-rule unit tests. These checks do not replace MySQL integration tests, BNB Smart Chain testnet exercises, SMTP tests, or a full reconciliation rehearsal before production.

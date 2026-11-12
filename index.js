@@ -4,6 +4,7 @@ const express = require("express");
 const routes = require("./routes");
 const { initDbIfEmpty, cleanup, PORT_SERVER } = require("./db");
 const { httpsRedirect } = require("./utils");
+const { startSellerLifecycleWorker } = require("./seller-worker");
 
 const app = express();
 
@@ -15,6 +16,7 @@ app.use("/", routes);
 async function startServer() {
   try {
     await initDbIfEmpty();
+    startSellerLifecycleWorker();
     await routes.initializeRechargePayments();
   } catch (error) {
     console.error("Server initialization failed. Server startup aborted:", error);

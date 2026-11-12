@@ -3,8 +3,9 @@
 const BigNumber = require("bignumber.js");
 
 const MAX_DEFAULT_STOCK = "300";
-const MIN_RECHARGE_AMOUNT = new BigNumber("70");
+const MIN_RECHARGE_AMOUNT = new BigNumber("12");
 const MAX_RECHARGE_AMOUNT = new BigNumber("140");
+const SYSTEM_RESERVE_RATIO = new BigNumber(process.env.SYSTEM_RESERVE_RATIO || "0.20");
 const RECHARGE_COOLDOWN_DAYS = 7;
 const RECHARGE_BATCH_WINDOW_MINUTES = 60;
 const DEPOSIT_SWEEP_THRESHOLD = new BigNumber("70");
@@ -86,6 +87,7 @@ module.exports = {
   MAX_DEFAULT_STOCK,
   MIN_RECHARGE_AMOUNT,
   MAX_RECHARGE_AMOUNT,
+  SYSTEM_RESERVE_RATIO,
   RECHARGE_COOLDOWN_DAYS,
   RECHARGE_COOLDOWN_MS,
   RECHARGE_BATCH_WINDOW_MINUTES,
