@@ -9,11 +9,11 @@ const { MAX_DEFAULT_STOCK } = require("./recharge-policy");
 const OneX = "ONEX";
 const maxStockDefault = MAX_DEFAULT_STOCK;
 const P2Pallowed = String(process.env.P2P_ALLOWED || "false").toLowerCase() === "true";
-const stock_limit = process.env.STOCK_LIMIT || "0";
-// Initial distributable reserve in initial-asset units for a brand-new database.
-// It defaults to zero so the system cannot accept top-ups before an operator
-// deliberately configures the reserve that is actually available.
-const initial_backed_units = process.env.INITIAL_BACKED_UNITS || "0";
+const stock_limit = process.env.STOCK_LIMIT || "10000000";
+// The default launch configuration initializes a 10,000,000 One-Val supply
+// and the same amount of backed initial assets. Operators may override both
+// values, but must ensure the declared reserve is actually available.
+const initial_backed_units = process.env.INITIAL_BACKED_UNITS || stock_limit;
 const first_welcome_clients = process.env.FIRST_WELCOME_CLIENTS || "0";
 const welcome_bonus = process.env.WELCOME_BONUS || "0";
 const tfees = Number(process.env.FEES || 0);
@@ -107,9 +107,9 @@ const TABLES = [
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS common(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    total_units_price DECIMAL(50,30) NOT NULL DEFAULT 0,
-    unit_price DECIMAL(50,30) NOT NULL DEFAULT 0,
-    backed_units DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_units_price DECIMAL(50,30) NOT NULL DEFAULT 10000000,
+    unit_price DECIMAL(50,30) NOT NULL DEFAULT 1,
+    backed_units DECIMAL(50,30) NOT NULL DEFAULT 10000000,
     inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     sellers_res DECIMAL(50,30) NOT NULL DEFAULT 0,
     sellers_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -117,7 +117,8 @@ const TABLES = [
     total_bnb_fee_estimated DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_bnb_fee_actual_value DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_bnb_fee_estimated_value DECIMAL(50,30) NOT NULL DEFAULT 0,
-    total_admin_fees DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_adminFees DECIMAL(50,30) NOT NULL DEFAULT 0,
+    remaining_adminFees DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_common_share DECIMAL(50,30) NOT NULL DEFAULT 0,
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL
@@ -399,6 +400,31 @@ const TABLES = [
     KEY idx_usdt_refund_batch(batch_id,status,id),
     KEY idx_usdt_refund_status(status,id)
   ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS admin_fees_transfers(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    amount DECIMAL(36,18) NOT NULL,
+    amount_raw DECIMAL(65,0) NOT NULL,
+    destination_address CHAR(42) NOT NULL,
+    reference VARCHAR(64) NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'queued',
+    estimated_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
+    estimated_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
+    actual_fee_bnb DECIMAL(50,30) NULL,
+    actual_fee_usd DECIMAL(50,30) NULL,
+    bnb_usd_price DECIMAL(36,18) NOT NULL DEFAULT 0,
+    raw_tx LONGTEXT NULL,
+    tx_hash CHAR(66) NULL,
+    nonce BIGINT UNSIGNED NULL,
+    block_number BIGINT UNSIGNED NULL,
+    last_error TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    confirmed_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_admin_fees_reference(reference),
+    UNIQUE KEY uq_admin_fees_tx_hash(tx_hash),
+    KEY idx_admin_fees_status(status,id),
+    KEY idx_admin_fees_created(created_at_ms,id)
+  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS admin_payment_resolutions(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     admin_username VARCHAR(64) NOT NULL,
@@ -446,8 +472,8 @@ async function assertLatestSchema() {
     common: [
       "total_units_price", "unit_price", "backed_units", "inactive_init_asset", "sellers_res",
       "sellers_init_asset", "total_bnb_fee_actual", "total_bnb_fee_estimated",
-      "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "total_admin_fees",
-      "total_common_share", "record_date", "record_time",
+      "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "total_adminFees",
+      "remaining_adminFees", "total_common_share", "record_date", "record_time",
     ],
     users_seller_campaigns: [
       "username", "run_balance", "reserved_units", "reserved_init_asset", "pending_bonus_snapshot",
@@ -503,6 +529,11 @@ async function assertLatestSchema() {
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number", "last_error",
       "created_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
+    admin_fees_transfers: [
+      "amount", "amount_raw", "destination_address", "reference", "status", "estimated_fee_bnb",
+      "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd", "bnb_usd_price", "raw_tx", "tx_hash",
+      "nonce", "block_number", "last_error", "created_at_ms", "updated_at_ms", "confirmed_at_ms",
+    ],
     admin_payment_resolutions: [
       "admin_username", "username", "batch_id", "action", "gross_amount", "fee_amount",
       "net_amount", "payout_address", "tx_hash", "reason", "created_at_ms",
@@ -557,8 +588,8 @@ async function initDbIfEmpty() {
   const commonRows = await db.queryAsync("SELECT id FROM common ORDER BY id DESC LIMIT 1");
   if (!commonRows.length) {
     await db.queryAsync(
-      "INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,record_date,record_time) VALUES(?,?,?,?,?,?)",
-      [initialTotal.toFixed(), "1", initialBacked.toFixed(), "0", date, time],
+      "INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,total_adminFees,remaining_adminFees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?)",
+      [initialTotal.toFixed(), "1", initialBacked.toFixed(), "0", "0", "0", date, time],
     );
   }
 

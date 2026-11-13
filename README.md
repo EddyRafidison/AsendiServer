@@ -6,7 +6,7 @@ Node.js backend for the OneX platform. The current payment rail accepts **Binanc
 
 - User stock is recorded in One-Val; `users_stock.balance` is not converted by `unit_price`. `users_stock.init_asset` stores the corresponding initial-asset basis.
 - P2P price is derived from the sender's current `balance / init_asset`. The sender pays only the gross requested amount; the recipient bears the full `tfees` deduction and receives the net amount. No BSC gas fee applies to P2P transfers.
-- P2P fees are split equally: 50% `CommonShare` and 50% `AdminFees`. The cumulative totals are stored in `common.total_common_share` and `common.total_admin_fees`.
+- Transaction fees are split equally: 50% `CommonShare` and 50% `AdminFees`. Both reward totals are denominated in BSC-USD. `common.total_adminFees` is cumulative and never decreases; `common.remaining_adminFees` is the untransferred administrative-reward balance.
 - Each user has an individual BSC-USD deposit address. Finalized deposits are grouped into 60-minute batches; a batch can contain any number of transfers.
 - The automatic recharge minimum is 12 BSC-USD per batch. The 140 BSC-USD limit and seven-day cooldown apply only to the portion funded by ONEX system reserves. Seller-funded amounts are exempt from that weekly restriction. The user's resulting balance must not exceed 300 One-Val.
 - Recharge credit is `gross received - tfees - configured BSC gas recovery`. The configured gas recovery is an estimate for OneX-paid outgoing deposit operations; the sender's own deposit gas is never charged again.
@@ -28,9 +28,20 @@ Node.js backend for the OneX platform. The current payment rail accepts **Binanc
 
 ## Reserve and BSC fee accounting
 
-- Common snapshots preserve all cumulative fields. `common.total_bnb_fee_estimated` and `common.total_bnb_fee_actual` are BNB amounts; their `_value` counterparts are BSC-USD equivalents. `total_common_share` and `total_admin_fees` are One-Val amounts.
+- Common snapshots preserve all cumulative fields. `common.total_bnb_fee_estimated` and `common.total_bnb_fee_actual` are BNB amounts; their `_value` counterparts are BSC-USD equivalents. `common.total_common_share`, `common.total_adminFees` and `common.remaining_adminFees` are BSC-USD amounts. `total_adminFees` is cumulative; `remaining_adminFees` can decrease only after a confirmed administrative payout.
 - Each outgoing BSC transaction is recorded in `bsc_fee_ledger` by transaction hash. Estimates are recorded when the transaction is prepared; actual fees are recorded only after the receipt is canonical and reaches finality. Actual BNB cost is `gasUsed * effectiveGasPrice`.
 - `BNB_USD_PRICE` must be a positive, manually captured BNB/USD quote before enabling the sweeper or treasury payout workers. The captured value is stored with the fee ledger entry; it is not presented as a live price feed.
+
+## Administrative rewards (`AdminFees`)
+
+- `AdminFees` are tracked in BSC-USD, independently from initial-asset reserve accounting.
+- `common.total_adminFees` is the lifetime cumulative amount of administrative rewards generated. It must never decrease.
+- `common.remaining_adminFees` is the BSC-USD amount still held in the main treasury and available for the administrative wallet. It increases with each new `AdminFees` accrual and decreases only after the corresponding BSC-USD transfer has reached the configured confirmation depth and the canonical Transfer event has been verified.
+- The initial-asset basis corresponding to the administrative reward is returned to the system reserves. For recharge and P2P fees, that basis is added to `inactive_init_asset`; for system disbursement, the fee basis is allocated 50/50 between `backed_units` (CommonShare) and `inactive_init_asset` (AdminFees). The BSC-USD reward transfer does not consume those initial-asset reserves.
+- When `remaining_adminFees >= ADMIN_FEES_THRESHOLD_USD` (100 by default), OneX queues a transfer of exactly `remaining_adminFees - ADMIN_FEES_RETAINED_BALANCE_USD` (10 by default) from the main treasury to `ADMIN_FEES_PAYOUT_ADDRESS`. It therefore leaves the configured 10 BSC-USD residual when no new reward arrives while the transfer is pending. If new rewards arrive before confirmation, the post-transfer balance includes those new rewards and may trigger another transfer.
+- No payout is queued when the threshold is invalid (zero, negative or non-finite), the retained balance is invalid, the destination address is invalid, or `ADMIN_FEES_TRANSFERS_ENABLED` is not `true`.
+- The transfer is performed by the isolated treasury worker (`npm run disburse`), using the same BSC treasury key held in `.env.disbursement`. The BNB gas cost is recorded separately in `bsc_fee_ledger`; it is not deducted from the BSC-USD amount sent to the administrative wallet.
+- `POST /admin/admin-fees-transfers` returns the authenticated, paginated history and the current cumulative and remaining balances. Supported status filters are `queued`, `signed`, `submitted`, `confirmed`, `failed` and `manual_review`.
 
 ## P2P accounting
 
@@ -71,9 +82,9 @@ Do not run this code against a database containing older OneX table definitions 
 ## Configuration
 
 1. Copy `.env.example` to `.env` and configure MySQL, SMTP, admin credentials, BSC RPC endpoints, treasury address, token contract, public deposit HD key, and the initial reserve.
-2. `STOCK_LIMIT` initializes `common.total_units_price`; `INITIAL_BACKED_UNITS` initializes `common.backed_units` on the first database creation. It defaults to `0`, so set it to the initial-asset reserve that is actually available before enabling recharge credits. It must not exceed `STOCK_LIMIT`. No reserve is auto-invented.
+2. By default, a new database starts with `common.total_units_price=10000000`, `common.unit_price=1` and `common.backed_units=10000000`. `STOCK_LIMIT` and `INITIAL_BACKED_UNITS` can override these defaults; `INITIAL_BACKED_UNITS` defaults to `STOCK_LIMIT` and must not exceed it. The declared backed reserve must correspond to assets actually available to the system.
 3. Set `COMMON_SHARE_RATIO=0.50`, `SYSTEM_RESERVE_RATIO=0.20`, and `RECHARGE_BSC_FEE_RECOVERY_USD` in `.env`. Set `BNB_USD_PRICE` to a captured positive BNB/USD quote before enabling any outgoing BSC worker.
-4. Copy `.env.disbursement.example` to `.env.disbursement`. Keep the treasury private key in this separate file, accessible only to the disbursement worker account. Policy flags and `BNB_USD_PRICE` remain in the main `.env`.
+4. Copy `.env.disbursement.example` to `.env.disbursement`. Keep the treasury private key in this separate file, accessible only to the treasury worker account. Policy flags, the dedicated admin-fees destination and `BNB_USD_PRICE` remain in the main `.env`. Set `ADMIN_FEES_TRANSFERS_ENABLED=true`, configure a valid `ADMIN_FEES_PAYOUT_ADDRESS`, a positive `ADMIN_FEES_THRESHOLD_USD` and a non-negative retained balance below the threshold to enable automatic administrative payouts.
 5. Copy `.env.sweeper.example` to `.env.sweeper`. Set the same captured `BNB_USD_PRICE` there because this worker loads its dedicated environment with override enabled. Keep the deposit HD private extended key and the separate gas-funder private key in this file, accessible only to the sweeper account.
 6. Never commit or distribute real `.env` files, extended private keys, seed phrases, or wallet private keys.
 7. Configure `BSC_DEPOSIT_XPUB` and its corresponding `BSC_DEPOSIT_XPRV` for the same non-hardened derivation branch. Keep the XPRV out of the HTTP server process.
@@ -96,7 +107,7 @@ Start each process under a service supervisor (PM2, systemd, or equivalent):
 npm start        # HTTP API and BEP-20 deposit scanner
 npm run telegram  # Telegram linking, block events and transactional outbox
 npm run sweep     # Separate deposit-address consolidation worker
-npm run disburse  # Separate treasury disbursement/refund and seller payout worker
+npm run disburse  # Separate treasury disbursement/refund, seller payout and admin-fees worker
 ```
 
 Set `USDT_SELLER_PAYOUTS_ENABLED=true` only when seller treasury payouts are ready. Enable each blockchain process only after its environment file, RPC, wallet addresses, and balances have been verified. Do not enable mainnet sends while testing business logic.
@@ -118,6 +129,7 @@ Set `USDT_SELLER_PAYOUTS_ENABLED=true` only when seller treasury payouts are rea
 - `POST /admin/unlock-disbursement`: requeues an expired, unsigned disbursement for the isolated worker after admin authentication and liquidity checks.
 - `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces the 140 BSC-USD system-funded cap, weekly cooldown when ONEX reserves are needed, 300 One-Val stock cap and reserve availability; seller funding remains first priority.
 - `POST /admin/recharge/refund`: queues a refund of a support-held recharge batch. No `tfees` is charged; a configured estimate of OneX's BSC gas cost is deducted, and the net refund must be at least 10 BSC-USD.
+- `POST /admin/admin-fees-transfers`: returns the paginated administrative-reward transfer history and the current `total_adminFees` / `remaining_adminFees` balances. Requires the configured administrator password and PIN.
 - `POST /admin/send-temp-pswd`: issues a seven-digit temporary password by email; valid for 10 minutes and usable only to sign in and change the permanent password.
 - `POST /app/join-system-sellers`: requests activation of a priority seller campaign.
 - `POST /app/cancel-system-sellers`: requests cancellation; the unused seller reserve remains locked pending admin review.

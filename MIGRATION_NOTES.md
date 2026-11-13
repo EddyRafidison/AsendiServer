@@ -4,7 +4,7 @@
 
 Cette version est destinée à un projet OneX non encore déployé. Elle définit directement le schéma cible. Elle ne migre pas et ne remplit pas les anciennes tables. Créer une base MySQL neuve et vide. `db.js` crée les tables avec `CREATE TABLE IF NOT EXISTS`, puis vérifie les colonnes requises. Une ancienne structure ne correspondant pas au schéma cible provoque volontairement une erreur au démarrage.
 
-`STOCK_LIMIT` initialise `common.total_units_price`. `INITIAL_BACKED_UNITS` initialise `common.backed_units` uniquement lors de la création initiale. La valeur par défaut est zéro. Ne renseigner que les actifs initiaux réellement disponibles. La réserve système non distribuable est fixée à `STOCK_LIMIT * SYSTEM_RESERVE_RATIO` (20 % par défaut). Aucune réserve n'est provisionnée automatiquement.
+Par défaut, une nouvelle base initialise `common.total_units_price=10000000`, `common.unit_price=1` et `common.backed_units=10000000`. `STOCK_LIMIT` et `INITIAL_BACKED_UNITS` peuvent remplacer ces valeurs; `INITIAL_BACKED_UNITS` prend par défaut la valeur de `STOCK_LIMIT` et ne peut pas la dépasser. La réserve déclarée doit correspondre aux actifs réellement disponibles. La réserve système non distribuable reste fixée à `STOCK_LIMIT * SYSTEM_RESERVE_RATIO` (20 % par défaut).
 
 ## Conventions comptables
 
@@ -110,9 +110,19 @@ Les estimations et les coûts réels ne sont jamais confondus :
 - `total_bnb_fee_estimated_value` : équivalent BSC-USD estimé.
 - `total_bnb_fee_actual` : BNB réel issu du reçu.
 - `total_bnb_fee_actual_value` : équivalent BSC-USD réel au prix capturé.
-- `total_common_share` et `total_admin_fees` : montants cumulés One-Val.
+- `total_common_share`, `total_adminFees` et `remaining_adminFees` : montants en BSC-USD. `total_adminFees` est un cumul historique monotone; `remaining_adminFees` est le solde encore disponible pour le paiement administratif.
 
 Le coût réel est `gasUsed * effectiveGasPrice`. Chaque transaction est journalisée dans `bsc_fee_ledger` et ne doit être comptabilisée qu'une fois. Les snapshots `common` préservent tous les cumuls.
+
+## Récompenses administratives (`AdminFees`)
+
+`AdminFees` sont libellés en BSC-USD. `common.total_adminFees` cumule toutes les récompenses administratives générées depuis le lancement et ne diminue jamais. `common.remaining_adminFees` suit uniquement la partie qui reste dans le treasury principal; elle augmente à chaque attribution et diminue seulement après confirmation blockchain définitive du transfert vers l'adresse administrative dédiée.
+
+La base d'actifs initiaux correspondant aux AdminFees reste dans les réserves système : les frais de recharge et P2P ajoutent leur base équivalente à `inactive_init_asset`; la liquidation système répartit la base des frais 50/50 entre `backed_units` (CommonShare) et `inactive_init_asset` (AdminFees). Le versement des récompenses BSC-USD ne débite pas ces réserves initiales.
+
+Dès que `remaining_adminFees >= ADMIN_FEES_THRESHOLD_USD` (100 BSC-USD par défaut), une demande est créée pour transférer exactement `remaining_adminFees - ADMIN_FEES_RETAINED_BALANCE_USD` (10 BSC-USD par défaut). Une seule demande non résolue peut exister à la fois. Si de nouveaux frais sont accumulés pendant le transfert, le worker réévalue le solde après confirmation et crée une autre demande si le seuil est toujours atteint. Une valeur de seuil nulle, négative ou non finie, une réserve résiduelle invalide, une adresse invalide ou `ADMIN_FEES_TRANSFERS_ENABLED=false` empêchent la création des transferts. Le worker ne soumet pas non plus les demandes déjà en file tant que cette configuration reste invalide; elles restent en attente et ne reprennent qu'après réactivation d'une configuration valide.
+
+Le worker treasury `npm run disburse` utilise la clé du treasury principal dans `.env.disbursement`, envoie le montant BSC-USD sans déduire le gas, puis comptabilise le gas BNB séparément dans `bsc_fee_ledger`. Le solde `remaining_adminFees` est protégé de toute autre sortie : les disbursements utilisateurs, paiements vendeurs et remboursements ne peuvent utiliser cette part de la liquidité du treasury. La diminution de `remaining_adminFees` intervient uniquement après vérification de la canonicalité, des confirmations requises et de l'événement BSC-USD `Transfer` vers l'adresse dédiée. `POST /admin/admin-fees-transfers` expose l'historique paginé aux administrateurs authentifiés.
 
 ## Telegram et SMTP
 
@@ -126,7 +136,7 @@ Les fichiers `.env` réels ne doivent jamais être distribués. Fournir uniqueme
 
 - HTTP + scanner : aucune clé privée de wallet.
 - `npm run sweep` : clé HD des adresses de dépôt et clé du financeur gas dans `.env.sweeper`.
-- `npm run disburse` : clé du treasury dans `.env.disbursement`; les flags et `BNB_USD_PRICE` viennent du `.env` principal.
+- `npm run disburse` : clé du treasury dans `.env.disbursement`; les flags, l'adresse dédiée AdminFees, les seuils et `BNB_USD_PRICE` viennent du `.env` principal. Ce worker traite aussi les demandes AdminFees lorsque `ADMIN_FEES_TRANSFERS_ENABLED=true`.
 - Le worker de cycle de vie vendeur et de préparation des lots de paiement est lancé par `npm start`; il nécessite uniquement la base de données, sans clé privée. Il utilise un verrou MySQL pour éviter le double traitement.
 
 ## Authentification et récupération

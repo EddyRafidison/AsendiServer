@@ -6,8 +6,15 @@ require("dotenv").config();
 
 const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
 const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
-if (!disbursementsEnabled && !sellerPayoutsEnabled) {
-  console.log("OneX BSC treasury payouts are disabled. Enable USDT_DISBURSEMENTS_ENABLED or USDT_SELLER_PAYOUTS_ENABLED.");
+const adminFeesRequested = String(process.env.ADMIN_FEES_TRANSFERS_ENABLED || "false").toLowerCase() === "true";
+const { getAdminFeesTransferConfig } = require("./admin-fees-policy");
+const adminFeesConfig = getAdminFeesTransferConfig();
+const adminFeesTransfersEnabled = adminFeesConfig.enabled;
+if (adminFeesRequested && !adminFeesTransfersEnabled) {
+  console.error(`Admin-fees transfers remain disabled: ${adminFeesConfig.reason}.`);
+}
+if (!disbursementsEnabled && !sellerPayoutsEnabled && !adminFeesTransfersEnabled) {
+  console.log("OneX BSC treasury payouts are disabled or have invalid admin-fees configuration.");
   process.exit(0);
 }
 

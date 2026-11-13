@@ -13,7 +13,11 @@ const { deriveInitAsset } = require("./stock-accounting");
 const { calculateDisbursementReserveSettlement } = require("./disbursement-policy");
 const { getDate } = require("./utils");
 const { queueTelegramMessageTx } = require("./telegram");
-const { getLatestCommonTx, insertCommonSnapshotTx } = require("./common-accounting");
+const {
+  getLatestCommonTx,
+  insertCommonSnapshotTx,
+  queueAdminFeesTransferIfDueTx,
+} = require("./common-accounting");
 const {
   getConfiguredBnbUsdPrice,
   calculateEstimatedGasFee,
@@ -21,6 +25,7 @@ const {
   recordActualBscFeeTx,
 } = require("./bsc-fee-accounting");
 const { calculateSellerPayoutNet } = require("./seller-accounting");
+const { getAdminFeesTransferConfig } = require("./admin-fees-policy");
 
 const CHAIN_ID = 56n;
 const TOKEN_DECIMALS = 18n;
@@ -54,7 +59,9 @@ function makeRuntime() {
 
   const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
   const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
-  if (!disbursementsEnabled && !sellerPayoutsEnabled) return null;
+  const adminFeesTransferConfig = getAdminFeesTransferConfig();
+  const adminFeesTransfersEnabled = adminFeesTransferConfig.enabled;
+  if (!disbursementsEnabled && !sellerPayoutsEnabled && !adminFeesTransfersEnabled) return null;
   if (!getConfiguredBnbUsdPrice().isGreaterThan(0)) {
     throw new Error("BNB_USD_PRICE must be set to a positive captured BNB/USD quote before treasury payouts are enabled.");
   }
@@ -69,6 +76,12 @@ function makeRuntime() {
     process.env.USDT_BEP20_TREASURY_ADDRESS || "",
     "OneX treasury address",
   );
+  const adminFeesPayoutAddress = adminFeesTransfersEnabled
+    ? requiredAddress(process.env.ADMIN_FEES_PAYOUT_ADDRESS || "", "Admin-fees payout address")
+    : null;
+  if (adminFeesPayoutAddress && adminFeesPayoutAddress.toLowerCase() === treasuryAddress.toLowerCase()) {
+    throw new Error("The admin-fees payout address must be different from the OneX treasury address.");
+  }
   const confirmations = Number(process.env.USDT_DISBURSEMENT_CONFIRMATIONS || 15);
   const pollIntervalMs = Number(process.env.USDT_DISBURSEMENT_POLL_MS || 3000);
   const gasLimit = BigInt(process.env.USDT_DISBURSEMENT_GAS_LIMIT || "100000");
@@ -104,6 +117,8 @@ function makeRuntime() {
     signer,
     tokenAddress,
     treasuryAddress,
+    adminFeesPayoutAddress,
+    adminFeesTransfersEnabled,
     confirmations,
     pollIntervalMs,
     gasLimit,
@@ -134,7 +149,28 @@ async function validateRuntime(activeRuntime) {
   }
 }
 
-async function checkTreasuryLiquidity(amountRaw) {
+async function getAdminFeesReservedRaw(db) {
+  const rows = await db.queryAsync(
+    "SELECT `remaining_adminFees` FROM common ORDER BY id DESC LIMIT 1",
+  );
+  if (!rows.length) throw new Error("Common admin-fees balance is not initialized.");
+  const remaining = new BigNumber(rows[0].remaining_adminFees || "0");
+  if (!remaining.isFinite() || remaining.isNegative()) {
+    throw new Error("common.remaining_adminFees is invalid.");
+  }
+  return BigInt(
+    remaining
+      .decimalPlaces(18, BigNumber.ROUND_UP)
+      .shiftedBy(18)
+      .integerValue(BigNumber.ROUND_UP)
+      .toFixed(0),
+  );
+}
+
+async function checkTreasuryLiquidity(amountRaw, dbPool) {
+  if (!dbPool || typeof dbPool.queryAsync !== "function") {
+    throw new TypeError("A database pool is required to protect the remaining AdminFees balance.");
+  }
   const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
   const tokenAddress = requiredAddress(
     process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
@@ -161,6 +197,10 @@ async function checkTreasuryLiquidity(amountRaw) {
     if (!code || code === "0x") throw new Error("The approved BSC-USD contract is unavailable.");
     const token = new Contract(tokenAddress, ["function balanceOf(address account) view returns (uint256)"], provider);
     const tokenBalance = await token.balanceOf(treasuryAddress);
+    const adminFeesReservedRaw = await getAdminFeesReservedRaw(dbPool);
+    const spendableTokenBalance = tokenBalance > adminFeesReservedRaw
+      ? tokenBalance - adminFeesReservedRaw
+      : 0n;
     const feeData = await provider.getFeeData();
     const gasPrice = feeData.gasPrice || BigInt(await provider.send("eth_gasPrice", []));
     const bnbBalance = await provider.getBalance(treasuryAddress);
@@ -171,8 +211,10 @@ async function checkTreasuryLiquidity(amountRaw) {
     }
     const estimatedFee = calculateEstimatedGasFee(gasLimit.toString(), gasPrice.toString(), bnbUsdPrice);
     return {
-      available: tokenBalance >= amount && bnbBalance >= gasRequired,
+      available: spendableTokenBalance >= amount && bnbBalance >= gasRequired,
       tokenBalanceRaw: tokenBalance.toString(),
+      adminFeesReservedRaw: adminFeesReservedRaw.toString(),
+      spendableTokenBalanceRaw: spendableTokenBalance.toString(),
       requiredTokenRaw: amount.toString(),
       bnbBalanceWei: bnbBalance.toString(),
       requiredBnbWei: gasRequired.toString(),
@@ -275,8 +317,9 @@ async function signQueuedJob(db, job, activeRuntime) {
   }
 
   const tokenBalanceRaw = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
-  if (tokenBalanceRaw < amountRaw) {
-    throw new Error("The OneX treasury does not have enough BSC-USD to cover this disbursement.");
+  const adminFeesReservedRaw = await getAdminFeesReservedRaw(db);
+  if (tokenBalanceRaw < amountRaw + adminFeesReservedRaw) {
+    throw new Error("The OneX treasury does not have enough spendable BSC-USD after protecting remaining AdminFees.");
   }
 
   const feeData = await activeRuntime.provider.getFeeData();
@@ -633,15 +676,19 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       [newSystemBalance.toFixed(), newSystemInitAsset.toFixed(), date, time],
     );
     const commonShareTotal = new BigNumber(common.total_common_share || "0");
-    const adminFeesTotal = new BigNumber(common.total_admin_fees || "0");
+    const adminFeesTotal = new BigNumber(common.total_adminFees || "0");
+    const remainingAdminFees = new BigNumber(common.remaining_adminFees || "0");
+    const adminFeesBscUsd = new BigNumber(job.fee_amount).dividedBy(2);
     await insertCommonSnapshotTx(tx, common, {
       total_units_price: newTotal.toFixed(),
       unit_price: unitPrice.toFixed(),
       backed_units: newBacked.toFixed(),
       inactive_init_asset: newInactive.toFixed(),
       total_common_share: commonShareTotal.plus(new BigNumber(job.fee_amount).dividedBy(2)).toFixed(),
-      total_admin_fees: adminFeesTotal.plus(new BigNumber(job.fee_amount).dividedBy(2)).toFixed(),
+      total_adminFees: adminFeesTotal.plus(adminFeesBscUsd).toFixed(),
+      remaining_adminFees: remainingAdminFees.plus(adminFeesBscUsd).toFixed(),
     }, date, time);
+    await queueAdminFeesTransferIfDueTx(tx, remainingAdminFees.plus(adminFeesBscUsd));
 
     const [existingActivityRows] = await tx.query(
       "SELECT id FROM activities WHERE reference=? LIMIT 1",
@@ -828,7 +875,10 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
   if (!amountRawDecimal.isGreaterThan(0)) throw new Error("Seller payout is too small after BSC gas recovery.");
   const amountRaw = BigInt(amountRawDecimal.toFixed(0));
   const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
-  if (tokenBalance < amountRaw) throw new Error("The OneX treasury has insufficient BSC-USD for seller payouts.");
+  const adminFeesReservedRaw = await getAdminFeesReservedRaw(db);
+  if (tokenBalance < amountRaw + adminFeesReservedRaw) {
+    throw new Error("The OneX treasury has insufficient spendable BSC-USD after protecting remaining AdminFees for seller payouts.");
+  }
   const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
   if (nativeBalance < activeRuntime.gasLimit * gasPrice) {
     throw new Error("The OneX treasury has insufficient BNB for the seller payout gas.");
@@ -1044,6 +1094,235 @@ async function processOneSellerPayout(db, job, activeRuntime) {
   await finalizeSellerPayout(db, job.id, receipt, activeRuntime);
 }
 
+async function signQueuedAdminFeesTransfer(db, job, activeRuntime) {
+  const payoutAddress = requiredAddress(job.destination_address, "Admin-fees payout address");
+  if (
+    !activeRuntime.adminFeesPayoutAddress ||
+    payoutAddress.toLowerCase() !== activeRuntime.adminFeesPayoutAddress.toLowerCase()
+  ) {
+    throw new Error("The queued admin-fees destination does not match the configured dedicated wallet.");
+  }
+  if (payoutAddress.toLowerCase() === activeRuntime.treasuryAddress.toLowerCase()) {
+    throw new Error("The admin-fees payout address cannot be the OneX treasury address.");
+  }
+
+  const amountRaw = BigInt(job.amount_raw);
+  if (amountRaw <= 0n) throw new Error("The admin-fees transfer amount must be positive.");
+  const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
+  if (tokenBalance < amountRaw) {
+    throw new Error("The OneX treasury does not have enough BSC-USD for the admin-fees transfer.");
+  }
+
+  const feeData = await activeRuntime.provider.getFeeData();
+  const gasPrice = feeData.gasPrice || BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
+  const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
+  if (nativeBalance < activeRuntime.gasLimit * gasPrice) {
+    throw new Error("The OneX treasury does not have enough BNB for the admin-fees transfer gas.");
+  }
+
+  const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
+  const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
+  const rawTransaction = await activeRuntime.signer.signTransaction({
+    type: 0,
+    chainId: Number(CHAIN_ID),
+    nonce,
+    to: activeRuntime.tokenAddress,
+    value: 0n,
+    data,
+    gasLimit: activeRuntime.gasLimit,
+    gasPrice,
+  });
+  const transactionHash = keccak256(rawTransaction);
+  const bnbUsdPrice = getConfiguredBnbUsdPrice();
+  if (!bnbUsdPrice.isGreaterThan(0)) {
+    throw new Error("BNB_USD_PRICE must be positive to record admin-fees transfer gas costs.");
+  }
+  const estimate = calculateEstimatedGasFee(
+    activeRuntime.gasLimit.toString(),
+    gasPrice.toString(),
+    bnbUsdPrice,
+  );
+
+  const [update] = await db.queryAsync(
+    `UPDATE admin_fees_transfers
+     SET raw_tx=?,tx_hash=?,nonce=?,estimated_fee_bnb=?,estimated_fee_usd=?,bnb_usd_price=?,
+         status='signed',last_error=NULL,updated_at_ms=?
+     WHERE id=? AND status='queued' AND raw_tx IS NULL AND tx_hash IS NULL`,
+    [
+      rawTransaction,
+      transactionHash,
+      String(nonce),
+      estimate.feeBnb.toFixed(30),
+      estimate.feeUsd.toFixed(18),
+      bnbUsdPrice.toFixed(12),
+      String(Date.now()),
+      job.id,
+    ],
+  );
+  if (update.affectedRows !== 1) {
+    throw new Error("The admin-fees transfer was claimed or updated concurrently.");
+  }
+
+  await withTransaction(db, async (tx) => {
+    await recordEstimatedBscFeeTx(tx, {
+      txHash: transactionHash,
+      operation: "admin_fees_transfer",
+      gasLimit: activeRuntime.gasLimit.toString(),
+      gasPriceWei: gasPrice.toString(),
+      bnbUsdPrice,
+    });
+  });
+  return true;
+}
+
+async function finalizeAdminFeesTransfer(db, jobId, receipt, activeRuntime) {
+  return withTransaction(db, async (tx) => {
+    const [lockRows] = await tx.query(
+      "SELECT lock_name FROM system_locks WHERE lock_name=? FOR UPDATE",
+      ["common_state"],
+    );
+    if (!lockRows.length) throw new Error("The common-state lock row has not been initialized.");
+    const [jobRows] = await tx.query(
+      "SELECT * FROM admin_fees_transfers WHERE id=? LIMIT 1 FOR UPDATE",
+      [jobId],
+    );
+    if (!jobRows.length) throw new Error(`Admin-fees transfer ${jobId} does not exist.`);
+    const job = jobRows[0];
+    if (job.status === "confirmed") return { confirmed: true };
+
+    const actualFee = await recordActualBscFeeTx(tx, {
+      txHash: job.tx_hash,
+      operation: "admin_fees_transfer",
+      receipt,
+      bnbUsdPrice: job.bnb_usd_price,
+    });
+    await tx.query(
+      `UPDATE admin_fees_transfers SET actual_fee_bnb=?,actual_fee_usd=?,block_number=?,updated_at_ms=?
+       WHERE id=?`,
+      [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), String(receipt.blockNumber), String(Date.now()), jobId],
+    );
+
+    const expectedTransfer = {
+      amount_raw: job.amount_raw,
+      payout_address: job.destination_address,
+    };
+    if (
+      Number(receipt.status) !== 1 ||
+      !receiptConfirmsExpectedTransfer(receipt, expectedTransfer, activeRuntime)
+    ) {
+      const reason = Number(receipt.status) !== 1
+        ? "The admin-fees transfer was finalized on BNB Smart Chain but reverted."
+        : "The finalized transaction did not contain the expected BSC-USD transfer to the dedicated admin wallet.";
+      await tx.query(
+        `UPDATE admin_fees_transfers SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?`,
+        [reason, String(Date.now()), jobId],
+      );
+      return { manualReview: true, reason };
+    }
+
+    const common = await getLatestCommonTx(tx, true);
+    const remaining = new BigNumber(common.remaining_adminFees || "0");
+    const amount = new BigNumber(job.amount);
+    if (
+      !remaining.isFinite() || remaining.isNegative() ||
+      !amount.isFinite() || !amount.isGreaterThan(0) ||
+      remaining.isLessThan(amount)
+    ) {
+      const reason = "The admin-fees transfer is confirmed on-chain, but the remaining_adminFees balance is insufficient for safe settlement.";
+      await tx.query(
+        `UPDATE admin_fees_transfers SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?`,
+        [reason, String(Date.now()), jobId],
+      );
+      return { manualReview: true, reason };
+    }
+
+    const now = String(Date.now());
+    await tx.query(
+      `UPDATE admin_fees_transfers
+       SET status='confirmed',last_error=NULL,confirmed_at_ms=?,updated_at_ms=?
+       WHERE id=? AND status IN ('signed','submitted')`,
+      [now, now, jobId],
+    );
+    const [date, time] = getDate();
+    await insertCommonSnapshotTx(tx, common, {
+      remaining_adminFees: remaining.minus(amount).toFixed(),
+    }, date, time, { allowAdminFeesDecrease: true });
+    await queueAdminFeesTransferIfDueTx(tx, remaining.minus(amount));
+    return {
+      confirmed: true,
+      amount: amount.toFixed(18),
+      actualGasBnb: actualFee.feeBnb.toFixed(30),
+      actualGasUsd: actualFee.feeUsd.toFixed(18),
+    };
+  });
+}
+
+async function processOneAdminFeesTransfer(db, job, activeRuntime) {
+  if (job.status === "queued") {
+    try {
+      await signQueuedAdminFeesTransfer(db, job, activeRuntime);
+    } catch (error) {
+      await db.queryAsync(
+        `UPDATE admin_fees_transfers SET last_error=?,updated_at_ms=? WHERE id=? AND status='queued'`,
+        [String(error.message || error).slice(0, 2000), String(Date.now()), job.id],
+      );
+      return;
+    }
+    const freshRows = await db.queryAsync(
+      "SELECT * FROM admin_fees_transfers WHERE id=? LIMIT 1",
+      [job.id],
+    );
+    if (!freshRows.length) return;
+    job = freshRows[0];
+  }
+  if (!job.raw_tx || !job.tx_hash) {
+    await db.queryAsync(
+      `UPDATE admin_fees_transfers SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')`,
+      ["The signed admin-fees transaction is missing its raw transaction or hash.", String(Date.now()), job.id],
+    );
+    return;
+  }
+
+  let receipt = await activeRuntime.provider.getTransactionReceipt(job.tx_hash);
+  if (!receipt) {
+    const known = await activeRuntime.provider.getTransaction(job.tx_hash);
+    if (!known) {
+      try {
+        const broadcast = await activeRuntime.provider.broadcastTransaction(job.raw_tx);
+        if (broadcast.hash.toLowerCase() !== job.tx_hash.toLowerCase()) {
+          throw new Error("Admin-fees payout broadcast hash differs from the persisted transaction hash.");
+        }
+      } catch (error) {
+        const afterError = await activeRuntime.provider.getTransaction(job.tx_hash);
+        if (!afterError) {
+          await db.queryAsync(
+            `UPDATE admin_fees_transfers SET last_error=?,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')`,
+            [String(error.message || error).slice(0, 2000), String(Date.now()), job.id],
+          );
+          return;
+        }
+      }
+    }
+    await db.queryAsync(
+      `UPDATE admin_fees_transfers SET status='submitted',last_error=NULL,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')`,
+      [String(Date.now()), job.id],
+    );
+    receipt = await activeRuntime.provider.getTransactionReceipt(job.tx_hash);
+    if (!receipt) return;
+  }
+
+  const canonicalBlock = await activeRuntime.provider.getBlock(receipt.blockNumber);
+  const latestBlock = await activeRuntime.provider.getBlockNumber();
+  const confirmations = latestBlock - Number(receipt.blockNumber) + 1;
+  if (
+    !canonicalBlock ||
+    String(canonicalBlock.hash || "").toLowerCase() !== String(receipt.blockHash || "").toLowerCase() ||
+    confirmations < activeRuntime.confirmations
+  ) return;
+
+  await finalizeAdminFeesTransfer(db, job.id, receipt, activeRuntime);
+}
+
 async function markRefundError(db, refundId, error) {
   await db.queryAsync(
     `UPDATE users_usdt_refunds
@@ -1139,7 +1418,10 @@ async function processOneRefundJob(db, job, activeRuntime) {
       throw new Error("Refund destination cannot be the OneX treasury address.");
     }
     const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
-    if (tokenBalance < amountRaw) throw new Error("The OneX treasury has insufficient BSC-USD for this refund.");
+    const adminFeesReservedRaw = await getAdminFeesReservedRaw(db);
+    if (tokenBalance < amountRaw + adminFeesReservedRaw) {
+      throw new Error("The OneX treasury has insufficient spendable BSC-USD after protecting remaining AdminFees for this refund.");
+    }
     const feeData = await activeRuntime.provider.getFeeData();
     const gasPrice = feeData.gasPrice || BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
     const bnbBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
@@ -1317,6 +1599,7 @@ async function runDisbursementCycle(db, activeRuntime) {
 
     const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
     const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
+    const adminFeesTransfersEnabled = activeRuntime.adminFeesTransfersEnabled === true;
     if (disbursementsEnabled) {
       const now = String(Date.now());
       const expiredReservations = await db.queryAsync(
@@ -1362,6 +1645,20 @@ async function runDisbursementCycle(db, activeRuntime) {
         }
       }
     }
+    if (adminFeesTransfersEnabled) {
+      const adminFeeJobs = await db.queryAsync(
+        `SELECT * FROM admin_fees_transfers
+         WHERE status IN ('queued','signed','submitted')
+         ORDER BY id ASC LIMIT 10`,
+      );
+      for (const job of adminFeeJobs) {
+        try {
+          await processOneAdminFeesTransfer(db, job, activeRuntime);
+        } catch (error) {
+          console.error(`Admin-fees transfer ${job.id} processing failed:`, error.message);
+        }
+      }
+    }
   } catch (error) {
     console.error("OneX BSC disbursement worker failed:", error);
   } finally {
@@ -1376,18 +1673,39 @@ async function runDisbursementCycle(db, activeRuntime) {
   }
 }
 
+async function queueExistingAdminFeesIfDue(db) {
+  return withTransaction(db, async (tx) => {
+    const [lockRows] = await tx.query(
+      "SELECT lock_name FROM system_locks WHERE lock_name=? FOR UPDATE",
+      ["common_state"],
+    );
+    if (!lockRows.length) throw new Error("The common-state lock row has not been initialized.");
+    const common = await getLatestCommonTx(tx, true);
+    return queueAdminFeesTransferIfDueTx(tx, common.remaining_adminFees || "0");
+  });
+}
+
 async function startDisbursementWorker(db) {
   const disbursementsEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
   const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
-  if (!disbursementsEnabled && !sellerPayoutsEnabled) {
-    console.log("OneX BSC treasury payouts are disabled.");
+  const adminFeesRequested = String(process.env.ADMIN_FEES_TRANSFERS_ENABLED || "false").toLowerCase() === "true";
+  const adminFeesConfig = getAdminFeesTransferConfig();
+  const adminFeesTransfersEnabled = adminFeesConfig.enabled;
+  if (adminFeesRequested && !adminFeesTransfersEnabled) {
+    console.error(`Admin-fees transfers remain disabled: ${adminFeesConfig.reason}.`);
+  }
+  if (!disbursementsEnabled && !sellerPayoutsEnabled && !adminFeesTransfersEnabled) {
+    console.log("OneX BSC treasury payouts are disabled or have invalid admin-fees configuration.");
     return { enabled: false };
   }
   if (timer) return { enabled: true };
 
   const activeRuntime = makeRuntime();
   await validateRuntime(activeRuntime);
-  console.log(`OneX BSC disbursement worker ready. Treasury: ${activeRuntime.treasuryAddress}`);
+  if (adminFeesTransfersEnabled) {
+    await queueExistingAdminFeesIfDue(db);
+  }
+  console.log(`OneX BSC treasury worker ready. Treasury: ${activeRuntime.treasuryAddress}`);
 
   const run = async () => {
     await runDisbursementCycle(db, activeRuntime);

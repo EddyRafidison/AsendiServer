@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const express = require("express");
 const crypto = require("crypto");
 const { getAddress: checksumEvmAddress } = require("ethers");
@@ -70,7 +72,11 @@ const {
 const { startDepositSweeper } = require("./sweep");
 const { checkTreasuryLiquidity } = require("./disbursement");
 const { createTelegramBotLinkTx, queueTelegramMessageTx } = require("./telegram");
-const { getLatestCommonTx, insertCommonSnapshotTx } = require("./common-accounting");
+const {
+  getLatestCommonTx,
+  insertCommonSnapshotTx,
+  queueAdminFeesTransferIfDueTx,
+} = require("./common-accounting");
 const { COMMON_SHARE_RATIO, BSC_FEE_RECHARGE_DEFAULT_USD } = require("./fee-policy");
 const {
   SELLER_STATUS_DURATION_MS,
@@ -465,7 +471,8 @@ async function applyUserTopUp(
     ? newTotal.dividedBy(lastTotal).multipliedBy(lastPrice)
     : lastPrice;
   const totalCommonFees = new BigNumber(common.total_common_share || "0").plus(commonShare);
-  const totalAdminFees = new BigNumber(common.total_admin_fees || "0").plus(adminFees);
+  const totalAdminFees = new BigNumber(common.total_adminFees || "0").plus(adminFees);
+  const remainingAdminFees = new BigNumber(common.remaining_adminFees || "0").plus(adminFees);
   const totalActivityBasis = sellerBasis.plus(systemBasis);
   const sellerFeeBasis = netAmount.isGreaterThan(0) ? feeBasis.multipliedBy(sellerAmount).dividedBy(netAmount) : new BigNumber(0);
   const systemFeeBasis = feeBasis.minus(sellerFeeBasis);
@@ -498,8 +505,10 @@ async function applyUserTopUp(
     sellers_res: newSellersReserve.toFixed(),
     sellers_init_asset: newSellersInitAsset.toFixed(),
     total_common_share: totalCommonFees.toFixed(),
-    total_admin_fees: totalAdminFees.toFixed(),
+    total_adminFees: totalAdminFees.toFixed(),
+    remaining_adminFees: remainingAdminFees.toFixed(),
   }, date, time);
+  await queueAdminFeesTransferIfDueTx(tx, remainingAdminFees);
 
   await queueTelegramMessageTx(
     tx,
@@ -2132,8 +2141,13 @@ router.post("/app/near-transfer", async (req, res) => {
         backed_units: newBackedUnits.toFixed(),
         inactive_init_asset: newInactiveAssets.toFixed(),
         total_common_share: new BigNumber(common.total_common_share || 0).plus(commonShareValue).toFixed(),
-        total_admin_fees: new BigNumber(common.total_admin_fees || 0).plus(adminFeeValue).toFixed(),
+        total_adminFees: new BigNumber(common.total_adminFees || 0).plus(adminFeeValue).toFixed(),
+        remaining_adminFees: new BigNumber(common.remaining_adminFees || 0).plus(adminFeeValue).toFixed(),
       }, date, time);
+      await queueAdminFeesTransferIfDueTx(
+        tx,
+        new BigNumber(common.remaining_adminFees || 0).plus(adminFeeValue),
+      );
       const p2pTimestamp = Date.now();
       if (sellerStatus > 0) {
         await tx.query(
@@ -2382,7 +2396,7 @@ router.post("/admin/recharge/refund", async (req, res) => {
     if (!grossRaw.isInteger() || grossRaw.isLessThanOrEqualTo(0)) {
       return res.send({ transf: "invalid refund amount" });
     }
-    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0));
+    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0), db);
     const bscFeeRecovery = new BigNumber(liquidityEstimate.estimatedFeeUsd || "0");
     const amount = grossAmount.minus(bscFeeRecovery);
     if (!amount.isFinite() || amount.isLessThan(10)) {
@@ -2393,7 +2407,7 @@ router.post("/admin/recharge/refund", async (req, res) => {
       return res.send({ transf: "invalid refund amount" });
     }
     const amountRaw = amountRawDecimal.toFixed(0);
-    const liquidity = await checkTreasuryLiquidity(amountRaw);
+    const liquidity = await checkTreasuryLiquidity(amountRaw, db);
     if (!liquidity.available) {
       return res.send({ transf: "insufficient treasury liquidity", liquidity });
     }
@@ -2507,7 +2521,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
     if (!isEvmAddress(snapshot.payout_address)) return res.send({ transf: "invalid payout address" });
 
     // The HTTP process checks balances only; the isolated worker owns the signing key.
-    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw);
+    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw, db);
     if (!liquidity.available) {
       return res.send({ transf: "insufficient treasury liquidity", liquidity });
     }
@@ -2917,6 +2931,67 @@ router.post("/admin/unlock-system-seller", async (req, res) => {
   } catch (error) {
     console.error("Admin seller unlock failed:", error.message);
     return res.send({ auth: "error" });
+  }
+});
+
+// Read-only administrative history for transfers of accumulated BSC-USD admin rewards.
+router.post("/admin/admin-fees-transfers", async (req, res) => {
+  const { pswd, pin, page: pageInput, limit: limitInput, status: statusInput } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ auth: "incorrect" });
+
+  const page = Number(pageInput || 1);
+  const limit = Number(limitInput || 20);
+  const status = typeof statusInput === "string" ? statusInput.trim().toLowerCase() : "";
+  const allowedStatuses = new Set([
+    "queued", "signed", "submitted", "confirmed", "failed", "manual_review",
+  ]);
+  if (
+    !Number.isInteger(page) || page < 1 || page > 1000000 ||
+    !Number.isInteger(limit) || limit < 1 || limit > 100 ||
+    (status && !allowedStatuses.has(status))
+  ) return res.status(400).send({ error: "invalid pagination or status" });
+
+  const where = status ? "WHERE status=?" : "";
+  const queryParams = status ? [status] : [];
+  const offset = (page - 1) * limit;
+  try {
+    const [countRows, transferRows, commonRows] = await Promise.all([
+      db.queryAsync(`SELECT COUNT(*) AS total FROM admin_fees_transfers ${where}`, queryParams),
+      db.queryAsync(
+        `SELECT id,amount,amount_raw,destination_address,reference,status,nonce,estimated_fee_bnb,estimated_fee_usd,
+                actual_fee_bnb,actual_fee_usd,bnb_usd_price,tx_hash,block_number,last_error,
+                created_at_ms,updated_at_ms,confirmed_at_ms
+         FROM admin_fees_transfers ${where}
+         ORDER BY id DESC LIMIT ? OFFSET ?`,
+        [...queryParams, limit, offset],
+      ),
+      db.queryAsync(
+        "SELECT `total_adminFees`,`remaining_adminFees` FROM common ORDER BY id DESC LIMIT 1",
+      ),
+    ]);
+    const summary = commonRows[0] || { total_adminFees: "0", remaining_adminFees: "0" };
+    return res.send({
+      transf: "ok",
+      page,
+      limit,
+      total: Number(countRows[0]?.total || 0),
+      total_adminFees: String(summary.total_adminFees),
+      remaining_adminFees: String(summary.remaining_adminFees),
+      history: transferRows.map((row) => ({
+        ...row,
+        id: String(row.id),
+        created_at_ms: String(row.created_at_ms),
+        updated_at_ms: String(row.updated_at_ms),
+        confirmed_at_ms: row.confirmed_at_ms == null ? null : String(row.confirmed_at_ms),
+        block_number: row.block_number == null ? null : String(row.block_number),
+      })),
+    });
+  } catch (error) {
+    console.error("Admin-fees transfer history lookup failed:", error.message);
+    return res.send({ transf: "error" });
   }
 });
 
