@@ -10,14 +10,14 @@ Par défaut, une nouvelle base initialise `common.total_units_price=10000000`, `
 
 - Réseau : BNB Smart Chain mainnet, chain ID 56.
 - Token : Binance-Peg BSC-USD, contrat `0x55d398326f99059fF775485246999027B3197955`, 18 décimales. Ce n'est pas un USDt directement émis par Tether.
-- Équivalence opérationnelle : 1 One-Val = 1 BSC-USD.
-- `users_stock.balance` : solde One-Val direct.
+- Équivalence opérationnelle : 1 XTU = 1 BSC-USD.
+- `users_stock.balance` : solde XTU direct.
 - `users_stock.init_asset` : base en actifs initiaux.
 - `users_stock` ne possède pas de `unit_price` individuel.
 - `activities.amount` et `activities.fees` suivent la dénomination définie par l'opération; `activities.unit_price` enregistre le prix de conversion utilisé.
-- `common.total_units_price` : valeur en One-Val.
+- `common.total_units_price` : valeur en XTU.
 - `common.backed_units`, `common.inactive_init_asset` et `common.sellers_init_asset` : actifs initiaux.
-- `common.sellers_res` : One-Val réservé aux vendeurs.
+- `common.sellers_res` : XTU réservé aux vendeurs.
 - Les calculs financiers utilisent `BigNumber`, jamais l'arithmétique flottante JavaScript.
 - Toutes les dates et heures nouvellement écrites par le serveur sont en UTC.
 
@@ -30,7 +30,7 @@ Règles de montant :
 - Minimum automatique : 12 BSC-USD par batch.
 - Maximum 140 BSC-USD et cooldown de sept jours : uniquement pour la portion financée par les réserves système ONEX.
 - Les montants financés par la réserve vendeurs ne sont pas soumis à cette limite hebdomadaire.
-- Le solde de l'utilisateur après crédit ne peut pas dépasser 300 One-Val.
+- Le solde de l'utilisateur après crédit ne peut pas dépasser 300 XTU.
 - Le seuil de 70 BSC-USD concerne la consolidation d'une adresse de dépôt vers le treasury, pas le minimum de recharge.
 
 Le montant crédité est :
@@ -53,7 +53,7 @@ Les adresses individuelles sont consolidées vers le treasury lorsque les évén
 
 ## Campagnes et réserve vendeurs
 
-`POST /app/join-system-sellers` permet de demander une campagne vendeur. Conditions : solde strictement supérieur à 12 One-Val; `run_balance` choisi au moins égal à 50 % du solde et à 12 One-Val, sans dépasser le solde; `pending_bonus` au moins égal à 10 % de `run_balance`.
+`POST /app/join-system-sellers` permet de demander une campagne vendeur. Conditions : solde strictement supérieur à 12 XTU; `run_balance` choisi au moins égal à 50 % du solde et à 12 XTU, sans dépasser le solde; `pending_bonus` au moins égal à 10 % de `run_balance`.
 
 `run_balance` est une référence fixe de campagne. À l'activation, 50 % de `run_balance` (hors bonus) est affecté à `common.sellers_res`, avec sa base initiale proportionnelle dans `common.sellers_init_asset`. Le solde principal affiché n'est pas diminué à la simple activation.
 
@@ -63,7 +63,7 @@ Pendant une campagne active ou en annulation en attente, le montant maximal sort
 
 Les transferts entrants restent autorisés. `/app/cancel-system-sellers` demande l'annulation, mais ne libère pas directement la réserve. `POST /admin/unlock-system-seller` libère uniquement la portion non consommée après authentification et justification administratives. La campagne expire après sept jours; le worker vendeur clôture les campagnes expirées et libère les lots inutilisés. Les montants déjà consommés demeurent des dettes de paiement envers le vendeur.
 
-Les lots sont suivis individuellement dans `users_seller_reserve_lots`, puis consommés en FIFO. Lorsqu'un lot finance une recharge, la base et le solde One-Val du vendeur sont diminués proportionnellement à la consommation; une dette de paiement vendeur est créée. Les dettes atteignant ensemble 300 One-Val sont regroupées en lots de paiement, chacun plafonné à 300 One-Val et ventilé par vendeur vers son adresse de paiement enregistrée.
+Les lots sont suivis individuellement dans `users_seller_reserve_lots`, puis consommés en FIFO. Lorsqu'un lot finance une recharge, la base et le solde XTU du vendeur sont diminués proportionnellement à la consommation; une dette de paiement vendeur est créée. Les dettes atteignant ensemble 300 XTU sont regroupées en lots de paiement, chacun plafonné à 300 XTU et ventilé par vendeur vers son adresse de paiement enregistrée.
 
 Le paiement vendeur est envoyé depuis le treasury en BSC-USD. Il n'y a pas de `tfees`; seul le coût estimé du gas BSC payé par OneX est récupéré sur le paiement du vendeur. Le coût réel est comptabilisé séparément après finalité. Les lots non payés restent une dette tant qu'une transaction n'est pas confirmée.
 
@@ -74,17 +74,17 @@ Le paiement vendeur est envoyé depuis le treasury en BSC-USD. Il n'y a pas de `
 `/app/near-transfer` refuse `ONEX` comme expéditeur. Pour un transfert utilisateur-vers-utilisateur :
 
 - `priceValue = sender.balance / sender.init_asset`.
-- L'expéditeur est débité uniquement du montant brut demandé en One-Val.
+- L'expéditeur est débité uniquement du montant brut demandé en XTU.
 - Le destinataire supporte l'intégralité de `tfees` et reçoit le montant net.
 - Aucun gas BSC n'est facturé à un transfert P2P.
 - Les frais sont répartis à 50 % `CommonShare` et 50 % `AdminFees`.
 - La base initiale du destinataire est augmentée uniquement de la base correspondant au montant net reçu; son historique n'est pas repricé au prix de l'expéditeur.
 - La base initiale de l'expéditeur est mise à jour selon son nouveau solde et le prix de l'opération.
-- La limite de 300 One-Val et le verrouillage vendeur sont contrôlés dans la transaction SQL.
+- La limite de 300 XTU et le verrouillage vendeur sont contrôlés dans la transaction SQL.
 
 ## Vente à ONEX (disbursement)
 
-La vente système est distincte du P2P. Conditions : solde d'au moins 290 One-Val, adresse de paiement enregistrée, aucune demande non résolue, et une vente réussie au maximum tous les 90 jours. Le solde entier est vendu; `tfees` est appliqué au brut :
+La vente système est distincte du P2P. Conditions : solde d'au moins 290 XTU, adresse de paiement enregistrée, aucune demande non résolue, et une vente réussie au maximum tous les 90 jours. Le solde entier est vendu; `tfees` est appliqué au brut :
 
 `fee = gross_balance * FEES / 100`
 

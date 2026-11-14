@@ -402,7 +402,7 @@ async function applyUserTopUp(
     throw new Error("Invalid common reserve values during top-up");
   }
 
-  // Seller-funded One-Val is consumed first. Only the shortfall can use ONEX reserves.
+  // Seller-funded XTU is consumed first. Only the shortfall can use ONEX reserves.
   const sellerAmount = BigNumber.minimum(netAmount, activeSellerReserve);
   const systemAmount = netAmount.minus(sellerAmount);
   if (systemAmount.isGreaterThan(0) && systemAmount.isGreaterThan(MAX_RECHARGE_AMOUNT)) {
@@ -520,7 +520,7 @@ async function applyUserTopUp(
       `Amount received: ${amountValue.toFixed(8)} BSC-USD`,
       `System fee: ${feeAmount.toFixed(8)} BSC-USD`,
       `BSC cost recovery: ${bscFeeRecovery.toFixed(8)} BSC-USD`,
-      `Amount credited: ${netAmount.toFixed(8)} One-Val`,
+      `Amount credited: ${netAmount.toFixed(8)} XTU`,
       `Funding source: ${sellerAmount.isZero() ? "ONEX reserves" : systemAmount.isZero() ? "seller reserve" : "seller + ONEX reserves"}`,
       `Reference: ${reference}`,
       "Status: SUCCESS",
@@ -731,8 +731,8 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     [
       "OneX Disbursement Update",
       "Your sale request has been accepted and the balance is reserved.",
-      `Gross amount: ${calculation.grossBalance.toFixed(8)} One-Val`,
-      `Fees: ${calculation.feeAmount.toFixed(8)} One-Val`,
+      `Gross amount: ${calculation.grossBalance.toFixed(8)} XTU`,
+      `Fees: ${calculation.feeAmount.toFixed(8)} XTU`,
       `Expected payment: ${calculation.payoutAmount.toFixed(8)} BSC-USD`,
       `Reference: ${reference}`,
       "Status: PROCESSING",
@@ -752,7 +752,7 @@ const RECHARGE_HOLD_REASON_TEXT = {
   below_minimum: "The total received during the 60-minute session is below 12 BSC-USD.",
   above_maximum: "The portion that requires ONEX system reserves exceeds 140 BSC-USD.",
   weekly_limit: "ONEX reserves cannot be used yet. The system may retry earlier if seller reserve becomes sufficient; otherwise it retries at the displayed release time.",
-  maximum_user_balance: "Crediting this recharge would exceed the maximum account balance of 300 One-Val.",
+  maximum_user_balance: "Crediting this recharge would exceed the maximum account balance of 300 XTU.",
   account_unavailable: "The OneX account is disabled, deleted or unavailable.",
   system_reserve: "The active seller and ONEX reserves are not currently sufficient to credit this payment.",
   previous_batch_unresolved: "A previous payment for this account still requires support review.",
@@ -1498,7 +1498,7 @@ router.post("/app/user-last-stock", async (req, res) => {
       return res.send({ msg: "error" });
     }
 
-    // users_stock.balance is stored directly in One-Val units.
+    // users_stock.balance is stored directly in XTU units.
     const balance = new BigNumber(stockRows[0].balance);
     if (!balance.isFinite() || balance.isNegative()) {
       throw new Error("Invalid user stock balance");
@@ -1784,8 +1784,8 @@ router.post("/app/join-system-sellers", async (req, res) => {
         "OneX Seller Update",
         "Your priority seller status is now active.",
         `Campaign: ${campaignResult.insertId}`,
-        `Locked reference: ${eligibility.runBalance.toFixed(8)} One-Val`,
-        `Seller reserve: ${eligibility.reservedUnits.toFixed(8)} One-Val`,
+        `Locked reference: ${eligibility.runBalance.toFixed(8)} XTU`,
+        `Seller reserve: ${eligibility.reservedUnits.toFixed(8)} XTU`,
         `Expires (UTC): ${new Date(expiresAt).toISOString()}`,
         "Status: ACTIVE",
       ].join("\n"));
@@ -2049,7 +2049,7 @@ router.post("/app/near-transfer", async (req, res) => {
         throw new Error("Recipient balance and init_asset are inconsistent");
       }
 
-      // P2P input amounts are One-Val; receiverAmountUnits and activity.amount use initial-asset units.
+      // P2P input amounts are XTU; receiverAmountUnits and activity.amount use initial-asset units.
       const amountUnits = requestedAmount.dividedBy(priceValue);
       const fees = amountUnits.multipliedBy(tfees).dividedBy(100);
       const totalDebit = amountUnits;
@@ -2177,7 +2177,7 @@ router.post("/app/near-transfer", async (req, res) => {
           "OneX Transaction Update",
           "Your P2P transfer was completed successfully.",
           `Recipient: ${D}`,
-          `Amount debited: ${senderStockDebit.toFixed(8)} One-Val`,
+          `Amount debited: ${senderStockDebit.toFixed(8)} XTU`,
           "The recipient pays the transfer fee.",
           `Reference: ${reference}`,
           "Status: SUCCESS",
@@ -2191,8 +2191,8 @@ router.post("/app/near-transfer", async (req, res) => {
           "OneX Transaction Update",
           "You have received a P2P transfer.",
           `Sender: ${S}`,
-          `Amount received after fee: ${receiverStockCredit.toFixed(8)} One-Val`,
-          `Transfer fee: ${fees.multipliedBy(priceValue).toFixed(8)} One-Val`,
+          `Amount received after fee: ${receiverStockCredit.toFixed(8)} XTU`,
+          `Transfer fee: ${fees.multipliedBy(priceValue).toFixed(8)} XTU`,
           `Reference: ${reference}`,
           "Status: SUCCESS",
         ].join("\n"),
@@ -2258,7 +2258,7 @@ router.post("/app/disbursement/status", async (req, res) => {
 });
 
 // Exceptional administrative credit of a support-held recharge batch.
-// Normal weekly cooldown, 300 One-Val stock cap and common reserve checks remain enforced.
+// Normal weekly cooldown, 300 XTU stock cap and common reserve checks remain enforced.
 // The administrator may bypass the automatic 12 BSC-USD minimum; the 140 BSC-USD system-funded cap remains enforced.
 router.post("/admin/recharge/credit", async (req, res) => {
   const { pswd, pin, username, batch_id, reason } = req.body || {};
@@ -2915,7 +2915,7 @@ router.post("/admin/unlock-system-seller", async (req, res) => {
       await queueTelegramMessageTx(tx, U, `seller-campaign:${campaignId}:unlocked`, [
         "OneX Seller Update",
         "OneX support has released the unused part of your seller reserve.",
-        `Released: ${remainingUnits.toFixed(8)} One-Val`,
+        `Released: ${remainingUnits.toFixed(8)} XTU`,
         `Campaign: ${campaignId}`,
         "Previously sold amounts remain in the seller payout queue.",
         "Status: UNLOCKED",

@@ -78,8 +78,8 @@ test("P2P price is derived from the sender and sender basis is recalculated", ()
 });
 
 test("P2P recipient preserves its existing initial-asset basis and adds the net received basis", () => {
-  // The recipient owns 100 One-Val backed by 80 initial assets.
-  // A 50 One-Val transfer at price 2 contributes 25 initial assets.
+  // The recipient owns 100 XTU backed by 80 initial assets.
+  // A 50 XTU transfer at price 2 contributes 25 initial assets.
   assert.equal(fixed(addReceivedInitAsset("80", "25")), "105");
   assert.throws(() => addReceivedInitAsset("-1", "25"), /cannot be negative/);
   assert.throws(() => addReceivedInitAsset("80", "0"), /greater than zero/);

@@ -84,7 +84,7 @@ function calculateDisbursementReserveSettlement(
     throw new RangeError("Disbursement fee reserve allocation is invalid");
   }
 
-  // The common One-Val total is reduced by the exact BSC-USD payout.
+  // The common XTU total is reduced by the exact BSC-USD payout.
   // The retained fee is split 50/50: CommonShare enters backed assets and
   // AdminFees enters inactive initial assets.
   const newTotalUnitsPrice = totalUnitsPrice.minus(payoutAmount);

@@ -10,7 +10,7 @@ const OneX = "ONEX";
 const maxStockDefault = MAX_DEFAULT_STOCK;
 const P2Pallowed = String(process.env.P2P_ALLOWED || "false").toLowerCase() === "true";
 const stock_limit = process.env.STOCK_LIMIT || "10000000";
-// The default launch configuration initializes a 10,000,000 One-Val supply
+// The default launch configuration initializes a 10,000,000 XTU supply
 // and the same amount of backed initial assets. Operators may override both
 // values, but must ensure the declared reserve is actually available.
 const initial_backed_units = process.env.INITIAL_BACKED_UNITS || stock_limit;

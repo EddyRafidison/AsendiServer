@@ -520,7 +520,7 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
     );
     await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:failed`, [
       "OneX Disbursement Update",
-      "Your disbursement transaction failed after blockchain finality. Your reserved One-Val balance has been restored.",
+      "Your disbursement transaction failed after blockchain finality. Your reserved XTU balance has been restored.",
       `Disbursement ID: ${jobId}`,
       `Reason: ${String(message).slice(0, 500)}`,
       "Status: FAILED - BALANCE RESTORED",
@@ -713,8 +713,8 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       "OneX Disbursement Update",
       "Your sale to OneX has been completed and the BSC-USD payment is confirmed.",
       `Actual BSC gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD).`,
-      `Gross amount: ${grossBalance.toFixed(8)} One-Val`,
-      `Fees: ${new BigNumber(job.fee_amount).toFixed(8)} One-Val`,
+      `Gross amount: ${grossBalance.toFixed(8)} XTU`,
+      `Fees: ${new BigNumber(job.fee_amount).toFixed(8)} XTU`,
       `Amount paid: ${payoutAmount.toFixed(8)} BSC-USD`,
       `Destination: ${job.payout_address}`,
       `Transaction: ${job.tx_hash}`,

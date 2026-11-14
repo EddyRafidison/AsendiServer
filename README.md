@@ -2,27 +2,31 @@
 
 Node.js backend for the OneX platform. The current payment rail accepts **Binance-Peg BSC-USD (BEP-20)** on BNB Smart Chain mainnet (chain ID 56). This token is not USDt directly issued by Tether.
 
+## Public unit: XTU (Extended Unit)
+
+XTU is the public unit of value and holding used by the OneX platform. It is the extended public expression of an initial asset under the platform's valuation rules. The initial asset remains the underlying economic and accounting basis; XTU is the unit presented to users and used for balances, transfers, accumulation and other platform operations. The relationship between an account's XTU balance and its initial-asset basis is governed by the platform's accounting and valuation rules, including `unit_price` and `users_stock.init_asset`. BSC-USD is the on-chain settlement asset and remains distinct from the XTU unit of account.
+
 ## Current core rules
 
-- User stock is recorded in One-Val; `users_stock.balance` is not converted by `unit_price`. `users_stock.init_asset` stores the corresponding initial-asset basis.
+- User stock is recorded in XTU; `users_stock.balance` is not converted by `unit_price`. `users_stock.init_asset` stores the corresponding initial-asset basis.
 - P2P price is derived from the sender's current `balance / init_asset`. The sender pays only the gross requested amount; the recipient bears the full `tfees` deduction and receives the net amount. No BSC gas fee applies to P2P transfers.
 - Transaction fees are split equally: 50% `CommonShare` and 50% `AdminFees`. Both reward totals are denominated in BSC-USD. `common.total_adminFees` is cumulative and never decreases; `common.remaining_adminFees` is the untransferred administrative-reward balance.
 - Each user has an individual BSC-USD deposit address. Finalized deposits are grouped into 60-minute batches; a batch can contain any number of transfers.
-- The automatic recharge minimum is 12 BSC-USD per batch. The 140 BSC-USD limit and seven-day cooldown apply only to the portion funded by ONEX system reserves. Seller-funded amounts are exempt from that weekly restriction. The user's resulting balance must not exceed 300 One-Val.
+- The automatic recharge minimum is 12 BSC-USD per batch. The 140 BSC-USD limit and seven-day cooldown apply only to the portion funded by ONEX system reserves. Seller-funded amounts are exempt from that weekly restriction. The user's resulting balance must not exceed 300 XTU.
 - Recharge credit is `gross received - tfees - configured BSC gas recovery`. The configured gas recovery is an estimate for OneX-paid outgoing deposit operations; the sender's own deposit gas is never charged again.
 - Recharge funding priority is `common.sellers_res`, then `common.inactive_init_asset`, then `common.backed_units`. The last two are limited by the non-distributable 20% system reserve floor (`STOCK_LIMIT * SYSTEM_RESERVE_RATIO`). A weekly-ineligible user receives no partial system-funded credit. A pending batch is retried every five minutes so it can be funded later by sellers or after the weekly window.
 - Deposit addresses are consolidated individually at 70 BSC-USD or when the oldest unswept finalized deposit reaches 30 days. The 70 BSC-USD value is a sweep threshold, not the recharge minimum.
-- A system sale to ONEX requires at least 290 One-Val, sells the full balance and deducts `FEES` from the gross balance. The net BSC-USD is reserved and paid by the isolated treasury worker. A successful sale starts a 90-day cooldown. A user with an active or cancellation-pending seller campaign cannot liquidate the account through this path.
+- A system sale to ONEX requires at least 290 XTU, sells the full balance and deducts `FEES` from the gross balance. The net BSC-USD is reserved and paid by the isolated treasury worker. A successful sale starts a 90-day cooldown. A user with an active or cancellation-pending seller campaign cannot liquidate the account through this path.
 - System disbursements and refunds respect a 60-minute reservation, canonical-chain checks and the configured finality depth (15 confirmations by default). A refund has no `tfees`; only the estimated BSC gas recovery is deducted, and the net refund must be at least 10 BSC-USD.
 - All new database timestamps and worker scheduling use UTC.
 
 ## Priority seller reserve
 
-- A seller campaign starts through `POST /app/join-system-sellers`. The user must have a balance greater than 12 One-Val, choose `run_balance` of at least 50% of the current balance and at least 12 One-Val, and have `pending_bonus >= 10% * run_balance`.
+- A seller campaign starts through `POST /app/join-system-sellers`. The user must have a balance greater than 12 XTU, choose `run_balance` of at least 50% of the current balance and at least 12 XTU, and have `pending_bonus >= 10% * run_balance`.
 - `run_balance` is a fixed campaign reference. The system reserves 50% of it in `common.sellers_res` and moves the corresponding initial-asset basis to `common.sellers_init_asset`; the user's displayed balance is not reduced when joining.
 - While `seller_status` is active or cancellation-pending, the sender cannot transfer more than `balance - 0.5 * run_balance` through P2P. Incoming transfers remain allowed.
-- Seller reserve lots are tracked individually and consumed FIFO. When a lot is consumed to fund a recharge, its seller's One-Val balance and initial-asset basis are reduced, and the amount becomes a seller payout liability.
-- Seller payouts are grouped when the outstanding amount reaches 300 One-Val; each treasury batch is capped at 300 One-Val. The treasury pays each seller's registered payout address in BSC-USD. The seller bears only the estimated BSC gas recovery; no `tfees` is charged on seller payouts.
+- Seller reserve lots are tracked individually and consumed FIFO. When a lot is consumed to fund a recharge, its seller's XTU balance and initial-asset basis are reduced, and the amount becomes a seller payout liability.
+- Seller payouts are grouped when the outstanding amount reaches 300 XTU; each treasury batch is capped at 300 XTU. The treasury pays each seller's registered payout address in BSC-USD. The seller bears only the estimated BSC gas recovery; no `tfees` is charged on seller payouts.
 - Seller status expires after seven days. A user may request cancellation through `POST /app/cancel-system-sellers`; the unused reserve remains locked until an administrator uses `POST /admin/unlock-system-seller`. Amounts already sold remain in the payout queue.
 - `pending_bonus` is stored and checked for eligibility, but bonus accrual, origin, calculation, the 24-hour bonus inactivity lifecycle, automatic credit and campaign-bonus generation are intentionally not implemented until those rules are specified. The code does not invent a bonus formula.
 
@@ -47,9 +51,9 @@ Node.js backend for the OneX platform. The current payment rail accepts **Binanc
 
 - `priceValue = sender.balance / sender.init_asset` is derived from the sender only.
 - `amountUnits = requestedAmount / priceValue` and the net received basis are measured in initial-asset units.
-- The sender's new `init_asset` is recalculated from the sender's new One-Val balance divided by `priceValue`.
+- The sender's new `init_asset` is recalculated from the sender's new XTU balance divided by `priceValue`.
 - The recipient retains its existing `init_asset`; its new basis is `old_init_asset + net_received_initial_asset`. Historical recipient balance is never repriced at the sender's transaction price.
-- The recipient's One-Val balance increases by the net initial-asset amount multiplied by the sender's `priceValue`.
+- The recipient's XTU balance increases by the net initial-asset amount multiplied by the sender's `priceValue`.
 - The fee is included in the basis conservation check and split 50/50 between CommonShare and AdminFees.
 
 ## Authentication and account recovery
@@ -120,14 +124,14 @@ Set `USDT_SELLER_PAYOUTS_ENABLED=true` only when seller treasury payouts are rea
 
 ## Important endpoints
 
-- `POST /app/user-last-stock`: returns One-Val balance, P2P fee rate, deposit address and seller campaign fields.
+- `POST /app/user-last-stock`: returns XTU balance, P2P fee rate, deposit address and seller campaign fields.
 - `POST /app/recharge`: returns deposit instructions and limits. It does not create a pre-payment order.
 - `POST /app/recharge/status`: returns the user's latest or specified deposit batch status.
 - `POST /app/set-payout-address`: lets the user declare the address that will receive a system-sale payout. OneX does not prove source-wallet ownership.
 - `POST /app/near-transfer`: user-to-user P2P or a user sale to OneX. OneX cannot be the sender. P2P fees are paid entirely by the recipient.
 - `POST /app/disbursement/status`: returns the status of a user's system-sale request.
 - `POST /admin/unlock-disbursement`: requeues an expired, unsigned disbursement for the isolated worker after admin authentication and liquidity checks.
-- `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces the 140 BSC-USD system-funded cap, weekly cooldown when ONEX reserves are needed, 300 One-Val stock cap and reserve availability; seller funding remains first priority.
+- `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces the 140 BSC-USD system-funded cap, weekly cooldown when ONEX reserves are needed, 300 XTU stock cap and reserve availability; seller funding remains first priority.
 - `POST /admin/recharge/refund`: queues a refund of a support-held recharge batch. No `tfees` is charged; a configured estimate of OneX's BSC gas cost is deducted, and the net refund must be at least 10 BSC-USD.
 - `POST /admin/admin-fees-transfers`: returns the paginated administrative-reward transfer history and the current `total_adminFees` / `remaining_adminFees` balances. Requires the configured administrator password and PIN.
 - `POST /admin/send-temp-pswd`: issues a seven-digit temporary password by email; valid for 10 minutes and usable only to sign in and change the permanent password.

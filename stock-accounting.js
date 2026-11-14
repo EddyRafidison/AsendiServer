@@ -17,7 +17,7 @@ function asBigNumber(value, fieldName) {
 }
 
 /**
- * Derive the account-specific unit price from its current One-Val balance
+ * Derive the account-specific unit price from its current XTU balance
  * and initial-asset balance. A positive init_asset is required.
  */
 function deriveUnitPrice(balanceValue, initAssetValue) {
@@ -81,7 +81,7 @@ function addReceivedInitAsset(currentInitAssetValue, receivedInitAssetValue) {
 }
 
 /**
- * Allocate a One-Val top-up against common reserves, consuming inactive
+ * Allocate an XTU top-up against common reserves, consuming inactive
  * initial assets first and backed initial assets only for any shortfall.
  * When backed assets are untouched, the common unit price remains unchanged.
  */
