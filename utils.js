@@ -14,10 +14,14 @@ const configuredArgonConcurrency = Number(process.env.ARGON2_MAX_PARALLEL || 4);
 const ARGON2_MAX_PARALLEL = Number.isInteger(configuredArgonConcurrency)
   ? Math.max(1, Math.min(configuredArgonConcurrency, 16))
   : 4;
-const configuredArgonQueue = Number(process.env.ARGON2_MAX_QUEUE || 100);
+const configuredArgonQueue = Number(process.env.ARGON2_MAX_QUEUE || 20);
 const ARGON2_MAX_QUEUE = Number.isInteger(configuredArgonQueue)
-  ? Math.max(1, Math.min(configuredArgonQueue, 1000))
-  : 100;
+  ? Math.max(1, Math.min(configuredArgonQueue, 64))
+  : 20;
+const configuredArgonQueueTimeout = Number(process.env.ARGON2_QUEUE_TIMEOUT_MS || 15000);
+const ARGON2_QUEUE_TIMEOUT_MS = Number.isInteger(configuredArgonQueueTimeout)
+  ? Math.max(1000, Math.min(configuredArgonQueueTimeout, 60000))
+  : 15000;
 
 let activeArgonOperations = 0;
 const argonWaitQueue = [];
@@ -27,9 +31,33 @@ async function withArgonSlot(operation) {
     activeArgonOperations += 1;
   } else {
     if (argonWaitQueue.length >= ARGON2_MAX_QUEUE) {
-      throw new Error("Argon2 operation queue is full");
+      const error = new Error("Argon2 operation queue is full");
+      error.code = "ARGON2_QUEUE_FULL";
+      throw error;
     }
-    await new Promise((resolve) => argonWaitQueue.push(resolve));
+
+    await new Promise((resolve, reject) => {
+      const entry = {
+        resolve: () => {
+          clearTimeout(entry.timer);
+          resolve();
+        },
+        reject: (error) => {
+          clearTimeout(entry.timer);
+          reject(error);
+        },
+        timer: null,
+      };
+      entry.timer = setTimeout(() => {
+        const index = argonWaitQueue.indexOf(entry);
+        if (index !== -1) argonWaitQueue.splice(index, 1);
+        const error = new Error("Argon2 operation queue wait timed out");
+        error.code = "ARGON2_QUEUE_TIMEOUT";
+        entry.reject(error);
+      }, ARGON2_QUEUE_TIMEOUT_MS);
+      if (typeof entry.timer.unref === "function") entry.timer.unref();
+      argonWaitQueue.push(entry);
+    });
   }
 
   try {
@@ -38,7 +66,7 @@ async function withArgonSlot(operation) {
     const next = argonWaitQueue.shift();
     if (next) {
       // Transfer the occupied slot directly to the next waiter.
-      next();
+      next.resolve();
     } else {
       activeArgonOperations -= 1;
     }

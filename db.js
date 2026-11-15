@@ -25,6 +25,18 @@ const PORT_SERVER = Number(process.env.SERVER_PORT || 3000);
 const MAIL_PORT = Number(process.env.MAIL_PORT || 587);
 const SERVER_MAIL = process.env.SERV_MAIL || "";
 const SERVER_MAIL_PSWD = process.env.SERV_MAIL_PSWD || "";
+const configuredConnectionLimit = Number(process.env.DB_CONNECTION_LIMIT || 20);
+const DB_CONNECTION_LIMIT = Number.isInteger(configuredConnectionLimit)
+  ? Math.max(5, Math.min(configuredConnectionLimit, 50))
+  : 20;
+const configuredQueueLimit = Number(process.env.DB_QUEUE_LIMIT || 100);
+const DB_QUEUE_LIMIT = Number.isInteger(configuredQueueLimit)
+  ? Math.max(10, Math.min(configuredQueueLimit, 500))
+  : 100;
+const configuredLockWaitTimeout = Number(process.env.DB_LOCK_WAIT_TIMEOUT_SECONDS || 30);
+const DB_LOCK_WAIT_TIMEOUT_SECONDS = Number.isInteger(configuredLockWaitTimeout)
+  ? Math.max(5, Math.min(configuredLockWaitTimeout, 60))
+  : 30;
 
 const DB_CONFIG = {
   host: process.env.DB_HOST,
@@ -33,9 +45,10 @@ const DB_CONFIG = {
   database: process.env.DB_NAME,
   port: PORT_DB,
   waitForConnections: true,
-  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 50),
-  queueLimit: 200,
-  multipleStatements: true,
+  connectionLimit: DB_CONNECTION_LIMIT,
+  queueLimit: DB_QUEUE_LIMIT,
+  connectTimeout: 10000,
+  multipleStatements: false,
   timezone: "Z",
 };
 
@@ -47,9 +60,16 @@ db.on("connection", (connection) => {
   connection.query("SET time_zone = '+00:00'", (error) => {
     if (error) console.error("Unable to set MySQL session timezone to UTC:", error);
   });
+  // Bound row-lock waits so an abusive or stalled transaction cannot occupy a pooled connection indefinitely.
+  connection.query(`SET SESSION innodb_lock_wait_timeout=${DB_LOCK_WAIT_TIMEOUT_SECONDS}`, (error) => {
+    if (error) console.error("Unable to configure MySQL lock wait timeout:", error.message);
+  });
 });
 db.queryAsync = (sql, params = []) => new Promise((resolve, reject) => {
   db.query(sql, params, (error, result) => error ? reject(error) : resolve(result));
+});
+db.executeAsync = (sql, params = []) => new Promise((resolve, reject) => {
+  db.execute(sql, params, (error, result) => error ? reject(error) : resolve(result));
 });
 
 const TABLES = [
@@ -103,7 +123,11 @@ const TABLES = [
     record_time CHAR(6) NOT NULL,
     UNIQUE KEY uq_activities_reference(reference),
     KEY idx_activities_recharge_user(sender,receiver,type,record_date,record_time,id),
-    KEY idx_activities_sender_type(sender,type,id)
+    KEY idx_activities_sender_type(sender,type,id),
+    KEY idx_activities_sender_id(sender,id),
+    KEY idx_activities_receiver_id(receiver,id),
+    KEY idx_activities_history_sender(sender,record_date,record_time,id),
+    KEY idx_activities_history_receiver(receiver,record_date,record_time,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS common(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -218,6 +242,29 @@ const TABLES = [
     confirmed_at_ms BIGINT UNSIGNED NULL,
     UNIQUE KEY uq_bsc_fee_tx_hash(tx_hash),
     KEY idx_bsc_fee_operation(operation,created_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS account_security_action_locks(
+    username VARCHAR(30) NOT NULL,
+    action VARCHAR(32) NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY(username,action)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS account_security_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(30) NOT NULL,
+    action VARCHAR(32) NOT NULL,
+    outcome VARCHAR(16) NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_account_security_events_window(username,action,created_at_ms,outcome)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS account_api_rate_limits(
+    username VARCHAR(30) NOT NULL,
+    action VARCHAR(48) NOT NULL,
+    window_start_ms BIGINT UNSIGNED NOT NULL,
+    request_count INT UNSIGNED NOT NULL DEFAULT 0,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY(username,action,window_start_ms),
+    KEY idx_account_api_rate_cleanup(window_start_ms)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS system_locks(
     lock_name VARCHAR(64) PRIMARY KEY
@@ -495,6 +542,9 @@ async function assertLatestSchema() {
       "tx_hash", "operation", "estimated_fee_bnb", "estimated_fee_usd", "bnb_usd_price", "gas_used",
       "effective_gas_price_wei", "actual_fee_bnb", "actual_fee_usd", "created_at_ms", "confirmed_at_ms",
     ],
+    account_security_action_locks: ["username", "action", "updated_at_ms"],
+    account_security_events: ["username", "action", "outcome", "created_at_ms"],
+    account_api_rate_limits: ["username", "action", "window_start_ms", "request_count", "updated_at_ms"],
     system_locks: ["lock_name"],
     users_usdt_deposit_wallets: [
       "username", "wallet_address", "payout_address", "derivation_index", "created_block",
@@ -550,6 +600,28 @@ async function assertLatestSchema() {
     if (missing.length) {
       throw new Error(
         `The database schema for ${table} is not the current OneX schema. Missing: ${missing.join(", ")}. Use a clean, empty development database; automatic legacy migrations are intentionally disabled.`,
+      );
+    }
+  }
+
+  const requiredIndexes = {
+    activities: [
+      "idx_activities_sender_id",
+      "idx_activities_receiver_id",
+      "idx_activities_history_sender",
+      "idx_activities_history_receiver",
+    ],
+  };
+  for (const [table, expected] of Object.entries(requiredIndexes)) {
+    const indexes = await db.queryAsync(
+      "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?",
+      [table],
+    );
+    const actual = new Set(indexes.map((row) => row.INDEX_NAME));
+    const missing = expected.filter((indexName) => !actual.has(indexName));
+    if (missing.length) {
+      throw new Error(
+        `The database table ${table} is missing required performance indexes: ${missing.join(", ")}. Apply the current schema indexes before starting OneX.`,
       );
     }
   }
@@ -609,6 +681,20 @@ async function cleanup() {
       "DELETE FROM telegram_link_challenges WHERE expires_at_ms<? OR used_at_ms IS NOT NULL",
       [String(Date.now() - 24 * 60 * 60 * 1000)],
     );
+    await db.queryAsync(
+      "DELETE FROM account_security_events WHERE created_at_ms<?",
+      [String(Date.now() - 8 * 24 * 60 * 60 * 1000)],
+    );
+    await db.queryAsync(
+      "DELETE FROM account_api_rate_limits WHERE window_start_ms<?",
+      [String(Date.now() - 2 * 24 * 60 * 60 * 1000)],
+    );
+    await db.queryAsync(
+      `DELETE action_lock FROM account_security_action_locks AS action_lock
+       LEFT JOIN auths ON auths.username=action_lock.username
+       WHERE auths.username IS NULL AND action_lock.updated_at_ms<?`,
+      [String(Date.now() - 30 * 24 * 60 * 60 * 1000)],
+    );
   } catch (error) {
     console.error("Database cleanup failed:", error.message);
   }
@@ -632,6 +718,9 @@ module.exports = {
   MAIL_PORT,
   SERVER_MAIL,
   SERVER_MAIL_PSWD,
+  DB_CONNECTION_LIMIT,
+  DB_QUEUE_LIMIT,
+  DB_LOCK_WAIT_TIMEOUT_SECONDS,
   initDbIfEmpty,
   cleanup,
 };

@@ -6,6 +6,7 @@ const { getAddress: checksumEvmAddress } = require("ethers");
 const fs = require("fs");
 const geoip = require("geoip-country");
 const nodemailer = require("nodemailer");
+const { createEmailQueue } = require("./email-queue");
 const BigNumber = require("bignumber.js");
 const {
   deriveUnitPrice,
@@ -54,7 +55,6 @@ const {
   encrypt,
   decrypt,
   getDate,
-  getDateBefore,
   getUserPrefixName,
   transliterateUserText,
   createUserSuffixName,
@@ -92,8 +92,44 @@ const {
   isPasswordProtectedActivityLocked,
   evaluatePasswordAuthentication,
 } = require("./auth-recovery");
+const { normalizeTransactionHistoryDays, getTransactionHistoryCutoffMs } = require("./history-policy");
+const {
+  DAY_MS,
+  evaluateAccountActionLimit,
+  lockAccountSecurityActionTx,
+  getRecentAccountSecurityEventsTx,
+  recordAccountSecurityEventTx,
+  consumeAccountApiRateLimit,
+} = require("./security-limits");
 
 const router = express.Router();
+
+async function accountApiLimitReached(res, username, action, limit, windowMs) {
+  const allowed = await consumeAccountApiRateLimit(db, username, action, limit, windowMs);
+  if (allowed) return false;
+  res.status(429).send({ auth: "limit reached" });
+  return true;
+}
+
+function parseBase64Image(value, filename, maxBytes = 3 * 1024 * 1024) {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string") return false;
+
+  let payload = value.trim();
+  let extension = "png";
+  const dataUri = payload.match(/^data:image\/(png|jpeg|jpg|webp);base64,/i);
+  if (dataUri) {
+    extension = dataUri[1].toLowerCase() === "jpeg" ? "jpg" : dataUri[1].toLowerCase();
+    payload = payload.slice(dataUri[0].length);
+  }
+  if (!payload || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(payload)) {
+    return false;
+  }
+
+  const decoded = Buffer.from(payload, "base64");
+  if (decoded.length === 0 || decoded.length > maxBytes) return false;
+  return { filename: `${filename}.${extension}`, content: payload, encoding: "base64" };
+}
 
 function normalizeFormValue(value) {
   // URL-encoded form decoding is handled by Express. Preserve the submitted
@@ -102,7 +138,8 @@ function normalizeFormValue(value) {
 }
 
 function normalizeUsername(value) {
-  return normalizeFormValue(value).trim().toUpperCase();
+  const username = normalizeFormValue(value).trim().toUpperCase();
+  return username.length <= 30 ? username : "";
 }
 
 function createFinancialReference(prefix = "ONEX") {
@@ -112,10 +149,10 @@ function createFinancialReference(prefix = "ONEX") {
 function requestTokenIsValid(req, token, password, username) {
   const ua = req.headers["user-agent"];
   if (
-    typeof token !== "string" ||
-    typeof password !== "string" ||
-    typeof username !== "string" ||
-    typeof ua !== "string"
+    typeof token !== "string" || Buffer.byteLength(token, "utf8") > 32_768 ||
+    typeof password !== "string" || Buffer.byteLength(password, "utf8") > 4096 ||
+    typeof username !== "string" || username.length > 30 ||
+    typeof ua !== "string" || Buffer.byteLength(ua, "utf8") > 16_384
   ) {
     return false;
   }
@@ -199,7 +236,7 @@ async function issueTemporaryPassword(username, email, subject, warningText) {
   if (!reservation.ok) return reservation;
 
   try {
-    await transporter.sendMail({
+    await mailQueue.sendMail({
       from: SERVER_MAIL,
       to: normalizedEmail,
       subject,
@@ -1109,6 +1146,8 @@ const transporter = nodemailer.createTransport({
   socketTimeout: 30000,
 });
 
+const mailQueue = createEmailQueue(transporter);
+
 if (!SERVER_MAIL || !SERVER_MAIL_PSWD) {
   console.warn("Email delivery is not configured: set SERV_MAIL and SERV_MAIL_PSWD.");
 }
@@ -1153,6 +1192,7 @@ router.post("/app/contact-onex", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ status: "error" });
+    if (await accountApiLimitReached(res, U, "contact_onex", 3, DAY_MS)) return;
     const rows = await db.queryAsync(
       "SELECT email FROM auths WHERE username=? LIMIT 1",
       [U],
@@ -1164,7 +1204,7 @@ router.post("/app/contact-onex", async (req, res) => {
       .trim()
       .slice(0, 160) || "OneX contact";
     const safeMessage = typeof msg === "string" ? msg.slice(0, 10_000) : "";
-    await transporter.sendMail({
+    await mailQueue.sendMail({
       from: SERVER_MAIL,
       to: SERVER_MAIL,
       subject: safeSubject,
@@ -1191,7 +1231,7 @@ router.post("/app/signup", async (req, res) => {
     cniimg2,
   } = req.body || {};
 
-  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  const ip = req.ip || req.socket.remoteAddress;
   const geo = geoip.lookup(ip);
   if (!geo) return res.send({ msg: "what country" });
 
@@ -1203,32 +1243,51 @@ router.post("/app/signup", async (req, res) => {
   if (requiredTextValues.some((value) => typeof value !== "string")) {
     return res.status(400).send({ msg: "invalid input" });
   }
-  if (!pswd || !seed) {
+
+  const Email = email.trim();
+  const Birth = birth.trim();
+  const rawAddress = addr.trim();
+  const rawName = name.trim();
+  const rawCni = cni.trim();
+  if (
+    !Email || Buffer.byteLength(Email, "utf8") > 254 ||
+    !Birth || Buffer.byteLength(Birth, "utf8") > 20 ||
+    !rawAddress || Buffer.byteLength(rawAddress, "utf8") > 100 ||
+    !rawName || Buffer.byteLength(rawName, "utf8") > 100 ||
+    !rawCni || Buffer.byteLength(rawCni, "utf8") > 128 ||
+    !pswd || !seed || Buffer.byteLength(pswd, "utf8") > 4096 || Buffer.byteLength(seed, "utf8") > 4096
+  ) {
     return res.status(400).send({ msg: "invalid input" });
+  }
+
+  const cniAttachment1 = parseBase64Image(cniimg1, "cni_1");
+  const cniAttachment2 = parseBase64Image(cniimg2, "cni_2");
+  if (cniAttachment1 === false || cniAttachment2 === false) {
+    return res.status(400).send({ msg: "invalid identity image" });
   }
 
   let latinName;
   let latinAddress;
   try {
     // Transliterate free-form personal text before deriving usernames or storing data.
-    latinName = transliterateUserText(name);
-    latinAddress = transliterateUserText(addr);
+    latinName = transliterateUserText(rawName);
+    latinAddress = transliterateUserText(rawAddress);
   } catch (error) {
     console.error("Signup text transliteration failed:", error);
     return res.status(400).send({ msg: "invalid input" });
   }
 
-  if (!latinName) {
-    return res.status(400).send({ msg: "invalid name" });
+  if (!latinName || Buffer.byteLength(latinName, "utf8") > 50 || Buffer.byteLength(latinAddress, "utf8") > 50) {
+    return res.status(400).send({ msg: "invalid name or address" });
   }
 
-  const Email = email.trim();
-  const Birth = birth.trim();
   const Address = latinAddress;
   const Name = latinName;
-  const CNI = encrypt(cni.trim(), DB_CONFIG.password);
+  const CNI = encrypt(rawCni, DB_CONFIG.password);
   const passwordValue = pswd;
   const seedValue = seed;
+  if (CNI.length > 255) return res.status(400).send({ msg: "invalid CNI" });
+
   let PWD;
   let SEED;
   try {
@@ -1236,19 +1295,8 @@ router.post("/app/signup", async (req, res) => {
     SEED = await hashSecret(seedValue);
   } catch (hashError) {
     console.error("Signup secret hashing failed:", hashError);
-    return res.status(400).send({ msg: "invalid credentials" });
-  }
-
-  // Keep stored values within the existing database column limits.
-  if (
-    Email.length > 50 ||
-    Birth.length > 20 ||
-    Address.length > 50 ||
-    Name.length > 50 ||
-    CNI.length > 255 ||
-    PWD.length > 255
-  ) {
-    return res.status(400).send({ msg: "invalid input" });
+    const status = ["ARGON2_QUEUE_FULL", "ARGON2_QUEUE_TIMEOUT"].includes(hashError.code) ? 503 : 400;
+    return res.status(status).send({ msg: status === 503 ? "temporarily unavailable" : "invalid credentials" });
   }
 
   // The username column allows 30 characters, including the hyphen and six-character suffix.
@@ -1259,7 +1307,8 @@ router.post("/app/signup", async (req, res) => {
   let U;
 
   try {
-    while (true) {
+    let accountCreated = false;
+    for (let collisionAttempt = 0; collisionAttempt < 10; collisionAttempt += 1) {
       const suffix = createUserSuffixName();
       U = `${prefix}-${suffix}`.toUpperCase();
 
@@ -1309,13 +1358,15 @@ router.post("/app/signup", async (req, res) => {
         if (conn) conn.release();
       }
 
+      accountCreated = true;
       break;
     }
+    if (!accountCreated) throw new Error("Unable to allocate a unique username after 10 attempts");
 
     res.send({ msg: "ok" });
 
     // Send the welcome email after the account is committed.
-    transporter.sendMail({
+    mailQueue.sendMail({
       from: SERVER_MAIL,
       to: Email,
       subject: "New member",
@@ -1325,15 +1376,12 @@ router.post("/app/signup", async (req, res) => {
     });
 
     // Send the identity documents for verification without modifying their encoded contents.
-    transporter.sendMail({
+    mailQueue.sendMail({
       from: SERVER_MAIL,
       to: "eddy.heriniaina.rafidison@gmail.com",
       subject: "Account Verification",
       text: [U, Name, Birth, Address, cni].join("\n"),
-      attachments: [
-        { filename: "cni_1.png", content: cniimg1, encoding: "base64" },
-        { filename: "cni_2.png", content: cniimg2, encoding: "base64" },
-      ],
+      attachments: [cniAttachment1, cniAttachment2].filter(Boolean),
     }).catch((mailError) => {
       console.error("Identity verification email failed:", mailError);
     });
@@ -1351,7 +1399,12 @@ router.post("/app/signin", async (req, res) => {
   const submittedSeed = normalizeFormValue(seed);
   const needsSeed = String(recon) === "0";
 
-  if (!U || !P) return res.status(400).send({ msg: "invalid request", ua: "", tg_botLink: null });
+  if (!U || !P || Buffer.byteLength(P, "utf8") > 4096) {
+    return res.status(400).send({ msg: "invalid request", ua: "", tg_botLink: null });
+  }
+  if (needsSeed && (!submittedSeed || Buffer.byteLength(submittedSeed, "utf8") > 4096)) {
+    return res.status(400).send({ msg: "invalid seed", ua: "", tg_botLink: null });
+  }
   if (needsSeed && !requestTokenIsValid(req, tkn, P, U)) {
     return res.send({ msg: "forbidden request", ua: "", tg_botLink: null });
   }
@@ -1488,6 +1541,7 @@ router.post("/app/user-last-stock", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "error" });
+    if (await accountApiLimitReached(res, U, "user_last_stock", 60, 60_000)) return;
 
     const stockRows = await db.queryAsync(
       `SELECT balance,seller_status,run_balance,pending_bonus,seller_expires_at_ms
@@ -1534,6 +1588,7 @@ router.post("/app/recharge", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "not allowed" });
+    if (await accountApiLimitReached(res, U, "recharge_info", 10, 60_000)) return;
     const config = getPaymentPublicConfig();
     if (!config.enabled) return res.send({ msg: "not allowed" });
     const depositAddress = await getOrCreateUserDepositAddress(db, U);
@@ -1569,6 +1624,7 @@ router.post("/app/recharge/status", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
+    if (await accountApiLimitReached(res, U, "recharge_status", 30, 60_000)) return;
     const rows = id
       ? await db.queryAsync(
           `SELECT id,status,total_amount,opened_at_ms,expires_at_ms,release_at_ms,reason_codes,credited_at_ms
@@ -1611,6 +1667,7 @@ router.post("/app/set-payout-address", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
+    if (await accountApiLimitReached(res, U, "set_payout_address", 3, DAY_MS)) return;
     const depositAddress = await getOrCreateUserDepositAddress(db, U);
     if (!depositAddress) return res.send({ auth: "error" });
     const payoutAddress = checksumEvmAddress(address);
@@ -1657,7 +1714,11 @@ router.post("/app/join-system-sellers", async (req, res) => {
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
-  const runBalance = new BigNumber(String(amount ?? "").trim());
+  const runBalanceText = String(amount ?? "").trim();
+  if (!runBalanceText || runBalanceText.length > 100) {
+    return res.status(400).send({ msg: "invalid amount" });
+  }
+  const runBalance = new BigNumber(runBalanceText);
   if (!runBalance.isFinite() || !runBalance.isGreaterThan(0)) {
     return res.status(400).send({ msg: "not allowed" });
   }
@@ -1665,6 +1726,7 @@ router.post("/app/join-system-sellers", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "not allowed" });
+    if (await accountApiLimitReached(res, U, "join_system_sellers", 3, DAY_MS)) return;
 
     const result = await withTransaction(async (tx) => {
       const [commonLockRows] = await tx.query(
@@ -1815,6 +1877,7 @@ router.post("/app/cancel-system-sellers", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "not allowed" });
+    if (await accountApiLimitReached(res, U, "cancel_system_sellers", 3, DAY_MS)) return;
     const result = await withTransaction(async (tx) => {
       const [authRows] = await tx.query(
         "SELECT status,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
@@ -1852,27 +1915,61 @@ router.post("/app/cancel-system-sellers", async (req, res) => {
   }
 });
 
-// transactions-history
+// Transaction history is limited to an exact rolling window of at most 30 days.
 router.post("/app/transactions-history", async (req, res) => {
-  const { user, pswd, days, tkn } = req.body || {};
+  const { user, pswd, days, limit: limitInput, before_id: beforeIdInput, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U))
+  if (!requestTokenIsValid(req, tkn, P, U)) {
     return res.send({ trans: "forbidden request" });
+  }
+
+  const historyDays = normalizeTransactionHistoryDays(days);
+  const pageLimit = limitInput == null || limitInput === "" ? 50 : Number(limitInput);
+  const beforeId = beforeIdInput == null || beforeIdInput === "" ? "" : String(beforeIdInput).trim();
+  if (
+    historyDays === null ||
+    !Number.isSafeInteger(pageLimit) || pageLimit < 1 || pageLimit > 100 ||
+    (beforeId && !/^\d{1,20}$/.test(beforeId))
+  ) {
+    return res.status(400).send({ trans: "invalid request" });
+  }
 
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ trans: "error" });
+    if (await accountApiLimitReached(res, U, "transactions_history", 20, 60_000)) return;
 
-    const before = getDateBefore(Number(days))[0];
-    const trans = await db.queryAsync(
-      "SELECT * FROM activities WHERE record_date>=? AND (sender=? OR receiver=?) ORDER BY id DESC",
-      [before, U, U],
-    );
-    res.send({ trans });
-  } catch {
-    res.send({ trans: "error" });
+    const cutoffMs = getTransactionHistoryCutoffMs(Date.now(), historyDays);
+    const [cutoffDate, cutoffTime] = formatUtcRecordDateTime(cutoffMs);
+    const params = [cutoffDate, cutoffDate, cutoffTime, U, U];
+    let sql = `SELECT id,sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time
+               FROM activities
+               WHERE (record_date>? OR (record_date=? AND record_time>=?))
+                 AND (sender=? OR receiver=?)`;
+    if (beforeId) {
+      sql += " AND id<?";
+      params.push(beforeId);
+    }
+    sql += " ORDER BY id DESC LIMIT ?";
+    params.push(pageLimit);
+
+    const trans = await db.queryAsync(sql, params);
+    const normalizedTransactions = trans.map((row) => ({ ...row, id: String(row.id) }));
+    const nextBeforeId = normalizedTransactions.length === pageLimit
+      ? normalizedTransactions[normalizedTransactions.length - 1].id
+      : null;
+
+    return res.send({
+      trans: normalizedTransactions,
+      days: historyDays,
+      limit: pageLimit,
+      next_before_id: nextBeforeId,
+    });
+  } catch (error) {
+    console.error("Transaction history lookup failed:", error.message);
+    return res.send({ trans: "error" });
   }
 });
 
@@ -1900,6 +1997,9 @@ router.post("/app/near-transfer", async (req, res) => {
     return res.send({ transf: "failed" });
   }
 
+  if (amountText.length > 100) {
+    return res.status(400).send({ transf: "invalid amount" });
+  }
   const requestedAmount = new BigNumber(amountText);
   if (!requestedAmount.isFinite() || !requestedAmount.isGreaterThan(0)) {
     return res.send({ warning: "abusive operation" });
@@ -1918,6 +2018,7 @@ router.post("/app/near-transfer", async (req, res) => {
     if (!(await verifySecret(senderAuthRows[0].password, P))) {
       return res.send({ transf: "failed" });
     }
+    if (await accountApiLimitReached(res, S, "near_transfer", 10, 60_000)) return;
     const verifiedPasswordHash = senderAuthRows[0].password;
 
     if (!Number.isFinite(tfees) || tfees < 0 || tfees >= 100) {
@@ -2233,6 +2334,7 @@ router.post("/app/disbursement/status", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ transf: "failed" });
+    if (await accountApiLimitReached(res, U, "disbursement_status", 20, 60_000)) return;
     const rows = await db.queryAsync(
       `SELECT id,payout_address,payout_amount,status,tx_hash,last_error,created_at_ms,confirmed_at_ms
        FROM users_usdt_disbursements WHERE id=? AND username=? LIMIT 1`,
@@ -2578,20 +2680,59 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
   }
 });
 
-// modify-pin-or-password
+// A user may record at most three failed password-change attempts and one successful change in any rolling 24-hour period.
 router.post("/app/modify-pin-or-password", async (req, res) => {
   const { user, pswd1, pswd2, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P1 = normalizeFormValue(pswd1);
   const P2 = normalizeFormValue(pswd2);
 
+  if (!U || U.length > 30 || !P1 || Buffer.byteLength(P1, "utf8") > 4096) {
+    return res.status(400).send({ auth: "invalid request" });
+  }
   if (!requestTokenIsValid(req, tkn, P1, U)) {
     return res.send({ auth: "forbidden request" });
   }
-  if (!P2) return res.status(400).send({ auth: "invalid password" });
+  if (!P2 || Buffer.byteLength(P2, "utf8") > 4096) {
+    return res.status(400).send({ auth: "invalid password" });
+  }
 
   try {
+    // Perform Argon2 work before opening a transaction so account rows are not locked while hashing.
+    const snapshotRows = await db.queryAsync(
+      `SELECT password,password_temp_expires_at_ms,consec_failed_auth
+       FROM auths WHERE username=? LIMIT 1`,
+      [U],
+    );
+    if (!snapshotRows.length) return res.send({ auth: "incorrect" });
+
+    const successEvents = await db.queryAsync(
+      `SELECT id FROM account_security_events
+       WHERE username=? AND action='password_change' AND outcome='successful' AND created_at_ms>=?
+       LIMIT 1`,
+      [U, String(Date.now() - DAY_MS)],
+    );
+    if (successEvents.length) return res.send({ auth: "limit reached" });
+
+    const snapshot = snapshotRows[0];
+    const snapshotIsTemporary = snapshot.password_temp_expires_at_ms != null;
+    const snapshotNow = Date.now();
+    if (Number(snapshot.consec_failed_auth || 0) >= 3 && !snapshotIsTemporary) {
+      return res.send({ auth: "not allowed" });
+    }
+    if (snapshotIsTemporary) {
+      const expiresAt = Number(snapshot.password_temp_expires_at_ms);
+      if (!Number.isFinite(expiresAt) || expiresAt <= snapshotNow) {
+        return res.send({ auth: "temporary password expired" });
+      }
+    }
+
+    const passwordMatches = await verifySecret(snapshot.password, P1);
+    const samePassword = P2 === P1;
+    const passwordHash = passwordMatches && !samePassword ? await hashSecret(P2) : null;
+
     const result = await withTransaction(async (tx) => {
+      const now = Date.now();
       const [rows] = await tx.query(
         `SELECT password,password_temp_expires_at_ms,consec_failed_auth
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
@@ -2599,24 +2740,32 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
       );
       if (!rows.length) return { auth: "incorrect" };
 
+      await lockAccountSecurityActionTx(tx, U, "password_change");
+      const counts = await getRecentAccountSecurityEventsTx(tx, U, "password_change", now);
+      const actionDecision = evaluateAccountActionLimit("password_change", counts);
+      if (!actionDecision.allowed) return { auth: "limit reached" };
+
       const current = rows[0];
+      // Reject a stale credential snapshot rather than applying a result verified against an old password.
+      if (current.password !== snapshot.password) return { auth: "incorrect" };
+
       const isRecoveryPassword = current.password_temp_expires_at_ms != null;
       const accountLocked = Number(current.consec_failed_auth || 0) >= 3;
-      if (accountLocked && !isRecoveryPassword) {
-        return { auth: "not allowed" };
-      }
+      if (accountLocked && !isRecoveryPassword) return { auth: "not allowed" };
       if (isRecoveryPassword) {
         const expiresAt = Number(current.password_temp_expires_at_ms);
-        if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        if (!Number.isFinite(expiresAt) || expiresAt <= now) {
           return { auth: "temporary password expired" };
         }
       }
-      if (!(await verifySecret(current.password, P1))) {
-        return { auth: "incorrect" };
-      }
-      if (P2 === P1) return { auth: "new password must be different" };
 
-      const passwordHash = await hashSecret(P2);
+      if (!passwordMatches || samePassword) {
+        if (!actionDecision.canRecordFailure) return { auth: "limit reached" };
+        await recordAccountSecurityEventTx(tx, U, "password_change", "failed", now);
+        return { auth: !passwordMatches ? "incorrect" : "new password must be different" };
+      }
+
+      if (!passwordHash) throw new Error("Password hash was not prepared");
       if (isRecoveryPassword) {
         await tx.query(
           `UPDATE auths SET password=?,password_temp_expires_at_ms=NULL,consec_failed_auth=0
@@ -2629,12 +2778,16 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
           [passwordHash, U],
         );
       }
+      await recordAccountSecurityEventTx(tx, U, "password_change", "successful", now);
       return { auth: "updated", recovery_completed: isRecoveryPassword };
     });
-    res.send(result);
+    return res.send(result);
   } catch (error) {
-    console.error("Password update failed:", error);
-    res.send({ auth: "error" });
+    console.error("Password update failed:", error.message);
+    if (["ARGON2_QUEUE_FULL", "ARGON2_QUEUE_TIMEOUT"].includes(error.code)) {
+      return res.status(503).send({ auth: "temporarily unavailable" });
+    }
+    return res.send({ auth: "error" });
   }
 });
 
@@ -2648,6 +2801,7 @@ router.post("/app/delete-user", async (req, res) => {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
+    if (await accountApiLimitReached(res, U, "delete_user", 2, DAY_MS)) return;
     const result = await withTransaction(async (tx) => {
       const [authRows] = await tx.query(
         "SELECT username,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
@@ -2702,14 +2856,35 @@ router.post("/app/delete-user", async (req, res) => {
   }
 });
 
-// recover-account
+// Account recovery is limited to two requests per account in a rolling 24-hour period.
 router.post("/app/recover-account", async (req, res) => {
   const { user, seed } = req.body || {};
   const U = normalizeUsername(user);
   const S = normalizeFormValue(seed);
-  if (!U || !S) return res.status(400).send({ auth: "invalid request" });
+  if (!U || U.length > 30 || !S || Buffer.byteLength(S, "utf8") > 4096) {
+    return res.status(400).send({ auth: "invalid request" });
+  }
 
   try {
+    const accountRows = await db.queryAsync(
+      "SELECT username FROM auths WHERE username=? LIMIT 1",
+      [U],
+    );
+    if (!accountRows.length) return res.send({ auth: "incorrect" });
+
+    const quotaResult = await withTransaction(async (tx) => {
+      const now = Date.now();
+      await lockAccountSecurityActionTx(tx, U, "account_recovery");
+      const counts = await getRecentAccountSecurityEventsTx(tx, U, "account_recovery", now);
+      if (!evaluateAccountActionLimit("account_recovery", counts).allowed) {
+        return { allowed: false };
+      }
+      // Count the recovery attempt before seed verification so invalid seeds also consume a request.
+      await recordAccountSecurityEventTx(tx, U, "account_recovery", "request", now);
+      return { allowed: true };
+    });
+    if (!quotaResult.allowed) return res.send({ auth: "limit reached" });
+
     const rows = await db.queryAsync(
       "SELECT email,seed FROM auths WHERE username=? LIMIT 1",
       [U],
@@ -2736,44 +2911,95 @@ router.post("/app/recover-account", async (req, res) => {
     return res.send({ auth: "recovery email sent", expires_in: issue.expiresInSeconds });
   } catch (error) {
     console.error("Account recovery failed:", error.message);
+    if (["ARGON2_QUEUE_FULL", "ARGON2_QUEUE_TIMEOUT"].includes(error.code)) {
+      return res.status(503).send({ auth: "temporarily unavailable" });
+    }
     return res.send({ auth: "error" });
   }
 });
 
-// modify-seed
+// A user may record at most three failed seed-change attempts and one successful change in any rolling 24-hour period.
 router.post("/app/modify-seed", async (req, res) => {
   const { user, pswd, seed, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   const S = normalizeFormValue(seed);
 
+  if (!U || U.length > 30 || !P || Buffer.byteLength(P, "utf8") > 4096) {
+    return res.status(400).send({ auth: "invalid request" });
+  }
   if (!requestTokenIsValid(req, tkn, P, U)) {
     return res.send({ auth: "forbidden request" });
   }
-  if (!S) return res.status(400).send({ auth: "invalid seed" });
+  if (!S || Buffer.byteLength(S, "utf8") > 4096) {
+    return res.status(400).send({ auth: "invalid seed" });
+  }
 
   try {
+    // Verify and hash outside the transaction to keep MySQL row locks short-lived.
+    const snapshotRows = await db.queryAsync(
+      `SELECT password,consec_failed_auth,password_temp_expires_at_ms
+       FROM auths WHERE username=? LIMIT 1`,
+      [U],
+    );
+    if (!snapshotRows.length) return res.send({ auth: "incorrect" });
+
+    const successEvents = await db.queryAsync(
+      `SELECT id FROM account_security_events
+       WHERE username=? AND action='seed_change' AND outcome='successful' AND created_at_ms>=?
+       LIMIT 1`,
+      [U, String(Date.now() - DAY_MS)],
+    );
+    if (successEvents.length) return res.send({ auth: "limit reached" });
+
+    const snapshot = snapshotRows[0];
+    if (isPasswordProtectedActivityLocked({
+      failedCount: Number(snapshot.consec_failed_auth || 0),
+      temporaryPasswordExpiresAtMs: snapshot.password_temp_expires_at_ms,
+    })) return res.send({ auth: "not allowed" });
+
+    const passwordMatches = await verifySecret(snapshot.password, P);
+    const seedHash = passwordMatches ? await hashSecret(S) : null;
+
     const result = await withTransaction(async (tx) => {
+      const now = Date.now();
       const [rows] = await tx.query(
         `SELECT password,consec_failed_auth,password_temp_expires_at_ms
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
         [U],
       );
       if (!rows.length) return { auth: "incorrect" };
-      if (isPasswordProtectedActivityLocked({
-        failedCount: Number(rows[0].consec_failed_auth || 0),
-        temporaryPasswordExpiresAtMs: rows[0].password_temp_expires_at_ms,
-      })) return { auth: "not allowed" };
-      if (!(await verifySecret(rows[0].password, P))) return { auth: "incorrect" };
 
-      const seedHash = await hashSecret(S);
+      await lockAccountSecurityActionTx(tx, U, "seed_change");
+      const counts = await getRecentAccountSecurityEventsTx(tx, U, "seed_change", now);
+      const actionDecision = evaluateAccountActionLimit("seed_change", counts);
+      if (!actionDecision.allowed) return { auth: "limit reached" };
+
+      const current = rows[0];
+      if (current.password !== snapshot.password) return { auth: "incorrect" };
+      if (isPasswordProtectedActivityLocked({
+        failedCount: Number(current.consec_failed_auth || 0),
+        temporaryPasswordExpiresAtMs: current.password_temp_expires_at_ms,
+      })) return { auth: "not allowed" };
+
+      if (!passwordMatches) {
+        if (!actionDecision.canRecordFailure) return { auth: "limit reached" };
+        await recordAccountSecurityEventTx(tx, U, "seed_change", "failed", now);
+        return { auth: "incorrect" };
+      }
+
+      if (!seedHash) throw new Error("Seed hash was not prepared");
       await tx.query("UPDATE auths SET seed=? WHERE username=?", [seedHash, U]);
+      await recordAccountSecurityEventTx(tx, U, "seed_change", "successful", now);
       return { auth: "updated" };
     });
-    res.send(result);
+    return res.send(result);
   } catch (error) {
-    console.error("Seed update failed:", error);
-    res.send({ auth: "not exists" });
+    console.error("Seed update failed:", error.message);
+    if (["ARGON2_QUEUE_FULL", "ARGON2_QUEUE_TIMEOUT"].includes(error.code)) {
+      return res.status(503).send({ auth: "temporarily unavailable" });
+    }
+    return res.send({ auth: "not exists" });
   }
 });
 
@@ -2830,13 +3056,14 @@ router.post("/admin/set-user-status", async (req, res) => {
   )
     return res.send({ auth: "incorrect" });
 
+  const U = normalizeUsername(user);
   const stat = Number(status);
-  if (isNaN(stat)) return res.send({ error: "invalid status" });
+  if (!U || !Number.isSafeInteger(stat)) return res.status(400).send({ error: "invalid status or user" });
 
   try {
     await db.queryAsync("UPDATE auths SET status=? WHERE username=?", [
       stat,
-      user,
+      U,
     ]);
     res.send({ account: "updated" });
   } catch {
@@ -2934,60 +3161,70 @@ router.post("/admin/unlock-system-seller", async (req, res) => {
   }
 });
 
-// Read-only administrative history for transfers of accumulated BSC-USD admin rewards.
+// Read-only administrative history uses cursor pagination to avoid deep OFFSET scans.
 router.post("/admin/admin-fees-transfers", async (req, res) => {
-  const { pswd, pin, page: pageInput, limit: limitInput, status: statusInput } = req.body || {};
+  const { pswd, pin, before_id: beforeIdInput, limit: limitInput, status: statusInput } = req.body || {};
   if (
     pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
     pin !== decrypt(admin_pin, DB_CONFIG.password)
   ) return res.send({ auth: "incorrect" });
 
-  const page = Number(pageInput || 1);
-  const limit = Number(limitInput || 20);
+  const limit = limitInput == null || limitInput === "" ? 20 : Number(limitInput);
+  const beforeId = beforeIdInput == null || beforeIdInput === "" ? "" : String(beforeIdInput).trim();
   const status = typeof statusInput === "string" ? statusInput.trim().toLowerCase() : "";
   const allowedStatuses = new Set([
     "queued", "signed", "submitted", "confirmed", "failed", "manual_review",
   ]);
   if (
-    !Number.isInteger(page) || page < 1 || page > 1000000 ||
     !Number.isInteger(limit) || limit < 1 || limit > 100 ||
+    (beforeId && !/^\d{1,20}$/.test(beforeId)) ||
     (status && !allowedStatuses.has(status))
   ) return res.status(400).send({ error: "invalid pagination or status" });
 
-  const where = status ? "WHERE status=?" : "";
-  const queryParams = status ? [status] : [];
-  const offset = (page - 1) * limit;
+  const conditions = [];
+  const params = [];
+  if (status) {
+    conditions.push("status=?");
+    params.push(status);
+  }
+  if (beforeId) {
+    conditions.push("id<?");
+    params.push(beforeId);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  params.push(limit);
+
   try {
-    const [countRows, transferRows, commonRows] = await Promise.all([
-      db.queryAsync(`SELECT COUNT(*) AS total FROM admin_fees_transfers ${where}`, queryParams),
+    const [transferRows, commonRows] = await Promise.all([
       db.queryAsync(
         `SELECT id,amount,amount_raw,destination_address,reference,status,nonce,estimated_fee_bnb,estimated_fee_usd,
                 actual_fee_bnb,actual_fee_usd,bnb_usd_price,tx_hash,block_number,last_error,
                 created_at_ms,updated_at_ms,confirmed_at_ms
          FROM admin_fees_transfers ${where}
-         ORDER BY id DESC LIMIT ? OFFSET ?`,
-        [...queryParams, limit, offset],
+         ORDER BY id DESC LIMIT ?`,
+        params,
       ),
       db.queryAsync(
         "SELECT `total_adminFees`,`remaining_adminFees` FROM common ORDER BY id DESC LIMIT 1",
       ),
     ]);
     const summary = commonRows[0] || { total_adminFees: "0", remaining_adminFees: "0" };
+    const history = transferRows.map((row) => ({
+      ...row,
+      id: String(row.id),
+      created_at_ms: String(row.created_at_ms),
+      updated_at_ms: String(row.updated_at_ms),
+      confirmed_at_ms: row.confirmed_at_ms == null ? null : String(row.confirmed_at_ms),
+      block_number: row.block_number == null ? null : String(row.block_number),
+    }));
+    const nextBeforeId = history.length === limit ? history[history.length - 1].id : null;
     return res.send({
       transf: "ok",
-      page,
       limit,
-      total: Number(countRows[0]?.total || 0),
+      next_before_id: nextBeforeId,
       total_adminFees: String(summary.total_adminFees),
       remaining_adminFees: String(summary.remaining_adminFees),
-      history: transferRows.map((row) => ({
-        ...row,
-        id: String(row.id),
-        created_at_ms: String(row.created_at_ms),
-        updated_at_ms: String(row.updated_at_ms),
-        confirmed_at_ms: row.confirmed_at_ms == null ? null : String(row.confirmed_at_ms),
-        block_number: row.block_number == null ? null : String(row.block_number),
-      })),
+      history,
     });
   } catch (error) {
     console.error("Admin-fees transfer history lookup failed:", error.message);
@@ -3005,11 +3242,15 @@ router.post("/admin/update-user-or-common-stock", async (req, res) => {
     return res.send({ auth: "incorrect" });
   }
 
-  if (typeof user !== "string") {
+  if (typeof user !== "string" || user.trim().length === 0 || user.trim().length > 30) {
     return res.status(400).send({ error: "invalid user" });
   }
 
-  const amountValue = new BigNumber(String(amount ?? ""));
+  const amountText = String(amount ?? "").trim();
+  if (!amountText || amountText.length > 100) {
+    return res.status(400).send({ error: "invalid amount" });
+  }
+  const amountValue = new BigNumber(amountText);
   if (!amountValue.isFinite() || !amountValue.isGreaterThan(0)) {
     return res.status(400).send({ error: "invalid amount" });
   }

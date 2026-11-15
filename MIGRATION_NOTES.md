@@ -152,3 +152,37 @@ Les fichiers `.env` réels ne doivent jamais être distribués. Fournir uniqueme
 - `npm test` : tests unitaires des politiques et fonctions comptables.
 - Les tests unitaires ne remplacent pas les tests d'intégration sur une base MySQL neuve, le testnet BSC, les tests SMTP/Telegram et la répétition des scénarios de reprise après redémarrage.
 - Bonus : aucune génération, accumulation ou formule de crédit n'est implémentée dans cette version.
+
+## API hardening update (2026-11-15)
+
+The HTTP layer now applies an IP-based global limit (default 180 requests / 60 seconds) and stricter windows for sensitive routes. The limiter runs before request-body parsing. Normal request bodies are limited to 256kb; `/app/signup` has a dedicated 10mb parser for base64 identity images, with each supplied image limited to 3mb decoded. Signup input lengths are validated before Argon2 hashing and username allocation retries stop after ten collisions.
+
+The new MySQL tables `account_security_action_locks`, `account_security_events` and `account_api_rate_limits` persist and serialize account-level quotas. Password and seed changes allow three recorded failures plus one successful change in a rolling 24-hour period. A fourth failed attempt is rejected with `{ "auth": "limit reached" }`; the one successful change remains available even after the three failed attempts. Account recovery allows two requests in 24 hours and counts each syntactically valid request before checking the seed. The third returns the same `auth` limit response. Cleanup removes security events after eight days and rate buckets after two days.
+
+Authenticated per-account request limits additionally protect expensive reads and write operations. SMTP sends now pass through a bounded in-process queue (30 messages/hour, 50 queued, concurrency 2, up to 2 attempts by default). Pending mail jobs are not persisted across a process restart.
+
+`multipleStatements` is disabled. SQL values remain parameterized; dynamic SQL identifiers are taken only from internal fixed allowlists. The database pool defaults to 20 connections and 100 queued requests. Argon2's queue defaults to 20 waiters with a 15-second queue timeout. `TRUST_PROXY_HOPS` defaults to zero; set it only to the exact trusted proxy count. Optional HTTPS enforcement uses `FORCE_HTTPS` and a configured `PUBLIC_HTTPS_ORIGIN`.
+
+Transaction history is restricted to a rolling window of at most 30 days; because activity timestamps are stored to whole seconds, the cutoff is rounded upward to avoid including an older second and cursor-paginated (50 rows by default, maximum 100). The response retains `trans` and adds `days`, `limit` and `next_before_id`; the client sends `next_before_id` back as `before_id`. Administrative admin-fee history also uses `before_id` cursor pagination, without deep `OFFSET` or a full count query.
+
+These changes add three tables and four activity-history indexes. The project still expects the current schema. `CREATE TABLE IF NOT EXISTS` creates the new security tables, but an existing `activities` table will not automatically gain the new indexes. For an existing database, inspect `SHOW INDEX FROM activities` and apply only the missing indexes (do not add duplicate indexes):
+
+```sql
+ALTER TABLE activities
+  ADD INDEX idx_activities_sender_id (sender, id),
+  ADD INDEX idx_activities_receiver_id (receiver, id),
+  ADD INDEX idx_activities_history_sender (sender, record_date, record_time, id),
+  ADD INDEX idx_activities_history_receiver (receiver, record_date, record_time, id);
+```
+
+This combined statement is for a table missing all four indexes. If only some are missing, create only those individual indexes. Index creation on a large production table can consume I/O and may affect writes; back up first and schedule it during a maintenance window. Startup checks that all four indexes exist and aborts rather than silently running the unindexed history query.
+
+
+## Additional API security hardening
+
+- The 24-hour password-change and seed-change quotas are checked and recorded in MySQL under account-specific locks. Argon2 verification and new-secret hashing are performed before opening the write transaction; the transaction then locks and re-checks the credential hash and current lock state before recording the result. This limits lock duration without allowing a stale password snapshot to overwrite a newer credential.
+- Signup payload size is separately parsed, with a hard maximum of 10 MiB regardless of environment configuration; each supplied identity image is separately capped at 3 MiB after decoding. Normal request bodies remain capped at 256 KiB.
+- Financial amount strings accepted directly from HTTP requests are length-capped before BigNumber parsing. This does not change XTU accounting formulas or transaction fee calculations.
+- The HTTP limiter applies route-specific IP windows to sensitive read, write, download and administrative endpoints. It normalizes route casing and trailing slashes. The limiter is process-local; multi-instance deployments must enforce the same or stricter IP policy at the shared reverse proxy/API gateway.
+- MySQL sessions use a bounded InnoDB row-lock wait timeout. Existing transaction logic and financial write ordering are unchanged.
+- The transaction-history endpoint accepts at most 30 days. A larger `days` value is clamped to 30, while invalid or fractional values are rejected. Existing `trans` payload format is preserved and cursor pagination is additive.
