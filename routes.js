@@ -3164,8 +3164,10 @@ router.post("/admin/unlock-system-seller", async (req, res) => {
   }
 });
 
-// Update an individual user stock or the administratively controlled common stock.
-router.post("/admin/update-common-stock", async (req, res) => {
+// Apply an administrator-approved credit to one user's stock through the
+// normal recharge allocation rules. The automatic minimum is bypassed, while
+// reserve priority, system-funded cooldown/cap, fees and the 300 XTU balance cap remain enforced.
+router.post("/admin/update-user-stock", async (req, res) => {
   const { pswd, pin, amount, user } = req.body || {};
   if (
     pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
@@ -3174,7 +3176,8 @@ router.post("/admin/update-common-stock", async (req, res) => {
     return res.send({ auth: "incorrect" });
   }
 
-  if (typeof user !== "string" || user.trim().length === 0 || user.trim().length > 30) {
+  const U = normalizeUsername(user);
+  if (!U || U === OneX) {
     return res.status(400).send({ error: "invalid user" });
   }
 
@@ -3188,16 +3191,59 @@ router.post("/admin/update-common-stock", async (req, res) => {
   }
 
   const [date, time] = getDate();
-  const isUserTopUp = user.includes("-");
-  const U = isUserTopUp ? normalizeUsername(user) : null;
-
+  const eventTimestampMs = Date.now();
   try {
     const result = await withTransaction(async (tx) => {
-      if (isUserTopUp) {
-        const reference = createFinancialReference(`TOP${U}`);
-        return applyUserTopUp(tx, U, amountValue, reference, date, time, Date.now(), { enforceRechargeRange: false });
-      }
+      const reference = createFinancialReference(`ADMTOP${U}`);
+      return applyUserTopUp(
+        tx,
+        U,
+        amountValue,
+        reference,
+        date,
+        time,
+        eventTimestampMs,
+        { enforceRechargeRange: false },
+      );
+    });
 
+    return res.send(result);
+  } catch (error) {
+    console.error("Administrative user-stock credit failed:", error);
+    return res.send({ error: "error" });
+  }
+});
+
+// Spend XTU from the protected administrative portion of the common stock.
+// This endpoint never modifies an individual user's balance.
+router.post("/admin/update-common-stock", async (req, res) => {
+  const { pswd, pin, amount, user } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) {
+    return res.send({ auth: "incorrect" });
+  }
+
+  // Accept the former explicit common marker, but never route a username here.
+  if (req.body?.username !== undefined || (user !== undefined && (
+    typeof user !== "string" || user.trim().toLowerCase() !== "common"
+  ))) {
+    return res.status(400).send({ error: "use /admin/update-user-stock for individual user balances" });
+  }
+
+  const amountText = String(amount ?? "").trim();
+  if (!amountText || amountText.length > 100) {
+    return res.status(400).send({ error: "invalid amount" });
+  }
+  const amountValue = new BigNumber(amountText);
+  if (!amountValue.isFinite() || !amountValue.isGreaterThan(0)) {
+    return res.status(400).send({ error: "invalid amount" });
+  }
+
+  const [date, time] = getDate();
+  try {
+    const result = await withTransaction(async (tx) => {
       const [commonLockRows] = await tx.query(
         "SELECT lock_name FROM system_locks WHERE lock_name=? FOR UPDATE",
         ["common_state"],
@@ -3236,7 +3282,7 @@ router.post("/admin/update-common-stock", async (req, res) => {
 
     return res.send(result);
   } catch (error) {
-    console.error("Admin stock update failed:", error);
+    console.error("Administrative common-stock expenditure failed:", error);
     return res.send({ error: "error" });
   }
 });

@@ -127,16 +127,23 @@ remaining_admin_quota = initial_admin_quota - common.sys_inactive_init_asset
 
 Le calcul bloque si `sys_inactive_init_asset` est négatif ou dépasse le quota initial. Pour les recharges et les réservations de disbursement, les actifs initiaux distribuables sont calculés comme `max(0, backed_units + inactive_init_asset - remaining_admin_quota)`. Une consommation administrative validée diminue le reliquat protégé et `backed_units` du même montant initial; elle ne rend donc pas disponible aux opérations utilisateur la portion administrative encore non dépensée. Au démarrage, le serveur vérifie aussi que `backed_units` couvre à lui seul le reliquat protégé; une incohérence bloque le démarrage. La réserve vendeurs reste suivie séparément.
 
-La route administrative est `POST /admin/update-common-stock` (ancien chemin remplacé, aucun alias conservé). Le paramètre `amount` est exprimé en XTU / BSC-USD, comme confirmé pour la branche common-stock. La conversion utilise le `common.unit_price` lu avant l'opération :
+Les opérations administratives de stock sont désormais séparées en deux routes, sans branche conditionnelle fondée sur le format du nom d'utilisateur :
+
+- `POST /admin/update-user-stock` crédite un compte utilisateur. Le corps contient `user` (nom d'utilisateur) et `amount` (montant brut en XTU / BSC-USD). La route réutilise `applyUserTopUp()` et conserve donc l'allocation vendeurs en priorité, le plafond de solde de 300 XTU, le plafond de 140 BSC-USD et le cooldown de sept jours pour toute partie financée par les réserves ONEX, les frais `tfees`, la récupération configurée des coûts BSC et le plancher administratif de 10 %. Seul le minimum automatique de 12 BSC-USD est contourné pour cette opération administrative. Une partie financée entièrement par les vendeurs ne consomme pas le cooldown ONEX.
+- `POST /admin/update-common-stock` effectue exclusivement une dépense administrative sur la portion protégée du common stock. Le corps contient `amount` en XTU / BSC-USD; aucun nom d'utilisateur individuel n'est accepté. Le marqueur historique facultatif `user: "common"` reste accepté pour compatibilité; tout nom d'utilisateur individuel est refusé et doit utiliser `/admin/update-user-stock`.
+
+Pour la dépense administrative, la conversion utilise le `common.unit_price` lu avant l'opération :
 
 ```text
 spent_initial_asset = amount / current_unit_price
+total_units_price_after = total_units_price_before - amount
+unit_price_after = current_unit_price
 backed_units_after = backed_units_before - spent_initial_asset
 sys_inactive_init_asset_after = sys_inactive_init_asset_before + spent_initial_asset
 remaining_admin_quota_after = remaining_admin_quota_before - spent_initial_asset
 ```
 
-Le rachat administratif réduit le stock total XTU du montant dépensé et conserve le prix courant : `total_units_price_after = total_units_price_before - amount`; `unit_price_after = current_unit_price`. Il ne s'agit ni d'une émission de nouvelles unités ni d'une opération de revalorisation. L'opération est rejetée si `amount` dépasse la valeur XTU du quota administratif encore disponible au prix courant, si elle ramène `total_units_price` à zéro ou moins, ou si elle crée une réserve négative ou un compteur supérieur au quota. La branche existante qui met à jour le stock d'un utilisateur est conservée sur ce même endpoint; seul le chemin HTTP est renommé.
+Il s'agit d'une dépense, pas d'un rachat, d'une émission ou d'une revalorisation. Elle est rejetée si `amount` dépasse la valeur XTU du quota administratif restant au prix courant, si elle ramène `total_units_price` à zéro ou moins, ou si elle crée une réserve négative ou un compteur supérieur au quota. Les deux routes exigent le mot de passe et le PIN administratifs et possèdent des limites HTTP distinctes.
 
 Tous les `tfees` retenus lors des recharges, P2P et ventes à ONEX sont conservés par OneX. Leur base initiale complète est ajoutée à `backed_units` et leur valeur BSC-USD équivalente augmente `common.total_tfees`. Ce compteur est cumulatif et ne diminue jamais. Il n'existe plus de portefeuille séparé, de file de transferts ni de transfert automatique lié à ces frais. Les frais BNB de chaque opération blockchain demeurent comptabilisés séparément dans `bsc_fee_ledger`.
 

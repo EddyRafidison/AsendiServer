@@ -51,16 +51,44 @@ A value above the configured initial quota is an accounting error and blocks the
 
 For example, with `STOCK_LIMIT=10,000,000` and a 10% ratio, the initial administrative quota is 1,000,000 initial assets and the initial user-distributable capacity is 9,000,000. If an authorized administrative operation spends 100,000 initial assets, `sys_inactive_init_asset` becomes 100,000 and the remaining protected quota becomes 900,000; `backed_units` is reduced by the same 100,000. The distributable initial-asset capacity therefore remains 9,000,000 rather than increasing because administrative assets were spent.
 
-Administrative common-stock operations use `POST /admin/update-common-stock`. The `amount` field is expressed in XTU / BSC-USD, not in initial-asset units. The operation converts it using the **current `common.unit_price` captured before the update**:
+Administrative stock operations are deliberately split into two endpoints so that an individual user credit can never be interpreted as an expenditure from the common administrative allocation.
+
+`POST /admin/update-user-stock` credits an individual user's stock. The request uses `user` (the user's username) and `amount` (gross XTU / BSC-USD value). It delegates to the same `applyUserTopUp()` accounting path as recharge processing. The automatic 12 BSC-USD minimum is bypassed for this administrator action, but the remaining business rules stay active: the 300 XTU user balance cap, seller-reserve-first funding, the 140 BSC-USD cap and seven-day cooldown for any ONEX-funded portion, the 10% protected reserve floor, transaction fees and configured BSC cost recovery. A seller-funded portion does not consume the ONEX weekly cooldown or system-funded cap. The route requires the configured administrator password and PIN.
+Example request body:
+
+```json
+{
+  "pswd": "<administrator-password>",
+  "pin": "<administrator-pin>",
+  "user": "<USER-PREFIX-SUFFIX>",
+  "amount": "50"
+}
+```
+
+
+`POST /admin/update-common-stock` is exclusively an administrative expenditure from the protected common-stock allocation. The request uses `amount` in XTU / BSC-USD; it does not accept an individual username. For compatibility with existing common-stock callers, the former explicit `user: "common"` marker is optional; any individual username is rejected with guidance to use `/admin/update-user-stock`. The operation converts the expenditure using the **current `common.unit_price` captured before the update**:
 
 ```text
 spent_initial_asset = amount / current_unit_price
+total_units_price_after = total_units_price_before - amount
+unit_price_after = current_unit_price
 backed_units_after = backed_units_before - spent_initial_asset
 sys_inactive_init_asset_after = sys_inactive_init_asset_before + spent_initial_asset
 remaining_admin_quota_after = remaining_admin_quota_before - spent_initial_asset
 ```
 
-The administrative buyback reduces the total XTU stock by the amount spent while preserving the current unit price: `total_units_price_after = total_units_price_before - amount` and `unit_price_after = current_unit_price`. This is not a new issuance or a repricing event. The operation is rejected if the requested XTU amount exceeds the value of the remaining administrative allocation at the current unit price, would reduce `total_units_price` to zero or below, or would create an invalid reserve. The endpoint keeps its existing administrative user-stock update branch as well as the common-stock branch; only the URL path is renamed.
+This is a spending operation, not a buyback, new issuance or repricing event. It is rejected if the requested XTU amount exceeds the remaining administrative allocation at the current unit price, would reduce `total_units_price` to zero or below, or would create an invalid reserve. Both endpoints use the configured administrator password and PIN and have separate HTTP rate-limit entries.
+
+Example common-stock expenditure request body:
+
+```json
+{
+  "pswd": "<administrator-password>",
+  "pin": "<administrator-pin>",
+  "amount": "125000"
+}
+```
+
 
 The `tfees` retained by recharge, P2P and system-sale operations are recorded in full. Their full initial-asset basis is returned to `common.backed_units`, and their BSC-USD-equivalent value increases `common.total_tfees`. There is no separate reward wallet, transfer queue, transfer-history endpoint or treasury liquidity reservation. Seller payouts and refunds continue to charge no `tfees`; their BSC gas handling remains separate.
 
@@ -150,7 +178,8 @@ Set `USDT_SELLER_PAYOUTS_ENABLED=true` only when seller treasury payouts are rea
 - `POST /admin/unlock-disbursement`: requeues an expired, unsigned disbursement for the isolated worker after admin authentication and liquidity checks.
 - `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces the 140 BSC-USD system-funded cap, weekly cooldown when ONEX reserves are needed, 300 XTU stock cap and reserve availability; seller funding remains first priority.
 - `POST /admin/recharge/refund`: queues a refund of a support-held recharge batch. No `tfees` is charged; a configured estimate of OneX's BSC gas cost is deducted, and the net refund must be at least 10 BSC-USD.
-- `POST /admin/update-common-stock`: administrative update of a user's stock or the common stock. For the common-stock branch, `amount` is expressed in XTU / BSC-USD; it is converted to initial-asset basis using the current `common.unit_price` captured before the update, and the spent basis is recorded in `common.sys_inactive_init_asset`. Requires the configured administrator password and PIN.
+- `POST /admin/update-user-stock`: applies an administrator-approved individual stock credit through the standard recharge allocator, preserving seller-first funding, system cooldown/cap, fees, cost recovery and the user balance ceiling. The automatic minimum is bypassed. Requires the configured administrator password and PIN.
+- `POST /admin/update-common-stock`: records an administrative expenditure from the protected common allocation. `amount` is XTU / BSC-USD; the current unit price converts it to initial-asset basis, `total_units_price` decreases by `amount`, `unit_price` stays unchanged, and the spent basis moves from `backed_units` to `sys_inactive_init_asset`. Requires the configured administrator password and PIN.
 - `POST /admin/send-temp-pswd`: issues a seven-digit temporary password by email; valid for 10 minutes and usable only to sign in and change the permanent password.
 - `POST /app/join-system-sellers`: requests activation of a priority seller campaign.
 - `POST /app/cancel-system-sellers`: requests cancellation; the unused seller reserve remains locked pending admin review.
