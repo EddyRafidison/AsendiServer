@@ -4,7 +4,7 @@
 
 Cette version est destinée à un projet OneX non encore déployé. Elle définit directement le schéma cible. Elle ne migre pas et ne remplit pas les anciennes tables. Créer une base MySQL neuve et vide. `db.js` crée les tables avec `CREATE TABLE IF NOT EXISTS`, puis vérifie les colonnes requises. Une ancienne structure ne correspondant pas au schéma cible provoque volontairement une erreur au démarrage.
 
-Par défaut, une nouvelle base initialise `common.total_units_price=10000000`, `common.unit_price=1` et `common.backed_units=10000000`. `STOCK_LIMIT` et `INITIAL_BACKED_UNITS` peuvent remplacer ces valeurs; `INITIAL_BACKED_UNITS` prend par défaut la valeur de `STOCK_LIMIT` et ne peut pas la dépasser. La réserve déclarée doit correspondre aux actifs réellement disponibles. La réserve système non distribuable reste fixée à `STOCK_LIMIT * SYSTEM_RESERVE_RATIO` (20 % par défaut).
+Par défaut, une nouvelle base initialise `common.total_units_price=10000000`, `common.unit_price=1` et `common.backed_units=10000000`. `STOCK_LIMIT` et `INITIAL_BACKED_UNITS` peuvent remplacer ces valeurs; `INITIAL_BACKED_UNITS` prend par défaut la valeur de `STOCK_LIMIT` et ne peut pas la dépasser. La réserve déclarée doit correspondre aux actifs réellement disponibles. La réserve administrative initiale non distribuable est fixée à `STOCK_LIMIT * SYSTEM_ADMIN_RESERVE_RATIO` (10 % par défaut). Les 90 % restants constituent la capacité initiale distribuable, sous réserve des soldes réellement adossés.
 
 ## Conventions comptables
 
@@ -16,7 +16,7 @@ Par défaut, une nouvelle base initialise `common.total_units_price=10000000`, `
 - `users_stock` ne possède pas de `unit_price` individuel.
 - `activities.amount` et `activities.fees` suivent la dénomination définie par l'opération; `activities.unit_price` enregistre le prix de conversion utilisé.
 - `common.total_units_price` : valeur en XTU.
-- `common.backed_units`, `common.inactive_init_asset` et `common.sellers_init_asset` : actifs initiaux.
+- `common.backed_units`, `common.inactive_init_asset`, `common.sys_inactive_init_asset` et `common.sellers_init_asset` : actifs initiaux.
 - `common.sellers_res` : XTU réservé aux vendeurs.
 - Les calculs financiers utilisent `BigNumber`, jamais l'arithmétique flottante JavaScript.
 - Toutes les dates et heures nouvellement écrites par le serveur sont en UTC.
@@ -45,7 +45,7 @@ Ordre de financement :
 2. `common.inactive_init_asset`.
 3. `common.backed_units` pour le complément uniquement.
 
-Le financement système respecte le plancher non distribuable de 20 % (`STOCK_LIMIT * SYSTEM_RESERVE_RATIO`). La consommation des réserves système prend les actifs inactifs avant les actifs adossés. Si le financement vendeur couvre toute la recharge, aucune réserve système ni cooldown ONEX n'est consommé. Si une recharge est bloquée par le cooldown et que les vendeurs ne peuvent pas financer intégralement le montant net, aucun crédit partiel n'est réalisé. Le batch est conservé en attente et réévalué périodiquement; il peut être financé dès que la réserve vendeurs devient suffisante ou lorsque le cooldown expire.
+Le financement système respecte le reliquat du quota administratif non distribuable, initialement fixé à 10 % (`STOCK_LIMIT * SYSTEM_ADMIN_RESERVE_RATIO`). Le quota est réduit uniquement par les dépenses administratives validées et cumulées dans `common.sys_inactive_init_asset`. La consommation des réserves système prend les actifs inactifs avant les actifs adossés. Si le financement vendeur couvre toute la recharge, aucune réserve système ni cooldown ONEX n'est consommé. Si une recharge est bloquée par le cooldown et que les vendeurs ne peuvent pas financer intégralement le montant net, aucun crédit partiel n'est réalisé. Le batch est conservé en attente et réévalué périodiquement; il peut être financé dès que la réserve vendeurs devient suffisante ou lorsque le cooldown expire.
 
 Seule une recharge réellement créditée via `ONEX` démarre le cooldown hebdomadaire. Un crédit financé par les vendeurs utilise `XUSER` comme expéditeur comptable. Les crédits utilisent une transaction SQL atomique et revérifient solde, source, cooldown et réserves immédiatement avant leur application.
 
@@ -77,7 +77,7 @@ Le paiement vendeur est envoyé depuis le treasury en BSC-USD. Il n'y a pas de `
 - L'expéditeur est débité uniquement du montant brut demandé en XTU.
 - Le destinataire supporte l'intégralité de `tfees` et reçoit le montant net.
 - Aucun gas BSC n'est facturé à un transfert P2P.
-- Les frais sont répartis à 50 % `CommonShare` et 50 % `AdminFees`.
+- La totalité des frais est conservée par OneX; aucune répartition en parts de récompense distinctes n'est appliquée.
 - La base initiale du destinataire est augmentée uniquement de la base correspondant au montant net reçu; son historique n'est pas repricé au prix de l'expéditeur.
 - La base initiale de l'expéditeur est mise à jour selon son nouveau solde et le prix de l'opération.
 - La limite de 300 XTU et le verrouillage vendeur sont contrôlés dans la transaction SQL.
@@ -90,9 +90,9 @@ La vente système est distincte du P2P. Conditions : solde d'au moins 290 XTU, a
 
 `payout = gross_balance - fee`
 
-La demande réserve le montant pendant 60 minutes, puis est signée et envoyée par le worker isolé du treasury. Les campagnes vendeurs actives ou en annulation en attente interdisent la liquidation à ONEX. Les demandes en attente sont déduites de la liquidité disponible et le plancher système de 20 % ne peut pas être utilisé pour les ventes.
+La demande réserve le montant pendant 60 minutes, puis est signée et envoyée par le worker isolé du treasury. Les campagnes vendeurs actives ou en annulation en attente interdisent la liquidation à ONEX. Les demandes en attente sont déduites de la liquidité disponible et le reliquat du quota administratif non distribuable de 10 % ne peut pas être utilisé pour les ventes.
 
-Après transfert BSC-USD canonique et finalisé : `common.total_units_price` diminue du montant net effectivement payé; la base initiale correspondant au net payé est ajoutée à `inactive_init_asset`; la base initiale des frais est répartie à 50 % dans `backed_units` (CommonShare) et à 50 % dans `inactive_init_asset` (AdminFees). Seules les ventes confirmées démarrent le cooldown de 90 jours.
+Après transfert BSC-USD canonique et finalisé : `common.total_units_price` diminue du montant net effectivement payé; la base initiale correspondant au net payé est ajoutée à `inactive_init_asset`; la base initiale correspondant à la totalité des frais retenus est ajoutée à `backed_units`. La valeur BSC-USD des frais augmente `common.total_tfees`. Seules les ventes confirmées démarrent le cooldown de 90 jours.
 
 Un échec on-chain ne restaure pas le solde avant confirmation de la canonicalité et 15 confirmations (ou la profondeur configurée). Une transaction signée/soumise est suivie par son hash; aucun nouveau paiement ne doit être signé simplement parce qu'un délai est dépassé.
 
@@ -110,19 +110,37 @@ Les estimations et les coûts réels ne sont jamais confondus :
 - `total_bnb_fee_estimated_value` : équivalent BSC-USD estimé.
 - `total_bnb_fee_actual` : BNB réel issu du reçu.
 - `total_bnb_fee_actual_value` : équivalent BSC-USD réel au prix capturé.
-- `total_common_share`, `total_adminFees` et `remaining_adminFees` : montants en BSC-USD. `total_adminFees` est un cumul historique monotone; `remaining_adminFees` est le solde encore disponible pour le paiement administratif.
+- `total_tfees` : cumul historique monotone de la valeur BSC-USD des frais de transaction retenus par OneX.
 
 Le coût réel est `gasUsed * effectiveGasPrice`. Chaque transaction est journalisée dans `bsc_fee_ledger` et ne doit être comptabilisée qu'une fois. Les snapshots `common` préservent tous les cumuls.
 
-## Récompenses administratives (`AdminFees`)
+## Réserve administrative 10/90 et mise à jour du common stock
 
-`AdminFees` sont libellés en BSC-USD. `common.total_adminFees` cumule toutes les récompenses administratives générées depuis le lancement et ne diminue jamais. `common.remaining_adminFees` suit uniquement la partie qui reste dans le treasury principal; elle augmente à chaque attribution et diminue seulement après confirmation blockchain définitive du transfert vers l'adresse administrative dédiée.
+Le quota administratif est fixé à l'initialisation à `STOCK_LIMIT * SYSTEM_ADMIN_RESERVE_RATIO`, avec `SYSTEM_ADMIN_RESERVE_RATIO=0.10` par défaut. Il est calculé sur le `STOCK_LIMIT` initial, et non sur le `total_units_price` courant. Les 90 % restants constituent la capacité initiale distribuable. La portion administrative demeure comprise dans `common.total_units_price` et `common.backed_units`, mais les recharges système et les disbursements ordinaires ne peuvent pas consommer son reliquat protégé. `INITIAL_BACKED_UNITS` doit être au moins égal au quota administratif initial et ne doit jamais déclarer plus d'actifs que ceux réellement détenus.
 
-La base d'actifs initiaux correspondant aux AdminFees reste dans les réserves système : les frais de recharge et P2P ajoutent leur base équivalente à `inactive_init_asset`; la liquidation système répartit la base des frais 50/50 entre `backed_units` (CommonShare) et `inactive_init_asset` (AdminFees). Le versement des récompenses BSC-USD ne débite pas ces réserves initiales.
+`common.sys_inactive_init_asset` est un compteur cumulatif en actifs initiaux. Il représente la base initiale dépensée par les opérations administratives sur l'allocation administrative. Il n'est pas une réserve utilisable et n'est pas additionné à `backed_units` ou `inactive_init_asset`. Le reliquat protégé est :
 
-Dès que `remaining_adminFees >= ADMIN_FEES_THRESHOLD_USD` (100 BSC-USD par défaut), une demande est créée pour transférer exactement `remaining_adminFees - ADMIN_FEES_RETAINED_BALANCE_USD` (10 BSC-USD par défaut). Une seule demande non résolue peut exister à la fois. Si de nouveaux frais sont accumulés pendant le transfert, le worker réévalue le solde après confirmation et crée une autre demande si le seuil est toujours atteint. Une valeur de seuil nulle, négative ou non finie, une réserve résiduelle invalide, une adresse invalide ou `ADMIN_FEES_TRANSFERS_ENABLED=false` empêchent la création des transferts. Le worker ne soumet pas non plus les demandes déjà en file tant que cette configuration reste invalide; elles restent en attente et ne reprennent qu'après réactivation d'une configuration valide.
+```text
+initial_admin_quota = STOCK_LIMIT * SYSTEM_ADMIN_RESERVE_RATIO
+remaining_admin_quota = initial_admin_quota - common.sys_inactive_init_asset
+```
 
-Le worker treasury `npm run disburse` utilise la clé du treasury principal dans `.env.disbursement`, envoie le montant BSC-USD sans déduire le gas, puis comptabilise le gas BNB séparément dans `bsc_fee_ledger`. Le solde `remaining_adminFees` est protégé de toute autre sortie : les disbursements utilisateurs, paiements vendeurs et remboursements ne peuvent utiliser cette part de la liquidité du treasury. La diminution de `remaining_adminFees` intervient uniquement après vérification de la canonicalité, des confirmations requises et de l'événement BSC-USD `Transfer` vers l'adresse dédiée. `POST /admin/admin-fees-transfers` expose l'historique paginé aux administrateurs authentifiés.
+Le calcul bloque si `sys_inactive_init_asset` est négatif ou dépasse le quota initial. Pour les recharges et les réservations de disbursement, les actifs initiaux distribuables sont calculés comme `max(0, backed_units + inactive_init_asset - remaining_admin_quota)`. Une consommation administrative validée diminue le reliquat protégé et `backed_units` du même montant initial; elle ne rend donc pas disponible aux opérations utilisateur la portion administrative encore non dépensée. Au démarrage, le serveur vérifie aussi que `backed_units` couvre à lui seul le reliquat protégé; une incohérence bloque le démarrage. La réserve vendeurs reste suivie séparément.
+
+La route administrative est `POST /admin/update-common-stock` (ancien chemin remplacé, aucun alias conservé). Le paramètre `amount` est exprimé en XTU / BSC-USD, comme confirmé pour la branche common-stock. La conversion utilise le `common.unit_price` lu avant l'opération :
+
+```text
+spent_initial_asset = amount / current_unit_price
+backed_units_after = backed_units_before - spent_initial_asset
+sys_inactive_init_asset_after = sys_inactive_init_asset_before + spent_initial_asset
+remaining_admin_quota_after = remaining_admin_quota_before - spent_initial_asset
+```
+
+Le rachat administratif réduit le stock total XTU du montant dépensé et conserve le prix courant : `total_units_price_after = total_units_price_before - amount`; `unit_price_after = current_unit_price`. Il ne s'agit ni d'une émission de nouvelles unités ni d'une opération de revalorisation. L'opération est rejetée si `amount` dépasse la valeur XTU du quota administratif encore disponible au prix courant, si elle ramène `total_units_price` à zéro ou moins, ou si elle crée une réserve négative ou un compteur supérieur au quota. La branche existante qui met à jour le stock d'un utilisateur est conservée sur ce même endpoint; seul le chemin HTTP est renommé.
+
+Tous les `tfees` retenus lors des recharges, P2P et ventes à ONEX sont conservés par OneX. Leur base initiale complète est ajoutée à `backed_units` et leur valeur BSC-USD équivalente augmente `common.total_tfees`. Ce compteur est cumulatif et ne diminue jamais. Il n'existe plus de portefeuille séparé, de file de transferts ni de transfert automatique lié à ces frais. Les frais BNB de chaque opération blockchain demeurent comptabilisés séparément dans `bsc_fee_ledger`.
+
+Pour une base issue d'une ancienne version, la nouvelle application n'utilise plus les anciens compteurs ni l'ancienne table d'historique des récompenses. Avant de supprimer d'anciennes colonnes ou tables, sauvegarder leurs valeurs et l'historique; vérifier qu'aucun paiement historique n'est encore en attente. La mise à jour du code ne convertit pas automatiquement les anciens snapshots. La procédure recommandée pour le déploiement initial reste une base neuve conformément au schéma cible.
 
 ## Telegram et SMTP
 
@@ -136,7 +154,7 @@ Les fichiers `.env` réels ne doivent jamais être distribués. Fournir uniqueme
 
 - HTTP + scanner : aucune clé privée de wallet.
 - `npm run sweep` : clé HD des adresses de dépôt et clé du financeur gas dans `.env.sweeper`.
-- `npm run disburse` : clé du treasury dans `.env.disbursement`; les flags, l'adresse dédiée AdminFees, les seuils et `BNB_USD_PRICE` viennent du `.env` principal. Ce worker traite aussi les demandes AdminFees lorsque `ADMIN_FEES_TRANSFERS_ENABLED=true`.
+- `npm run disburse` : clé du treasury dans `.env.disbursement`; les flags opérationnels et `BNB_USD_PRICE` viennent du `.env` principal. Le worker traite uniquement les disbursements, remboursements et paiements vendeurs.
 - Le worker de cycle de vie vendeur et de préparation des lots de paiement est lancé par `npm start`; il nécessite uniquement la base de données, sans clé privée. Il utilise un verrou MySQL pour éviter le double traitement.
 
 ## Authentification et récupération
@@ -163,7 +181,7 @@ Authenticated per-account request limits additionally protect expensive reads an
 
 `multipleStatements` is disabled. SQL values remain parameterized; dynamic SQL identifiers are taken only from internal fixed allowlists. The database pool defaults to 20 connections and 100 queued requests. Argon2's queue defaults to 20 waiters with a 15-second queue timeout. `TRUST_PROXY_HOPS` defaults to zero; set it only to the exact trusted proxy count. Optional HTTPS enforcement uses `FORCE_HTTPS` and a configured `PUBLIC_HTTPS_ORIGIN`.
 
-Transaction history is restricted to a rolling window of at most 30 days; because activity timestamps are stored to whole seconds, the cutoff is rounded upward to avoid including an older second and cursor-paginated (50 rows by default, maximum 100). The response retains `trans` and adds `days`, `limit` and `next_before_id`; the client sends `next_before_id` back as `before_id`. Administrative admin-fee history also uses `before_id` cursor pagination, without deep `OFFSET` or a full count query.
+Transaction history is restricted to a rolling window of at most 30 days; because activity timestamps are stored to whole seconds, the cutoff is rounded upward to avoid including an older second and cursor-paginated (50 rows by default, maximum 100). The response retains `trans` and adds `days`, `limit` and `next_before_id`; the client sends `next_before_id` back as `before_id`.
 
 These changes add three tables and four activity-history indexes. The project still expects the current schema. `CREATE TABLE IF NOT EXISTS` creates the new security tables, but an existing `activities` table will not automatically gain the new indexes. For an existing database, inspect `SHOW INDEX FROM activities` and apply only the missing indexes (do not add duplicate indexes):
 

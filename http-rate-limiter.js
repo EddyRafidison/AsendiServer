@@ -30,8 +30,7 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /admin/unlock-disbursement": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/set-user-status": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/unlock-system-seller": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
-  "POST /admin/update-user-or-common-stock": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
-  "POST /admin/admin-fees-transfers": { limit: 30, windowMs: 5 * 60_000, authResponse: true },
+  "POST /admin/update-common-stock": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
 });
 
 function normalizeIp(value) {

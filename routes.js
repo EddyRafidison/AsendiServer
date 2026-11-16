@@ -13,6 +13,9 @@ const {
   deriveInitAsset,
   addReceivedInitAsset,
   calculateTopUpReserveAllocation,
+  calculateRemainingSystemAdminReserve,
+  calculateAdminCommonStockUpdate,
+  calculateDistributableInitialAssets,
 } = require("./stock-accounting");
 const {
   MIN_RECHARGE_AMOUNT,
@@ -24,7 +27,7 @@ const {
   assessRechargeCooldown,
   formatUtcRecordDateTime,
   getWeeklyReleaseAt,
-  SYSTEM_RESERVE_RATIO,
+  SYSTEM_ADMIN_RESERVE_RATIO,
 } = require("./recharge-policy");
 const {
   DISBURSEMENT_COOLDOWN_MS,
@@ -75,9 +78,8 @@ const { createTelegramBotLinkTx, queueTelegramMessageTx } = require("./telegram"
 const {
   getLatestCommonTx,
   insertCommonSnapshotTx,
-  queueAdminFeesTransferIfDueTx,
 } = require("./common-accounting");
-const { COMMON_SHARE_RATIO, BSC_FEE_RECHARGE_DEFAULT_USD } = require("./fee-policy");
+const { BSC_FEE_RECHARGE_DEFAULT_USD } = require("./fee-policy");
 const {
   SELLER_STATUS_DURATION_MS,
   validateSellerJoin,
@@ -423,11 +425,8 @@ async function applyUserTopUp(
   const sellersReserve = new BigNumber(common.sellers_res || "0");
   const activeSellerReserve = await getActiveSellerReserveAvailableTx(tx);
   const sellersInitAsset = new BigNumber(common.sellers_init_asset || "0");
-  const commonShare = feeAmount.multipliedBy(COMMON_SHARE_RATIO);
-  const adminFees = feeAmount.minus(commonShare);
+  // All transaction fees remain in the system reserve; no administrative split exists.
   const feeBasis = feeAmount.dividedBy(lastPrice);
-  const commonShareBasis = commonShare.dividedBy(lastPrice);
-  const adminFeeBasis = adminFees.dividedBy(lastPrice);
   if (
     !lastTotal.isFinite() || !lastTotal.isGreaterThan(0) ||
     !lastPrice.isFinite() || !lastPrice.isGreaterThan(0) ||
@@ -463,10 +462,15 @@ async function applyUserTopUp(
   let reserveAllocation = null;
   if (systemAmount.isGreaterThan(0)) {
     const initialStock = new BigNumber(stock_limit);
-    if (!initialStock.isFinite() || initialStock.isNegative() || !SYSTEM_RESERVE_RATIO.isFinite() || SYSTEM_RESERVE_RATIO.isNegative() || SYSTEM_RESERVE_RATIO.gte(1)) {
-      throw new Error("Invalid protected system reserve configuration");
+    const sysInactive = new BigNumber(common.sys_inactive_init_asset || "0");
+    if (!initialStock.isFinite() || !initialStock.isGreaterThan(0) || !SYSTEM_ADMIN_RESERVE_RATIO.isFinite() || SYSTEM_ADMIN_RESERVE_RATIO.isNegative() || SYSTEM_ADMIN_RESERVE_RATIO.gte(1)) {
+      throw new Error("Invalid administrative system reserve configuration");
     }
-    const protectedFloor = initialStock.multipliedBy(SYSTEM_RESERVE_RATIO);
+    const protectedFloor = calculateRemainingSystemAdminReserve(
+      initialStock,
+      SYSTEM_ADMIN_RESERVE_RATIO,
+      sysInactive,
+    ).remainingInitialAsset;
     reserveAllocation = calculateTopUpReserveAllocation(
       systemAmount,
       lastPrice,
@@ -496,20 +500,18 @@ async function applyUserTopUp(
   }
 
   const preFeeTotal = reserveAllocation ? reserveAllocation.newTotalUnitsPrice : lastTotal;
-  const newTotal = preFeeTotal.plus(commonShare);
-  const newBacked = (reserveAllocation ? reserveAllocation.newBacked : backed).plus(commonShareBasis);
-  const newInactive = (reserveAllocation ? reserveAllocation.newInactive : inactive).plus(adminFeeBasis);
+  const newTotal = preFeeTotal.plus(feeAmount);
+  const newBacked = (reserveAllocation ? reserveAllocation.newBacked : backed).plus(feeBasis);
+  const newInactive = reserveAllocation ? reserveAllocation.newInactive : inactive;
   const newSellersReserve = sellersReserve.minus(sellerAllocation.consumedUnits);
   const newSellersInitAsset = sellersInitAsset.minus(sellerBasis);
   if (newSellersReserve.isNegative() || newSellersInitAsset.isNegative()) {
     throw new Error("Seller reserve totals would become negative");
   }
-  const newPrice = reserveAllocation?.usedBackedAssets || commonShare.isGreaterThan(0)
+  const newPrice = reserveAllocation?.usedBackedAssets || feeAmount.isGreaterThan(0)
     ? newTotal.dividedBy(lastTotal).multipliedBy(lastPrice)
     : lastPrice;
-  const totalCommonFees = new BigNumber(common.total_common_share || "0").plus(commonShare);
-  const totalAdminFees = new BigNumber(common.total_adminFees || "0").plus(adminFees);
-  const remainingAdminFees = new BigNumber(common.remaining_adminFees || "0").plus(adminFees);
+  const totalTfees = new BigNumber(common.total_tfees || "0").plus(feeAmount);
   const totalActivityBasis = sellerBasis.plus(systemBasis);
   const sellerFeeBasis = netAmount.isGreaterThan(0) ? feeBasis.multipliedBy(sellerAmount).dividedBy(netAmount) : new BigNumber(0);
   const systemFeeBasis = feeBasis.minus(sellerFeeBasis);
@@ -541,11 +543,8 @@ async function applyUserTopUp(
     inactive_init_asset: newInactive.toFixed(),
     sellers_res: newSellersReserve.toFixed(),
     sellers_init_asset: newSellersInitAsset.toFixed(),
-    total_common_share: totalCommonFees.toFixed(),
-    total_adminFees: totalAdminFees.toFixed(),
-    remaining_adminFees: remainingAdminFees.toFixed(),
+    total_tfees: totalTfees.toFixed(),
   }, date, time);
-  await queueAdminFeesTransferIfDueTx(tx, remainingAdminFees);
 
   await queueTelegramMessageTx(
     tx,
@@ -683,7 +682,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   }
 
   const [commonRows] = await tx.query(
-    `SELECT total_units_price,unit_price,backed_units,inactive_init_asset
+    `SELECT total_units_price,unit_price,backed_units,inactive_init_asset,sys_inactive_init_asset
      FROM common ORDER BY id DESC LIMIT 1 FOR UPDATE`,
   );
   if (commonRows.length === 0) throw new Error("Common reserve is not initialized");
@@ -701,9 +700,20 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   const commonUnitPrice = new BigNumber(commonRows[0].unit_price);
   const commonBackedUnits = new BigNumber(commonRows[0].backed_units);
   const commonInactiveAssets = new BigNumber(commonRows[0].inactive_init_asset);
-  const availableAfterPending = totalUnitsPrice.minus(pendingPayoutTotal);
-  const protectedInitialAssets = new BigNumber(stock_limit).multipliedBy(SYSTEM_RESERVE_RATIO);
-  const protectedUnitValue = protectedInitialAssets.multipliedBy(commonUnitPrice);
+  const protectedInitialAssets = calculateRemainingSystemAdminReserve(
+    stock_limit,
+    SYSTEM_ADMIN_RESERVE_RATIO,
+    commonRows[0].sys_inactive_init_asset || "0",
+  ).remainingInitialAsset;
+  const { totalAvailableInitialAssets: totalReserveInitialAssets, distributableInitialAssets } =
+    calculateDistributableInitialAssets(
+      commonBackedUnits,
+      commonInactiveAssets,
+      protectedInitialAssets,
+    );
+  const availableAfterPending = distributableInitialAssets
+    .multipliedBy(commonUnitPrice)
+    .minus(pendingPayoutTotal);
   if (
     !totalUnitsPrice.isFinite() ||
     totalUnitsPrice.isNegative() ||
@@ -713,11 +723,12 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     commonBackedUnits.isNegative() ||
     !commonInactiveAssets.isFinite() ||
     commonInactiveAssets.isNegative() ||
-    !pendingPayoutTotal.isFinite() ||
-    pendingPayoutTotal.isNegative() ||
-    !protectedUnitValue.isFinite() ||
-    protectedUnitValue.isNegative() ||
-    !availableAfterPending.minus(protectedUnitValue).isGreaterThanOrEqualTo(calculation.payoutAmount)
+    !totalReserveInitialAssets.isFinite() ||
+    totalReserveInitialAssets.isNegative() ||
+    !protectedInitialAssets.isFinite() ||
+    protectedInitialAssets.isNegative() ||
+    !availableAfterPending.isFinite() ||
+    !availableAfterPending.isGreaterThanOrEqualTo(calculation.payoutAmount)
   ) {
     return { transf: "insufficient disbursement reserve" };
   }
@@ -2155,10 +2166,7 @@ router.post("/app/near-transfer", async (req, res) => {
       const fees = amountUnits.multipliedBy(tfees).dividedBy(100);
       const totalDebit = amountUnits;
       const receiverAmountUnits = amountUnits.minus(fees);
-      const commonShare = fees.multipliedBy(COMMON_SHARE_RATIO);
-      const adminFees = fees.minus(commonShare);
-      const commonShareValue = commonShare.multipliedBy(priceValue);
-      const adminFeeValue = adminFees.multipliedBy(priceValue);
+      const feeValue = fees.multipliedBy(priceValue);
 
       const sellerStatus = Number(senderStock.seller_status || 0);
       const lockedSellerUnits = new BigNumber(senderStock.run_balance || 0).multipliedBy("0.5");
@@ -2199,10 +2207,11 @@ router.post("/app/near-transfer", async (req, res) => {
         return { transf: "unsupported" };
       }
 
-      const newTotal = lastTotal.plus(commonShareValue);
+      const newTotal = lastTotal.plus(feeValue);
       const newPrice = newTotal.dividedBy(lastTotal).multipliedBy(priceValue);
-      const newBackedUnits = backedUnits.plus(commonShare);
-      const newInactiveAssets = inactiveInitAsset.plus(adminFees);
+      const newBackedUnits = backedUnits.plus(fees);
+      const newInactiveAssets = inactiveInitAsset;
+      const newTotalTfees = new BigNumber(common.total_tfees || 0).plus(feeValue);
       const [date, time] = getDate();
       const reference = createFinancialReference(`P2P${S}`);
 
@@ -2241,14 +2250,8 @@ router.post("/app/near-transfer", async (req, res) => {
         unit_price: newPrice.toFixed(),
         backed_units: newBackedUnits.toFixed(),
         inactive_init_asset: newInactiveAssets.toFixed(),
-        total_common_share: new BigNumber(common.total_common_share || 0).plus(commonShareValue).toFixed(),
-        total_adminFees: new BigNumber(common.total_adminFees || 0).plus(adminFeeValue).toFixed(),
-        remaining_adminFees: new BigNumber(common.remaining_adminFees || 0).plus(adminFeeValue).toFixed(),
+        total_tfees: newTotalTfees.toFixed(),
       }, date, time);
-      await queueAdminFeesTransferIfDueTx(
-        tx,
-        new BigNumber(common.remaining_adminFees || 0).plus(adminFeeValue),
-      );
       const p2pTimestamp = Date.now();
       if (sellerStatus > 0) {
         await tx.query(
@@ -2498,7 +2501,7 @@ router.post("/admin/recharge/refund", async (req, res) => {
     if (!grossRaw.isInteger() || grossRaw.isLessThanOrEqualTo(0)) {
       return res.send({ transf: "invalid refund amount" });
     }
-    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0), db);
+    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0));
     const bscFeeRecovery = new BigNumber(liquidityEstimate.estimatedFeeUsd || "0");
     const amount = grossAmount.minus(bscFeeRecovery);
     if (!amount.isFinite() || amount.isLessThan(10)) {
@@ -2509,7 +2512,7 @@ router.post("/admin/recharge/refund", async (req, res) => {
       return res.send({ transf: "invalid refund amount" });
     }
     const amountRaw = amountRawDecimal.toFixed(0);
-    const liquidity = await checkTreasuryLiquidity(amountRaw, db);
+    const liquidity = await checkTreasuryLiquidity(amountRaw);
     if (!liquidity.available) {
       return res.send({ transf: "insufficient treasury liquidity", liquidity });
     }
@@ -2623,7 +2626,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
     if (!isEvmAddress(snapshot.payout_address)) return res.send({ transf: "invalid payout address" });
 
     // The HTTP process checks balances only; the isolated worker owns the signing key.
-    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw, db);
+    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw);
     if (!liquidity.available) {
       return res.send({ transf: "insufficient treasury liquidity", liquidity });
     }
@@ -3161,79 +3164,8 @@ router.post("/admin/unlock-system-seller", async (req, res) => {
   }
 });
 
-// Read-only administrative history uses cursor pagination to avoid deep OFFSET scans.
-router.post("/admin/admin-fees-transfers", async (req, res) => {
-  const { pswd, pin, before_id: beforeIdInput, limit: limitInput, status: statusInput } = req.body || {};
-  if (
-    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
-    pin !== decrypt(admin_pin, DB_CONFIG.password)
-  ) return res.send({ auth: "incorrect" });
-
-  const limit = limitInput == null || limitInput === "" ? 20 : Number(limitInput);
-  const beforeId = beforeIdInput == null || beforeIdInput === "" ? "" : String(beforeIdInput).trim();
-  const status = typeof statusInput === "string" ? statusInput.trim().toLowerCase() : "";
-  const allowedStatuses = new Set([
-    "queued", "signed", "submitted", "confirmed", "failed", "manual_review",
-  ]);
-  if (
-    !Number.isInteger(limit) || limit < 1 || limit > 100 ||
-    (beforeId && !/^\d{1,20}$/.test(beforeId)) ||
-    (status && !allowedStatuses.has(status))
-  ) return res.status(400).send({ error: "invalid pagination or status" });
-
-  const conditions = [];
-  const params = [];
-  if (status) {
-    conditions.push("status=?");
-    params.push(status);
-  }
-  if (beforeId) {
-    conditions.push("id<?");
-    params.push(beforeId);
-  }
-  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  params.push(limit);
-
-  try {
-    const [transferRows, commonRows] = await Promise.all([
-      db.queryAsync(
-        `SELECT id,amount,amount_raw,destination_address,reference,status,nonce,estimated_fee_bnb,estimated_fee_usd,
-                actual_fee_bnb,actual_fee_usd,bnb_usd_price,tx_hash,block_number,last_error,
-                created_at_ms,updated_at_ms,confirmed_at_ms
-         FROM admin_fees_transfers ${where}
-         ORDER BY id DESC LIMIT ?`,
-        params,
-      ),
-      db.queryAsync(
-        "SELECT `total_adminFees`,`remaining_adminFees` FROM common ORDER BY id DESC LIMIT 1",
-      ),
-    ]);
-    const summary = commonRows[0] || { total_adminFees: "0", remaining_adminFees: "0" };
-    const history = transferRows.map((row) => ({
-      ...row,
-      id: String(row.id),
-      created_at_ms: String(row.created_at_ms),
-      updated_at_ms: String(row.updated_at_ms),
-      confirmed_at_ms: row.confirmed_at_ms == null ? null : String(row.confirmed_at_ms),
-      block_number: row.block_number == null ? null : String(row.block_number),
-    }));
-    const nextBeforeId = history.length === limit ? history[history.length - 1].id : null;
-    return res.send({
-      transf: "ok",
-      limit,
-      next_before_id: nextBeforeId,
-      total_adminFees: String(summary.total_adminFees),
-      remaining_adminFees: String(summary.remaining_adminFees),
-      history,
-    });
-  } catch (error) {
-    console.error("Admin-fees transfer history lookup failed:", error.message);
-    return res.send({ transf: "error" });
-  }
-});
-
-// update-user-or-common-stock
-router.post("/admin/update-user-or-common-stock", async (req, res) => {
+// Update an individual user stock or the administratively controlled common stock.
+router.post("/admin/update-common-stock", async (req, res) => {
   const { pswd, pin, amount, user } = req.body || {};
   if (
     pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
@@ -3275,38 +3207,31 @@ router.post("/admin/update-user-or-common-stock", async (req, res) => {
       }
 
       const common = await getLatestCommonTx(tx, true);
-      const lastTotal = new BigNumber(common.total_units_price);
-      const lastPrice = new BigNumber(common.unit_price);
-      const backed = new BigNumber(common.backed_units);
-      const inactiveInitAsset = new BigNumber(common.inactive_init_asset);
-      if (
-        !lastTotal.isFinite() ||
-        !lastTotal.isGreaterThan(0) ||
-        !lastPrice.isFinite() ||
-        !lastPrice.isGreaterThan(0) ||
-        !backed.isFinite() ||
-        backed.isNegative() ||
-        !inactiveInitAsset.isFinite() ||
-        inactiveInitAsset.isNegative()
-      ) {
-        throw new Error("Invalid common reserve values");
+      const calculation = calculateAdminCommonStockUpdate(
+        amountValue,
+        common.total_units_price,
+        common.unit_price,
+        common.backed_units,
+        common.sys_inactive_init_asset || "0",
+        stock_limit,
+        SYSTEM_ADMIN_RESERVE_RATIO,
+      );
+      if (!calculation.available) {
+        return { limit: `BSC-USD ${calculation.availableValue.toFixed(18)}` };
       }
 
-      const availableValue = backed.multipliedBy(lastPrice);
-      if (amountValue.isGreaterThan(availableValue)) {
-        return { limit: `BSC-USD ${availableValue.toFixed()}` };
-      }
-
-      const newTotal = lastTotal.plus(amountValue);
-      const remained = backed.minus(amountValue.dividedBy(lastPrice));
-      const newPrice = newTotal.dividedBy(lastTotal).multipliedBy(lastPrice);
       await insertCommonSnapshotTx(tx, common, {
-        total_units_price: newTotal.toFixed(),
-        unit_price: newPrice.toFixed(),
-        backed_units: remained.toFixed(),
-        inactive_init_asset: inactiveInitAsset.toFixed(),
+        total_units_price: calculation.newTotalUnitsPrice.toFixed(),
+        unit_price: calculation.newUnitPrice.toFixed(),
+        backed_units: calculation.newBackedUnits.toFixed(),
+        sys_inactive_init_asset: calculation.newSysInactiveInitAsset.toFixed(),
       }, date, time);
-      return { total_units_price: "updated" };
+      return {
+        total_units_price: "updated",
+        amount_xtu: amountValue.toFixed(18),
+        spent_initial_asset: calculation.spentInitialAsset.toFixed(30),
+        remaining_admin_initial_asset: calculation.remainingAdminInitialAsset.toFixed(30),
+      };
     });
 
     return res.send(result);

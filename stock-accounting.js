@@ -80,6 +80,136 @@ function addReceivedInitAsset(currentInitAssetValue, receivedInitAssetValue) {
   return result;
 }
 
+
+/**
+ * Calculate the remaining non-distributable administrative initial-asset quota.
+ * Administrative spending is cumulative and reduces the protected quota one-for-one.
+ */
+function calculateRemainingSystemAdminReserve(initialStockValue, ratioValue, spentInitialAssetValue) {
+  const initialStock = asBigNumber(initialStockValue, "STOCK_LIMIT");
+  const ratio = asBigNumber(ratioValue, "SYSTEM_ADMIN_RESERVE_RATIO");
+  const spent = asBigNumber(spentInitialAssetValue, "common.sys_inactive_init_asset");
+
+  if (!initialStock.isGreaterThan(0)) throw new RangeError("STOCK_LIMIT must be positive");
+  if (ratio.isNegative() || !ratio.isLessThan(1)) {
+    throw new RangeError("SYSTEM_ADMIN_RESERVE_RATIO must be between zero and one");
+  }
+  if (spent.isNegative()) throw new RangeError("Administrative spending cannot be negative");
+
+  const initialQuota = initialStock.multipliedBy(ratio);
+  if (spent.isGreaterThan(initialQuota)) {
+    throw new RangeError("common.sys_inactive_init_asset exceeds the initial administrative reserve quota");
+  }
+  return {
+    initialQuota,
+    spentInitialAsset: spent,
+    remainingInitialAsset: initialQuota.minus(spent),
+  };
+}
+
+/**
+ * Apply an administrative common-stock operation using the current unit price.
+ * The spent initial-asset basis moves out of backed_units into the cumulative
+ * sys_inactive_init_asset ledger. The buyback reduces total_units_price by the
+ * XTU amount spent while preserving the current unit_price.
+ */
+function calculateAdminCommonStockUpdate(
+  amountValue,
+  totalUnitsPriceValue,
+  unitPriceValue,
+  backedUnitsValue,
+  sysInactiveInitAssetValue,
+  initialStockValue,
+  ratioValue,
+) {
+  const amount = asBigNumber(amountValue, "administrative amount");
+  const totalUnitsPrice = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
+  const unitPrice = asBigNumber(unitPriceValue, "common.unit_price");
+  const backedUnits = asBigNumber(backedUnitsValue, "common.backed_units");
+  const sysInactive = asBigNumber(sysInactiveInitAssetValue, "common.sys_inactive_init_asset");
+  const reserve = calculateRemainingSystemAdminReserve(initialStockValue, ratioValue, sysInactive);
+
+  if (!amount.isGreaterThan(0)) throw new RangeError("Administrative amount must be positive");
+  if (!totalUnitsPrice.isGreaterThan(0)) throw new RangeError("common.total_units_price must be positive");
+  if (!unitPrice.isGreaterThan(0)) throw new RangeError("common.unit_price must be positive");
+  if (backedUnits.isNegative()) throw new RangeError("common.backed_units cannot be negative");
+
+  const availableInitialAsset = BigNumber.minimum(reserve.remainingInitialAsset, backedUnits);
+  const availableValue = BigNumber.minimum(
+    availableInitialAsset.multipliedBy(unitPrice),
+    totalUnitsPrice,
+  );
+  if (amount.isGreaterThan(availableValue)) {
+    return {
+      available: false,
+      availableValue,
+      availableInitialAsset,
+      spentInitialAsset: new BigNumber(0),
+      newTotalUnitsPrice: totalUnitsPrice,
+      newUnitPrice: unitPrice,
+      newBackedUnits: backedUnits,
+      newSysInactiveInitAsset: sysInactive,
+      remainingAdminInitialAsset: reserve.remainingInitialAsset,
+    };
+  }
+
+  if (amount.isGreaterThanOrEqualTo(totalUnitsPrice)) {
+    throw new RangeError("Administrative amount must be lower than common.total_units_price");
+  }
+
+  const spentInitialAsset = amount.dividedBy(unitPrice);
+  const newBackedUnits = backedUnits.minus(spentInitialAsset);
+  const newSysInactiveInitAsset = sysInactive.plus(spentInitialAsset);
+  const newTotalUnitsPrice = totalUnitsPrice.minus(amount);
+  const newUnitPrice = unitPrice;
+  const remainingAdminInitialAsset = reserve.remainingInitialAsset.minus(spentInitialAsset);
+
+  if (
+    !spentInitialAsset.isFinite() || spentInitialAsset.isNegative() ||
+    newBackedUnits.isNegative() ||
+    !newSysInactiveInitAsset.isFinite() ||
+    newSysInactiveInitAsset.isGreaterThan(reserve.initialQuota) ||
+    !newTotalUnitsPrice.isFinite() ||
+    !newUnitPrice.isFinite() || !newUnitPrice.isGreaterThan(0) ||
+    remainingAdminInitialAsset.isNegative()
+  ) {
+    throw new RangeError("Administrative common-stock update would create an invalid reserve state");
+  }
+
+  return {
+    available: true,
+    availableValue,
+    availableInitialAsset,
+    spentInitialAsset,
+    newTotalUnitsPrice,
+    newUnitPrice,
+    newBackedUnits,
+    newSysInactiveInitAsset,
+    remainingAdminInitialAsset,
+  };
+}
+
+/**
+ * Calculate the initial-asset reserve that remains distributable after
+ * protecting the unspent administrative quota.
+ */
+function calculateDistributableInitialAssets(backedValue, inactiveValue, protectedFloorValue) {
+  const backed = asBigNumber(backedValue, "common.backed_units");
+  const inactive = asBigNumber(inactiveValue, "common.inactive_init_asset");
+  const protectedFloor = asBigNumber(protectedFloorValue, "remaining administrative reserve");
+
+  if (backed.isNegative() || inactive.isNegative() || protectedFloor.isNegative()) {
+    throw new RangeError("Reserve amounts and the protected floor cannot be negative");
+  }
+
+  const totalAvailableInitialAssets = backed.plus(inactive);
+  const distributableInitialAssets = BigNumber.maximum(
+    new BigNumber(0),
+    totalAvailableInitialAssets.minus(protectedFloor),
+  );
+  return { totalAvailableInitialAssets, distributableInitialAssets };
+}
+
 /**
  * Allocate an XTU top-up against common reserves, consuming inactive
  * initial assets first and backed initial assets only for any shortfall.
@@ -111,11 +241,8 @@ function calculateTopUpReserveAllocation(
   }
 
   const activityAmount = amount.dividedBy(unitPrice);
-  const totalAvailableInitialAssets = inactive.plus(backed);
-  const distributableInitialAssets = BigNumber.maximum(
-    new BigNumber(0),
-    totalAvailableInitialAssets.minus(nonDistributableFloor),
-  );
+  const { totalAvailableInitialAssets, distributableInitialAssets } =
+    calculateDistributableInitialAssets(backed, inactive, nonDistributableFloor);
   const availableValue = distributableInitialAssets.multipliedBy(unitPrice);
   if (amount.isGreaterThan(availableValue)) {
     return {
@@ -179,4 +306,7 @@ module.exports = {
   deriveInitAsset,
   addReceivedInitAsset,
   calculateTopUpReserveAllocation,
+  calculateRemainingSystemAdminReserve,
+  calculateAdminCommonStockUpdate,
+  calculateDistributableInitialAssets,
 };

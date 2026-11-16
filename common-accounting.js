@@ -1,23 +1,20 @@
 "use strict";
 
-const crypto = require("crypto");
 const BigNumber = require("bignumber.js");
-const { getAdminFeesTransferConfig, calculateAdminFeesTransfer } = require("./admin-fees-policy");
 
 const COMMON_NUMERIC_FIELDS = Object.freeze([
   "total_units_price",
   "unit_price",
   "backed_units",
   "inactive_init_asset",
+  "sys_inactive_init_asset",
   "sellers_res",
   "sellers_init_asset",
+  "total_tfees",
   "total_bnb_fee_actual",
   "total_bnb_fee_estimated",
   "total_bnb_fee_actual_value",
   "total_bnb_fee_estimated_value",
-  "total_adminFees",
-  "remaining_adminFees",
-  "total_common_share",
 ]);
 
 function commonSnapshotValues(row, overrides = {}) {
@@ -28,68 +25,31 @@ function commonSnapshotValues(row, overrides = {}) {
   return values;
 }
 
-async function queueAdminFeesTransferIfDueTx(tx, remainingValue) {
-  const config = getAdminFeesTransferConfig();
-  if (!config.enabled) return null;
-
-  const transfer = calculateAdminFeesTransfer(
-    remainingValue,
-    config.threshold,
-    config.retainedBalance,
-  );
-  if (!transfer) return null;
-
-  const [activeRows] = await tx.query(
-    `SELECT id FROM admin_fees_transfers
-     WHERE status IN ('queued','signed','submitted','manual_review')
-     ORDER BY id DESC LIMIT 1 FOR UPDATE`,
-  );
-  if (activeRows.length) return null;
-
-  const now = String(Date.now());
-  const reference = `ADMFEE${crypto.randomBytes(16).toString("hex")}`;
-  const [result] = await tx.query(
-    `INSERT INTO admin_fees_transfers
-     (amount,amount_raw,destination_address,reference,status,created_at_ms,updated_at_ms)
-     VALUES(?,?,?,?, 'queued', ?, ?)`,
-    [
-      transfer.amount.toFixed(18),
-      transfer.amountRaw,
-      config.payoutAddress,
-      reference,
-      now,
-      now,
-    ],
-  );
-  return { id: result.insertId, reference, amount: transfer.amount.toFixed(18) };
+function assertCumulativeNonNegative(fieldName, previousValue, nextValue) {
+  const previous = new BigNumber(previousValue ?? "0");
+  const next = new BigNumber(nextValue ?? "0");
+  if (
+    !previous.isFinite() || previous.isNegative() ||
+    !next.isFinite() || next.isNegative() ||
+    next.isLessThan(previous)
+  ) {
+    throw new RangeError(`common.${fieldName} must remain finite, non-negative and cumulative.`);
+  }
 }
 
-async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time, options = {}) {
+async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
   const values = commonSnapshotValues(currentRow, overrides);
-  const previousTotalAdminFees = new BigNumber(currentRow?.total_adminFees || "0");
-  const nextTotalAdminFees = new BigNumber(values.total_adminFees);
-  const previousRemainingAdminFees = new BigNumber(currentRow?.remaining_adminFees || "0");
-  const nextRemainingAdminFees = new BigNumber(values.remaining_adminFees);
-  if (
-    !previousTotalAdminFees.isFinite() || previousTotalAdminFees.isNegative() ||
-    !nextTotalAdminFees.isFinite() || nextTotalAdminFees.isNegative() ||
-    nextTotalAdminFees.isLessThan(previousTotalAdminFees)
-  ) {
-    throw new RangeError("common.total_adminFees must be finite, non-negative and cumulative.");
-  }
-  if (
-    !previousRemainingAdminFees.isFinite() || previousRemainingAdminFees.isNegative() ||
-    !nextRemainingAdminFees.isFinite() || nextRemainingAdminFees.isNegative() ||
-    nextRemainingAdminFees.isGreaterThan(nextTotalAdminFees)
-  ) {
-    throw new RangeError("common.remaining_adminFees must be finite, non-negative and cannot exceed total_adminFees.");
-  }
-  if (
-    nextRemainingAdminFees.isLessThan(previousRemainingAdminFees) &&
-    options.allowAdminFeesDecrease !== true
-  ) {
-    throw new Error("common.remaining_adminFees can decrease only after a confirmed admin-fees blockchain transfer.");
-  }
+  assertCumulativeNonNegative(
+    "sys_inactive_init_asset",
+    currentRow?.sys_inactive_init_asset || "0",
+    values.sys_inactive_init_asset,
+  );
+  assertCumulativeNonNegative(
+    "total_tfees",
+    currentRow?.total_tfees || "0",
+    values.total_tfees,
+  );
+
   const columns = [...COMMON_NUMERIC_FIELDS, "record_date", "record_time"];
   const placeholders = columns.map(() => "?").join(",");
   const params = [...COMMON_NUMERIC_FIELDS.map((field) => values[field]), date, time];
@@ -113,6 +73,5 @@ module.exports = {
   COMMON_NUMERIC_FIELDS,
   commonSnapshotValues,
   insertCommonSnapshotTx,
-  queueAdminFeesTransferIfDueTx,
   getLatestCommonTx,
 };

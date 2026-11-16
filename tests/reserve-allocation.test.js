@@ -47,11 +47,11 @@ test("rejects negative reserve quantities and invalid unit price", () => {
 });
 
 
-test("protects the non-distributable 20 percent reserve floor", () => {
-  const result = calculateTopUpReserveAllocation("170", "2", "80", "20", "500", "20");
+test("protects the remaining non-distributable administrative reserve floor", () => {
+  const result = calculateTopUpReserveAllocation("190", "2", "80", "20", "500", "10");
   assert.equal(result.available, false);
-  assert.equal(result.availableValue.toFixed(), "160");
-  assert.equal(result.protectedFloor.toFixed(), "20");
+  assert.equal(result.availableValue.toFixed(), "180");
+  assert.equal(result.protectedFloor.toFixed(), "10");
   assert.equal(result.newInactive.toFixed(), "20");
   assert.equal(result.newBacked.toFixed(), "80");
 });
