@@ -6,6 +6,7 @@ const {
   validateSellerJoin,
   allocateSellerLotConsumption,
   sumActiveSellerReserveLots,
+  calculateSellerPayoutGrossAtLockedPrice,
   calculateSellerPayoutNet,
   SELLER_STATUS_DURATION_MS,
   SELLER_PAYOUT_BATCH_LIMIT,
@@ -13,52 +14,56 @@ const {
 
 const fixed = (value) => value.toFixed();
 
-test("seller campaign requires a minimum balance, a half-balance lock and sufficient pending bonus", () => {
-  const valid = validateSellerJoin("100", "50", "50", "5");
+test("seller campaign input is converted using the single global price", () => {
+  const valid = validateSellerJoin("100", "50", "5", "2");
   assert.equal(valid.eligible, true);
-  assert.equal(fixed(valid.reservedUnits), "25");
-  assert.equal(fixed(valid.reservedInitAsset), "12.5");
+  assert.equal(fixed(valid.runBalanceInitial), "50");
+  assert.equal(fixed(valid.runBalanceXtu), "100");
+  assert.equal(fixed(valid.reservedInitialAsset), "25");
   assert.equal(fixed(valid.requiredBonus), "5");
-
-  assert.equal(validateSellerJoin("12", "6", "12", "2").eligible, false);
-  assert.equal(validateSellerJoin("100", "50", "49", "5").reason, "run_balance_below_half_balance");
-  assert.equal(validateSellerJoin("100", "50", "50", "4.99").reason, "pending_bonus_below_threshold");
+  assert.equal(validateSellerJoin("6", "3", "1", "2").eligible, false);
+  assert.equal(validateSellerJoin("100", "40", "10", "2").reason, "run_balance_below_half_balance");
+  assert.equal(validateSellerJoin("100", "50", "4.99", "2").reason, "pending_bonus_below_threshold");
 });
 
-test("only active seller lots contribute to the immediately available seller reserve", () => {
+test("only active seller lots contribute to the available seller reserve in initial assets", () => {
   const available = sumActiveSellerReserveLots([
-    { remaining_units: "12.5" },
-    { remaining_units: "7.5" },
+    { remaining_initial_asset: "12.5" },
+    { remaining_initial_asset: "7.5" },
   ]);
   assert.equal(fixed(available), "20");
 });
 
-test("seller reserve consumption allocates FIFO and prorates remaining initial-asset basis", () => {
+test("seller reserve consumption allocates FIFO amounts directly in initial assets", () => {
   const result = allocateSellerLotConsumption([
-    { id: 1, username: "SELLER_A", remaining_units: "10", remaining_init_asset: "5" },
-    { id: 2, username: "SELLER_B", remaining_units: "20", remaining_init_asset: "8" },
-  ], "15");
-
+    { id: 1, username: "SELLER_A", remaining_initial_asset: "5", unit_price: "1.2" },
+    { id: 2, username: "SELLER_B", remaining_initial_asset: "8", unit_price: "1.5" },
+  ], "7");
   assert.equal(result.available, true);
-  assert.equal(fixed(result.consumedUnits), "15");
-  assert.equal(fixed(result.consumedInitAsset), "7");
+  assert.equal(fixed(result.consumedInitialAsset), "7");
   assert.equal(result.allocations.length, 2);
-  assert.equal(fixed(result.allocations[0].units), "10");
-  assert.equal(fixed(result.allocations[0].initAsset), "5");
-  assert.equal(fixed(result.allocations[1].units), "5");
-  assert.equal(fixed(result.allocations[1].initAsset), "2");
+  assert.equal(fixed(result.allocations[0].initialAsset), "5");
+  assert.equal(fixed(result.allocations[1].initialAsset), "2");
+  assert.equal(fixed(result.allocations[0].unitPrice), "1.2");
+  assert.equal(fixed(result.allocations[1].unitPrice), "1.5");
 });
 
-test("seller reserve allocation reports insufficiency without inventing units", () => {
+test("seller reserve allocation reports insufficiency without inventing initial assets", () => {
   const result = allocateSellerLotConsumption([
-    { id: 1, username: "SELLER_A", remaining_units: "10", remaining_init_asset: "5" },
-  ], "12");
+    { id: 1, username: "SELLER_A", remaining_initial_asset: "5", unit_price: "1.2" },
+  ], "7");
   assert.equal(result.available, false);
-  assert.equal(fixed(result.consumedUnits), "10");
-  assert.equal(fixed(result.remainingUnits), "2");
+  assert.equal(fixed(result.consumedInitialAsset), "5");
+  assert.equal(fixed(result.remainingInitialAsset), "2");
 });
 
-test("seller payout deducts only gas recovery and has no transfer-fee component", () => {
+test("seller payout gross is permanently valued at the price locked at campaign request", () => {
+  assert.equal(fixed(calculateSellerPayoutGrossAtLockedPrice("100", "1.25")), "125");
+  assert.equal(fixed(calculateSellerPayoutGrossAtLockedPrice("100", "1.25")), "125");
+  assert.notEqual(fixed(calculateSellerPayoutGrossAtLockedPrice("100", "1.8")), "125");
+});
+
+test("seller payout deducts only gas recovery and never tfees", () => {
   const result = calculateSellerPayoutNet("300", "0.1");
   assert.equal(fixed(result.grossAmount), "300");
   assert.equal(fixed(result.gasFee), "0.1");
@@ -66,7 +71,7 @@ test("seller payout deducts only gas recovery and has no transfer-fee component"
   assert.throws(() => calculateSellerPayoutNet("0.1", "0.1"), /gas fee must be lower/);
 });
 
-test("seller lifecycle and payout batch limits are fixed by the approved policy", () => {
+test("seller lifecycle and payout batch limits follow the current policy", () => {
   assert.equal(SELLER_STATUS_DURATION_MS, 7 * 24 * 60 * 60 * 1000);
   assert.equal(fixed(SELLER_PAYOUT_BATCH_LIMIT), "300");
 });

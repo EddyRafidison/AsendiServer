@@ -3,101 +3,117 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  deriveUnitPrice,
-  deriveInitAsset,
+  calculateGlobalUnitPrice,
+  xtuToInitialAsset,
+  initialAssetToXtu,
   calculateRemainingSystemAdminReserve,
   calculateAdminCommonStockUpdate,
   calculateDistributableInitialAssets,
+  calculateUnreservedDistributableInitialAssets,
+  calculateTopUpReserveAllocation,
 } = require("../stock-accounting");
 
-test("derives the account price from balance / init_asset", () => {
-  assert.equal(deriveUnitPrice("250", "50").toFixed(), "5");
+const fixed = (value) => value.toFixed();
+
+test("the only live unit price is total_units_price divided by backed_units", () => {
+  assert.equal(fixed(calculateGlobalUnitPrice("10000000", "10000000")), "1");
+  assert.equal(fixed(calculateGlobalUnitPrice("10000000", "8000000")), "1.25");
+  assert.equal(fixed(xtuToInitialAsset("125000", "1.25")), "100000");
+  assert.equal(fixed(initialAssetToXtu("100000", "1.25")), "125000");
+  assert.throws(() => calculateGlobalUnitPrice("100", "0"), /backed_units/);
+  assert.throws(() => xtuToInitialAsset("10", "0"), /unit_price/);
 });
 
-test("recalculates init_asset from the new balance and transfer price", () => {
-  const price = deriveUnitPrice("250", "50");
-  assert.equal(deriveInitAsset("180", price).toFixed(), "36");
-  assert.equal(deriveInitAsset("320", price).toFixed(), "64");
-});
-
-test("allows a zero resulting balance and resets init_asset to zero", () => {
-  assert.equal(deriveInitAsset("0", "5").toFixed(), "0");
-});
-
-test("rejects a sender without a positive initial-asset basis", () => {
-  assert.throws(() => deriveUnitPrice("250", "0"), /init_asset/);
-  assert.throws(() => deriveUnitPrice("0", "50"), /balance/);
-});
-
-test("rejects negative balances and invalid prices", () => {
-  assert.throws(() => deriveInitAsset("-1", "5"), /negative/);
-  assert.throws(() => deriveInitAsset("10", "0"), /priceValue/);
-});
-
-
-test("the initial administrative reserve is 10 percent and decreases only by recorded system spending", () => {
+test("the initial administrative reserve is 10 percent and decreases only by recorded spending", () => {
   const reserve = calculateRemainingSystemAdminReserve("10000000", "0.10", "100000");
-  assert.equal(reserve.initialQuota.toFixed(), "1000000");
-  assert.equal(reserve.remainingInitialAsset.toFixed(), "900000");
+  assert.equal(fixed(reserve.initialQuota), "1000000");
+  assert.equal(fixed(reserve.remainingInitialAsset), "900000");
   assert.throws(
     () => calculateRemainingSystemAdminReserve("10000000", "0.10", "1000001"),
     /exceeds the initial administrative reserve quota/,
   );
 });
 
-test("administrative common-stock spending converts XTU at the current unit price", () => {
+test("administrative expenditure removes XTU and the matching initial-asset basis proportionally", () => {
   const result = calculateAdminCommonStockUpdate(
-    "125000",
-    "10000000",
-    "1.25",
-    "10000000",
-    "0",
-    "10000000",
-    "0.10",
+    "125000", "10000000", "1.25", "10000000", "0", "10000000", "0.10",
   );
   assert.equal(result.available, true);
-  assert.equal(result.spentInitialAsset.toFixed(), "100000");
-  assert.equal(result.newBackedUnits.toFixed(), "9900000");
-  assert.equal(result.newSysInactiveInitAsset.toFixed(), "100000");
-  assert.equal(result.newTotalUnitsPrice.toFixed(), "9875000");
-  assert.equal(result.newUnitPrice.toFixed(), "1.25");
-  assert.equal(result.remainingAdminInitialAsset.toFixed(), "900000");
+  assert.equal(fixed(result.spentInitialAsset), "100000");
+  assert.equal(fixed(result.newBackedUnits), "9900000");
+  assert.equal(fixed(result.newSysInactiveInitAsset), "100000");
+  assert.equal(fixed(result.newTotalUnitsPrice), "9875000");
+  assert.equal(fixed(result.newUnitPrice), "1.25");
+  assert.equal(fixed(result.remainingAdminInitialAsset), "900000");
 });
 
-test("administrative common-stock spending cannot reduce total_units_price to zero", () => {
-  assert.throws(
-    () => calculateAdminCommonStockUpdate(
-      "10000000", "10000000", "1", "10000000", "0", "100000000", "0.10",
-    ),
-    /must be lower than common.total_units_price/,
-  );
-});
-
-test("administrative common-stock spending cannot exceed the remaining 10 percent reserve", () => {
+test("administrative expenditure cannot spend more than the remaining protected quota", () => {
   const result = calculateAdminCommonStockUpdate(
-    "1000001",
-    "10000000",
-    "1",
-    "10000000",
-    "0",
-    "10000000",
-    "0.10",
+    "1000001", "10000000", "1", "10000000", "0", "10000000", "0.10",
   );
   assert.equal(result.available, false);
-  assert.equal(result.availableValue.toFixed(), "1000000");
-  assert.equal(result.newSysInactiveInitAsset.toFixed(), "0");
+  assert.equal(fixed(result.availableValue), "1000000");
+  assert.equal(fixed(result.newSysInactiveInitAsset), "0");
 });
 
-
-test("administrative spending preserves the original distributable initial-asset capacity", () => {
+test("administrative expenditure preserves the distributable initial-asset capacity", () => {
   const before = calculateDistributableInitialAssets("10000000", "0", "1000000");
-  assert.equal(before.distributableInitialAssets.toFixed(), "9000000");
-
+  assert.equal(fixed(before.distributableInitialAssets), "9000000");
   const update = calculateAdminCommonStockUpdate(
     "125000", "10000000", "1.25", "10000000", "0", "10000000", "0.10",
   );
   const after = calculateDistributableInitialAssets(
     update.newBackedUnits, "0", update.remainingAdminInitialAsset,
   );
-  assert.equal(after.distributableInitialAssets.toFixed(), "9000000");
+  assert.equal(fixed(after.distributableInitialAssets), "9000000");
+});
+
+
+test("pending disbursements reserve their initial-asset capacity against later system top-ups", () => {
+  const result = calculateUnreservedDistributableInitialAssets("100", "50", "10", "35");
+  assert.equal(fixed(result.distributableInitialAssets), "140");
+  assert.equal(fixed(result.pendingDisbursementInitialAssets), "35");
+  assert.equal(fixed(result.availableAfterPending), "105");
+  const overReserved = calculateUnreservedDistributableInitialAssets("100", "50", "10", "145");
+  assert.equal(fixed(overReserved.availableAfterPending), "-5");
+});
+
+test("top-up consumes inactive initial assets first and recomputes the global price", () => {
+  const result = calculateTopUpReserveAllocation("50", "2", "100", "100", "200", "10");
+  assert.equal(result.available, true);
+  assert.equal(fixed(result.activityAmount), "25");
+  assert.equal(fixed(result.consumedInactive), "25");
+  assert.equal(fixed(result.consumedBacked), "0");
+  assert.equal(fixed(result.newInactive), "75");
+  assert.equal(fixed(result.newBacked), "100");
+  assert.equal(fixed(result.newTotalUnitsPrice), "250");
+  assert.equal(fixed(result.newUnitPrice), "2.5");
+});
+
+test("top-up consumes backed assets only after inactive reserve and protects the admin floor", () => {
+  const result = calculateTopUpReserveAllocation("50", "2", "100", "20", "200", "10");
+  assert.equal(result.available, true);
+  assert.equal(fixed(result.activityAmount), "25");
+  assert.equal(fixed(result.consumedInactive), "20");
+  assert.equal(fixed(result.consumedBacked), "5");
+  assert.equal(fixed(result.newInactive), "0");
+  assert.equal(fixed(result.newBacked), "95");
+  assert.equal(fixed(result.newTotalUnitsPrice), "250");
+  assert.equal(fixed(result.newUnitPrice), fixed(calculateGlobalUnitPrice("250", "95")));
+  assert.equal(result.newBacked.gte("10"), true);
+});
+
+test("top-up reports insufficiency without changing reserve values", () => {
+  const result = calculateTopUpReserveAllocation("221", "2", "100", "20", "200", "10");
+  assert.equal(result.available, false);
+  assert.equal(fixed(result.availableValue), "220");
+  assert.equal(fixed(result.newInactive), "20");
+  assert.equal(fixed(result.newBacked), "100");
+  assert.equal(fixed(result.newTotalUnitsPrice), "200");
+});
+
+test("top-up rejects invalid reserve quantities, inconsistent prices and invalid backing", () => {
+  assert.throws(() => calculateTopUpReserveAllocation("10", "0", "2", "3", "10"), /unit_price/);
+  assert.throws(() => calculateTopUpReserveAllocation("10", "1", "-1", "3", "10"), /negative/);
+  assert.throws(() => calculateTopUpReserveAllocation("10", "2", "3", "3", "100"), /inconsistent/);
 });

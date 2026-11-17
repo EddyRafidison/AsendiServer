@@ -9,7 +9,6 @@ const {
   keccak256,
 } = require("ethers");
 const BigNumber = require("bignumber.js");
-const { deriveInitAsset } = require("./stock-accounting");
 const { calculateDisbursementReserveSettlement } = require("./disbursement-policy");
 const { getDate } = require("./utils");
 const { queueTelegramMessageTx } = require("./telegram");
@@ -425,7 +424,7 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
       [username],
     );
     const [stockRows] = await tx.query(
-      "SELECT balance,init_asset FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
+      "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
       [username],
     );
     const [jobRows] = await tx.query(
@@ -452,9 +451,8 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
       return;
     }
 
-    const currentBalance = new BigNumber(stockRows[0].balance);
-    const currentInitAsset = new BigNumber(stockRows[0].init_asset);
-    if (!currentBalance.isZero() || !currentInitAsset.isZero()) {
+    const currentBalanceInitial = new BigNumber(stockRows[0].balance);
+    if (!currentBalanceInitial.isZero()) {
       const reviewReason = `Cannot safely restore reserved stock because the user balance changed. ${message}`;
       await tx.query(
         "UPDATE users_usdt_disbursements SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
@@ -472,8 +470,8 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
 
     const [date, time] = getDate();
     await tx.query(
-      "UPDATE users_stock SET balance=?,init_asset=?,record_date=?,record_time=? WHERE username=?",
-      [job.gross_balance, job.gross_init_asset, date, time, username],
+      "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
+      [job.gross_initial_asset, date, time, username],
     );
     await tx.query(
       `UPDATE users_usdt_disbursements
@@ -505,7 +503,7 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       [username],
     );
     const [userStockRows] = await tx.query(
-      "SELECT balance,init_asset FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
+      "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
       [username],
     );
     const [jobRows] = await tx.query(
@@ -541,9 +539,8 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       return { manualReview: true };
     }
 
-    const userBalance = new BigNumber(userStockRows[0].balance);
-    const userInitAsset = new BigNumber(userStockRows[0].init_asset);
-    if (!userBalance.isZero() || !userInitAsset.isZero()) {
+    const userBalanceInitial = new BigNumber(userStockRows[0].balance);
+    if (!userBalanceInitial.isZero()) {
       const reviewReason = "The payout was confirmed on-chain, but the reserved user balance changed before accounting finalization.";
       await tx.query(
         `UPDATE users_usdt_disbursements SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?`,
@@ -560,7 +557,7 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     }
 
     const [systemRows] = await tx.query(
-      "SELECT balance,init_asset FROM users_stock WHERE username='ONEX' LIMIT 1 FOR UPDATE",
+      "SELECT balance FROM users_stock WHERE username='ONEX' LIMIT 1 FOR UPDATE",
     );
     if (systemRows.length === 0) throw new Error("The OneX system stock row is missing.");
 
@@ -575,16 +572,19 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     const backed = new BigNumber(common.backed_units);
     const inactive = new BigNumber(common.inactive_init_asset);
     const payoutAmount = new BigNumber(job.payout_amount);
-    const storedSoldInitialAssets = new BigNumber(job.sold_init_asset || "0");
-    const grossBalance = new BigNumber(job.gross_balance);
+    const soldInitialAssets = new BigNumber(job.sold_initial_asset);
+    const grossInitialAsset = new BigNumber(job.gross_initial_asset);
     const priceValue = new BigNumber(job.price_value);
-    const feeInitialAssets = new BigNumber(job.fee_init_asset);
-    const soldInitialAssets =
-      storedSoldInitialAssets.isFinite() && storedSoldInitialAssets.isGreaterThan(0)
-        ? storedSoldInitialAssets
-        : payoutAmount.isFinite() && payoutAmount.isGreaterThan(0) && priceValue.isFinite() && priceValue.isGreaterThan(0)
-          ? payoutAmount.dividedBy(priceValue)
-          : new BigNumber("NaN");
+    const feeInitialAssets = new BigNumber(job.fee_initial_asset);
+    const grossBalance = grossInitialAsset.multipliedBy(priceValue);
+    const expectedPayoutAmount = soldInitialAssets.multipliedBy(priceValue)
+      .decimalPlaces(18, BigNumber.ROUND_DOWN);
+    const expectedFeeAmount = feeInitialAssets.multipliedBy(priceValue)
+      .decimalPlaces(18, BigNumber.ROUND_DOWN);
+    const lockedAmountsTolerance = new BigNumber("0.000000000000000001");
+    const grossInitialAssetMismatch = grossInitialAsset.minus(soldInitialAssets.plus(feeInitialAssets)).abs();
+    const payoutAmountMismatch = payoutAmount.minus(expectedPayoutAmount).abs();
+    const feeAmountMismatch = new BigNumber(job.fee_amount).minus(expectedFeeAmount).abs();
 
     if (
       !total.isFinite() || !total.isGreaterThanOrEqualTo(payoutAmount) ||
@@ -593,9 +593,14 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       !inactive.isFinite() || inactive.isNegative() ||
       !payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0) ||
       !soldInitialAssets.isFinite() || !soldInitialAssets.isGreaterThan(0) ||
+      !grossInitialAsset.isFinite() || !grossInitialAsset.isGreaterThan(0) ||
       !grossBalance.isFinite() || !grossBalance.isGreaterThan(0) ||
       !priceValue.isFinite() || !priceValue.isGreaterThan(0) ||
-      !feeInitialAssets.isFinite() || feeInitialAssets.isNegative()
+      !feeInitialAssets.isFinite() || feeInitialAssets.isNegative() ||
+      !new BigNumber(job.fee_amount).isFinite() || new BigNumber(job.fee_amount).isNegative() ||
+      grossInitialAssetMismatch.gt(lockedAmountsTolerance) ||
+      payoutAmountMismatch.gt(lockedAmountsTolerance) ||
+      feeAmountMismatch.gt(lockedAmountsTolerance)
     ) {
       await tx.query(
         `UPDATE users_usdt_disbursements SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?`,
@@ -604,26 +609,24 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       return { manualReview: true };
     }
 
-    const systemBalance = new BigNumber(systemRows[0].balance);
-    const newSystemBalance = systemBalance.plus(grossBalance);
-    const newSystemInitAsset = deriveInitAsset(newSystemBalance, priceValue);
+    const systemBalanceInitial = new BigNumber(systemRows[0].balance);
+    const newSystemBalanceInitial = systemBalanceInitial.plus(grossInitialAsset);
     const reserveSettlement = calculateDisbursementReserveSettlement(
       total,
       backed,
       inactive,
       {
         payoutAmount,
-        soldInitAsset: soldInitialAssets,
-        feeInitAsset: feeInitialAssets,
+        soldInitialAsset: soldInitialAssets,
+        feeInitialAsset: feeInitialAssets,
       },
     );
     const newTotal = reserveSettlement.newTotalUnitsPrice;
     const newInactive = reserveSettlement.newInactiveInitAsset;
     const newBacked = reserveSettlement.newBackedUnits;
     if (
-      !systemBalance.isFinite() || systemBalance.isNegative() ||
-      !newSystemBalance.isFinite() ||
-      !newSystemInitAsset.isFinite() ||
+      !systemBalanceInitial.isFinite() || systemBalanceInitial.isNegative() ||
+      !newSystemBalanceInitial.isFinite() || newSystemBalanceInitial.isNegative() ||
       !newTotal.isFinite() || newTotal.isNegative() ||
       !newInactive.isFinite() || newInactive.isNegative() ||
       !newBacked.isFinite() || newBacked.isNegative()
@@ -633,13 +636,12 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
 
     const [date, time] = getDate();
     await tx.query(
-      "UPDATE users_stock SET balance=?,init_asset=?,record_date=?,record_time=? WHERE username='ONEX'",
-      [newSystemBalance.toFixed(), newSystemInitAsset.toFixed(), date, time],
+      "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username='ONEX'",
+      [newSystemBalanceInitial.toFixed(30), date, time],
     );
-    const totalTfees = new BigNumber(common.total_tfees || "0").plus(new BigNumber(job.fee_amount));
+    const totalTfees = new BigNumber(common.total_tfees || "0").plus(feeInitialAssets);
     await insertCommonSnapshotTx(tx, common, {
       total_units_price: newTotal.toFixed(),
-      unit_price: unitPrice.toFixed(),
       backed_units: newBacked.toFixed(),
       inactive_init_asset: newInactive.toFixed(),
       total_tfees: totalTfees.toFixed(),
@@ -669,7 +671,8 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       "Your sale to OneX has been completed and the BSC-USD payment is confirmed.",
       `Actual BSC gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD).`,
       `Gross amount: ${grossBalance.toFixed(8)} XTU`,
-      `Fees: ${new BigNumber(job.fee_amount).toFixed(8)} XTU`,
+      `Fees: ${feeInitialAssets.multipliedBy(priceValue).toFixed(8)} XTU`,
+      `Valuation price locked at request submission: ${priceValue.toFixed(12)} XTU per initial asset`,
       `Amount paid: ${payoutAmount.toFixed(8)} BSC-USD`,
       `Destination: ${job.payout_address}`,
       `Transaction: ${job.tx_hash}`,
@@ -926,7 +929,8 @@ async function finalizeSellerPayout(db, jobId, receipt, activeRuntime) {
     }
 
     const [allocations] = await tx.query(
-      `SELECT a.id,a.lot_id,a.amount,l.payout_pending_units,l.payout_reserved_units,l.paid_units
+      `SELECT a.id,a.lot_id,a.initial_asset_amount,l.payout_pending_initial_asset,
+              l.payout_reserved_initial_asset,l.paid_initial_asset
        FROM users_seller_payout_allocations a
        JOIN users_seller_reserve_lots l ON l.id=a.lot_id
        WHERE a.payout_id=? AND a.status='reserved'
@@ -936,10 +940,10 @@ async function finalizeSellerPayout(db, jobId, receipt, activeRuntime) {
     );
     if (!allocations.length) throw new Error(`Seller payout ${jobId} has no reserved lot allocations.`);
     for (const allocation of allocations) {
-      const amount = new BigNumber(allocation.amount);
-      const pending = new BigNumber(allocation.payout_pending_units);
-      const reserved = new BigNumber(allocation.payout_reserved_units);
-      const paid = new BigNumber(allocation.paid_units);
+      const amount = new BigNumber(allocation.initial_asset_amount);
+      const pending = new BigNumber(allocation.payout_pending_initial_asset);
+      const reserved = new BigNumber(allocation.payout_reserved_initial_asset);
+      const paid = new BigNumber(allocation.paid_initial_asset);
       if (
         !amount.isFinite() || !amount.isGreaterThan(0) ||
         pending.isLessThan(amount) || reserved.isLessThan(amount)
@@ -948,7 +952,7 @@ async function finalizeSellerPayout(db, jobId, receipt, activeRuntime) {
       }
       await tx.query(
         `UPDATE users_seller_reserve_lots
-         SET payout_pending_units=?,payout_reserved_units=?,paid_units=?,updated_at_ms=? WHERE id=?`,
+         SET payout_pending_initial_asset=?,payout_reserved_initial_asset=?,paid_initial_asset=?,updated_at_ms=? WHERE id=?`,
         [pending.minus(amount).toFixed(), reserved.minus(amount).toFixed(), paid.plus(amount).toFixed(), String(Date.now()), allocation.lot_id],
       );
       await tx.query(

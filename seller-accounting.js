@@ -5,12 +5,16 @@ const BigNumber = require("bignumber.js");
 BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP });
 const { queueTelegramMessageTx } = require("./telegram");
 
+// The public minimum is expressed in XTU. Stored campaign and reserve amounts
+// are initial assets and are converted using the global price at campaign entry.
 const SELLER_MIN_RUN_BALANCE = new BigNumber("12");
 const SELLER_LOCK_RATIO = new BigNumber("0.5");
 const SELLER_BONUS_RATIO = new BigNumber("0.1");
 const SELLER_STATUS_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 const SELLER_BONUS_GRACE_MS = 24 * 60 * 60 * 1000;
-const SELLER_PAYOUT_BATCH_LIMIT = new BigNumber("300");
+const SELLER_PAYOUT_BATCH_LIMIT = new BigNumber("300"); // BSC-USD gross payout value.
+const DB_ASSET_DECIMALS = 30;
+const TOKEN_DECIMALS = 18;
 
 function finiteNonNegative(value, fieldName) {
   const number = new BigNumber(value);
@@ -18,74 +22,93 @@ function finiteNonNegative(value, fieldName) {
   return number;
 }
 
-function validateSellerJoin(balanceValue, initAssetValue, runBalanceValue, pendingBonusValue) {
-  const balance = finiteNonNegative(balanceValue, "users_stock.balance");
-  const initAsset = finiteNonNegative(initAssetValue, "users_stock.init_asset");
-  const runBalance = finiteNonNegative(runBalanceValue, "run_balance");
-  const pendingBonus = finiteNonNegative(pendingBonusValue, "pending_bonus");
-  if (!balance.isGreaterThan(SELLER_MIN_RUN_BALANCE)) return { eligible: false, reason: "balance_too_low" };
-  if (!initAsset.isGreaterThan(0)) return { eligible: false, reason: "invalid_initial_asset_basis" };
-  if (!runBalance.isGreaterThanOrEqualTo(SELLER_MIN_RUN_BALANCE)) return { eligible: false, reason: "run_balance_too_low" };
-  if (runBalance.isLessThan(balance.multipliedBy(SELLER_LOCK_RATIO))) return { eligible: false, reason: "run_balance_below_half_balance" };
-  if (runBalance.isGreaterThan(balance)) return { eligible: false, reason: "run_balance_exceeds_balance" };
-  const requiredBonus = runBalance.multipliedBy(SELLER_BONUS_RATIO);
-  if (pendingBonus.isLessThan(requiredBonus)) return { eligible: false, reason: "pending_bonus_below_threshold", requiredBonus };
-  const reservedUnits = runBalance.multipliedBy(SELLER_LOCK_RATIO);
-  const reservedInitAsset = initAsset.multipliedBy(reservedUnits).dividedBy(balance);
+function finitePositive(value, fieldName) {
+  const number = finiteNonNegative(value, fieldName);
+  if (!number.isGreaterThan(0)) throw new RangeError(`${fieldName} must be positive`);
+  return number;
+}
+
+function validateSellerJoin(balanceInitialValue, runBalanceInitialValue, pendingBonusInitialValue, unitPriceValue) {
+  const balanceInitial = finiteNonNegative(balanceInitialValue, "users_stock.balance");
+  const runBalanceInitial = finiteNonNegative(runBalanceInitialValue, "users_stock.run_balance");
+  const pendingBonusInitial = finiteNonNegative(pendingBonusInitialValue, "users_stock.pending_bonus");
+  const unitPrice = finitePositive(unitPriceValue, "common.unit_price");
+  const balanceXtu = balanceInitial.multipliedBy(unitPrice);
+  const runBalanceXtu = runBalanceInitial.multipliedBy(unitPrice);
+
+  if (!balanceXtu.isGreaterThan(SELLER_MIN_RUN_BALANCE)) return { eligible: false, reason: "balance_too_low" };
+  if (!runBalanceXtu.isGreaterThanOrEqualTo(SELLER_MIN_RUN_BALANCE)) return { eligible: false, reason: "run_balance_too_low" };
+  if (runBalanceInitial.isLessThan(balanceInitial.multipliedBy(SELLER_LOCK_RATIO))) {
+    return { eligible: false, reason: "run_balance_below_half_balance" };
+  }
+  if (runBalanceInitial.isGreaterThan(balanceInitial)) return { eligible: false, reason: "run_balance_exceeds_balance" };
+
+  const requiredBonus = runBalanceInitial.multipliedBy(SELLER_BONUS_RATIO);
+  if (pendingBonusInitial.isLessThan(requiredBonus)) {
+    return { eligible: false, reason: "pending_bonus_below_threshold", requiredBonus };
+  }
+  const reservedInitialAsset = runBalanceInitial.multipliedBy(SELLER_LOCK_RATIO);
   return {
     eligible: true,
-    runBalance,
-    reservedUnits,
-    reservedInitAsset,
+    runBalanceInitial,
+    runBalanceXtu,
+    reservedInitialAsset,
     requiredBonus,
-    priceValue: balance.dividedBy(initAsset),
+    unitPrice,
   };
 }
 
 function sumActiveSellerReserveLots(lots) {
-  return lots.reduce((sum, lot) => {
-    const remaining = finiteNonNegative(lot.remaining_units, "seller lot remaining_units");
-    return sum.plus(remaining);
-  }, new BigNumber(0));
+  return lots.reduce(
+    (sum, lot) => sum.plus(finiteNonNegative(lot.remaining_initial_asset, "seller lot remaining initial assets")),
+    new BigNumber(0),
+  );
 }
 
 async function getActiveSellerReserveAvailableTx(tx) {
   const [rows] = await tx.query(
-    `SELECT l.id,l.remaining_units
+    `SELECT l.id,l.remaining_initial_asset
      FROM users_seller_reserve_lots l
      JOIN users_seller_campaigns c ON c.id=l.campaign_id
-     WHERE l.status='active' AND c.status='active' AND l.remaining_units>0
+     WHERE l.status='active' AND c.status='active' AND l.remaining_initial_asset>0
      ORDER BY l.activated_at_ms ASC,l.id ASC
      FOR UPDATE`,
   );
   return sumActiveSellerReserveLots(rows);
 }
 
-function allocateSellerLotConsumption(lots, requestedUnits) {
-  let remaining = finiteNonNegative(requestedUnits, "requested seller units");
+function allocateSellerLotConsumption(lots, requestedInitialAssetValue) {
+  let remaining = finiteNonNegative(requestedInitialAssetValue, "requested seller initial assets");
   const allocations = [];
-  let totalUnits = new BigNumber(0);
-  let totalInitAsset = new BigNumber(0);
+  let totalInitialAsset = new BigNumber(0);
   for (const lot of lots) {
     if (remaining.isZero()) break;
-    const availableUnits = finiteNonNegative(lot.remaining_units, "seller lot remaining_units");
-    const availableBasis = finiteNonNegative(lot.remaining_init_asset, "seller lot remaining_init_asset");
-    if (availableUnits.isZero()) continue;
-    const used = BigNumber.minimum(availableUnits, remaining);
-    const basis = availableBasis.multipliedBy(used).dividedBy(availableUnits);
-    allocations.push({ lotId: String(lot.id), username: lot.username, units: used, initAsset: basis });
-    totalUnits = totalUnits.plus(used);
-    totalInitAsset = totalInitAsset.plus(basis);
-    remaining = remaining.minus(used);
+    const available = finiteNonNegative(lot.remaining_initial_asset, "seller lot remaining initial assets");
+    if (available.isZero()) continue;
+    const consumed = BigNumber.minimum(available, remaining);
+    allocations.push({
+      lotId: String(lot.id),
+      username: lot.username,
+      initialAsset: consumed,
+      unitPrice: finitePositive(lot.unit_price, "seller lot unit_price"),
+    });
+    totalInitialAsset = totalInitialAsset.plus(consumed);
+    remaining = remaining.minus(consumed);
   }
   return {
     available: remaining.isZero(),
-    requestedUnits: new BigNumber(requestedUnits),
-    consumedUnits: totalUnits,
-    consumedInitAsset: totalInitAsset,
-    remainingUnits: remaining,
+    requestedInitialAsset: new BigNumber(requestedInitialAssetValue),
+    consumedInitialAsset: totalInitialAsset,
+    remainingInitialAsset: remaining,
     allocations,
   };
+}
+
+function calculateSellerPayoutGrossAtLockedPrice(initialAssetValue, lockedUnitPriceValue) {
+  const initialAsset = finiteNonNegative(initialAssetValue, "seller payout initial assets");
+  const lockedUnitPrice = finitePositive(lockedUnitPriceValue, "seller request locked unit price");
+  return initialAsset.multipliedBy(lockedUnitPrice)
+    .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
 }
 
 function calculateSellerPayoutNet(grossValue, gasFeeValue) {
@@ -96,76 +119,71 @@ function calculateSellerPayoutNet(grossValue, gasFeeValue) {
   return { grossAmount: gross, gasFee, payoutAmount: net };
 }
 
-
-async function consumeSellerReserveTx(tx, requestedUnitsValue, reference, date, time) {
-  const requestedUnits = finiteNonNegative(requestedUnitsValue, "seller reserve consumption");
-  if (requestedUnits.isZero()) {
-    return { consumedUnits: new BigNumber(0), consumedInitAsset: new BigNumber(0), allocations: [] };
+async function consumeSellerReserveTx(tx, requestedInitialAssetValue, reference, date, time) {
+  const requestedInitialAsset = finiteNonNegative(requestedInitialAssetValue, "seller reserve consumption");
+  if (requestedInitialAsset.isZero()) {
+    return { consumedInitialAsset: new BigNumber(0), allocations: [] };
   }
 
   const [lotRows] = await tx.query(
-    `SELECT l.id,l.campaign_id,l.username,l.remaining_units,l.remaining_init_asset,
-            l.payout_pending_units,l.payout_reserved_units,c.status AS campaign_status
+    `SELECT l.id,l.campaign_id,l.username,l.remaining_initial_asset,l.unit_price,
+            l.payout_pending_initial_asset,l.payout_reserved_initial_asset,c.status AS campaign_status
      FROM users_seller_reserve_lots l
      JOIN users_seller_campaigns c ON c.id=l.campaign_id
-     WHERE l.status='active' AND c.status='active' AND l.remaining_units>0
+     WHERE l.status='active' AND c.status='active' AND l.remaining_initial_asset>0
      ORDER BY l.activated_at_ms ASC,l.id ASC
      FOR UPDATE`,
   );
-  const allocation = allocateSellerLotConsumption(lotRows, requestedUnits);
-  if (allocation.consumedUnits.isZero()) {
-    return { consumedUnits: allocation.consumedUnits, consumedInitAsset: allocation.consumedInitAsset, allocations: [] };
+  const allocation = allocateSellerLotConsumption(lotRows, requestedInitialAsset);
+  if (!allocation.available) {
+    throw new Error("The active seller reserve cannot cover the requested initial-asset amount");
   }
 
   for (const item of allocation.allocations) {
     const lot = lotRows.find((row) => String(row.id) === item.lotId);
     if (!lot) throw new Error(`Seller reserve lot ${item.lotId} disappeared during allocation`);
     const [stockRows] = await tx.query(
-      "SELECT balance,init_asset FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
+      "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
       [item.username],
     );
     if (!stockRows.length) throw new Error(`Seller stock row is missing for ${item.username}`);
     const balance = finiteNonNegative(stockRows[0].balance, "seller balance");
-    const initAsset = finiteNonNegative(stockRows[0].init_asset, "seller init_asset");
-    if (balance.isLessThan(item.units) || initAsset.isLessThan(item.initAsset)) {
-      throw new Error(`Seller ${item.username} has insufficient balance to settle consumed reserve units`);
+    if (balance.isLessThan(item.initialAsset)) {
+      throw new Error(`Seller ${item.username} has insufficient initial-asset balance to settle consumed reserve assets`);
     }
 
-    const remainingUnits = finiteNonNegative(lot.remaining_units, "seller lot remaining units").minus(item.units);
-    const remainingInitAsset = finiteNonNegative(lot.remaining_init_asset, "seller lot remaining initial assets").minus(item.initAsset);
-    const newBalance = balance.minus(item.units);
-    const newInitAsset = initAsset.minus(item.initAsset);
-    if (remainingUnits.isNegative() || remainingInitAsset.isNegative() || newBalance.isNegative() || newInitAsset.isNegative()) {
+    const remainingInitialAsset = finiteNonNegative(lot.remaining_initial_asset, "seller lot remaining initial assets").minus(item.initialAsset);
+    const pendingInitialAsset = finiteNonNegative(lot.payout_pending_initial_asset, "seller payout pending initial assets").plus(item.initialAsset);
+    const newBalance = balance.minus(item.initialAsset);
+    if (remainingInitialAsset.isNegative() || newBalance.isNegative()) {
       throw new Error(`Seller reserve consumption would make ${item.username} negative`);
     }
 
     await tx.query(
       `UPDATE users_seller_reserve_lots
-       SET remaining_units=?,remaining_init_asset=?,payout_pending_units=payout_pending_units+?,
-           status=?,updated_at_ms=? WHERE id=?`,
+       SET remaining_initial_asset=?,payout_pending_initial_asset=?,status=?,updated_at_ms=?
+       WHERE id=?`,
       [
-        remainingUnits.toFixed(),
-        remainingInitAsset.toFixed(),
-        item.units.toFixed(),
-        remainingUnits.isZero() ? "depleted" : "active",
+        remainingInitialAsset.toFixed(DB_ASSET_DECIMALS),
+        pendingInitialAsset.toFixed(DB_ASSET_DECIMALS),
+        remainingInitialAsset.isZero() ? "depleted" : "active",
         String(Date.now()),
         item.lotId,
       ],
     );
     await tx.query(
-      "UPDATE users_stock SET balance=?,init_asset=?,record_date=?,record_time=? WHERE username=?",
-      [newBalance.toFixed(), newInitAsset.toFixed(), date, time, item.username],
+      "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
+      [newBalance.toFixed(DB_ASSET_DECIMALS), date, time, item.username],
     );
     await tx.query(
-      "UPDATE users_seller_campaigns SET sold_units=sold_units+? WHERE id=? AND status IN ('active','cancel_requested')",
-      [item.units.toFixed(), lot.campaign_id],
+      "UPDATE users_seller_campaigns SET sold_initial_asset=sold_initial_asset+? WHERE id=? AND status IN ('active','cancel_requested')",
+      [item.initialAsset.toFixed(DB_ASSET_DECIMALS), lot.campaign_id],
     );
-    const unitPrice = item.units.dividedBy(item.initAsset);
     const activityReference = `SELL${String(reference).slice(0, 40)}${item.lotId}`.slice(0, 64);
     await tx.query(
       `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time)
        VALUES(?, 'XUSER', 3, ?, ?, 0, ?, ?, ?)`,
-      [item.username, item.initAsset.toFixed(), unitPrice.toFixed(), activityReference, date, time],
+      [item.username, item.initialAsset.toFixed(DB_ASSET_DECIMALS), item.unitPrice.toFixed(30), activityReference, date, time],
     );
   }
 
@@ -177,61 +195,104 @@ async function queueSellerPayoutBatchesTx(tx) {
   const now = String(Date.now());
   for (let batchIndex = 0; batchIndex < 10; batchIndex += 1) {
     const [rows] = await tx.query(
-      `SELECT l.id,l.username,l.payout_pending_units,l.payout_reserved_units,w.payout_address
+      `SELECT l.id,l.username,l.payout_pending_initial_asset,l.payout_reserved_initial_asset,
+              l.unit_price,w.payout_address
        FROM users_seller_reserve_lots l
        JOIN users_usdt_deposit_wallets w ON w.username=l.username
-       WHERE l.payout_pending_units>l.payout_reserved_units
-         AND w.account_status='active' AND w.payout_address IS NOT NULL AND w.payout_address<>'' 
+       WHERE l.payout_pending_initial_asset>l.payout_reserved_initial_asset
+         AND w.account_status='active' AND w.payout_address IS NOT NULL AND w.payout_address<>''
        ORDER BY l.activated_at_ms ASC,l.id ASC
        FOR UPDATE`,
     );
     const eligible = rows.map((row) => {
-      const rawAvailable = new BigNumber(row.payout_pending_units).minus(row.payout_reserved_units);
-      const tokenPrecisionAvailable = rawAvailable
-        .shiftedBy(18)
-        .integerValue(BigNumber.ROUND_DOWN)
-        .shiftedBy(-18);
-      return { ...row, available: tokenPrecisionAvailable };
-    }).filter((row) => row.available.isGreaterThan(0));
-    const availableTotal = eligible.reduce((sum, row) => sum.plus(row.available), new BigNumber(0));
-    if (availableTotal.isLessThan(SELLER_PAYOUT_BATCH_LIMIT)) break;
+      const rawInitial = new BigNumber(row.payout_pending_initial_asset).minus(row.payout_reserved_initial_asset);
+      const price = finitePositive(row.unit_price, "seller payout locked unit price");
+      const availableInitialAsset = rawInitial.shiftedBy(DB_ASSET_DECIMALS)
+        .integerValue(BigNumber.ROUND_DOWN).shiftedBy(-DB_ASSET_DECIMALS);
+      // The lot price was frozen when the seller submitted the campaign request.
+      // Never revalue this seller liability using the price at payout time.
+      const grossAvailable = calculateSellerPayoutGrossAtLockedPrice(availableInitialAsset, price);
+      return { ...row, price, availableInitialAsset, grossAvailable };
+    }).filter((row) => row.availableInitialAsset.isGreaterThan(0) && row.grossAvailable.isGreaterThan(0));
+    const availableGrossTotal = eligible.reduce((sum, row) => sum.plus(row.grossAvailable), new BigNumber(0));
+    if (availableGrossTotal.isLessThan(SELLER_PAYOUT_BATCH_LIMIT)) break;
 
     const grouped = new Map();
-    let batchRemaining = new BigNumber(SELLER_PAYOUT_BATCH_LIMIT);
+    let batchRemainingUsd = new BigNumber(SELLER_PAYOUT_BATCH_LIMIT);
     for (const row of eligible) {
-      if (batchRemaining.isZero()) break;
-      const amount = BigNumber.minimum(row.available, batchRemaining);
+      if (batchRemainingUsd.isZero()) break;
+      const maxInitialByBatch = batchRemainingUsd.dividedBy(row.price);
+      let initialAssetAmount = BigNumber.minimum(row.availableInitialAsset, maxInitialByBatch)
+        .decimalPlaces(DB_ASSET_DECIMALS, BigNumber.ROUND_DOWN);
+      let grossAmount = calculateSellerPayoutGrossAtLockedPrice(initialAssetAmount, row.price);
+      if (!initialAssetAmount.isGreaterThan(0) || !grossAmount.isGreaterThan(0)) continue;
+      if (grossAmount.isGreaterThan(batchRemainingUsd)) {
+        initialAssetAmount = initialAssetAmount.minus(new BigNumber(1).shiftedBy(-DB_ASSET_DECIMALS));
+        grossAmount = calculateSellerPayoutGrossAtLockedPrice(initialAssetAmount, row.price);
+      }
+      if (!initialAssetAmount.isGreaterThan(0) || !grossAmount.isGreaterThan(0)) continue;
+
       if (!grouped.has(row.username)) {
-        grouped.set(row.username, { username: row.username, payoutAddress: row.payout_address, amount: new BigNumber(0), allocations: [] });
+        grouped.set(row.username, {
+          username: row.username,
+          payoutAddress: row.payout_address,
+          grossAmount: new BigNumber(0),
+          initialAssetAmount: new BigNumber(0),
+          allocations: [],
+        });
       }
       const seller = grouped.get(row.username);
       if (String(seller.payoutAddress).toLowerCase() !== String(row.payout_address).toLowerCase()) {
         throw new Error(`Seller ${row.username} has inconsistent payout addresses across reserve lots`);
       }
-      seller.amount = seller.amount.plus(amount);
-      seller.allocations.push({ lotId: String(row.id), amount });
+      seller.grossAmount = seller.grossAmount.plus(grossAmount);
+      seller.initialAssetAmount = seller.initialAssetAmount.plus(initialAssetAmount);
+      seller.allocations.push({ lotId: String(row.id), initialAssetAmount, grossAmount, unitPrice: row.price });
       await tx.query(
-        "UPDATE users_seller_reserve_lots SET payout_reserved_units=payout_reserved_units+?,updated_at_ms=? WHERE id=?",
-        [amount.toFixed(), now, row.id],
+        `UPDATE users_seller_reserve_lots
+         SET payout_reserved_initial_asset=payout_reserved_initial_asset+?,updated_at_ms=?
+         WHERE id=?`,
+        [initialAssetAmount.toFixed(DB_ASSET_DECIMALS), now, row.id],
       );
-      batchRemaining = batchRemaining.minus(amount);
+      batchRemainingUsd = batchRemainingUsd.minus(grossAmount);
     }
-
+    if (grouped.size === 0) break;
+    const batchGross = [...grouped.values()].reduce((sum, seller) => sum.plus(seller.grossAmount), new BigNumber(0));
     const [batchResult] = await tx.query(
       "INSERT INTO users_usdt_seller_payout_batches(gross_amount,status,created_at_ms,updated_at_ms) VALUES(?,'queued',?,?)",
-      [SELLER_PAYOUT_BATCH_LIMIT.toFixed(18), now, now],
+      [batchGross.toFixed(TOKEN_DECIMALS), now, now],
     );
     for (const seller of grouped.values()) {
+      const effectiveUnitPrice = seller.grossAmount.dividedBy(seller.initialAssetAmount);
       const [payoutResult] = await tx.query(
         `INSERT INTO users_usdt_seller_payouts
-         (batch_id,username,payout_address,gross_amount,gas_fee_estimated,payout_amount,amount_raw,status,created_at_ms,updated_at_ms)
-         VALUES(?,?,?,?,'0','0','0','queued',?,?)`,
-        [batchResult.insertId, seller.username, seller.payoutAddress, seller.amount.toFixed(18), now, now],
+         (batch_id,username,payout_address,gross_amount,gross_initial_asset,effective_unit_price,
+          gas_fee_estimated,payout_amount,amount_raw,status,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,?,?,'0','0','0','queued',?,?)`,
+        [
+          batchResult.insertId,
+          seller.username,
+          seller.payoutAddress,
+          seller.grossAmount.toFixed(TOKEN_DECIMALS),
+          seller.initialAssetAmount.toFixed(DB_ASSET_DECIMALS),
+          effectiveUnitPrice.toFixed(30),
+          now,
+          now,
+        ],
       );
       for (const allocation of seller.allocations) {
         await tx.query(
-          "INSERT INTO users_seller_payout_allocations(payout_id,lot_id,amount,status,created_at_ms) VALUES(?,?,?,'reserved',?)",
-          [payoutResult.insertId, allocation.lotId, allocation.amount.toFixed(18), now],
+          `INSERT INTO users_seller_payout_allocations
+           (payout_id,lot_id,initial_asset_amount,gross_amount,unit_price,status,created_at_ms)
+           VALUES(?,?,?,?,?,'reserved',?)`,
+          [
+            payoutResult.insertId,
+            allocation.lotId,
+            allocation.initialAssetAmount.toFixed(DB_ASSET_DECIMALS),
+            allocation.grossAmount.toFixed(TOKEN_DECIMALS),
+            allocation.unitPrice.toFixed(30),
+            now,
+          ],
         );
       }
       await queueTelegramMessageTx(
@@ -240,10 +301,11 @@ async function queueSellerPayoutBatchesTx(tx) {
         `seller-payout:${payoutResult.insertId}:queued`,
         [
           "OneX Seller Update",
-          "Your sold reserve units have reached a payout batch and are queued for BSC-USD settlement.",
+          "Your sold seller-reserve assets have reached a payout batch and are queued for BSC-USD settlement.",
           `Payout ID: ${payoutResult.insertId}`,
-          `Gross amount: ${seller.amount.toFixed(8)} BSC-USD`,
-          "The outgoing BSC gas fee will be deducted from your payout.",
+          `Gross amount: ${seller.grossAmount.toFixed(8)} BSC-USD`,
+          `Valuation price locked at campaign submission: ${effectiveUnitPrice.toFixed(12)} XTU per initial asset`,
+          "The outgoing BSC gas fee will be deducted from your payout. No transaction fee is charged to priority sellers.",
           "Status: PROCESSING",
         ].join("\n"),
       );
@@ -253,15 +315,14 @@ async function queueSellerPayoutBatchesTx(tx) {
 
 async function closeExpiredSellerCampaignsTx(tx, nowMs = Date.now()) {
   const now = String(nowMs);
-  // Use the common-state lock first, matching recharge, seller activation and admin unlock.
   const [lockRows] = await tx.query("SELECT lock_name FROM system_locks WHERE lock_name=? FOR UPDATE", ["common_state"]);
   if (!lockRows.length) throw new Error("The common-state lock row has not been initialized");
   const [commonRows] = await tx.query(
-    "SELECT sellers_res,sellers_init_asset FROM common ORDER BY id DESC LIMIT 1 FOR UPDATE",
+    "SELECT sellers_res,total_run_balance FROM common ORDER BY id DESC LIMIT 1 FOR UPDATE",
   );
   if (!commonRows.length) throw new Error("Common reserve is not initialized");
   const [campaigns] = await tx.query(
-    `SELECT id,username,reserved_units,reserved_init_asset
+    `SELECT id,username,run_balance,unit_price
      FROM users_seller_campaigns
      WHERE status IN ('active','cancel_requested') AND CAST(expires_at_ms AS UNSIGNED)<=?
      ORDER BY expires_at_ms ASC,id ASC
@@ -269,23 +330,29 @@ async function closeExpiredSellerCampaignsTx(tx, nowMs = Date.now()) {
     [now],
   );
   if (!campaigns.length) return 0;
-  const sellersRes = finiteNonNegative(commonRows[0].sellers_res, "common.sellers_res");
-  const sellersInit = finiteNonNegative(commonRows[0].sellers_init_asset, "common.sellers_init_asset");
-  let releaseUnits = new BigNumber(0);
-  let releaseBasis = new BigNumber(0);
+
+  const sellersReserve = finiteNonNegative(commonRows[0].sellers_res, "common.sellers_res");
+  const totalRunBalance = finiteNonNegative(commonRows[0].total_run_balance, "common.total_run_balance");
+  let releaseInitialAsset = new BigNumber(0);
+  let closedRunBalance = new BigNumber(0);
+
   for (const campaign of campaigns) {
     const [lotRows] = await tx.query(
-      "SELECT id,remaining_units,remaining_init_asset FROM users_seller_reserve_lots WHERE campaign_id=? LIMIT 1 FOR UPDATE",
+      "SELECT id,remaining_initial_asset,unit_price FROM users_seller_reserve_lots WHERE campaign_id=? LIMIT 1 FOR UPDATE",
       [campaign.id],
     );
+    let releasedXtu = new BigNumber(0);
     if (lotRows.length) {
-      releaseUnits = releaseUnits.plus(finiteNonNegative(lotRows[0].remaining_units, "seller lot remaining_units"));
-      releaseBasis = releaseBasis.plus(finiteNonNegative(lotRows[0].remaining_init_asset, "seller lot remaining_init_asset"));
+      const remaining = finiteNonNegative(lotRows[0].remaining_initial_asset, "seller lot remaining initial assets");
+      const campaignPrice = finitePositive(lotRows[0].unit_price, "seller lot unit_price");
+      releasedXtu = remaining.multipliedBy(campaignPrice);
+      releaseInitialAsset = releaseInitialAsset.plus(remaining);
       await tx.query(
-        "UPDATE users_seller_reserve_lots SET remaining_units=0,remaining_init_asset=0,status='expired',updated_at_ms=? WHERE id=?",
+        "UPDATE users_seller_reserve_lots SET remaining_initial_asset=0,status='expired',updated_at_ms=? WHERE id=?",
         [now, lotRows[0].id],
       );
     }
+    closedRunBalance = closedRunBalance.plus(finiteNonNegative(campaign.run_balance, "campaign.run_balance"));
     await tx.query(
       "UPDATE users_seller_campaigns SET status='expired',closed_at_ms=?,close_reason='expired' WHERE id=? AND status IN ('active','cancel_requested')",
       [now, campaign.id],
@@ -295,24 +362,29 @@ async function closeExpiredSellerCampaignsTx(tx, nowMs = Date.now()) {
        WHERE username=? AND seller_status IN (1,2)`,
       [campaign.username],
     );
+    const price = finitePositive(campaign.unit_price, "campaign.unit_price");
     await queueTelegramMessageTx(tx, campaign.username, `seller-campaign:${campaign.id}:expired`, [
       "OneX Seller Update",
-      "Your 7-day seller status has expired. Unused seller reserve units have been released.",
+      "Your 7-day seller status has expired. Unused seller-reserve assets have been released.",
       `Campaign: ${campaign.id}`,
+      `Released value: ${releasedXtu.toFixed(8)} XTU at campaign valuation`,
+      `Released initial assets: ${new BigNumber(lotRows[0]?.remaining_initial_asset || "0").toFixed(30)}`,
+      `Campaign valuation price: ${price.toFixed(12)} XTU per initial asset`,
       "Status: EXPIRED",
     ].join("\n"));
   }
-  const newSellersRes = sellersRes.minus(releaseUnits);
-  const newSellersInit = sellersInit.minus(releaseBasis);
-  if (newSellersRes.isNegative() || newSellersInit.isNegative()) {
+
+  const newSellersReserve = sellersReserve.minus(releaseInitialAsset);
+  const newTotalRunBalance = totalRunBalance.minus(closedRunBalance);
+  if (newSellersReserve.isNegative() || newTotalRunBalance.isNegative()) {
     throw new Error("Seller reserve totals are inconsistent with expired campaign lots");
   }
-  if (releaseUnits.isGreaterThan(0) || releaseBasis.isGreaterThan(0)) {
+  if (releaseInitialAsset.isGreaterThan(0) || closedRunBalance.isGreaterThan(0)) {
     const [date, time] = require("./utils").getDate();
     const current = await require("./common-accounting").getLatestCommonTx(tx, true);
     await require("./common-accounting").insertCommonSnapshotTx(tx, current, {
-      sellers_res: newSellersRes.toFixed(),
-      sellers_init_asset: newSellersInit.toFixed(),
+      sellers_res: newSellersReserve.toFixed(DB_ASSET_DECIMALS),
+      total_run_balance: newTotalRunBalance.toFixed(DB_ASSET_DECIMALS),
     }, date, time);
   }
   return campaigns.length;
@@ -329,6 +401,7 @@ module.exports = {
   allocateSellerLotConsumption,
   sumActiveSellerReserveLots,
   getActiveSellerReserveAvailableTx,
+  calculateSellerPayoutGrossAtLockedPrice,
   calculateSellerPayoutNet,
   consumeSellerReserveTx,
   queueSellerPayoutBatchesTx,

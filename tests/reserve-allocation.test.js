@@ -4,54 +4,41 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { calculateTopUpReserveAllocation } = require("../stock-accounting");
 
-test("consumes inactive initial assets first and preserves price when sufficient", () => {
-  const result = calculateTopUpReserveAllocation("70", "2", "100", "80", "500");
+const fixed = (value) => value.toFixed();
+
+test("inactive initial assets are consumed first and global price follows total / backed", () => {
+  const result = calculateTopUpReserveAllocation("50", "2", "100", "100", "200", "10");
   assert.equal(result.available, true);
-  assert.equal(result.activityAmount.toFixed(), "35");
-  assert.equal(result.consumedInactive.toFixed(), "35");
-  assert.equal(result.consumedBacked.toFixed(), "0");
-  assert.equal(result.newInactive.toFixed(), "45");
-  assert.equal(result.newBacked.toFixed(), "100");
-  assert.equal(result.newTotalUnitsPrice.toFixed(), "570");
-  assert.equal(result.newUnitPrice.toFixed(), "2");
-  assert.equal(result.usedBackedAssets, false);
+  assert.equal(fixed(result.activityAmount), "25");
+  assert.equal(fixed(result.consumedInactive), "25");
+  assert.equal(fixed(result.consumedBacked), "0");
+  assert.equal(fixed(result.newInactive), "75");
+  assert.equal(fixed(result.newBacked), "100");
+  assert.equal(fixed(result.newTotalUnitsPrice), "250");
+  assert.equal(fixed(result.newUnitPrice), "2.5");
 });
 
-test("uses backed assets only after exhausting inactive assets and updates price", () => {
-  const result = calculateTopUpReserveAllocation("100", "2", "100", "20", "500");
+test("backed assets are consumed after inactive assets without breaching the admin floor", () => {
+  const result = calculateTopUpReserveAllocation("50", "2", "100", "20", "200", "10");
   assert.equal(result.available, true);
-  assert.equal(result.activityAmount.toFixed(), "50");
-  assert.equal(result.consumedInactive.toFixed(), "20");
-  assert.equal(result.consumedBacked.toFixed(), "30");
-  assert.equal(result.newInactive.toFixed(), "0");
-  assert.equal(result.newBacked.toFixed(), "70");
-  assert.equal(result.newTotalUnitsPrice.toFixed(), "600");
-  assert.equal(result.newUnitPrice.toFixed(), "2.4");
-  assert.equal(result.usedBackedAssets, true);
+  assert.equal(fixed(result.consumedInactive), "20");
+  assert.equal(fixed(result.consumedBacked), "5");
+  assert.equal(fixed(result.newBacked), "95");
+  assert.equal(fixed(result.newTotalUnitsPrice), "250");
+  assert.equal(result.newBacked.gte("10"), true);
 });
 
-test("reports total available value without consuming reserves when insufficient", () => {
-  const result = calculateTopUpReserveAllocation("121", "2", "40", "20", "500");
+test("reports insufficient distributable reserves without mutating calculated state", () => {
+  const result = calculateTopUpReserveAllocation("221", "2", "100", "20", "200", "10");
   assert.equal(result.available, false);
-  assert.equal(result.availableValue.toFixed(), "120");
-  assert.equal(result.consumedInactive.toFixed(), "0");
-  assert.equal(result.consumedBacked.toFixed(), "0");
-  assert.equal(result.newInactive.toFixed(), "20");
-  assert.equal(result.newBacked.toFixed(), "40");
-  assert.equal(result.newUnitPrice.toFixed(), "2");
+  assert.equal(fixed(result.availableValue), "220");
+  assert.equal(fixed(result.newInactive), "20");
+  assert.equal(fixed(result.newBacked), "100");
+  assert.equal(fixed(result.newTotalUnitsPrice), "200");
 });
 
-test("rejects negative reserve quantities and invalid unit price", () => {
-  assert.throws(() => calculateTopUpReserveAllocation("10", "0", "2", "3", "100"), /unit_price/);
-  assert.throws(() => calculateTopUpReserveAllocation("10", "1", "-1", "3", "100"), /negative/);
-});
-
-
-test("protects the remaining non-distributable administrative reserve floor", () => {
-  const result = calculateTopUpReserveAllocation("190", "2", "80", "20", "500", "10");
-  assert.equal(result.available, false);
-  assert.equal(result.availableValue.toFixed(), "180");
-  assert.equal(result.protectedFloor.toFixed(), "10");
-  assert.equal(result.newInactive.toFixed(), "20");
-  assert.equal(result.newBacked.toFixed(), "80");
+test("rejects negative reserves, invalid prices and inconsistent common snapshots", () => {
+  assert.throws(() => calculateTopUpReserveAllocation("10", "0", "2", "3", "10"), /unit_price/);
+  assert.throws(() => calculateTopUpReserveAllocation("10", "1", "-1", "3", "10"), /negative/);
+  assert.throws(() => calculateTopUpReserveAllocation("10", "2", "3", "3", "100"), /inconsistent/);
 });

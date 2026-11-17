@@ -1,6 +1,7 @@
 "use strict";
 
 const BigNumber = require("bignumber.js");
+const { calculateGlobalUnitPrice } = require("./stock-accounting");
 
 const COMMON_NUMERIC_FIELDS = Object.freeze([
   "total_units_price",
@@ -9,7 +10,7 @@ const COMMON_NUMERIC_FIELDS = Object.freeze([
   "inactive_init_asset",
   "sys_inactive_init_asset",
   "sellers_res",
-  "sellers_init_asset",
+  "total_run_balance",
   "total_tfees",
   "total_bnb_fee_actual",
   "total_bnb_fee_estimated",
@@ -20,8 +21,11 @@ const COMMON_NUMERIC_FIELDS = Object.freeze([
 function commonSnapshotValues(row, overrides = {}) {
   const values = {};
   for (const field of COMMON_NUMERIC_FIELDS) {
+    if (field === "unit_price") continue;
     values[field] = String(overrides[field] ?? row?.[field] ?? "0");
   }
+  const calculatedPrice = calculateGlobalUnitPrice(values.total_units_price, values.backed_units);
+  values.unit_price = calculatedPrice.toFixed(30);
   return values;
 }
 
@@ -49,7 +53,6 @@ async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
     currentRow?.total_tfees || "0",
     values.total_tfees,
   );
-
   const columns = [...COMMON_NUMERIC_FIELDS, "record_date", "record_time"];
   const placeholders = columns.map(() => "?").join(",");
   const params = [...COMMON_NUMERIC_FIELDS.map((field) => values[field]), date, time];
@@ -66,7 +69,13 @@ async function getLatestCommonTx(tx, lock = true) {
     `SELECT ${COMMON_NUMERIC_FIELDS.map((field) => `\`${field}\``).join(",")} FROM common ORDER BY id DESC LIMIT 1${suffix}`,
   );
   if (!rows.length) throw new Error("Common reserve is not initialized");
-  return rows[0];
+  const row = rows[0];
+  const expected = calculateGlobalUnitPrice(row.total_units_price, row.backed_units);
+  const stored = new BigNumber(row.unit_price);
+  if (!stored.isFinite() || stored.minus(expected).abs().gt("0.000000000000000000000000000001")) {
+    throw new Error("common.unit_price is inconsistent with common.total_units_price / common.backed_units");
+  }
+  return row;
 }
 
 module.exports = {

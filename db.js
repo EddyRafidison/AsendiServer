@@ -11,9 +11,9 @@ const OneX = "ONEX";
 const maxStockDefault = MAX_DEFAULT_STOCK;
 const P2Pallowed = String(process.env.P2P_ALLOWED || "false").toLowerCase() === "true";
 const stock_limit = process.env.STOCK_LIMIT || "10000000";
-// The default launch configuration initializes a 10,000,000 XTU supply
-// and the same amount of backed initial assets. Operators may override both
-// values, but must ensure the declared reserve is actually available.
+// The default launch configuration initializes 10,000,000 public XTU and
+// 10,000,000 backed initial assets, giving an initial global price of 1.
+// Operators may override these values; the price is always derived from T / B.
 const initial_backed_units = process.env.INITIAL_BACKED_UNITS || stock_limit;
 const first_welcome_clients = process.env.FIRST_WELCOME_CLIENTS || "0";
 const welcome_bonus = process.env.WELCOME_BONUS || "0";
@@ -99,8 +99,7 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS users_stock(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
-    balance DECIMAL(50,30) NOT NULL DEFAULT 0,
-    init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    balance DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Initial-asset balance; public XTU is calculated using common.unit_price',
     seller_status TINYINT UNSIGNED NOT NULL DEFAULT 0,
     run_balance DECIMAL(50,30) NOT NULL DEFAULT 0,
     pending_bonus DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -138,7 +137,7 @@ const TABLES = [
     inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     sys_inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     sellers_res DECIMAL(50,30) NOT NULL DEFAULT 0,
-    sellers_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_run_balance DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_bnb_fee_actual DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_bnb_fee_estimated DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_bnb_fee_actual_value DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -150,11 +149,11 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS users_seller_campaigns(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
-    run_balance DECIMAL(50,30) NOT NULL,
-    reserved_units DECIMAL(50,30) NOT NULL,
-    reserved_init_asset DECIMAL(50,30) NOT NULL,
+    run_balance DECIMAL(50,30) NOT NULL COMMENT 'Initial assets; unit_price stores the frozen public valuation',
+    reserved_initial_asset DECIMAL(50,30) NOT NULL,
+    unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable global price captured when the seller submitted this campaign; not a live account price',
     pending_bonus_snapshot DECIMAL(50,30) NOT NULL,
-    sold_units DECIMAL(50,30) NOT NULL DEFAULT 0,
+    sold_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     status VARCHAR(24) NOT NULL DEFAULT 'active',
     activated_at_ms BIGINT UNSIGNED NOT NULL,
     expires_at_ms BIGINT UNSIGNED NOT NULL,
@@ -168,13 +167,12 @@ const TABLES = [
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     campaign_id BIGINT UNSIGNED NOT NULL,
     username VARCHAR(30) NOT NULL,
-    original_units DECIMAL(50,30) NOT NULL,
-    remaining_units DECIMAL(50,30) NOT NULL,
-    original_init_asset DECIMAL(50,30) NOT NULL,
-    remaining_init_asset DECIMAL(50,30) NOT NULL,
-    payout_pending_units DECIMAL(50,30) NOT NULL DEFAULT 0,
-    payout_reserved_units DECIMAL(50,30) NOT NULL DEFAULT 0,
-    paid_units DECIMAL(50,30) NOT NULL DEFAULT 0,
+    original_initial_asset DECIMAL(50,30) NOT NULL,
+    remaining_initial_asset DECIMAL(50,30) NOT NULL,
+    unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable campaign-submission price used for seller payout valuation',
+    payout_pending_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    payout_reserved_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    paid_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     status VARCHAR(24) NOT NULL DEFAULT 'active',
     activated_at_ms BIGINT UNSIGNED NOT NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
@@ -197,6 +195,8 @@ const TABLES = [
     username VARCHAR(30) NOT NULL,
     payout_address CHAR(42) NOT NULL,
     gross_amount DECIMAL(36,18) NOT NULL,
+    gross_initial_asset DECIMAL(50,30) NOT NULL,
+    effective_unit_price DECIMAL(50,30) NOT NULL,
     gas_fee_estimated DECIMAL(36,18) NOT NULL DEFAULT 0,
     actual_fee_bnb DECIMAL(50,30) NULL,
     actual_fee_usd DECIMAL(36,18) NULL,
@@ -221,7 +221,9 @@ const TABLES = [
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     payout_id BIGINT UNSIGNED NOT NULL,
     lot_id BIGINT UNSIGNED NOT NULL,
-    amount DECIMAL(36,18) NOT NULL,
+    initial_asset_amount DECIMAL(50,30) NOT NULL,
+    gross_amount DECIMAL(36,18) NOT NULL,
+    unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable source-lot campaign price snapshot',
     status VARCHAR(16) NOT NULL DEFAULT 'reserved',
     created_at_ms BIGINT UNSIGNED NOT NULL,
     UNIQUE KEY uq_seller_payout_lot(payout_id,lot_id),
@@ -391,12 +393,11 @@ const TABLES = [
     requested_amount DECIMAL(36,18) NOT NULL,
     payout_amount DECIMAL(36,18) NOT NULL,
     amount_raw DECIMAL(65,0) NOT NULL,
-    gross_balance DECIMAL(50,30) NOT NULL,
-    gross_init_asset DECIMAL(50,30) NOT NULL,
-    sold_init_asset DECIMAL(50,30) NOT NULL,
-    fee_amount DECIMAL(50,30) NOT NULL,
-    fee_init_asset DECIMAL(50,30) NOT NULL,
-    price_value DECIMAL(50,30) NOT NULL,
+    gross_initial_asset DECIMAL(50,30) NOT NULL,
+    sold_initial_asset DECIMAL(50,30) NOT NULL,
+    fee_amount DECIMAL(36,18) NOT NULL COMMENT 'BSC-USD fee value locked at submission',
+    fee_initial_asset DECIMAL(50,30) NOT NULL,
+    price_value DECIMAL(50,30) NOT NULL COMMENT 'Immutable common.unit_price captured at user request submission',
     estimated_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
     estimated_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
     actual_fee_bnb DECIMAL(50,30) NULL,
@@ -453,6 +454,7 @@ const TABLES = [
     username VARCHAR(30) NOT NULL,
     batch_id BIGINT UNSIGNED NULL,
     action VARCHAR(32) NOT NULL,
+    initial_asset_amount DECIMAL(50,30) NOT NULL DEFAULT 0,
     gross_amount DECIMAL(36,18) NOT NULL,
     fee_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
     net_amount DECIMAL(36,18) NOT NULL,
@@ -476,7 +478,7 @@ async function assertLatestSchema() {
       "tg_userId", "tg_chat_id", "record_date", "record_time",
     ],
     users_stock: [
-      "username", "balance", "init_asset", "seller_status", "run_balance", "pending_bonus",
+      "username", "balance", "seller_status", "run_balance", "pending_bonus",
       "seller_activated_at_ms", "seller_expires_at_ms", "seller_last_p2p_at_ms", "record_date", "record_time",
     ],
     activities: [
@@ -493,25 +495,25 @@ async function assertLatestSchema() {
     telegram_bot_state: ["state_key", "state_value", "updated_at_ms"],
     common: [
       "total_units_price", "unit_price", "backed_units", "inactive_init_asset", "sys_inactive_init_asset",
-      "sellers_res", "sellers_init_asset", "total_tfees", "total_bnb_fee_actual", "total_bnb_fee_estimated",
+      "sellers_res", "total_run_balance", "total_tfees", "total_bnb_fee_actual", "total_bnb_fee_estimated",
       "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "record_date", "record_time",
     ],
     users_seller_campaigns: [
-      "username", "run_balance", "reserved_units", "reserved_init_asset", "pending_bonus_snapshot",
-      "sold_units", "status", "activated_at_ms", "expires_at_ms", "last_p2p_at_ms", "closed_at_ms", "close_reason",
+      "username", "run_balance", "reserved_initial_asset", "unit_price", "pending_bonus_snapshot",
+      "sold_initial_asset", "status", "activated_at_ms", "expires_at_ms", "last_p2p_at_ms", "closed_at_ms", "close_reason",
     ],
     users_seller_reserve_lots: [
-      "campaign_id", "username", "original_units", "remaining_units", "original_init_asset",
-      "remaining_init_asset", "payout_pending_units", "payout_reserved_units", "paid_units",
+      "campaign_id", "username", "original_initial_asset", "remaining_initial_asset", "unit_price",
+      "payout_pending_initial_asset", "payout_reserved_initial_asset", "paid_initial_asset",
       "status", "activated_at_ms", "updated_at_ms",
     ],
     users_usdt_seller_payout_batches: ["gross_amount", "status", "created_at_ms", "updated_at_ms", "completed_at_ms"],
     users_usdt_seller_payouts: [
-      "batch_id", "username", "payout_address", "gross_amount", "gas_fee_estimated", "actual_fee_bnb",
+      "batch_id", "username", "payout_address", "gross_amount", "gross_initial_asset", "effective_unit_price", "gas_fee_estimated", "actual_fee_bnb",
       "actual_fee_usd", "payout_amount", "amount_raw", "bnb_usd_price", "raw_tx", "tx_hash", "nonce", "block_number", "status",
       "last_error", "created_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
-    users_seller_payout_allocations: ["payout_id", "lot_id", "amount", "status", "created_at_ms"],
+    users_seller_payout_allocations: ["payout_id", "lot_id", "initial_asset_amount", "gross_amount", "unit_price", "status", "created_at_ms"],
     bsc_fee_ledger: [
       "tx_hash", "operation", "estimated_fee_bnb", "estimated_fee_usd", "bnb_usd_price", "gas_used",
       "effective_gas_price_wei", "actual_fee_bnb", "actual_fee_usd", "created_at_ms", "confirmed_at_ms",
@@ -542,7 +544,7 @@ async function assertLatestSchema() {
     ],
     users_usdt_disbursements: [
       "username", "payout_address", "requested_amount", "payout_amount", "amount_raw",
-      "gross_balance", "gross_init_asset", "sold_init_asset", "fee_amount", "fee_init_asset",
+      "gross_initial_asset", "sold_initial_asset", "fee_amount", "fee_initial_asset",
       "price_value", "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd",
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number",
       "last_error", "created_at_ms", "reservation_expires_at_ms", "updated_at_ms", "confirmed_at_ms",
@@ -554,7 +556,7 @@ async function assertLatestSchema() {
       "created_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
     admin_payment_resolutions: [
-      "admin_username", "username", "batch_id", "action", "gross_amount", "fee_amount",
+      "admin_username", "username", "batch_id", "action", "initial_asset_amount", "gross_amount", "fee_amount",
       "net_amount", "payout_address", "tx_hash", "reason", "created_at_ms",
     ],
   };
@@ -603,8 +605,7 @@ async function initDbIfEmpty() {
   const initialAdminReserve = initialTotal.multipliedBy(SYSTEM_ADMIN_RESERVE_RATIO);
   if (
     !initialTotal.isFinite() || !initialTotal.isGreaterThan(0) ||
-    !initialBacked.isFinite() || initialBacked.isNegative() ||
-    initialBacked.isGreaterThan(initialTotal) ||
+    !initialBacked.isFinite() || !initialBacked.isGreaterThan(0) ||
     !SYSTEM_ADMIN_RESERVE_RATIO.isFinite() || SYSTEM_ADMIN_RESERVE_RATIO.isNegative() ||
     !SYSTEM_ADMIN_RESERVE_RATIO.isLessThan(1) ||
     initialBacked.isLessThan(initialAdminReserve)
@@ -625,21 +626,21 @@ async function initDbIfEmpty() {
   const stockRows = await db.queryAsync("SELECT id FROM users_stock WHERE username=? LIMIT 1", [OneX]);
   if (!stockRows.length) {
     await db.queryAsync(
-      "INSERT INTO users_stock(username,balance,init_asset,record_date,record_time) VALUES(?,?,?,?,?)",
-      [OneX, "0", "0", date, time],
+      "INSERT INTO users_stock(username,balance,record_date,record_time) VALUES(?,?,?,?)",
+      [OneX, "0", date, time],
     );
   }
 
   const commonRows = await db.queryAsync("SELECT id FROM common ORDER BY id DESC LIMIT 1");
   if (!commonRows.length) {
     await db.queryAsync(
-      "INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,sys_inactive_init_asset,sellers_res,sellers_init_asset,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?)",
-      [initialTotal.toFixed(), "1", initialBacked.toFixed(), "0", "0", "0", "0", "0", date, time],
+      "INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,sys_inactive_init_asset,sellers_res,total_run_balance,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      [initialTotal.toFixed(), initialTotal.dividedBy(initialBacked).toFixed(30), initialBacked.toFixed(), "0", "0", "0", "0", "0", date, time],
     );
   }
 
   const latestCommonRows = await db.queryAsync(
-    `SELECT backed_units,inactive_init_asset,sys_inactive_init_asset
+    `SELECT total_units_price,unit_price,backed_units,inactive_init_asset,sys_inactive_init_asset
      FROM common ORDER BY id DESC LIMIT 1`,
   );
   if (!latestCommonRows.length) throw new Error("Common reserve initialization failed");
@@ -650,11 +651,20 @@ async function initDbIfEmpty() {
     latestCommon.sys_inactive_init_asset || "0",
   ).remainingInitialAsset;
   const currentBackedInitialAssets = new BigNumber(latestCommon.backed_units);
+  const currentTotalUnitsPrice = new BigNumber(latestCommon.total_units_price);
+  const storedUnitPrice = new BigNumber(latestCommon.unit_price);
   if (
-    !currentBackedInitialAssets.isFinite() || currentBackedInitialAssets.isNegative() ||
-    currentBackedInitialAssets.isLessThan(remainingAdminReserve)
+    !currentBackedInitialAssets.isFinite() || !currentBackedInitialAssets.isGreaterThan(0) ||
+    !currentTotalUnitsPrice.isFinite() || !currentTotalUnitsPrice.isGreaterThan(0)
   ) {
+    throw new Error("common.total_units_price and common.backed_units must remain finite and strictly positive.");
+  }
+  if (currentBackedInitialAssets.isLessThan(remainingAdminReserve)) {
     throw new Error("common.backed_units does not cover the remaining non-distributable administrative reserve quota.");
+  }
+  const expectedUnitPrice = currentTotalUnitsPrice.dividedBy(currentBackedInitialAssets);
+  if (!storedUnitPrice.isFinite() || storedUnitPrice.minus(expectedUnitPrice).abs().gt("0.000000000000000000000000000001")) {
+    throw new Error("common.unit_price must equal common.total_units_price / common.backed_units");
   }
 
   console.log(`OneX database ready. UTC time: ${date} ${time}`);
