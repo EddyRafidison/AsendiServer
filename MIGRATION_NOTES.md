@@ -10,7 +10,7 @@ Par défaut, une nouvelle base initialise `common.total_units_price=10000000`, `
 
 - Réseau : BNB Smart Chain mainnet, chain ID 56.
 - Token de règlement : Binance-Peg BSC-USD (BEP-20), contrat `0x55d398326f99059fF775485246999027B3197955`, 18 décimales. Il ne s'agit pas d'un USDt émis directement par Tether.
-- **Tous les soldes et réserves internes sont enregistrés en actifs initiaux.** Cela comprend `users_stock.balance`, `users_stock.run_balance`, `users_stock.pending_bonus`, `common.backed_units`, `common.inactive_init_asset`, `common.sys_inactive_init_asset`, `common.sellers_res` et `common.total_run_balance`.
+- **Tous les soldes et réserves internes sont enregistrés en actifs initiaux.** Cela comprend `users_stock.balance`, `users_stock.run_balance`, `common.backed_units`, `common.inactive_init_asset`, `common.sys_inactive_init_asset`, `common.sellers_res` et `common.total_run_balance`.
 - `common.total_units_price` est la seule valeur de stock persistée en XTU.
 - Le seul prix courant du système est `common.unit_price`, en XTU par actif initial :
 
@@ -66,25 +66,29 @@ Chaque compte possède une adresse individuelle de dépôt BSC-USD. Les dépôts
 - Les montants financés par la réserve vendeurs ne sont pas soumis à cette restriction hebdomadaire.
 - Le solde public après crédit ne peut pas dépasser 300 XTU; le contrôle multiplie le nouveau solde initial par le prix global résultant de l'opération.
 - `net = gross_received - tfees - configured_BSC_gas_recovery`. La récupération concerne le gas d'opérations sortantes payées par OneX; le gas déjà payé par le déposant ne doit pas être refacturé.
-- Ordre de financement : réserve vendeurs FIFO (`common.sellers_res`), puis `common.inactive_init_asset`, puis `common.backed_units` au-dessus du quota administratif restant.
+- Ordre de financement strict : `common.inactive_init_asset` d'abord, lots de réserve vendeurs actifs en FIFO ensuite, puis `common.backed_units` au-dessus du quota administratif restant. Les demandes de disbursement non résolues sont déduites de la capacité système.
 - La part financée par les vendeurs est un transfert d'actifs initiaux du lot vendeur vers le compte bénéficiaire; elle ne crée pas une deuxième fois ces actifs.
-- La part financée par ONEX convertit le net XTU en actifs initiaux au prix global courant verrouillé au début de la transaction. Les réserves sont ensuite mises à jour et le prix global est recalculé par le ratio commun.
+- La part financée par OneX convertit le net XTU en actifs initiaux au prix global verrouillé au début de l'opération. `inactive_init_asset` et la réserve vendeurs sont consommés avant la partie distribuable de `backed_units`. Le prix est recalculé par le ratio commun.
 - Si l'utilisateur est sous cooldown et que la réserve vendeurs ne couvre pas intégralement le net, aucun crédit partiel n'est effectué. Le batch est mis en attente et réévalué périodiquement.
 - Le seuil de 70 BSC-USD concerne le sweep des dépôts vers le treasury, pas le minimum de recharge; les dépôts non balayés peuvent aussi être consolidés après 30 jours.
 
 Les transactions en attente de disbursement doivent être protégées contre l'utilisation concurrente de la réserve système par les recharges. Le contrôle de disponibilité tient donc compte des montants initialement réservés par les demandes non résolues.
 
-## Campagnes vendeurs et paiements figés
+## Rémunération individuelle et campagnes vendeurs
 
-`POST /app/join-system-sellers` reçoit `run_balance` en XTU. Sous verrou `common_state`, la route capture le `common.unit_price` courant et convertit le montant en actifs initiaux. Le solde, `run_balance`, `pending_bonus`, le total des campagnes (`common.total_run_balance`), `common.sellers_res` et les lots sont stockés en actifs initiaux. Les seuils publics de 12 XTU, le verrouillage d'au moins 50 % et le bonus d'au moins 10 % sont vérifiés à partir du même prix de soumission.
+Aucun bonus séparé n'est distribué. Chaque compte possède un prix de référence `A` et un seuil individuel `B` calculé avec le taux `tfees` réellement appliqué à sa dernière acquisition :
 
-Lors de l'activation, 50 % de `run_balance` (hors bonus) est réservé dans `common.sellers_res`; le solde principal n'est pas diminué uniquement parce que le vendeur rejoint la campagne. Pendant la campagne, la limite P2P est calculée en actifs initiaux : `balance - 0.5 * run_balance`. Les lots sont consommés en FIFO; la consommation débite le solde initial du vendeur et crée une dette de paiement.
+```text
+B = A * (1 + 2 * tfees / 100)
+```
 
-**Le prix de paiement vendeur est figé lors de la soumission de sa campagne** (`/app/join-system-sellers`). Chaque lot conserve ce prix. Le montant BSC-USD dû est calculé à partir des actifs initiaux consommés multipliés par le prix figé du lot; un changement ultérieur de `common.unit_price` ne modifie pas cette dette. Les paiements sont regroupés par vendeur, en lots d'au plus 300 BSC-USD brut. Le worker envoie le montant déjà enregistré, ne le recalcule pas au prix courant et déduit uniquement le gas BSC estimé; aucun `tfees` n'est appliqué au vendeur prioritaire.
+Une recharge ou une acquisition/vente réussie réinitialise `A` au prix global obtenu après l'opération. Avant une acquisition, le serveur vérifie si le seuil précédent a déjà été atteint avec le solde principal antérieur à l'opération; l'acquisition met ensuite à jour `A/B` sans lever une pause existante. Un franchissement met en pause l'accumulation individuelle et crée une notification Telegram. Les variations de prix sont enregistrées dans `common_price_events`; le worker parcourt les seuils indexés uniquement pour les événements de hausse, sans balayage périodique complet des comptes.
 
-Les campagnes expirent après sept jours. Une demande d'annulation ne libère pas les actifs non consommés avant le déverrouillage administratif ou l'expiration normale. Les actifs vendus restent une dette jusqu'au paiement confirmé. `common.total_run_balance` est le cumul des références de campagnes actives, en actifs initiaux.
+Au franchissement, le serveur fige `S0`, le solde principal en actifs initiaux, et calcule le volume de ventes requis `50 % * S0`. Seules les sorties P2P réussies sont cumulées en montant brut initial (avant les tfees supportés par le destinataire). Les P2P entrants, les activations vendeurs, la consommation des lots vendeurs et les ventes à OneX ne sont pas des ventes admissibles. Une recharge reçue pendant la pause réinitialise `A/B`, mais la pause demeure jusqu'à ce que le volume P2P requis soit atteint. À ce moment, un nouveau cycle démarre automatiquement au prix global courant.
 
-Le bonus demeure incomplet : `pending_bonus` est stocké en actifs initiaux et son seuil d'éligibilité est contrôlé, mais son origine, son calcul, son accumulation et son crédit automatique ne sont pas implémentés tant que ces règles n'ont pas été définies.
+L'adhésion vendeur nécessite un seuil individuel déjà atteint et un solde principal public d'au moins 10 XTU. À l'activation, le serveur engage automatiquement 50 % de la totalité du solde principal en actifs initiaux dans `common.sellers_res`; l'utilisateur ne choisit plus un montant de verrouillage et aucun bonus n'est exigé. Le solde principal n'est pas débité au seul motif de l'activation : le montant engagé est bloqué par un lot vendeur. Un même cycle de prix ne peut servir qu'à une campagne. La campagne et le lot conservent le prix global à l'activation pour fixer leur valeur de paiement.
+
+Les lots vendeurs sont consommés en FIFO. La consommation débite le solde vendeur en actifs initiaux et crée une dette de paiement. Les paiements sont regroupés par lots d'au plus 300 BSC-USD brut; le prix utilisé est le prix de campagne figé. Aucun `tfees` n'est appliqué au vendeur prioritaire; seul le gas BSC estimé est récupéré. Les campagnes durent sept jours. Une annulation ne libère pas les lots tant qu'ils n'ont pas été déverrouillés par l'administration ou par la fermeture normale. La disponibilité P2P d'un vendeur est son solde principal moins le montant réel encore bloqué dans ses lots actifs.
 
 ## Transferts P2P et frais
 
@@ -92,13 +96,15 @@ Le bonus demeure incomplet : `pending_bonus` est stocké en actifs initiaux et s
 
 La base initiale complète des `tfees` est conservée par OneX et ajoutée à `common.backed_units`; sa valeur XTU au prix de l'opération augmente `common.total_units_price`. `common.total_tfees` est un compteur cumulatif en actifs initiaux et ne diminue jamais. Il n'existe aucune séparation CommonShare/AdminFees ni transfert vers un portefeuille dédié aux frais.
 
-## Vente à ONEX et disbursement
+## Disbursement individuel et disbursement global
 
-Une vente à ONEX exige une valeur publique d'au moins 290 XTU, une adresse BSC-USD enregistrée, aucune demande non résolue et un cooldown de 90 jours après une vente confirmée. Le solde complet de l'utilisateur est réservé en actifs initiaux. Lors de la soumission, la route capture `common.unit_price`, calcule les frais et le paiement BSC-USD, puis enregistre `price_value`, `gross_initial_asset`, `sold_initial_asset`, `fee_initial_asset`, `fee_amount`, `payout_amount` et `amount_raw`.
+Le mode demandé par un utilisateur est appelé **disbursement individuel**. `/app/near-transfer` vers `ONEX` reçoit un montant brut XTU, le convertit au prix global verrouillé, applique les `tfees` courants et réserve le montant brut correspondant en actifs initiaux. L'éligibilité exige un solde public minimum de 290 XTU, un portefeuille BSC valide, aucune demande non résolue et un cooldown glissant de 30 jours après chaque disbursement individuel confirmé. Les variables `DISBURSEMENT_INDIVIDUAL_MINIMUM_XTU` et `DISBURSEMENT_INDIVIDUAL_MINIMUM_REMAINING_XTU` règlent le montant minimum et le solde minimal après demande. Le prix et le montant BSC-USD sont figés à l'acceptation; une erreur de paiement restaure le montant réservé au-dessus du solde restant.
 
-**Le prix de disbursement est figé au moment où l'utilisateur soumet la demande**, pas au moment où le worker paie. Le worker utilise exclusivement les valeurs persistées et ne les réévalue pas au prix global courant. Après transfert BSC-USD confirmé et finalisé, le système applique la sortie au common stock selon le payout et les bases initiaux figés; il calcule ensuite le nouveau prix global pour les opérations suivantes. Une opération échouée ne restaure le solde réservé qu'après vérification de canonicalité/finalité et de la profondeur de confirmations configurée.
+Le **disbursement global** est une liquidation initiée par décision définitive du système en situation critique. Il ne peut être déclenché que par `/admin/start-global-disbursement`, après authentification administrative et fourniture d'un motif ainsi que d'une référence de décision unique. Les variables d'environnement autorisent le démarrage mais ne déclenchent pas la liquidation elles-mêmes. Au lancement, le serveur fige un seul prix global et la borne maximale des identifiants `users_stock`; le worker traite ensuite les comptes par lots afin d'éviter une transaction géante. Chaque paiement correspond au solde brut évalué au prix commun figé moins la récupération de gas BSC, stockée séparément dans `bsc_fee_recovered_usd`. Aucun `tfees` n'est appliqué au mode global.
 
-Les demandes non résolues sont réservées en actifs initiaux et soustraites de la capacité distribuable pour empêcher les recharges d'utiliser les mêmes actifs avant le paiement. Une campagne vendeur active ou en annulation en attente interdit la vente complète à ONEX.
+Le lancement global est refusé tant que des demandes individuelles, campagnes/lots vendeurs, paiements vendeurs, recharges ou remboursements restent en attente. Pendant le run, les recharges, P2P, nouvelles activations vendeurs, nouveaux disbursements individuels et modifications administratives du stock commun sont bloqués. Un compte dont le portefeuille est absent/invalide ou qui exige une réconciliation est consigné en `manual_review` sans débit de son solde. Le contrôle de trésorerie tient compte du BSC-USD et du BNB déjà engagés par les paiements globaux encore en attente. Le run ne devient `completed` qu'après la finalisation de tous les paiements; toute intervention requise le laisse en `manual_review`. `/admin/resolve-global-disbursement-review` peut libérer uniquement les lignes non payées, sans transaction blockchain, sans débit réservé et avec un solde inchangé; tout hash de transaction ou état ambigu exige une réconciliation distincte.
+
+`USDT_DISBURSEMENTS_ENABLED` est le verrou général. `USDT_INDIVIDUAL_DISBURSEMENT_ENABLED` autorise les nouvelles demandes individuelles; `USDT_GLOBAL_DISBURSEMENT_ENABLED` autorise le lancement administratif d'un run global. Désactiver ces flags bloque les nouvelles demandes, mais n'interrompt pas les paiements déjà acceptés : le worker doit continuer jusqu'à leur résolution.
 
 ## Historique et frais
 
@@ -179,3 +185,6 @@ This combined statement is for a table missing all four indexes. If only some ar
 - The HTTP limiter applies route-specific IP windows to sensitive read, write, download and administrative endpoints. It normalizes route casing and trailing slashes. The limiter is process-local; multi-instance deployments must enforce the same or stricter IP policy at the shared reverse proxy/API gateway.
 - MySQL sessions use a bounded InnoDB row-lock wait timeout. Existing transaction logic and financial write ordering are unchanged.
 - The transaction-history endpoint accepts at most 30 days. A larger `days` value is clamped to 30, while invalid or fractional values are rejected. Existing `trans` payload format is preserved and cursor pagination is additive.
+
+
+Un run global conserve le prix global, le total `common.total_units_price` et le passif initial total des comptes au lancement. Le lancement est refusé si le passif brut au prix figé épuiserait la valeur stockée. Les jobs globaux restent réservés jusqu’à finalisation ou réconciliation explicite et ne sont pas expirés automatiquement.

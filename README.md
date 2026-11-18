@@ -18,7 +18,7 @@ There is no individual live price for an account, sender, buyer or seller. All c
 
 ## Internal accounting conventions
 
-- `users_stock.balance`, `users_stock.run_balance` and `users_stock.pending_bonus` are initial assets.
+- `users_stock.balance` and `users_stock.run_balance` are initial assets. There is no separate bonus balance or bonus eligibility mechanism.
 - `common.backed_units`, `common.inactive_init_asset`, `common.sys_inactive_init_asset`, `common.sellers_res` and `common.total_run_balance` are initial assets.
 - `common.total_units_price` is XTU. `common.unit_price` is always recomputed as `total_units_price / backed_units` on every common snapshot; `backed_units` must remain strictly positive.
 - `activities.amount` and `activities.fees` are initial assets. `activities.unit_price` is the immutable global price used for the recorded transaction. Historical XTU values are `amount * activities.unit_price` and `fees * activities.unit_price`.
@@ -68,26 +68,31 @@ Each account has an individual BSC-USD deposit address. Finalized `Transfer` eve
 - The 140 BSC-USD cap and seven-day cooldown apply only to the portion funded by ONEX reserves. Seller-funded amounts are exempt.
 - The user's resulting public balance must not exceed 300 XTU, measured using the global price after the financial update.
 - Net credit is `gross received - tfees - configured BSC gas recovery`. The recovered BSC cost covers only eligible OneX-paid outgoing operations; the user's own deposit gas is not charged again. The resulting net deposit amount is treated as its nominal XTU value for that recharge operation, then converted to initial assets using the global price captured before the operation.
-- Funding priority is `common.sellers_res`, then `common.inactive_init_asset`, then `common.backed_units` above the remaining administrative quota.
-- Seller-funded credit transfers initial assets from the seller reserve to the recipient. It does not issue a second copy of the seller-funded amount.
-- The ONEX-funded portion converts its public XTU value to initial assets using the pre-operation global price. Common snapshots then recompute the global price from their resulting `total_units_price` and `backed_units`.
+- Funding priority is strictly `common.inactive_init_asset` first, then active seller lots in FIFO order, then `common.backed_units` above the remaining administrative quota. Pending disbursement reservations reduce the system-funded capacity.
+- Seller-funded credit transfers initial assets from the seller reserve to the recipient. The beneficiary's own active seller lot is excluded from the funding pool so a user cannot recycle their locked balance into their own recharge. It does not issue a second copy of the seller-funded amount.
+- The OneX-funded portion converts its public XTU value to initial assets using the pre-operation global price. `inactive_init_asset` is consumed before seller lots; `backed_units` is touched only after both earlier sources are exhausted. Common snapshots then recompute the global price from their resulting `total_units_price` and `backed_units`.
 - A weekly-ineligible user receives no partial ONEX-funded credit. A pending batch is retried so it may be funded by sellers or after the weekly cooldown.
 - The 70 BSC-USD amount is a deposit-wallet sweep threshold, not the recharge minimum. Older unswept finalized deposits are swept after 30 days.
 
 `activities.amount` and `activities.fees` are stored in initial assets. `activities.unit_price` freezes the transaction price. The history endpoint returns both the internal initial-asset fields and their historical XTU equivalents.
 
-## Priority seller reserve
+## Individual price remuneration and priority seller reserve
 
-- `POST /app/join-system-sellers` receives the selected `run_balance` in XTU and converts it to initial assets using the global price captured under the common-state lock at campaign submission.
-- The user's `balance`, campaign `run_balance`, `pending_bonus`, common `sellers_res`, `total_run_balance`, and seller-lot quantities are stored in initial assets. Public eligibility thresholds (12 XTU, 50% lock and 10% pending bonus) are checked using the captured global price.
-- 50% of the selected `run_balance` (excluding bonus) is assigned to `common.sellers_res`; the user's principal balance is not debited merely by joining. The seller reserve lot stores the campaign submission price as an immutable payout valuation snapshot.
-- P2P availability during an active campaign is computed in initial assets as `balance - 0.5 * run_balance`. Incoming transfers remain allowed.
-- Seller lots are consumed FIFO. Consumption reduces the seller's internal balance and lot amount in initial assets and creates a payout liability.
-- Seller payout gross BSC-USD is calculated from each lot's consumed initial assets multiplied by the **price locked at that seller's campaign submission**. A later change to `common.unit_price` does not change that liability. Payout batches are capped at 300 BSC-USD gross per batch.
-- Priority sellers pay no `tfees`; only the estimated BSC gas cost is deducted from their BSC-USD payout. Actual gas is recorded separately after finality.
-- Seller status expires after seven days. Cancellation requests do not release unused reserve until the administrative unlock or normal expiry. Amounts already consumed remain payout liabilities.
-- `common.total_run_balance` is the sum of active campaign run-balance references in initial assets.
-- Bonus calculation, origin, accumulation, inactivity lifecycle and automatic credit remain deliberately unimplemented until separately specified. `pending_bonus` is stored in initial assets and only used for current eligibility checks.
+There is no separate bonus balance. Each user has an individual reference price `A` and a target `B`, while the system still uses one global price `common.unit_price`:
+
+```text
+B = A * (1 + 2 * applied_tfees_rate / 100)
+```
+
+The fee rate saved in the user's price state is the rate actually applied to the most recent acquisition. A successful recharge or purchase/sale resets `A` to the resulting global price; a sale preserves the last acquisition's applied fee rate when recalculating `B`. A threshold crossing pauses the individual accumulation and queues a Telegram notification. The system records common price changes in `common_price_events`; an indexed worker processes only upward threshold crossings and preserves crossings even if the global price later falls.
+
+At the crossing, the system freezes the user's principal balance `S0` in initial assets and requires successful outgoing P2P sales totalling at least `50% * S0`. Only outgoing P2P transfers count; receiving a P2P transfer, activating as a priority seller, consuming seller lots, and disbursement to OneX do not count. A recharge while paused updates the user's `A/B` reference but does not remove the pause. Once the sale requirement is met, a new cycle starts automatically using the current global price. Incoming P2P credits also reset their recipient's price reference, after first checking any already-reached threshold against the pre-transfer balance.
+
+A priority seller is eligible only after the individual threshold has been reached and the main balance is at least 10 XTU. Activation commits 50% of the full principal balance to the seller reserve automatically; the user no longer selects a lock amount and no bonus threshold is checked. The public balance remains in the user's main stock while the reserved half is blocked through a seller reserve lot. A price cycle can activate only one campaign. The campaign and lot retain the activation-time global price for payout valuation.
+
+Seller lots are consumed FIFO. Consumption reduces the seller's internal balance and lot amount in initial assets and creates a payout liability. Seller payout gross BSC-USD is calculated from the consumed initial assets multiplied by the **price locked at campaign activation**. Payout batches are capped at 300 BSC-USD gross per batch. Priority sellers pay no `tfees`; only estimated BSC gas recovery is deducted, with actual gas recorded separately after finality.
+
+Seller campaigns last seven days. Cancellation requests do not release unused reserve until administrative unlock or normal expiry. Amounts already consumed remain payout liabilities. P2P availability during an active campaign is calculated as the main balance less the actual remaining locked seller-lot amounts, not as a fixed percentage of `run_balance`.
 
 ## P2P transfers and transaction fees
 
@@ -95,13 +100,15 @@ Each account has an individual BSC-USD deposit address. Finalized `Transfer` eve
 
 The full fee basis is retained by OneX and added to `common.backed_units`; the equivalent public XTU fee amount is added to `common.total_units_price`. `common.total_tfees` accumulates the fee basis in initial assets and never decreases. This paired update preserves the pre-operation global price for the fee component. There is no separate CommonShare/AdminFees split or administrative fee-wallet transfer.
 
-## Sale to ONEX (disbursement)
+## Individual and global disbursements
 
-A system sale requires a public balance of at least 290 XTU, a registered payout address, no unresolved request and a successful-sale cooldown of 90 days. The complete internal balance is reserved in initial assets. The global price is captured when the user submits the request; `price_value`, gross/sold/fee initial-asset values and the BSC-USD payout are persisted in that request.
+The user-requested mode is called **individual disbursement**. `POST /app/near-transfer` with destination `ONEX` accepts a gross XTU amount, converts it using the global price captured under the common-state lock, applies the configured `tfees`, and reserves the corresponding gross initial-asset balance. A request requires a public balance of at least 290 XTU, a registered payout address, no unresolved request, and a rolling 30-day cooldown after each confirmed individual disbursement. `DISBURSEMENT_INDIVIDUAL_MINIMUM_XTU` and `DISBURSEMENT_INDIVIDUAL_MINIMUM_REMAINING_XTU` configure the minimum request and minimum residual balance. The BSC-USD payout and price are persisted when the request is accepted; later global price changes do not reprice it. Failed jobs restore the reserved amount on top of any remaining balance.
 
-The BSC-USD payout remains fixed at that submission-time price even if `common.unit_price` changes while the request waits for treasury processing. The worker sends the already persisted amount and never reprices it at payment time. On canonical finality, common stock accounting applies the frozen payout and initial-asset basis while recalculating the current global price for subsequent operations. A confirmed sale starts the 90-day cooldown; a failed transaction restores the user's reserved initial-asset balance only after canonicality/finality checks.
+Global disbursement is a separate, system-initiated liquidation mode. It can only be started through the authenticated administrative endpoint `/admin/start-global-disbursement`, with a decision reason and a unique decision reference. The environment flags authorize this action but do not trigger it automatically. At launch, the system freezes one global price and one maximum `users_stock.id` boundary for the entire run. It processes users in batches, reserves each eligible account balance once, and pays the gross valuation at that common snapshot price less the captured BSC gas recovery. Global mode applies no `tfees`; gas recovery is stored separately in `bsc_fee_recovered_usd`.
 
-Active or cancellation-pending seller campaigns prevent a system sale. Pending disbursement reservations count against the distributable initial-asset capacity and cannot consume the remaining protected administrative quota.
+Before a global run starts, unresolved individual disbursements, seller campaigns/reserves, seller payouts, recharge batches and refunds must be resolved. The launch also snapshots the total user initial-asset balance, global price and `common.total_units_price`; it rejects the run unless the gross user liability at the frozen price is strictly below the captured stock value, leaving a positive residual value. The snapshot is retained for reconciliation. Global disbursement jobs do not expire automatically while the run is active; they remain reserved until confirmed or explicitly reconciled. During the run, new user recharges, P2P transfers, seller activations, individual disbursements and administrative common-stock changes are blocked. Missing/invalid payout wallets and accounts requiring reconciliation are recorded as `manual_review` without debiting their balances. Treasury BSC-USD and BNB liquidity is checked against both the next page and outstanding global payout reservations. The run is completed only after all queued payments are finalized; accounts needing manual intervention leave the run in `manual_review`. `/admin/resolve-global-disbursement-review` can release only review rows with no transaction hash, no reserved debit and an unchanged user balance; confirmed or otherwise ambiguous on-chain records require separate reconciliation.
+
+Three independent environment switches govern admission: `USDT_DISBURSEMENTS_ENABLED` is the master gate, `USDT_INDIVIDUAL_DISBURSEMENT_ENABLED` enables new user-requested requests, and `USDT_GLOBAL_DISBURSEMENT_ENABLED` enables an administrator to start a global run. Turning a switch off prevents new requests but does not abandon already accepted payouts. Keep the disbursement worker running until accepted jobs are reconciled.
 
 ## Refunds, gas and cumulative fees
 
@@ -111,7 +118,7 @@ Refunds charge no `tfees`; only configured recovery of OneX-paid BSC gas is dedu
 
 ## Administrative stock endpoints
 
-- `POST /admin/update-user-stock` credits one user through the same seller-first top-up allocator used by recharge processing. `amount` is public XTU/BSC-USD; the route converts it using the current global price. The normal automatic minimum is bypassed, but the user cap, ONEX-funded cooldown/cap, transaction fees, BSC recovery and administrative reserve floor remain enforced.
+- `POST /admin/update-user-stock` credits one user through the same reserve-priority top-up allocator used by recharge processing. `amount` is public XTU/BSC-USD; the route converts it using the current global price. The normal automatic minimum is bypassed, but the user cap, ONEX-funded cooldown/cap, transaction fees, BSC recovery and administrative reserve floor remain enforced.
 - `POST /admin/update-common-stock` is exclusively an administrative expenditure. `amount` is XTU; it is converted using the current global price and debited proportionally from `total_units_price` and `backed_units`. The initial-asset basis is added to `sys_inactive_init_asset`. It does not credit a user and is not a buyback or new issuance.
 
 ## Database and deployment
@@ -183,9 +190,9 @@ Set `USDT_SELLER_PAYOUTS_ENABLED=true` only when seller treasury payouts are rea
 - `POST /app/near-transfer`: user-to-user P2P or a user sale to OneX. OneX cannot be the sender. P2P fees are paid entirely by the recipient.
 - `POST /app/disbursement/status`: returns the status of a user's system-sale request.
 - `POST /admin/unlock-disbursement`: requeues an expired, unsigned disbursement for the isolated worker after admin authentication and liquidity checks.
-- `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces the 140 BSC-USD system-funded cap, weekly cooldown when ONEX reserves are needed, 300 XTU stock cap and reserve availability; seller funding remains first priority.
+- `POST /admin/recharge/credit`: records an exceptional administrator-approved credit for a support-held recharge batch. It still enforces the 140 BSC-USD system-funded cap, weekly cooldown when ONEX reserves are needed, 300 XTU stock cap and reserve availability; inactive reserve is consumed first, seller lots second and backed reserve last.
 - `POST /admin/recharge/refund`: queues a refund of a support-held recharge batch. No `tfees` is charged; a configured estimate of OneX's BSC gas cost is deducted, and the net refund must be at least 10 BSC-USD.
-- `POST /admin/update-user-stock`: applies an administrator-approved individual stock credit through the standard recharge allocator, preserving seller-first funding, system cooldown/cap, fees, cost recovery and the user balance ceiling. The automatic minimum is bypassed. Requires the configured administrator password and PIN.
+- `POST /admin/update-user-stock`: applies an administrator-approved individual stock credit through the standard recharge allocator, preserving inactive-reserve → seller-lot → backed-reserve funding priority, system cooldown/cap, fees, cost recovery and the user balance ceiling. The automatic minimum is bypassed. Requires the configured administrator password and PIN.
 - `POST /admin/update-common-stock`: records an administrative expenditure from the protected common allocation. `amount` is XTU / BSC-USD; the current unit price converts it to initial-asset basis, `total_units_price` decreases by `amount`, `unit_price` stays unchanged, and the spent basis moves from `backed_units` to `sys_inactive_init_asset`. Requires the configured administrator password and PIN.
 - `POST /admin/send-temp-pswd`: issues a seven-digit temporary password by email; valid for 10 minutes and usable only to sign in and change the permanent password.
 - `POST /app/join-system-sellers`: requests activation of a priority seller campaign.

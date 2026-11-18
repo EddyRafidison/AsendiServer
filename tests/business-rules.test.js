@@ -36,7 +36,7 @@ test("current OneX business limits are centralized", () => {
   assert.equal(RECHARGE_BATCH_WINDOW_MS, 60 * 60 * 1000);
   assert.equal(fixed(DEPOSIT_SWEEP_THRESHOLD), "70");
   assert.equal(DEPOSIT_SWEEP_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000);
-  assert.equal(DISBURSEMENT_COOLDOWN_MS, 90 * 24 * 60 * 60 * 1000);
+  assert.equal(DISBURSEMENT_COOLDOWN_MS, 30 * 24 * 60 * 60 * 1000);
 });
 
 test("a system-funded top-up converts the XTU request to initial assets at the pre-operation global price", () => {

@@ -59,6 +59,90 @@ function calculateSystemDisbursement(balanceInitialValue, priceValue, feePercent
   };
 }
 
+/** Calculate a user-requested individual disbursement from a gross XTU amount. */
+function calculateIndividualDisbursement(grossAmountXtuValue, availableInitialAssetValue, priceValue, feePercent) {
+  const grossXtu = finitePositive(grossAmountXtuValue, "requested gross XTU amount");
+  const availableInitialAsset = finitePositive(availableInitialAssetValue, "users_stock.balance");
+  const price = finitePositive(priceValue, "common.unit_price");
+  const fee = new BigNumber(feePercent);
+  if (!fee.isFinite() || fee.isNegative() || !fee.isLessThan(100)) {
+    throw new RangeError("FEES must be greater than or equal to 0 and less than 100");
+  }
+  const grossInitialAsset = grossXtu.dividedBy(price);
+  if (grossInitialAsset.isGreaterThan(availableInitialAsset)) {
+    throw new RangeError("The requested gross XTU amount exceeds the user's available initial-asset balance");
+  }
+  const feeInitialAsset = grossInitialAsset.multipliedBy(fee).dividedBy(100);
+  const soldInitialAsset = grossInitialAsset.minus(feeInitialAsset);
+  const feeAmount = grossXtu.multipliedBy(fee).dividedBy(100);
+  const payoutAmount = soldInitialAsset.multipliedBy(price)
+    .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
+  const amountRawDecimal = payoutAmount.shiftedBy(TOKEN_DECIMALS);
+  if (
+    !grossInitialAsset.isFinite() || !grossInitialAsset.isGreaterThan(0) ||
+    !feeInitialAsset.isFinite() || feeInitialAsset.isNegative() ||
+    !soldInitialAsset.isFinite() || !soldInitialAsset.isGreaterThan(0) ||
+    !feeAmount.isFinite() || feeAmount.isNegative() ||
+    !payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0) ||
+    !amountRawDecimal.isInteger()
+  ) throw new RangeError("The calculated individual disbursement amount is invalid");
+
+  return {
+    grossAmountXtu: grossXtu,
+    grossInitialAsset,
+    grossBalance: grossXtu,
+    priceValue: price,
+    payoutAmount,
+    soldInitialAsset,
+    feeAmount,
+    feeInitialAsset,
+    amountRaw: amountRawDecimal.toFixed(0),
+  };
+}
+
+/** Ensure the frozen global liquidation liability leaves a positive XTU backing value. */
+function validateGlobalDisbursementCapacity(totalUnitsPriceValue, snapshotPriceValue, totalInitialAssetValue) {
+  const totalUnitsPrice = finitePositive(totalUnitsPriceValue, "common.total_units_price");
+  const snapshotPrice = finitePositive(snapshotPriceValue, "global snapshot unit price");
+  const totalInitialAsset = new BigNumber(totalInitialAssetValue);
+  if (!totalInitialAsset.isFinite() || totalInitialAsset.isNegative()) {
+    throw new RangeError("Global liquidation initial-asset total must be finite and non-negative");
+  }
+  const grossLiability = totalInitialAsset.multipliedBy(snapshotPrice);
+  const remainingValue = totalUnitsPrice.minus(grossLiability);
+  return {
+    available: remainingValue.isGreaterThan(0),
+    grossLiability,
+    remainingValue,
+  };
+}
+
+/** Global liquidation is fee-free; the caller subtracts the captured BSC gas estimate. */
+function calculateGlobalDisbursement(balanceInitialAssetValue, priceValue, gasRecoveryValue = 0) {
+  const grossInitialAsset = finitePositive(balanceInitialAssetValue, "users_stock.balance");
+  const price = finitePositive(priceValue, "common.unit_price");
+  const gasRecovery = new BigNumber(gasRecoveryValue);
+  if (!gasRecovery.isFinite() || gasRecovery.isNegative()) {
+    throw new RangeError("BSC fee recovery must be finite and non-negative");
+  }
+  const grossAmount = grossInitialAsset.multipliedBy(price);
+  const payoutAmount = grossAmount.minus(gasRecovery).decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
+  if (!payoutAmount.isGreaterThan(0)) throw new RangeError("Global disbursement is not sufficient to cover its BSC gas fee");
+  const amountRawDecimal = payoutAmount.shiftedBy(TOKEN_DECIMALS);
+  if (!amountRawDecimal.isInteger()) throw new RangeError("Global disbursement raw amount is invalid");
+  return {
+    grossInitialAsset,
+    grossBalance: grossAmount,
+    priceValue: price,
+    payoutAmount,
+    soldInitialAsset: grossInitialAsset,
+    feeAmount: new BigNumber(0),
+    feeInitialAsset: new BigNumber(0),
+    bscFeeRecoveredUsd: gasRecovery,
+    amountRaw: amountRawDecimal.toFixed(0),
+  };
+}
+
 function calculateDisbursementReserveSettlement(
   totalUnitsPriceValue,
   backedUnitsValue,
@@ -104,6 +188,9 @@ module.exports = {
   DISBURSEMENT_TOLERANCE,
   DISBURSEMENT_COOLDOWN_MS,
   calculateSystemDisbursement,
+  calculateIndividualDisbursement,
+  validateGlobalDisbursementCapacity,
+  calculateGlobalDisbursement,
   calculateDisbursementReserveSettlement,
   isRequestedPayoutWithinTolerance,
 };

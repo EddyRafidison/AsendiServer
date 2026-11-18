@@ -261,6 +261,116 @@ function calculateTopUpReserveAllocation(
   };
 }
 
+/**
+ * Allocate a recharge in the required funding order:
+ * inactive OneX reserve, active seller lots, then distributable backed assets.
+ * `pendingDisbursementInitialAssetValue` is a system-reserve reservation and
+ * must remain available after this recharge. Seller lots are tracked
+ * separately and are therefore not included in that reservation pool.
+ */
+function calculateRechargeFundingAllocation(
+  requestedInitialAssetValue,
+  unitPriceValue,
+  backedValue,
+  inactiveValue,
+  sellersReserveValue,
+  totalUnitsPriceValue,
+  protectedFloorValue = 0,
+  pendingDisbursementInitialAssetValue = 0,
+) {
+  const requested = asBigNumber(requestedInitialAssetValue, "recharge initial-asset amount");
+  const unitPrice = asBigNumber(unitPriceValue, "common.unit_price");
+  const backed = asBigNumber(backedValue, "common.backed_units");
+  const inactive = asBigNumber(inactiveValue, "common.inactive_init_asset");
+  const sellers = asBigNumber(sellersReserveValue, "common.sellers_res");
+  const total = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
+  const protectedFloor = asBigNumber(protectedFloorValue, "remaining administrative reserve");
+  const pending = asBigNumber(pendingDisbursementInitialAssetValue, "pending disbursement initial assets");
+
+  if (!requested.isGreaterThan(0)) throw new RangeError("Recharge initial-asset amount must be positive");
+  if (!unitPrice.isGreaterThan(0)) throw new RangeError("common.unit_price must be positive");
+  if (!total.isGreaterThan(0)) throw new RangeError("common.total_units_price must be positive");
+  if ([backed, inactive, sellers, protectedFloor, pending].some((value) => value.isNegative())) {
+    throw new RangeError("Recharge reserve amounts cannot be negative");
+  }
+  if (backed.isLessThan(protectedFloor)) {
+    throw new RangeError("common.backed_units is below the remaining administrative reserve quota");
+  }
+
+  const currentPrice = calculateGlobalUnitPrice(total, backed);
+  if (currentPrice.minus(unitPrice).abs().gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price is inconsistent with total_units_price / backed_units");
+  }
+
+  const distributableBacked = backed.minus(protectedFloor);
+  const availableSystemReserves = inactive.plus(distributableBacked);
+  const availableAfterPending = availableSystemReserves.minus(pending);
+
+  const consumedInactive = BigNumber.minimum(requested, inactive);
+  const afterInactive = requested.minus(consumedInactive);
+  const consumedSellers = BigNumber.minimum(afterInactive, sellers);
+  const afterSellers = afterInactive.minus(consumedSellers);
+  const consumedBacked = afterSellers;
+  const systemInitialAsset = consumedInactive.plus(consumedBacked);
+  const sellerInitialAsset = consumedSellers;
+
+  const available =
+    (systemInitialAsset.isZero() || availableAfterPending.isGreaterThanOrEqualTo(systemInitialAsset)) &&
+    consumedBacked.isLessThanOrEqualTo(distributableBacked);
+
+  if (!available) {
+    return {
+      available: false,
+      requestedInitialAsset: requested,
+      availableSystemReserves,
+      availableAfterPending,
+      distributableBacked,
+      consumedInactive: new BigNumber(0),
+      consumedSellers: new BigNumber(0),
+      consumedBacked: new BigNumber(0),
+      systemInitialAsset: new BigNumber(0),
+      sellerInitialAsset: new BigNumber(0),
+      newInactive: inactive,
+      newSellersReserve: sellers,
+      newBacked: backed,
+      newTotalUnitsPrice: total,
+      newUnitPrice: unitPrice,
+    };
+  }
+
+  const systemAmountXtu = systemInitialAsset.multipliedBy(unitPrice);
+  const newInactive = inactive.minus(consumedInactive);
+  const newSellersReserve = sellers.minus(consumedSellers);
+  const newBacked = backed.minus(consumedBacked);
+  const newTotalUnitsPrice = total.plus(systemAmountXtu);
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBacked);
+
+  if (newBacked.isLessThan(protectedFloor) || newInactive.isNegative() || newSellersReserve.isNegative()) {
+    throw new RangeError("Recharge allocation would breach a protected reserve");
+  }
+
+  return {
+    available: true,
+    requestedInitialAsset: requested,
+    availableSystemReserves,
+    availableAfterPending,
+    distributableBacked,
+    consumedInactive,
+    consumedSellers,
+    consumedBacked,
+    systemInitialAsset,
+    sellerInitialAsset,
+    systemAmountXtu,
+    sellerAmountXtu: sellerInitialAsset.multipliedBy(unitPrice),
+    newInactive,
+    newSellersReserve,
+    newBacked,
+    newTotalUnitsPrice,
+    newUnitPrice,
+    usedBackedAssets: consumedBacked.isGreaterThan(0),
+  };
+}
+
 module.exports = {
   calculateGlobalUnitPrice,
   xtuToInitialAsset,
@@ -270,4 +380,5 @@ module.exports = {
   calculateDistributableInitialAssets,
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,
+  calculateRechargeFundingAllocation,
 };

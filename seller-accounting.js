@@ -7,11 +7,9 @@ const { queueTelegramMessageTx } = require("./telegram");
 
 // The public minimum is expressed in XTU. Stored campaign and reserve amounts
 // are initial assets and are converted using the global price at campaign entry.
-const SELLER_MIN_RUN_BALANCE = new BigNumber("12");
+const SELLER_MIN_RUN_BALANCE = new BigNumber("10");
 const SELLER_LOCK_RATIO = new BigNumber("0.5");
-const SELLER_BONUS_RATIO = new BigNumber("0.1");
 const SELLER_STATUS_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
-const SELLER_BONUS_GRACE_MS = 24 * 60 * 60 * 1000;
 const SELLER_PAYOUT_BATCH_LIMIT = new BigNumber("300"); // BSC-USD gross payout value.
 const DB_ASSET_DECIMALS = 30;
 const TOKEN_DECIMALS = 18;
@@ -28,32 +26,22 @@ function finitePositive(value, fieldName) {
   return number;
 }
 
-function validateSellerJoin(balanceInitialValue, runBalanceInitialValue, pendingBonusInitialValue, unitPriceValue) {
+function validateSellerJoin(balanceInitialValue, unitPriceValue, thresholdReached) {
   const balanceInitial = finiteNonNegative(balanceInitialValue, "users_stock.balance");
-  const runBalanceInitial = finiteNonNegative(runBalanceInitialValue, "users_stock.run_balance");
-  const pendingBonusInitial = finiteNonNegative(pendingBonusInitialValue, "users_stock.pending_bonus");
   const unitPrice = finitePositive(unitPriceValue, "common.unit_price");
+  if (thresholdReached !== true) return { eligible: false, reason: "price_threshold_not_reached" };
   const balanceXtu = balanceInitial.multipliedBy(unitPrice);
-  const runBalanceXtu = runBalanceInitial.multipliedBy(unitPrice);
-
-  if (!balanceXtu.isGreaterThan(SELLER_MIN_RUN_BALANCE)) return { eligible: false, reason: "balance_too_low" };
-  if (!runBalanceXtu.isGreaterThanOrEqualTo(SELLER_MIN_RUN_BALANCE)) return { eligible: false, reason: "run_balance_too_low" };
-  if (runBalanceInitial.isLessThan(balanceInitial.multipliedBy(SELLER_LOCK_RATIO))) {
-    return { eligible: false, reason: "run_balance_below_half_balance" };
+  if (balanceXtu.isLessThan(SELLER_MIN_RUN_BALANCE)) {
+    return { eligible: false, reason: "balance_too_low", minimumBalanceXtu: SELLER_MIN_RUN_BALANCE };
   }
-  if (runBalanceInitial.isGreaterThan(balanceInitial)) return { eligible: false, reason: "run_balance_exceeds_balance" };
-
-  const requiredBonus = runBalanceInitial.multipliedBy(SELLER_BONUS_RATIO);
-  if (pendingBonusInitial.isLessThan(requiredBonus)) {
-    return { eligible: false, reason: "pending_bonus_below_threshold", requiredBonus };
-  }
-  const reservedInitialAsset = runBalanceInitial.multipliedBy(SELLER_LOCK_RATIO);
+  const runBalanceInitial = balanceInitial;
+  const reservedInitialAsset = balanceInitial.multipliedBy(SELLER_LOCK_RATIO);
   return {
     eligible: true,
     runBalanceInitial,
-    runBalanceXtu,
+    runBalanceXtu: balanceXtu,
     reservedInitialAsset,
-    requiredBonus,
+    balanceXtu,
     unitPrice,
   };
 }
@@ -65,14 +53,17 @@ function sumActiveSellerReserveLots(lots) {
   );
 }
 
-async function getActiveSellerReserveAvailableTx(tx) {
+async function getActiveSellerReserveAvailableTx(tx, excludedUsername = null) {
+  const exclude = typeof excludedUsername === "string" && excludedUsername.length > 0;
   const [rows] = await tx.query(
     `SELECT l.id,l.remaining_initial_asset
      FROM users_seller_reserve_lots l
      JOIN users_seller_campaigns c ON c.id=l.campaign_id
      WHERE l.status='active' AND c.status='active' AND l.remaining_initial_asset>0
+       ${exclude ? "AND l.username<>?" : ""}
      ORDER BY l.activated_at_ms ASC,l.id ASC
      FOR UPDATE`,
+    exclude ? [excludedUsername] : [],
   );
   return sumActiveSellerReserveLots(rows);
 }
@@ -119,7 +110,7 @@ function calculateSellerPayoutNet(grossValue, gasFeeValue) {
   return { grossAmount: gross, gasFee, payoutAmount: net };
 }
 
-async function consumeSellerReserveTx(tx, requestedInitialAssetValue, reference, date, time) {
+async function consumeSellerReserveTx(tx, requestedInitialAssetValue, reference, date, time, excludedUsername = null) {
   const requestedInitialAsset = finiteNonNegative(requestedInitialAssetValue, "seller reserve consumption");
   if (requestedInitialAsset.isZero()) {
     return { consumedInitialAsset: new BigNumber(0), allocations: [] };
@@ -131,8 +122,10 @@ async function consumeSellerReserveTx(tx, requestedInitialAssetValue, reference,
      FROM users_seller_reserve_lots l
      JOIN users_seller_campaigns c ON c.id=l.campaign_id
      WHERE l.status='active' AND c.status='active' AND l.remaining_initial_asset>0
+       AND (? IS NULL OR l.username<>?)
      ORDER BY l.activated_at_ms ASC,l.id ASC
      FOR UPDATE`,
+    [excludedUsername, excludedUsername],
   );
   const allocation = allocateSellerLotConsumption(lotRows, requestedInitialAsset);
   if (!allocation.available) {
@@ -393,9 +386,7 @@ async function closeExpiredSellerCampaignsTx(tx, nowMs = Date.now()) {
 module.exports = {
   SELLER_MIN_RUN_BALANCE,
   SELLER_LOCK_RATIO,
-  SELLER_BONUS_RATIO,
   SELLER_STATUS_DURATION_MS,
-  SELLER_BONUS_GRACE_MS,
   SELLER_PAYOUT_BATCH_LIMIT,
   validateSellerJoin,
   allocateSellerLotConsumption,

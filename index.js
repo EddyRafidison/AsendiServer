@@ -8,6 +8,7 @@ const routes = require("./routes");
 const { initDbIfEmpty, cleanup, PORT_SERVER } = require("./db");
 const { createHttpRateLimiter } = require("./http-rate-limiter");
 const { startSellerLifecycleWorker } = require("./seller-worker");
+const { startPriceWorker } = require("./price-worker");
 
 function boundedIntegerEnv(name, fallback, minimum, maximum) {
   const raw = process.env[name];
@@ -93,6 +94,7 @@ async function startServer() {
   try {
     await initDbIfEmpty();
     startSellerLifecycleWorker();
+    startPriceWorker(require("./db").db);
     await routes.initializeRechargePayments();
   } catch (error) {
     console.error("Server initialization failed. Server startup aborted:", error);

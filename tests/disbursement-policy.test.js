@@ -4,6 +4,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   calculateSystemDisbursement,
+  calculateIndividualDisbursement,
+  validateGlobalDisbursementCapacity,
+  calculateGlobalDisbursement,
   calculateDisbursementReserveSettlement,
   isRequestedPayoutWithinTolerance,
 } = require("../disbursement-policy");
@@ -56,4 +59,43 @@ test("rejects invalid fee percentages and invalid request balances or prices", (
   assert.throws(() => calculateSystemDisbursement("300", "1.25", 100), /FEES/);
   assert.throws(() => calculateSystemDisbursement("0", "1.25", 3), /balance/);
   assert.throws(() => calculateSystemDisbursement("300", "0", 3), /unit_price/);
+});
+
+
+test("individual disbursement applies tfees to a gross XTU request at the frozen price", () => {
+  const result = calculateIndividualDisbursement("200", "250", "1.25", 3);
+  assert.equal(fixed(result.grossInitialAsset), "160");
+  assert.equal(fixed(result.feeInitialAsset), "4.8");
+  assert.equal(fixed(result.soldInitialAsset), "155.2");
+  assert.equal(fixed(result.feeAmount), "6");
+  assert.equal(fixed(result.payoutAmount), "194");
+  assert.equal(result.amountRaw, "194000000000000000000");
+});
+
+test("global disbursement deducts only captured BSC gas recovery and never tfees", () => {
+  const result = calculateGlobalDisbursement("100", "1.2", "0.03");
+  assert.equal(fixed(result.grossBalance), "120");
+  assert.equal(fixed(result.soldInitialAsset), "100");
+  assert.equal(fixed(result.feeInitialAsset), "0");
+  assert.equal(fixed(result.feeAmount), "0");
+  assert.equal(fixed(result.bscFeeRecoveredUsd), "0.03");
+  assert.equal(fixed(result.payoutAmount), "119.97");
+  assert.equal(result.amountRaw, "119970000000000000000");
+  assert.throws(() => calculateGlobalDisbursement("0.01", "1", "0.02"), /gas fee/);
+});
+
+
+test("global liquidation preflight rejects liabilities that exhaust the frozen stock value", () => {
+  const safe = validateGlobalDisbursementCapacity("1000", "1.25", "700");
+  assert.equal(safe.available, true);
+  assert.equal(fixed(safe.grossLiability), "875");
+  assert.equal(fixed(safe.remainingValue), "125");
+
+  const exhausted = validateGlobalDisbursementCapacity("875", "1.25", "700");
+  assert.equal(exhausted.available, false);
+  assert.equal(fixed(exhausted.remainingValue), "0");
+
+  const exceeded = validateGlobalDisbursementCapacity("874", "1.25", "700");
+  assert.equal(exceeded.available, false);
+  assert.equal(fixed(exceeded.remainingValue), "-1");
 });

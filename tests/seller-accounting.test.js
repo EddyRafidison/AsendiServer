@@ -14,16 +14,14 @@ const {
 
 const fixed = (value) => value.toFixed();
 
-test("seller campaign input is converted using the single global price", () => {
-  const valid = validateSellerJoin("100", "50", "5", "2");
+test("seller activation requires a reached individual threshold and at least 10 XTU", () => {
+  const valid = validateSellerJoin("100", "2", true);
   assert.equal(valid.eligible, true);
-  assert.equal(fixed(valid.runBalanceInitial), "50");
-  assert.equal(fixed(valid.runBalanceXtu), "100");
-  assert.equal(fixed(valid.reservedInitialAsset), "25");
-  assert.equal(fixed(valid.requiredBonus), "5");
-  assert.equal(validateSellerJoin("6", "3", "1", "2").eligible, false);
-  assert.equal(validateSellerJoin("100", "40", "10", "2").reason, "run_balance_below_half_balance");
-  assert.equal(validateSellerJoin("100", "50", "4.99", "2").reason, "pending_bonus_below_threshold");
+  assert.equal(fixed(valid.runBalanceInitial), "100");
+  assert.equal(fixed(valid.runBalanceXtu), "200");
+  assert.equal(fixed(valid.reservedInitialAsset), "50");
+  assert.equal(validateSellerJoin("100", "2", false).reason, "price_threshold_not_reached");
+  assert.equal(validateSellerJoin("4", "2", true).reason, "balance_too_low");
 });
 
 test("only active seller lots contribute to the available seller reserve in initial assets", () => {
@@ -57,7 +55,7 @@ test("seller reserve allocation reports insufficiency without inventing initial 
   assert.equal(fixed(result.remainingInitialAsset), "2");
 });
 
-test("seller payout gross is permanently valued at the price locked at campaign request", () => {
+test("seller payout gross is permanently valued at the price locked at campaign activation", () => {
   assert.equal(fixed(calculateSellerPayoutGrossAtLockedPrice("100", "1.25")), "125");
   assert.equal(fixed(calculateSellerPayoutGrossAtLockedPrice("100", "1.25")), "125");
   assert.notEqual(fixed(calculateSellerPayoutGrossAtLockedPrice("100", "1.8")), "125");

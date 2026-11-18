@@ -60,6 +60,17 @@ async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
     `INSERT INTO common(${columns.map((column) => `\`${column}\``).join(",")}) VALUES(${placeholders})`,
     params,
   );
+
+  const previousPrice = new BigNumber(currentRow?.unit_price ?? values.unit_price);
+  const nextPrice = new BigNumber(values.unit_price);
+  if (previousPrice.isFinite() && nextPrice.isFinite() && !previousPrice.eq(nextPrice)) {
+    const now = String(Date.now());
+    await tx.query(
+      `INSERT INTO common_price_events(old_price,new_price,status,last_username,created_at_ms,updated_at_ms)
+       VALUES(?,?,'pending','',?,?)`,
+      [previousPrice.toFixed(30), nextPrice.toFixed(30), now, now],
+    );
+  }
   return values;
 }
 

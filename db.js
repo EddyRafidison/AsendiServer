@@ -15,8 +15,6 @@ const stock_limit = process.env.STOCK_LIMIT || "10000000";
 // 10,000,000 backed initial assets, giving an initial global price of 1.
 // Operators may override these values; the price is always derived from T / B.
 const initial_backed_units = process.env.INITIAL_BACKED_UNITS || stock_limit;
-const first_welcome_clients = process.env.FIRST_WELCOME_CLIENTS || "0";
-const welcome_bonus = process.env.WELCOME_BONUS || "0";
 const tfees = Number(process.env.FEES || 0);
 const admin_pswd = process.env.ADMIN_PSWD || "";
 const admin_pin = process.env.ADMIN_PIN || "";
@@ -102,7 +100,6 @@ const TABLES = [
     balance DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Initial-asset balance; public XTU is calculated using common.unit_price',
     seller_status TINYINT UNSIGNED NOT NULL DEFAULT 0,
     run_balance DECIMAL(50,30) NOT NULL DEFAULT 0,
-    pending_bonus DECIMAL(50,30) NOT NULL DEFAULT 0,
     seller_activated_at_ms BIGINT UNSIGNED NULL,
     seller_expires_at_ms BIGINT UNSIGNED NULL,
     seller_last_p2p_at_ms BIGINT UNSIGNED NULL,
@@ -146,13 +143,60 @@ const TABLES = [
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL
   ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS common_price_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    old_price DECIMAL(50,30) NOT NULL,
+    new_price DECIMAL(50,30) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    last_username VARCHAR(30) NOT NULL DEFAULT '',
+    processed_at_ms BIGINT UNSIGNED NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_common_price_events_status_id(status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS user_price_state(
+    username VARCHAR(30) PRIMARY KEY,
+    cycle_number INT UNSIGNED NOT NULL,
+    base_price DECIMAL(50,30) NOT NULL,
+    tfees_rate DECIMAL(20,10) NOT NULL,
+    target_price DECIMAL(50,30) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'watching',
+    start_price_event_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    triggered_price DECIMAL(50,30) NULL,
+    triggered_at_ms BIGINT UNSIGNED NULL,
+    trigger_balance_initial_asset DECIMAL(50,30) NULL,
+    required_sale_initial_asset DECIMAL(50,30) NULL,
+    sold_since_trigger_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_user_price_state_threshold(status,target_price,start_price_event_id,username)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS user_price_cycle_history(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(30) NOT NULL,
+    cycle_number INT UNSIGNED NOT NULL,
+    base_price DECIMAL(50,30) NOT NULL,
+    tfees_rate DECIMAL(20,10) NOT NULL,
+    target_price DECIMAL(50,30) NOT NULL,
+    start_price_event_id BIGINT UNSIGNED NOT NULL,
+    triggered_price DECIMAL(50,30) NULL,
+    triggered_at_ms BIGINT UNSIGNED NULL,
+    trigger_balance_initial_asset DECIMAL(50,30) NULL,
+    required_sale_initial_asset DECIMAL(50,30) NULL,
+    sold_since_trigger_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    resumed_at_ms BIGINT UNSIGNED NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_user_price_cycle(username,cycle_number),
+    KEY idx_user_price_history_trigger(username,triggered_at_ms)
+  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_seller_campaigns(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
     run_balance DECIMAL(50,30) NOT NULL COMMENT 'Initial assets; unit_price stores the frozen public valuation',
     reserved_initial_asset DECIMAL(50,30) NOT NULL,
     unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable global price captured when the seller submitted this campaign; not a live account price',
-    pending_bonus_snapshot DECIMAL(50,30) NOT NULL,
+    price_cycle_number INT UNSIGNED NOT NULL,
     sold_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     status VARCHAR(24) NOT NULL DEFAULT 'active',
     activated_at_ms BIGINT UNSIGNED NOT NULL,
@@ -161,6 +205,7 @@ const TABLES = [
     closed_at_ms BIGINT UNSIGNED NULL,
     close_reason VARCHAR(32) NULL,
     KEY idx_seller_campaign_user_status(username,status,id),
+    UNIQUE KEY uq_seller_campaign_user_cycle(username,price_cycle_number),
     KEY idx_seller_campaign_expiry(status,expires_at_ms,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_seller_reserve_lots(
@@ -398,6 +443,10 @@ const TABLES = [
     fee_amount DECIMAL(36,18) NOT NULL COMMENT 'BSC-USD fee value locked at submission',
     fee_initial_asset DECIMAL(50,30) NOT NULL,
     price_value DECIMAL(50,30) NOT NULL COMMENT 'Immutable common.unit_price captured at user request submission',
+    disbursement_mode VARCHAR(16) NOT NULL DEFAULT 'individual',
+    global_run_id BIGINT UNSIGNED NULL,
+    balance_after_reservation DECIMAL(50,30) NOT NULL DEFAULT 0,
+    bsc_fee_recovered_usd DECIMAL(36,18) NOT NULL DEFAULT 0,
     estimated_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
     estimated_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
     actual_fee_bnb DECIMAL(50,30) NULL,
@@ -418,6 +467,27 @@ const TABLES = [
     KEY idx_usdt_disbursement_user_success(username,status,confirmed_at_ms),
     KEY idx_usdt_disbursement_status(status,id),
     KEY idx_usdt_disbursement_reservation(status,reservation_expires_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS global_disbursement_runs(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    status VARCHAR(24) NOT NULL DEFAULT 'queued',
+    trigger_reason TEXT NOT NULL,
+    decision_reference VARCHAR(128) NOT NULL,
+    snapshot_unit_price DECIMAL(50,30) NOT NULL,
+    snapshot_total_units_price DECIMAL(50,30) NOT NULL,
+    planned_total_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    last_user_stock_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    max_user_stock_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    total_users BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    processed_users BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    total_gross_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_paid_bsc_usd DECIMAL(50,18) NOT NULL DEFAULT 0,
+    last_error TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    completed_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_global_disbursement_decision(decision_reference),
+    KEY idx_global_disbursement_status(status,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_refunds(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -478,7 +548,7 @@ async function assertLatestSchema() {
       "tg_userId", "tg_chat_id", "record_date", "record_time",
     ],
     users_stock: [
-      "username", "balance", "seller_status", "run_balance", "pending_bonus",
+      "username", "balance", "seller_status", "run_balance",
       "seller_activated_at_ms", "seller_expires_at_ms", "seller_last_p2p_at_ms", "record_date", "record_time",
     ],
     activities: [
@@ -498,8 +568,11 @@ async function assertLatestSchema() {
       "sellers_res", "total_run_balance", "total_tfees", "total_bnb_fee_actual", "total_bnb_fee_estimated",
       "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "record_date", "record_time",
     ],
+    common_price_events: ["old_price", "new_price", "status", "last_username", "processed_at_ms", "created_at_ms", "updated_at_ms"],
+    user_price_state: ["username", "cycle_number", "base_price", "tfees_rate", "target_price", "status", "start_price_event_id", "triggered_price", "triggered_at_ms", "trigger_balance_initial_asset", "required_sale_initial_asset", "sold_since_trigger_initial_asset", "updated_at_ms", "created_at_ms"],
+    user_price_cycle_history: ["username", "cycle_number", "base_price", "tfees_rate", "target_price", "start_price_event_id", "triggered_price", "triggered_at_ms", "trigger_balance_initial_asset", "required_sale_initial_asset", "sold_since_trigger_initial_asset", "resumed_at_ms", "created_at_ms", "updated_at_ms"],
     users_seller_campaigns: [
-      "username", "run_balance", "reserved_initial_asset", "unit_price", "pending_bonus_snapshot",
+      "username", "run_balance", "reserved_initial_asset", "unit_price", "price_cycle_number",
       "sold_initial_asset", "status", "activated_at_ms", "expires_at_ms", "last_p2p_at_ms", "closed_at_ms", "close_reason",
     ],
     users_seller_reserve_lots: [
@@ -545,10 +618,12 @@ async function assertLatestSchema() {
     users_usdt_disbursements: [
       "username", "payout_address", "requested_amount", "payout_amount", "amount_raw",
       "gross_initial_asset", "sold_initial_asset", "fee_amount", "fee_initial_asset",
-      "price_value", "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd",
+      "price_value", "disbursement_mode", "global_run_id", "balance_after_reservation", "bsc_fee_recovered_usd",
+      "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd",
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number",
       "last_error", "created_at_ms", "reservation_expires_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
+    global_disbursement_runs: ["status", "trigger_reason", "decision_reference", "snapshot_unit_price", "snapshot_total_units_price", "planned_total_initial_asset", "last_user_stock_id", "max_user_stock_id", "total_users", "processed_users", "total_gross_initial_asset", "total_paid_bsc_usd", "last_error", "created_at_ms", "updated_at_ms", "completed_at_ms"],
     users_usdt_refunds: [
       "username", "batch_id", "payout_address", "amount", "gross_amount", "fee_amount", "amount_raw",
       "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd", "bnb_usd_price",
@@ -710,8 +785,6 @@ module.exports = {
   P2Pallowed,
   stock_limit,
   initial_backed_units,
-  first_welcome_clients,
-  welcome_bonus,
   tfees,
   admin_pswd,
   admin_pin,
