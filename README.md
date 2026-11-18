@@ -125,6 +125,18 @@ Refunds charge no `tfees`; only configured recovery of OneX-paid BSC gas is dedu
 
 This is a target schema for a first deployment, not an automatic migration. Create a new empty MySQL database. Old `users_stock.init_asset` and `common.sellers_init_asset` fields are not part of the target schema. Do not attempt to reuse old balance snapshots without a separately designed, audited migration. All amounts must be converted from their historical unit according to each table's old schema and historical transaction price before any data migration.
 
+## International signup and identity documents
+
+`POST /app/signup` is available to eligible adults regardless of the country from which they register, subject to applicable local law. The IP country lookup is diagnostic only: it does not determine nationality or residence country, select the required identity document, or approve or reject signup.
+
+The signup request must include both `nationality` and `residenceCountry` as ISO 3166-1 alpha-2 country codes. The identity-document rule is based on these two declared values:
+
+- If `nationality` and `residenceCountry` are the same, submit a national identity card issued by that country where available. A passport is also accepted where the country does not issue a national identity card or the applicant uses a passport as their identity document.
+- If `nationality` and `residenceCountry` differ, the applicant is treated as a foreign resident and must submit a valid passport.
+
+This rule applies to all countries; CNI is not a Madagascar-only document category. The canonical `identityType` values are `NATIONAL_ID` and `PASSPORT`. The legacy API value `CNI` is normalized to `NATIONAL_ID`. If `identityType` is omitted, the server defaults to `NATIONAL_ID` for a national resident and `PASSPORT` for a foreign resident. Submit the document number through `identityNumber` and the required document image through `identityImage1`; `identityImage2` is optional for additional document details. Each image is limited to 3 MiB after base64 decoding. Former request keys `cni`, `cniimg1` and `cniimg2` remain accepted as API compatibility aliases only; database storage uses the generic `identity_document_number` column.
+
+The fresh `auths` table stores `nationality`, `residence_country`, `identity_document_type` and the encrypted `identity_document_number` as required fields. Create the database from the current `db.js` schema before starting the server. This pre-deployment project uses a fresh-schema approach and intentionally contains no SQL migration or legacy-data backfill for these fields.
 ## Optional Telegram notifications
 
 - Telegram is optional. Users can sign in and use financial features without linking a bot account. Transactional notifications are sent through Telegram only when both `tg_userId` and `tg_chat_id` are linked.

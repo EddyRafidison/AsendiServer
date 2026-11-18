@@ -79,7 +79,10 @@ const TABLES = [
     name VARCHAR(50) NOT NULL,
     email VARCHAR(254) NOT NULL,
     birthdate VARCHAR(20) NOT NULL,
-    cni VARCHAR(255) NOT NULL,
+    nationality CHAR(2) NOT NULL COMMENT 'Declared nationality using ISO 3166-1 alpha-2',
+    residence_country CHAR(2) NOT NULL COMMENT 'Declared country of residence using ISO 3166-1 alpha-2',
+    identity_document_type ENUM('NATIONAL_ID','PASSPORT') NOT NULL COMMENT 'National identity card or passport; foreign residents must use passport',
+    identity_document_number VARCHAR(255) NOT NULL COMMENT 'Encrypted national ID card or passport number',
     address VARCHAR(100) NOT NULL,
     seed TEXT NOT NULL,
     status INT NOT NULL DEFAULT 1,
@@ -539,11 +542,11 @@ const TABLES = [
 ];
 
 async function assertLatestSchema() {
-  // This project is not deployed yet. Do not ALTER or backfill legacy tables:
+  // This pre-deployment project uses a fresh schema. Do not ALTER or backfill legacy tables;
   // fail fast unless the database was created from the current schema below.
   const requiredColumns = {
     auths: [
-      "username", "password", "name", "email", "birthdate", "cni", "address",
+      "username", "password", "name", "email", "birthdate", "nationality", "residence_country", "identity_document_type", "identity_document_number", "address",
       "seed", "status", "consec_failed_auth", "password_temp_expires_at_ms",
       "tg_userId", "tg_chat_id", "record_date", "record_time",
     ],

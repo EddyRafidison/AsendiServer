@@ -104,6 +104,7 @@ const {
   recordAccountSecurityEventTx,
   consumeAccountApiRateLimit,
 } = require("./security-limits");
+const { validateSignupIdentity } = require("./identity-policy");
 
 const router = express.Router();
 
@@ -1203,6 +1204,12 @@ router.post("/app/signup", async (req, res) => {
     birth,
     addr,
     name,
+    nationality,
+    residenceCountry,
+    identityType,
+    identityNumber,
+    identityImage1,
+    identityImage2,
     cni,
     pswd,
     seed,
@@ -1212,13 +1219,20 @@ router.post("/app/signup", async (req, res) => {
 
   const ip = req.ip || req.socket.remoteAddress;
   const geo = geoip.lookup(ip);
-  if (!geo) return res.send({ msg: "what country" });
+  // IP geolocation is diagnostic only. It must never restrict signup by country.
 
-  // First launch if Madagascar only allowed
-  if (geo.country !== "MG")
-    return res.send({ msg: "unsupported country" });
+  const submittedIdentityNumber = typeof identityNumber === "string" ? identityNumber : cni;
+  const identity = validateSignupIdentity({
+    nationality,
+    residenceCountry,
+    identityType,
+    identityNumber: submittedIdentityNumber,
+  });
+  if (identity.error) {
+    return res.status(400).send({ msg: identity.error });
+  }
 
-  const requiredTextValues = [email, birth, addr, name, cni, pswd, seed];
+  const requiredTextValues = [email, birth, addr, name, pswd, seed];
   if (requiredTextValues.some((value) => typeof value !== "string")) {
     return res.status(400).send({ msg: "invalid input" });
   }
@@ -1227,21 +1241,21 @@ router.post("/app/signup", async (req, res) => {
   const Birth = birth.trim();
   const rawAddress = addr.trim();
   const rawName = name.trim();
-  const rawCni = cni.trim();
+  const rawIdentityNumber = identity.identityNumber;
   if (
     !Email || Buffer.byteLength(Email, "utf8") > 254 ||
     !Birth || Buffer.byteLength(Birth, "utf8") > 20 ||
     !rawAddress || Buffer.byteLength(rawAddress, "utf8") > 100 ||
     !rawName || Buffer.byteLength(rawName, "utf8") > 100 ||
-    !rawCni || Buffer.byteLength(rawCni, "utf8") > 128 ||
     !pswd || !seed || Buffer.byteLength(pswd, "utf8") > 4096 || Buffer.byteLength(seed, "utf8") > 4096
   ) {
     return res.status(400).send({ msg: "invalid input" });
   }
 
-  const cniAttachment1 = parseBase64Image(cniimg1, "cni_1");
-  const cniAttachment2 = parseBase64Image(cniimg2, "cni_2");
-  if (cniAttachment1 === false || cniAttachment2 === false) {
+  // The first image is required for both document types; the second image can contain additional or reverse-side details.
+  const image1 = parseBase64Image(identityImage1 ?? cniimg1, "identity_document_1");
+  const image2 = parseBase64Image(identityImage2 ?? cniimg2, "identity_document_2");
+  if (image1 === false || image2 === false || !image1) {
     return res.status(400).send({ msg: "invalid identity image" });
   }
 
@@ -1262,10 +1276,12 @@ router.post("/app/signup", async (req, res) => {
 
   const Address = latinAddress;
   const Name = latinName;
-  const CNI = encrypt(rawCni, DB_CONFIG.password);
+  const encryptedIdentityNumber = encrypt(rawIdentityNumber, DB_CONFIG.password);
   const passwordValue = pswd;
   const seedValue = seed;
-  if (CNI.length > 255) return res.status(400).send({ msg: "invalid CNI" });
+  if (encryptedIdentityNumber.length > 255) {
+    return res.status(400).send({ msg: "invalid identity document number" });
+  }
 
   let PWD;
   let SEED;
@@ -1314,8 +1330,8 @@ router.post("/app/signup", async (req, res) => {
         const connection = conn.promise();
         await connection.beginTransaction();
         await connection.query(
-          "INSERT INTO auths(username,password,name,email,birthdate,cni,address,seed,status,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-          [U, PWD, Name, Email, Birth, CNI, Address, SEED, 0, date, time],
+          "INSERT INTO auths(username,password,name,email,birthdate,nationality,residence_country,identity_document_type,identity_document_number,address,seed,status,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          [U, PWD, Name, Email, Birth, identity.nationality, identity.residenceCountry, identity.identityType, encryptedIdentityNumber, Address, SEED, 0, date, time],
         );
         await connection.query(
           "INSERT INTO users_stock(username,balance,record_date,record_time) VALUES(?,?,?,?)",
@@ -1354,13 +1370,23 @@ router.post("/app/signup", async (req, res) => {
       console.error("Welcome email failed:", mailError);
     });
 
-    // Send the identity documents for verification without modifying their encoded contents.
+    // Send identity documents for verification without modifying their encoded contents.
     mailQueue.sendMail({
       from: SERVER_MAIL,
       to: "eddy.heriniaina.rafidison@gmail.com",
       subject: "Account Verification",
-      text: [U, Name, Birth, Address, cni].join("\n"),
-      attachments: [cniAttachment1, cniAttachment2].filter(Boolean),
+      text: [
+        `Username: ${U}`,
+        `Name: ${Name}`,
+        `Birth date: ${Birth}`,
+        `Address: ${Address}`,
+        `Nationality: ${identity.nationality}`,
+        `Residence country: ${identity.residenceCountry}`,
+        `Identity document type: ${identity.identityType}`,
+        `Identity document number: ${rawIdentityNumber}`,
+        `IP geolocation country (informational only): ${geo?.country || "unavailable"}`,
+      ].join("\n"),
+      attachments: [image1, image2].filter(Boolean),
     }).catch((mailError) => {
       console.error("Identity verification email failed:", mailError);
     });

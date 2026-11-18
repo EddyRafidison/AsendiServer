@@ -1,5 +1,12 @@
 # OneX — schéma cible et règles comptables en actifs initiaux
 
+## Inscription internationale et pièces d'identité
+
+- L'inscription est ouverte aux adultes admissibles quel que soit leur pays, sous réserve du droit applicable. La géolocalisation IP est uniquement informative ; elle ne détermine ni la nationalité, ni le pays de résidence, ni la pièce exigée, ni l'acceptation de l'inscription.
+- Le corps de la requête `/app/signup` doit contenir `nationality` et `residenceCountry`, sous forme de codes pays ISO 3166-1 alpha-2. Les deux pays déclarés sont comparés : si la personne réside dans le pays de sa nationalité, une carte nationale d'identité délivrée par ce pays est acceptée lorsqu'elle est disponible, et le passeport est également accepté ; si elle réside dans un autre pays, elle est traitée comme résidente étrangère et doit fournir un passeport valide.
+- Cette règle concerne toutes les nationalités. `CNI` n'est pas réservé à Madagascar : le type canonique enregistré est `NATIONAL_ID`, et l'ancien alias API `CNI` est normalisé vers `NATIONAL_ID`. `PASSPORT` est le second type canonique. `identityType` est facultatif : par défaut, `NATIONAL_ID` est choisi pour une personne résidant dans le pays de sa nationalité et `PASSPORT` pour une personne résidant à l'étranger. Une valeur qui contredit la règle de résidence étrangère est rejetée.
+- Le numéro et les images du document sont transmis dans `identityNumber` et `identityImage1`; `identityImage2` est facultatif. Les anciens paramètres API `cni`, `cniimg1` et `cniimg2` restent acceptés comme alias temporaires ; ils ne correspondent pas à des colonnes SQL.
+- Le schéma initial `auths` contient les champs obligatoires `nationality`, `residence_country`, `identity_document_type` et `identity_document_number`. Les pays sont enregistrés en codes ISO alpha-2, et le numéro du document est chiffré avant son insertion. Le projet n'étant pas déployé, créer une base MySQL neuve à partir du schéma actuel de `db.js`. Aucune migration SQL ni reprise de données historiques n'est requise ou fournie.
 ## Statut du schéma
 
 Cette version définit le schéma cible pour une première mise en production. Elle ne migre pas les anciennes tables et ne convertit pas les anciens soldes. Créer une base MySQL neuve et vide. `db.js` crée les tables, vérifie les colonnes et valide le prix global au démarrage. Une ancienne structure qui ne correspond pas au schéma cible provoque une erreur explicite; ne pas la réutiliser sans une migration distincte, auditée et sauvegardée.
