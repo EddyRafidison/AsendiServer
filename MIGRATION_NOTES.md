@@ -206,3 +206,19 @@ Les utilisateurs doivent chacun présenter leur demande à `ONEX` via `/app/near
 Le bonus est financé par la réserve administrative protégée de 10 % des actifs initiaux. Le taux est figé à l'annonce, hérite de `FEES` s'il est absent ou vide et reste plafonné à 10 %. Les coûts BSC sont comptabilisés séparément du bonus et rapprochés avec les reçus de blockchain.
 
 `POST /admin/common-history` retourne au plus 50 snapshots `common` par appel, avec pagination par `before_id`, une liste fixe de colonnes et une authentification administrative par mot de passe et PIN.
+
+
+## Deposit-address availability guard
+
+`/app/user-last-stock` and `/app/recharge` return a deposit address only when the account can accept at least one minimum 10 BSC-USD recharge after the configured `FEES`/`tfees` deduction without exceeding the 300 XTU maximum. The check is performed under the shared `common_state` lock and uses a conservative projection of the post-recharge global price when current reserves can fund the minimum recharge. The actual recharge credit path remains authoritative and rechecks the projected balance inside its own transaction.
+
+As soon as a global disbursement is effective, these endpoints return no deposit address and mark recharge as unavailable. `/app/signin` itself does not issue deposit addresses; the post-login balance endpoint is `/app/user-last-stock`.
+
+
+## Recharge service control (fresh schema)
+
+The fresh database schema now creates `recharge_service_control` and `recharge_service_control_events`. The singleton control row starts unsuspended. No SQL migration is supplied; initialize a new database with the current schema.
+
+The administrator can suspend or resume recharge with `POST /admin/recharge/control`. A manual suspension hides (but does not delete or deactivate) users' deposit addresses, prevents new addresses from being assigned, and holds automatic batch credits for administrative review. The address is also hidden when the BSC payment provider is disabled or when the account cannot receive the minimum net recharge under the 300 XTU cap. Existing on-chain transfers remain traceable and are not silently discarded.
+
+`/app/user-last-stock` is the sole endpoint that returns `deposit_addr`. `/app/recharge` returns the public BEP-20 configuration and availability only; it must not create or return a deposit address.

@@ -65,6 +65,8 @@ Because numerator and denominator decrease proportionally, the price remains unc
 Each account has an individual BSC-USD deposit address. Finalized `Transfer` events are attributed by transaction hash and log index and grouped into 60-minute recharge sessions; a session can contain multiple transfers.
 
 - Automatic recharge session total must be at least **10 BSC-USD** and must not exceed **100 BSC-USD**. Out-of-range sessions are placed in `pending_support` rather than partially credited.
+- The deposit address is returned by `/app/user-last-stock` and `/app/recharge` only while the account can accept at least one minimum recharge after `tfees` without exceeding the 300 XTU account ceiling. At 3% `tfees`, a minimum 10 BSC-USD recharge produces 9.70 BSC-USD of net credit. The availability check uses the current account balance and a conservative post-recharge price projection; the actual credit transaction repeats the definitive maximum-balance check.
+- When an administrator activates a global disbursement, the deposit address is withheld (`deposit_addr: null`) and the recharge endpoints report `recharge_allowed: false`. The `/app/signin` endpoint itself does not return a deposit address; clients obtain account balance and deposit availability from `/app/user-last-stock`.
 - The 60-minute session limit is separate from the seven-day cooldown applied only when a recharge needs ONEX system-funded reserves. Seller-funded portions are exempt from that weekly ONEX funding cooldown.
 - The deposit-wallet sweep threshold is **100 BSC-USD**. Older finalized unswept deposits are swept after 30 days.
 - The user's resulting public balance must not exceed 300 XTU, measured using the global price after the financial update.
@@ -258,3 +260,18 @@ Email delivery is bounded by an in-process queue: at most 30 messages initiated 
 `POST /app/transactions-history` now enforces a maximum of 30 rolling days (the stored UTC activity timestamp is accurate to one second; the cutoff is rounded upward so no older second is included), regardless of a larger requested `days` value. It returns at most 100 rows per request (50 by default). The existing `trans` response property is preserved. When another page may exist, `next_before_id` contains the last returned activity ID; send it as `before_id` on the next request. The cursor prevents deep `OFFSET` scans and preserves descending ID order.
 
 The IP limiter is process-local. For a deployment with multiple Node.js instances, enforce the same or stricter IP limits at the shared reverse proxy/API gateway. Per-account quotas and the additional per-account request counters are MySQL-backed and therefore shared across instances.
+
+
+## Deposit-address visibility and manual recharge suspension
+
+`POST /app/user-last-stock` is the only application endpoint that returns the user's assigned deposit address. When recharge is unavailable (global disbursement, manual suspension, disabled BSC payment provider or insufficient capacity for the minimum net recharge), the endpoint returns `deposit_addr: null` but does not delete, deactivate or regenerate the stored deposit wallet. When recharge becomes available again, the same assigned address can be returned.
+
+`POST /app/recharge` returns only the BEP-20 payment configuration and recharge availability. It does not call `getOrCreateUserDepositAddress`, does not create a deposit wallet and never returns `deposit_addr`. `POST /app/recharge/status` remains the status endpoint for an incoming payment session.
+
+Administrators can manage a critical manual recharge suspension through `POST /admin/recharge/control` using the configured admin password and PIN:
+
+- `{ "action": "suspend", "reason": "..." }` hides addresses and stops automatic recharge credits. A reason of 5 to 1000 characters is required.
+- `{ "action": "resume", "reason": "..." }` restores normal recharge availability, subject to global-disbursement and account-capacity rules. A reason is required and recorded.
+- `{ "action": "status" }` reads the current control state.
+
+The control is persisted in `recharge_service_control`; changes are recorded in `recharge_service_control_events`. The admin command and recharge intake/credit paths serialize on `system_locks.common_state`. Incoming BSC-USD transfers during manual suspension are still recorded and swept into treasury custody, but their batches are held as `pending_support` with reason `manual_recharge_suspended`; they are not credited automatically. Automatic credits are also held if the payment provider is unavailable. Reviewed administrative batch-credit operations have an explicit override; public recharge flows do not. The reviewed admin credit/refund workflow remains available for manual resolution.

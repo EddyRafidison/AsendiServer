@@ -1,6 +1,7 @@
 "use strict";
 
 const BigNumber = require("bignumber.js");
+const { calculateGlobalUnitPrice, calculateRechargeFundingAllocation } = require("./stock-accounting");
 
 const MAX_DEFAULT_STOCK = "300";
 // Automatic deposit sessions are fixed to the published 10–100 BSC-USD range.
@@ -42,6 +43,104 @@ function validateRechargeAmount(amountValue) {
     return { allowed: false, reason: "above_maximum" };
   }
   return { allowed: true, reason: null, amount };
+}
+
+
+/**
+ * Determine whether the account can accept one minimum automatic recharge
+ * without exceeding its public XTU stock limit.
+ *
+ * The projected price uses a conservative assumption that the complete gross
+ * tfees may be consumed by eligible BSC gas. This is the highest post-recharge
+ * price produced by the current recharge accounting formula; actual retained
+ * tfees can only lower that projected price. Reserve availability is evaluated
+ * without pending payout reservations because this check is about the account
+ * stock ceiling, while payout reservations are still enforced by applyUserTopUp.
+ */
+function calculateMinimumRechargeCapacity({
+  currentBalanceInitialAsset,
+  totalUnitsPrice,
+  backedUnits,
+  inactiveInitialAsset,
+  availableSellerInitialAsset,
+  protectedAdminInitialAsset,
+  currentUnitPrice,
+  tfeesRate,
+  maximumUserXtu = MAX_DEFAULT_STOCK,
+}) {
+  const currentBalance = new BigNumber(currentBalanceInitialAsset);
+  const total = new BigNumber(totalUnitsPrice);
+  const backed = new BigNumber(backedUnits);
+  const inactive = new BigNumber(inactiveInitialAsset);
+  const sellers = new BigNumber(availableSellerInitialAsset || 0);
+  const protectedFloor = new BigNumber(protectedAdminInitialAsset || 0);
+  const price = new BigNumber(currentUnitPrice);
+  const feeRate = new BigNumber(tfeesRate);
+  const maximumXtu = new BigNumber(maximumUserXtu);
+
+  const values = [currentBalance, total, backed, inactive, sellers, protectedFloor, price, feeRate, maximumXtu];
+  if (values.some((value) => !value.isFinite())) {
+    throw new TypeError("Minimum-recharge capacity inputs must be finite");
+  }
+  if (
+    currentBalance.isNegative() || total.isLessThanOrEqualTo(0) || backed.isLessThanOrEqualTo(0) ||
+    inactive.isNegative() || sellers.isNegative() || protectedFloor.isNegative() ||
+    price.isLessThanOrEqualTo(0) || feeRate.isNegative() || feeRate.isGreaterThanOrEqualTo(100) ||
+    maximumXtu.isLessThanOrEqualTo(0)
+  ) {
+    throw new RangeError("Minimum-recharge capacity inputs are outside their valid ranges");
+  }
+
+  const calculatedPrice = calculateGlobalUnitPrice(total, backed);
+  if (calculatedPrice.minus(price).abs().gt("0.000000000000000000000000000001")) {
+    throw new RangeError("Current XTU price is inconsistent with common reserve values");
+  }
+
+  const feeAmount = MIN_RECHARGE_AMOUNT.multipliedBy(feeRate).dividedBy(100);
+  const minimumNetAmount = MIN_RECHARGE_AMOUNT.minus(feeAmount);
+  if (!minimumNetAmount.isGreaterThan(0)) {
+    throw new RangeError("The minimum recharge is fully consumed by tfees");
+  }
+  const requiredInitialAsset = minimumNetAmount.dividedBy(price);
+  const allocation = calculateRechargeFundingAllocation(
+    requiredInitialAsset,
+    price,
+    backed,
+    inactive,
+    sellers,
+    total,
+    protectedFloor,
+    0,
+  );
+
+  let projectedPrice = price;
+  let projectionMethod = "current_price_fallback";
+  if (allocation.available) {
+    // This models the highest price possible under the current fee policy:
+    // all tfees are consumed by BSC gas, so no fee value is added to reserves.
+    const projectedTotal = total.plus(allocation.systemInitialAsset.multipliedBy(price));
+    const projectedBacked = backed.minus(allocation.consumedBacked);
+    if (!projectedBacked.isGreaterThan(0)) {
+      throw new RangeError("The minimum recharge would exhaust common.backed_units");
+    }
+    projectedPrice = calculateGlobalUnitPrice(projectedTotal, projectedBacked);
+    projectionMethod = "conservative_post_recharge_price";
+  }
+
+  const projectedBalanceXtu = currentBalance.plus(requiredInitialAsset).multipliedBy(projectedPrice);
+  return {
+    allowed: projectedBalanceXtu.isLessThanOrEqualTo(maximumXtu),
+    minimumGrossAmount: new BigNumber(MIN_RECHARGE_AMOUNT),
+    minimumTfeesAmount: feeAmount,
+    minimumNetAmount,
+    requiredInitialAsset,
+    currentBalanceXtu: currentBalance.multipliedBy(price),
+    projectedBalanceXtu,
+    projectedUnitPrice: projectedPrice,
+    maximumUserXtu: maximumXtu,
+    reserveAllocationAvailable: allocation.available,
+    projectionMethod,
+  };
 }
 
 function recordDateTimeToUtcMs(recordDate, recordTime) {
@@ -129,4 +228,5 @@ module.exports = {
   formatUtcRecordDateTime,
   getWeeklyReleaseAt,
   validateRechargeAmount,
+  calculateMinimumRechargeCapacity,
 };

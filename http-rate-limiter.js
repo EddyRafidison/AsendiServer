@@ -25,6 +25,7 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /app/recover-account": { limit: 4, windowMs: 15 * 60_000, authResponse: true },
   "POST /app/delete-user": { limit: 3, windowMs: 24 * 60 * 60_000, authResponse: true },
   "POST /admin/send-temp-pswd": { limit: 5, windowMs: 60 * 60_000, authResponse: true },
+  "POST /admin/recharge/control": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/recharge/credit": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/recharge/refund": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/unlock-disbursement": { limit: 10, windowMs: 5 * 60_000, authResponse: true },

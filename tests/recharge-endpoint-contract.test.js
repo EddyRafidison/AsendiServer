@@ -1,0 +1,50 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = path.join(__dirname, "..");
+const routesSource = fs.readFileSync(path.join(root, "routes.js"), "utf8");
+const limiterSource = fs.readFileSync(path.join(root, "http-rate-limiter.js"), "utf8");
+const dbSource = fs.readFileSync(path.join(root, "db.js"), "utf8");
+
+function getRouteBlock(routePath, nextRoutePath) {
+  const startMarker = `router.post("${routePath}"`;
+  const start = routesSource.indexOf(startMarker);
+  assert.notEqual(start, -1, `Missing route ${routePath}`);
+  const end = routesSource.indexOf(`router.post("${nextRoutePath}"`, start + startMarker.length);
+  assert.notEqual(end, -1, `Missing next route ${nextRoutePath}`);
+  return routesSource.slice(start, end);
+}
+
+test("user-last-stock is the only app endpoint that creates and returns a deposit address", () => {
+  const stockRoute = getRouteBlock("/app/user-last-stock", "/app/recharge");
+  const rechargeRoute = getRouteBlock("/app/recharge", "/app/recharge/status");
+  assert.match(stockRoute, /getOrCreateUserDepositAddress\(db, U\)/);
+  assert.match(stockRoute, /deposit_addr:\s*depositAddress/);
+  assert.match(stockRoute, /getVisibleDepositAddress/);
+  assert.doesNotMatch(rechargeRoute, /getOrCreateUserDepositAddress/);
+  assert.doesNotMatch(rechargeRoute, /deposit_addr/);
+});
+
+test("manual recharge control is admin-authenticated, serialized and audited", () => {
+  const controlRoute = getRouteBlock("/admin/recharge/control", "/admin/recharge/credit");
+  assert.match(controlRoute, /decrypt\(admin_pswd/);
+  assert.match(controlRoute, /decrypt\(admin_pin/);
+  assert.match(controlRoute, /\[\"suspend\", \"resume\", \"status\"\]/);
+  assert.match(controlRoute, /lock_name='common_state' FOR UPDATE/);
+  assert.match(controlRoute, /UPDATE recharge_service_control/);
+  assert.match(controlRoute, /INSERT INTO recharge_service_control_events/);
+  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS recharge_service_control/);
+  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS recharge_service_control_events/);
+  assert.match(limiterSource, /POST \/admin\/recharge\/control/);
+});
+
+test("manual suspension holds automated credit while reviewed admin resolution has an explicit override", () => {
+  assert.match(routesSource, /const reviewedAdminCredit = options\.allowReviewedAdminCredit === true/);
+  assert.match(routesSource, /allowReviewedAdminCredit: true/);
+  assert.match(routesSource, /manual_recharge_suspended/);
+  assert.match(routesSource, /status='pending_support'/);
+});

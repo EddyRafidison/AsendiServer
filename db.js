@@ -329,6 +329,23 @@ const TABLES = [
     PRIMARY KEY(username,action,window_start_ms),
     KEY idx_account_api_rate_cleanup(window_start_ms)
   ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS recharge_service_control(
+    control_id TINYINT UNSIGNED PRIMARY KEY,
+    is_suspended TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    suspension_reason VARCHAR(1000) NULL,
+    changed_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    updated_at_ms BIGINT UNSIGNED NOT NULL
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS recharge_service_control_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    action VARCHAR(16) NOT NULL,
+    previous_suspended TINYINT UNSIGNED NOT NULL,
+    current_suspended TINYINT UNSIGNED NOT NULL,
+    reason VARCHAR(1000) NOT NULL,
+    changed_by VARCHAR(64) NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_recharge_control_events_created(created_at_ms,id)
+  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS system_locks(
     lock_name VARCHAR(64) PRIMARY KEY
   ) ENGINE=InnoDB`,
@@ -666,6 +683,8 @@ async function assertLatestSchema() {
     account_security_action_locks: ["username", "action", "updated_at_ms"],
     account_security_events: ["username", "action", "outcome", "created_at_ms"],
     account_api_rate_limits: ["username", "action", "window_start_ms", "request_count", "updated_at_ms"],
+    recharge_service_control: ["control_id", "is_suspended", "suspension_reason", "changed_by", "updated_at_ms"],
+    recharge_service_control_events: ["action", "previous_suspended", "current_suspended", "reason", "changed_by", "created_at_ms"],
     system_locks: ["lock_name"],
     users_usdt_deposit_wallets: [
       "username", "wallet_address", "payout_address", "derivation_index", "created_block",
@@ -732,6 +751,7 @@ async function assertLatestSchema() {
       "idx_activities_history_sender",
       "idx_activities_history_receiver",
     ],
+    recharge_service_control_events: ["idx_recharge_control_events_created"],
   };
   for (const [table, expected] of Object.entries(requiredIndexes)) {
     const indexes = await db.queryAsync(
@@ -764,6 +784,12 @@ async function initDbIfEmpty() {
   }
   for (const statement of TABLES) await db.queryAsync(statement);
   await assertLatestSchema();
+  await db.queryAsync(
+    `INSERT IGNORE INTO recharge_service_control
+     (control_id,is_suspended,suspension_reason,changed_by,updated_at_ms)
+     VALUES(1,0,NULL,'system',?)`,
+    [String(Date.now())],
+  );
   await db.queryAsync(
     "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?),(?),(?)",
     ["common_state", "deposit_wallet_index", "onex_bsc_disbursement_worker", "onex_bsc_sweeper_global"],
