@@ -229,6 +229,7 @@ const TABLES = [
     updated_at_ms BIGINT UNSIGNED NOT NULL,
     UNIQUE KEY uq_seller_lot_campaign(campaign_id),
     KEY idx_seller_lot_fifo(status,activated_at_ms,id),
+    KEY idx_seller_lot_availability(status,remaining_initial_asset,campaign_id),
     KEY idx_seller_lot_user(username,status,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_seller_payout_batches(
@@ -501,6 +502,7 @@ const TABLES = [
     UNIQUE KEY uq_usdt_disbursement_tx_hash(tx_hash),
     KEY idx_usdt_disbursement_user_success(username,status,confirmed_at_ms),
     KEY idx_usdt_disbursement_status(status,id),
+    KEY idx_usdt_disbursement_reserve_availability(status,sold_initial_asset),
     KEY idx_usdt_disbursement_reservation(status,reservation_expires_at_ms)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS global_disbursement_runs(
@@ -752,6 +754,8 @@ async function assertLatestSchema() {
       "idx_activities_history_receiver",
     ],
     recharge_service_control_events: ["idx_recharge_control_events_created"],
+    users_seller_reserve_lots: ["idx_seller_lot_availability"],
+    users_usdt_disbursements: ["idx_usdt_disbursement_reserve_availability"],
   };
   for (const [table, expected] of Object.entries(requiredIndexes)) {
     const indexes = await db.queryAsync(

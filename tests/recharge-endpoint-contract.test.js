@@ -48,3 +48,16 @@ test("manual suspension holds automated credit while reviewed admin resolution h
   assert.match(routesSource, /manual_recharge_suspended/);
   assert.match(routesSource, /status='pending_support'/);
 });
+
+
+test("public reserve availability endpoint is authenticated, cached and separate from user-specific deposit disclosure", () => {
+  const availabilityRoute = getRouteBlock("/app/recharge/availability", "/app/recharge/status");
+  assert.match(availabilityRoute, /requestTokenIsValid/);
+  assert.match(availabilityRoute, /getPublicRechargeAvailability/);
+  assert.match(availabilityRoute, /available_reserve_xtu/);
+  assert.match(availabilityRoute, /minimum_recharge_amount_bsc_usd/);
+  assert.match(availabilityRoute, /maximum_recharge_amount_bsc_usd/);
+  assert.doesNotMatch(availabilityRoute, /unit_price|recharge_available|availability_reason|updated_at_ms|refresh_after_ms/);
+  assert.doesNotMatch(availabilityRoute, /getOrCreateUserDepositAddress/);
+  assert.match(limiterSource, /POST \/app\/recharge\/availability/);
+});

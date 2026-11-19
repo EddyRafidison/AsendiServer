@@ -210,7 +210,7 @@ Le bonus est financé par la réserve administrative protégée de 10 % des acti
 
 ## Deposit-address availability guard
 
-`/app/user-last-stock` and `/app/recharge` return a deposit address only when the account can accept at least one minimum 10 BSC-USD recharge after the configured `FEES`/`tfees` deduction without exceeding the 300 XTU maximum. The check is performed under the shared `common_state` lock and uses a conservative projection of the post-recharge global price when current reserves can fund the minimum recharge. The actual recharge credit path remains authoritative and rechecks the projected balance inside its own transaction.
+`/app/user-last-stock` returns a deposit address only when the account can accept at least one minimum 10 BSC-USD recharge after the configured `FEES`/`tfees` deduction without exceeding the 300 XTU maximum. `/app/recharge` does not return or create the address. The check is performed under the shared `common_state` lock and uses a conservative projection of the post-recharge global price when current reserves can fund the minimum recharge. The actual recharge credit path remains authoritative and rechecks the projected balance inside its own transaction.
 
 As soon as a global disbursement is effective, these endpoints return no deposit address and mark recharge as unavailable. `/app/signin` itself does not issue deposit addresses; the post-login balance endpoint is `/app/user-last-stock`.
 
@@ -222,3 +222,9 @@ The fresh database schema now creates `recharge_service_control` and `recharge_s
 The administrator can suspend or resume recharge with `POST /admin/recharge/control`. A manual suspension hides (but does not delete or deactivate) users' deposit addresses, prevents new addresses from being assigned, and holds automatic batch credits for administrative review. The address is also hidden when the BSC payment provider is disabled or when the account cannot receive the minimum net recharge under the 300 XTU cap. Existing on-chain transfers remain traceable and are not silently discarded.
 
 `/app/user-last-stock` is the sole endpoint that returns `deposit_addr`. `/app/recharge` returns the public BEP-20 configuration and availability only; it must not create or return a deposit address.
+
+## Public recharge reserve availability
+
+`POST /app/recharge/availability` is intended for authenticated one-second app polling. Its successful response contains exactly three values: `available_reserve_xtu`, `minimum_recharge_amount_bsc_usd` and `maximum_recharge_amount_bsc_usd`. The available XTU amount is calculated from currently active seller reserve lots and the distributable part of the common reserve, including inactive assets, after subtracting unresolved system-disbursement reservations. The remaining administrative quota (10% of initial assets less administrative expenditure already recorded) is excluded from `backed_units`. All initial-asset components are converted using the verified current `common.unit_price`. The endpoint does not return reserve components, service-availability flags or the deposit address. A shared one-second cache coalesces concurrent requests and avoids `FOR UPDATE` locks on financial rows.
+
+Recharge suspension and user-specific eligibility are handled by the existing recharge/address endpoints and the authoritative recharge-credit transaction; they are intentionally not duplicated in this aggregate polling response.

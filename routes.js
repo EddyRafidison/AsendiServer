@@ -110,6 +110,7 @@ const {
 const { validateSignupIdentity } = require("./identity-policy");
 const { resolveRechargeAvailability, getVisibleDepositAddress } = require("./recharge-service-control");
 const { getRechargeBatchBscFeeCostTx } = require("./bsc-fee-allocations");
+const { getPublicRechargeAvailability } = require("./recharge-availability");
 const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
 const {
   GLOBAL_DISBURSEMENT_NOTICE_MS,
@@ -2098,6 +2099,41 @@ router.post("/app/recharge", async (req, res) => {
   } catch (error) {
     console.error("BEP-20 recharge information failed:", error.message);
     return res.send({ msg: "not allowed" });
+  }
+});
+
+// Lightweight reserve-availability polling endpoint. Authentication uses the
+// signed user-agent token; it deliberately avoids an Argon2 password re-hash on
+// every one-second poll. A shared one-second cache prevents repeated reserve scans.
+router.post("/app/recharge/availability", async (req, res) => {
+  const { user, pswd, tkn } = req.body || {};
+  const U = normalizeUsername(user);
+  const P = normalizeFormValue(pswd);
+  if (!requestTokenIsValid(req, tkn, P, U)) {
+    return res.status(401).send({ msg: "not allowed" });
+  }
+
+  try {
+    // This endpoint exposes only the aggregate public indicator, not account data.
+    // The session token is validated above; account eligibility is enforced by
+    // the address-disclosure and actual recharge-credit endpoints.
+    const snapshot = await getPublicRechargeAvailability(db, {
+      stockLimit,
+      adminReserveRatio: SYSTEM_ADMIN_RESERVE_RATIO.toString(),
+    });
+
+    return res.send({
+      available_reserve_xtu: snapshot.availableReserveXtu,
+      minimum_recharge_amount_bsc_usd: MIN_RECHARGE_AMOUNT.toFixed(0),
+      maximum_recharge_amount_bsc_usd: MAX_RECHARGE_AMOUNT.toFixed(0),
+    });
+  } catch (error) {
+    console.error("Public recharge-availability lookup failed:", error.message);
+    return res.status(503).send({
+      available_reserve_xtu: null,
+      minimum_recharge_amount_bsc_usd: MIN_RECHARGE_AMOUNT.toFixed(0),
+      maximum_recharge_amount_bsc_usd: MAX_RECHARGE_AMOUNT.toFixed(0),
+    });
   }
 });
 

@@ -13,6 +13,7 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /app/contact-onex": { limit: 5, windowMs: 60 * 60_000, authResponse: true },
   "POST /app/user-last-stock": { limit: 30, windowMs: 60_000, authResponse: true },
   "POST /app/recharge": { limit: 10, windowMs: 60_000, authResponse: true },
+  "POST /app/recharge/availability": { limit: 70, windowMs: 60_000, authResponse: true },
   "POST /app/recharge/status": { limit: 30, windowMs: 60_000, authResponse: true },
   "POST /app/set-payout-address": { limit: 5, windowMs: 15 * 60_000, authResponse: true },
   "POST /app/join-system-sellers": { limit: 5, windowMs: 15 * 60_000, authResponse: true },
