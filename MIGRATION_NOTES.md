@@ -11,7 +11,7 @@
 
 Cette version définit le schéma cible pour une première mise en production. Elle ne migre pas les anciennes tables et ne convertit pas les anciens soldes. Créer une base MySQL neuve et vide. `db.js` crée les tables, vérifie les colonnes et valide le prix global au démarrage. Une ancienne structure qui ne correspond pas au schéma cible provoque une erreur explicite; ne pas la réutiliser sans une migration distincte, auditée et sauvegardée.
 
-Par défaut, une nouvelle base initialise `common.total_units_price=10000000`, `common.backed_units=10000000`, et donc `common.unit_price=1`. `STOCK_LIMIT` et `INITIAL_BACKED_UNITS` règlent les valeurs initiales. La quantité d'actifs déclarée doit correspondre aux actifs réellement détenus. `INITIAL_BACKED_UNITS` doit couvrir le quota administratif initial de 10 %.
+Par défaut, une nouvelle base initialise `common.total_units_price=18000000`, `common.backed_units=18000000`, et donc `common.unit_price=1`. `STOCK_LIMIT` et `INITIAL_BACKED_UNITS` règlent les valeurs initiales. La quantité d'actifs déclarée doit correspondre aux actifs réellement détenus. `INITIAL_BACKED_UNITS` doit couvrir le quota administratif initial de 10 %.
 
 ## Convention d'unités
 
@@ -50,7 +50,7 @@ ordinary_backed_available = common.backed_units - remaining_admin_quota
 ordinary_reserve_available = common.inactive_init_asset + ordinary_backed_available
 ```
 
-`SYSTEM_ADMIN_RESERVE_RATIO` vaut 0.10 par défaut. Pour `STOCK_LIMIT=10,000,000`, le quota administratif initial est de 1,000,000 actifs initiaux et la capacité distribuable initiale est de 9,000,000. Les 1,000,000 sont déjà compris dans `backed_units` et continuent à participer à `unit_price`. Les recharges et ventes ordinaires peuvent consommer `inactive_init_asset` et la partie de `backed_units` supérieure au quota administratif restant.
+`SYSTEM_ADMIN_RESERVE_RATIO` vaut 0.10 par défaut. Pour `STOCK_LIMIT=18,000,000` par défaut, le quota administratif initial est de 1,800,000 actifs initiaux et la capacité distribuable initiale est de 16,200,000. Les 1,800,000 sont déjà compris dans `backed_units` et continuent à participer à `unit_price`. Les recharges et ventes ordinaires peuvent consommer `inactive_init_asset` et la partie de `backed_units` supérieure au quota administratif restant.
 
 `common.sys_inactive_init_asset` est un compteur cumulatif des actifs initiaux déjà dépensés par l'administration; il n'est pas une réserve dépensable. Lorsqu'une dépense administrative de `amount` XTU est enregistrée, le prix courant est figé avant l'opération :
 
@@ -66,20 +66,16 @@ Le numérateur et le dénominateur diminuent proportionnellement : le prix est d
 
 ## Recharges et dépôts
 
-Chaque compte possède une adresse individuelle de dépôt BSC-USD. Les dépôts finalisés sont identifiés par transaction hash et log index puis regroupés pendant 60 minutes; un batch peut contenir plusieurs transferts.
+Chaque compte possède une adresse individuelle de dépôt BSC-USD. Les dépôts finalisés sont identifiés par hash de transaction et index du journal d'événement puis regroupés dans une session de recharge de 60 minutes.
 
-- Minimum automatique : 12 BSC-USD par batch.
-- Maximum de 140 BSC-USD et cooldown de sept jours : uniquement pour la part financée par les réserves système ONEX.
-- Les montants financés par la réserve vendeurs ne sont pas soumis à cette restriction hebdomadaire.
-- Le solde public après crédit ne peut pas dépasser 300 XTU; le contrôle multiplie le nouveau solde initial par le prix global résultant de l'opération.
-- `net = gross_received - tfees - configured_BSC_gas_recovery`. La récupération concerne le gas d'opérations sortantes payées par OneX; le gas déjà payé par le déposant ne doit pas être refacturé.
-- Ordre de financement strict : `common.inactive_init_asset` d'abord, lots de réserve vendeurs actifs en FIFO ensuite, puis `common.backed_units` au-dessus du quota administratif restant. Les demandes de disbursement non résolues sont déduites de la capacité système.
-- La part financée par les vendeurs est un transfert d'actifs initiaux du lot vendeur vers le compte bénéficiaire; elle ne crée pas une deuxième fois ces actifs.
-- La part financée par OneX convertit le net XTU en actifs initiaux au prix global verrouillé au début de l'opération. `inactive_init_asset` et la réserve vendeurs sont consommés avant la partie distribuable de `backed_units`. Le prix est recalculé par le ratio commun.
-- Si l'utilisateur est sous cooldown et que la réserve vendeurs ne couvre pas intégralement le net, aucun crédit partiel n'est effectué. Le batch est mis en attente et réévalué périodiquement.
-- Le seuil de 70 BSC-USD concerne le sweep des dépôts vers le treasury, pas le minimum de recharge; les dépôts non balayés peuvent aussi être consolidés après 30 jours.
-
-Les transactions en attente de disbursement doivent être protégées contre l'utilisation concurrente de la réserve système par les recharges. Le contrôle de disponibilité tient donc compte des montants initialement réservés par les demandes non résolues.
+- Le montant total d'une session automatique doit être compris entre **10 et 100 BSC-USD inclus**. En dehors de cette plage, la session passe en `pending_support` et n'est pas créditée partiellement.
+- Le seuil de sweep du portefeuille de dépôt est de **100 BSC-USD**. Les dépôts finalisés non balayés sont également traités après 30 jours.
+- Le cooldown de sept jours s'applique uniquement à la part nécessitant un financement par les réserves système ONEX. Les financements provenant des lots vendeurs n'utilisent pas ce cooldown système.
+- Le solde public de l'utilisateur après crédit ne doit jamais dépasser 300 XTU, au prix global recalculé après l'opération.
+- Le crédit net est `montant reçu - tfees`. Les coûts BSC réels des transactions de financement et de sweep sont répartis au prorata entre les sessions concernées. Ils sont imputés sur les `tfees` bruts ; seul le reliquat augmente les réserves et `common.total_tfees`. Tout dépassement de coûts BSC est enregistré comme coût OneX et n'est pas facturé une seconde fois à l'utilisateur.
+- Priorité de financement : `common.inactive_init_asset`, puis lots vendeurs actifs en FIFO, puis `common.backed_units` au-delà du quota administratif restant. Les réservations de décaissement réduisent la capacité finançable.
+- Un crédit financé par un lot vendeur transfère les actifs initiaux du lot vers le bénéficiaire ; le lot vendeur du bénéficiaire est exclu de son propre financement.
+- Une recharge qui dépasse le plafond utilisateur est mise en attente pour support, sans crédit. Les opérations administratives de crédit exceptionnel peuvent contourner la plage automatique 10–100 après examen, mais ne contournent pas le plafond utilisateur ni les protections de réserve.
 
 ## Rémunération individuelle et campagnes vendeurs
 
@@ -101,17 +97,21 @@ Les lots vendeurs sont consommés en FIFO. La consommation débite le solde vend
 
 `POST /app/near-transfer` reçoit un montant public XTU. Le prix global unique est lu sous le verrou `common_state`, puis le montant est converti en actifs initiaux. L'expéditeur est débité du montant brut initial; le destinataire reçoit le montant initial net après déduction de la totalité des `tfees`. Le destinataire supporte les frais; aucun gas BSC n'est appliqué aux transferts P2P.
 
-La base initiale complète des `tfees` est conservée par OneX et ajoutée à `common.backed_units`; sa valeur XTU au prix de l'opération augmente `common.total_units_price`. `common.total_tfees` est un compteur cumulatif en actifs initiaux et ne diminue jamais. Il n'existe aucune séparation CommonShare/AdminFees ni transfert vers un portefeuille dédié aux frais.
+Pour un transfert P2P, l'intégralité des `tfees` est conservée par OneX, puisqu'aucun coût de gas BSC ne s'applique. Pour les recharges et les décaissements individuels, le coût BSC réel admissible est d'abord imputé sur les `tfees` bruts. Seul le reliquat augmente les réserves système et `common.total_tfees`. À la confirmation d'un paiement de trésorerie, la valeur de stock commune est également débitée du montant BSC-USD réellement transféré et du coût BNB réel valorisé en BSC-USD. `common.total_tfees_bsc_cost_usd` suit les frais BSC couverts par `tfees`; `common.total_tfees_bsc_uncovered_usd` suit les coûts dépassant les `tfees` disponibles et absorbés par OneX. `bsc_fee_allocations` distribue de façon idempotente les coûts de sweep aux lots de recharge.
 
 ## Disbursement individuel et disbursement global
 
-Le mode demandé par un utilisateur est appelé **disbursement individuel**. `/app/near-transfer` vers `ONEX` reçoit un montant brut XTU, le convertit au prix global verrouillé, applique les `tfees` courants et réserve le montant brut correspondant en actifs initiaux. L'éligibilité exige un solde public minimum de 290 XTU, un portefeuille BSC valide, aucune demande non résolue et un cooldown glissant de 30 jours après chaque disbursement individuel confirmé. Les variables `DISBURSEMENT_INDIVIDUAL_MINIMUM_XTU` et `DISBURSEMENT_INDIVIDUAL_MINIMUM_REMAINING_XTU` règlent le montant minimum et le solde minimal après demande. Le prix et le montant BSC-USD sont figés à l'acceptation; une erreur de paiement restaure le montant réservé au-dessus du solde restant.
+Les deux modes utilisent le même parcours utilisateur : `POST /app/near-transfer` avec `dest=ONEX`. Le client ne choisit pas le mode ; le serveur le détermine sous verrou `common_state` selon l'état du run global.
 
-Le **disbursement global** est une liquidation initiée par décision définitive du système en situation critique. Il ne peut être déclenché que par `/admin/start-global-disbursement`, après authentification administrative et fourniture d'un motif ainsi que d'une référence de décision unique. Les variables d'environnement autorisent le démarrage mais ne déclenchent pas la liquidation elles-mêmes. Au lancement, le serveur fige un seul prix global et la borne maximale des identifiants `users_stock`; le worker traite ensuite les comptes par lots afin d'éviter une transaction géante. Chaque paiement correspond au solde brut évalué au prix commun figé moins la récupération de gas BSC, stockée séparément dans `bsc_fee_recovered_usd`. Aucun `tfees` n'est appliqué au mode global.
+Le **disbursement individuel habituel** est périodique et initié par l'utilisateur. Le montant brut minimal est de **200 XTU** (`DISBURSEMENT_INDIVIDUAL_MINIMUM_XTU`). Le compte doit également disposer d'au moins 290 XTU de solde public, d'une adresse BSC valide, ne présenter aucun engagement vendeur actif ni autre paiement non résolu et respecter le délai glissant de 30 jours après un décaissement individuel confirmé. Le prix courant est figé à l'acceptation, les `tfees` habituels s'appliquent et aucun bonus global n'est accordé.
 
-Le lancement global est refusé tant que des demandes individuelles, campagnes/lots vendeurs, paiements vendeurs, recharges ou remboursements restent en attente. Pendant le run, les recharges, P2P, nouvelles activations vendeurs, nouveaux disbursements individuels et modifications administratives du stock commun sont bloqués. Un compte dont le portefeuille est absent/invalide ou qui exige une réconciliation est consigné en `manual_review` sans débit de son solde. Le contrôle de trésorerie tient compte du BSC-USD et du BNB déjà engagés par les paiements globaux encore en attente. Le run ne devient `completed` qu'après la finalisation de tous les paiements; toute intervention requise le laisse en `manual_review`. `/admin/resolve-global-disbursement-review` peut libérer uniquement les lignes non payées, sans transaction blockchain, sans débit réservé et avec un solde inchangé; tout hash de transaction ou état ambigu exige une réconciliation distincte.
+Le **disbursement global** est une décision définitive de l'administration. `/admin/start-global-disbursement` enregistre l'annonce, la référence administrative, le canal d'information choisi par l'administration, la date d'annonce, la date prévue d'activation, la durée de la fenêtre de demandes et le taux du bonus. La notification peut être envoyée par l'administration en dehors du serveur ; Telegram, e-mail ou une annonce dans l'application ne sont pas imposés techniquement. Le préavis doit couvrir au moins sept jours calendaires complets. La date planifiée n'active jamais le mode automatiquement : l'administration doit appeler explicitement `/admin/activate-global-disbursement`, après le préavis et la résolution des opérations financières bloquantes.
 
-`USDT_DISBURSEMENTS_ENABLED` est le verrou général. `USDT_INDIVIDUAL_DISBURSEMENT_ENABLED` autorise les nouvelles demandes individuelles; `USDT_GLOBAL_DISBURSEMENT_ENABLED` autorise le lancement administratif d'un run global. Désactiver ces flags bloque les nouvelles demandes, mais n'interrompt pas les paiements déjà acceptés : le worker doit continuer jusqu'à leur résolution.
+Pendant le préavis, les opérations normales continuent. À l'activation explicite, le serveur fige le prix global, enregistre les comptes participants et la date limite, puis bloque les nouvelles recharges et les transferts P2P entre utilisateurs. Les demandes de disbursement vers `ONEX` restent ouvertes. Le montant brut minimal est de **1 XTU uniquement pendant cette fenêtre globale active**. Chaque utilisateur doit soumettre sa propre demande ; le worker ne crée aucune demande et ne débite aucun solde sans action de l'utilisateur. Après règlement d'une demande, une nouvelle demande peut porter sur le solde restant tant que la fenêtre est ouverte.
+
+Une demande globale est enregistrée avec `disbursement_mode='global'` et son `global_run_id`. Elle utilise le prix figé à l'activation, ne prélève aucun `tfees` et applique le bonus annoncé, calculé sur le montant net XTU demandé. Le bonus suit `FEES` lorsque `GLOBAL_DISBURSEMENT_BONUS` est absent ou vide, et ne peut jamais dépasser 10 %. Exemple : 200 XTU avec un bonus de 3 % donnent 6 BSC-USD de bonus et 206 BSC-USD avant récupération du gas BSC. Le coût estimé est déduit du paiement puis rapproché du gas réellement payé. Le bonus est financé par la réserve administrative protégée, sous réserve des contrôles de réserve et de liquidité.
+
+À l'expiration, aucune nouvelle demande globale n'est acceptée. Les paiements déjà acceptés continuent leur traitement. Aucun remboursement automatique n'est créé pour les comptes n'ayant pas demandé le disbursement ou pour les soldes résiduels. Ces comptes et montants passent en `manual_review` pour résolution administrative individuelle, sans débit automatique. Le run n'est `completed` qu'après règlement des paiements acceptés et résolution des participants en examen. Le cutoff global reste en vigueur après clôture : les recharges et les P2P ordinaires ne reprennent pas automatiquement.
 
 ## Historique et frais
 
@@ -119,7 +119,7 @@ Le lancement global est refusé tant que des demandes individuelles, campagnes/l
 
 `common.total_tfees` est le cumul historique des frais retenus, en actifs initiaux. Les frais BNB sont distincts : `total_bnb_fee_estimated` et `total_bnb_fee_actual` sont en BNB; leurs champs `_value` sont des équivalents BSC-USD capturés. Le gas réel est calculé par `gasUsed * effectiveGasPrice` et journalisé une seule fois dans `bsc_fee_ledger` après finalité.
 
-Les remboursements n'appliquent aucun `tfees`; seule la récupération configurée du gas BSC supporté par OneX est déduite. Le minimum de remboursement net reste 10 BSC-USD.
+Les remboursements de recharge approuvés n'appliquent aucun `tfees`; seule la récupération configurée du gas BSC supporté par OneX est déduite. Le minimum net de ce type de remboursement reste 10 BSC-USD. Cette règle de remboursement ne modifie pas les minima des disbursements individuel et global.
 
 ## Routes administratives de stock
 
@@ -157,7 +157,7 @@ Les fichiers `.env` réels ne doivent jamais être distribués. Fournir uniqueme
 - `npm run check` : contrôle de syntaxe des fichiers JavaScript.
 - `npm test` : tests unitaires des politiques et fonctions comptables.
 - Les tests unitaires ne remplacent pas les tests d'intégration sur une base MySQL neuve, le testnet BSC, les tests SMTP/Telegram et la répétition des scénarios de reprise après redémarrage.
-- Bonus : aucune génération, accumulation ou formule de crédit n'est implémentée dans cette version.
+- Aucun bonus individuel n'est généré ou accumulé. Le seul bonus configuré est le bonus de remboursement automatique réservé au disbursement global.
 
 ## API hardening update (2026-11-15)
 
@@ -195,3 +195,14 @@ This combined statement is for a table missing all four indexes. If only some ar
 
 
 Un run global conserve le prix global, le total `common.total_units_price` et le passif initial total des comptes au lancement. Le lancement est refusé si le passif brut au prix figé épuiserait la valeur stockée. Les jobs globaux restent réservés jusqu’à finalisation ou réconciliation explicite et ne sont pas expirés automatiquement.
+
+
+## Liquidation globale : activation explicite et demandes utilisateur
+
+L'administration choisit elle-même comment informer les utilisateurs ; le serveur peut enregistrer la date, la référence et le canal déclaré, mais l'annonce n'a pas à être expédiée par OneX. Le préavis minimal est de sept jours calendaires complets. Aucun worker ne transforme automatiquement une annonce en activation. Seule l'action administrative explicite active le mode, fige le prix et ouvre la période de demandes.
+
+Les utilisateurs doivent chacun présenter leur demande à `ONEX` via `/app/near-transfer`. Le mode global est choisi côté serveur, le minimum brut est de 1 XTU, aucun `tfees` n'est prélevé et le bonus s'applique au montant XTU demandé. Le worker traite uniquement les décaissements réellement créés à la suite d'une demande utilisateur ; il ne parcourt pas les soldes pour générer des paiements. À la date limite, les demandes nouvelles sont fermées. Les soldes non demandés et résiduels passent en `manual_review` sans débit ou remboursement automatique.
+
+Le bonus est financé par la réserve administrative protégée de 10 % des actifs initiaux. Le taux est figé à l'annonce, hérite de `FEES` s'il est absent ou vide et reste plafonné à 10 %. Les coûts BSC sont comptabilisés séparément du bonus et rapprochés avec les reçus de blockchain.
+
+`POST /admin/common-history` retourne au plus 50 snapshots `common` par appel, avec pagination par `before_id`, une liste fixe de colonnes et une authentification administrative par mot de passe et PIN.

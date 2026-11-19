@@ -27,6 +27,12 @@ const {
   recordActualBscFeeTx,
 } = require("./bsc-fee-accounting");
 const { calculateSellerPayoutNet } = require("./seller-accounting");
+const { SYSTEM_ADMIN_RESERVE_RATIO } = require("./recharge-policy");
+const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
+const { calculateRequiredAdminBonusReserve } = require("./global-disbursement-policy");
+const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
+
+const INITIAL_STOCK_LIMIT = process.env.STOCK_LIMIT || "18000000";
 
 const CHAIN_ID = 56n;
 const TOKEN_DECIMALS = 18n;
@@ -268,7 +274,7 @@ async function updateJobError(db, jobId, error) {
 }
 
 async function signQueuedJob(db, job, activeRuntime) {
-  if (Number(job.reservation_expires_at_ms) <= Date.now()) {
+  if (job.disbursement_mode !== "global" && Number(job.reservation_expires_at_ms) <= Date.now()) {
     await markManualReview(
       db,
       job.id,
@@ -276,39 +282,53 @@ async function signQueuedJob(db, job, activeRuntime) {
     );
     return false;
   }
-  const amountRaw = BigInt(job.amount_raw);
-  if (amountRaw <= 0n) throw new Error("The disbursement token amount must be positive.");
-
   const payoutAddress = requiredAddress(job.payout_address, "Disbursement payout address");
   if (payoutAddress.toLowerCase() === activeRuntime.treasuryAddress.toLowerCase()) {
     throw new Error("The payout address cannot be the OneX treasury address.");
+  }
+
+  const feeData = await activeRuntime.provider.getFeeData();
+  let gasPrice = feeData.gasPrice;
+  if (!gasPrice || gasPrice <= 0n) gasPrice = BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
+  if (gasPrice <= 0n) throw new Error("The BSC RPC returned an invalid gas price.");
+  const estimate = calculateEstimatedGasFee(
+    activeRuntime.gasLimit.toString(), gasPrice.toString(), getConfiguredBnbUsdPrice(),
+  );
+
+  let amountRaw;
+  let payoutAmount = new BigNumber(job.payout_amount);
+  let bscFeeRecovered = new BigNumber(job.bsc_fee_recovered_usd || "0");
+  if (job.disbursement_mode === "global") {
+    const gross = new BigNumber(job.gross_initial_asset).multipliedBy(new BigNumber(job.price_value));
+    const bonus = new BigNumber(job.bonus_amount || "0");
+    payoutAmount = gross.plus(bonus).minus(estimate.feeUsd).decimalPlaces(18, BigNumber.ROUND_DOWN);
+    bscFeeRecovered = estimate.feeUsd;
+    if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
+      throw new Error("The global request is too small to cover the estimated BSC network fee.");
+    }
+    const rawDecimal = payoutAmount.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN);
+    if (!rawDecimal.isGreaterThan(0)) throw new Error("Global payout rounds to zero after BSC gas recovery.");
+    amountRaw = BigInt(rawDecimal.toFixed(0));
+  } else {
+    if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
+      throw new Error("The individual disbursement amount must be positive.");
+    }
+    amountRaw = BigInt(job.amount_raw);
+    if (amountRaw <= 0n) throw new Error("The disbursement token amount must be positive.");
   }
 
   const tokenBalanceRaw = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
   if (tokenBalanceRaw < amountRaw) {
     throw new Error("The OneX treasury does not have enough BSC-USD for this disbursement.");
   }
-
-  const feeData = await activeRuntime.provider.getFeeData();
-  let gasPrice = feeData.gasPrice;
-  if (!gasPrice || gasPrice <= 0n) {
-    gasPrice = BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
-  }
-
   const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
   const requiredGasBalance = activeRuntime.gasLimit * gasPrice;
   if (nativeBalance < requiredGasBalance) {
     throw new Error("The OneX treasury does not have enough BNB to pay the disbursement transaction fee.");
   }
 
-  const nonce = await activeRuntime.provider.getTransactionCount(
-    activeRuntime.treasuryAddress,
-    "pending",
-  );
-  const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [
-    payoutAddress,
-    amountRaw,
-  ]);
+  const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
+  const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
   const rawTransaction = await activeRuntime.signer.signTransaction({
     type: 0,
     chainId: Number(CHAIN_ID),
@@ -320,21 +340,19 @@ async function signQueuedJob(db, job, activeRuntime) {
     gasPrice,
   });
   const transactionHash = keccak256(rawTransaction);
-
   const result = await db.queryAsync(
     `UPDATE users_usdt_disbursements
-     SET raw_tx=?,tx_hash=?,nonce=?,status='signed',last_error=NULL,updated_at_ms=?
+     SET raw_tx=?,tx_hash=?,nonce=?,status='signed',payout_amount=?,amount_raw=?,
+         bsc_fee_recovered_usd=?,estimated_fee_bnb=?,estimated_fee_usd=?,last_error=NULL,updated_at_ms=?
      WHERE id=? AND status='queued' AND raw_tx IS NULL AND tx_hash IS NULL`,
-    [rawTransaction, transactionHash, String(nonce), String(Date.now()), job.id],
+    [
+      rawTransaction, transactionHash, String(nonce), payoutAmount.toFixed(18), amountRaw.toString(),
+      bscFeeRecovered.toFixed(18), estimate.feeBnb.toFixed(30), estimate.feeUsd.toFixed(18),
+      String(Date.now()), job.id,
+    ],
   );
-  if (result.affectedRows !== 1) {
-    throw new Error("The disbursement job was claimed or updated concurrently.");
-  }
-  const estimate = calculateEstimatedGasFee(
-    activeRuntime.gasLimit.toString(),
-    gasPrice.toString(),
-    getConfiguredBnbUsdPrice(),
-  );
+  if (result.affectedRows !== 1) throw new Error("The disbursement job was claimed or updated concurrently.");
+
   await withTransaction(db, async (tx) => {
     await recordEstimatedBscFeeTx(tx, {
       txHash: transactionHash,
@@ -343,10 +361,6 @@ async function signQueuedJob(db, job, activeRuntime) {
       gasPriceWei: gasPrice.toString(),
       bnbUsdPrice: estimate.bnbUsdPrice,
     });
-    await tx.query(
-      "UPDATE users_usdt_disbursements SET estimated_fee_bnb=?,estimated_fee_usd=? WHERE id=? AND tx_hash=?",
-      [estimate.feeBnb.toFixed(30), estimate.feeUsd.toFixed(18), job.id, transactionHash],
-    );
   });
   return true;
 }
@@ -363,7 +377,7 @@ async function markSubmitted(db, jobId, transactionHash) {
 async function markManualReview(db, jobId, message, receipt = null) {
   return withTransaction(db, async (tx) => {
     const [rows] = await tx.query(
-      "SELECT username,status,tx_hash FROM users_usdt_disbursements WHERE id=? LIMIT 1 FOR UPDATE",
+      "SELECT username,status,tx_hash,disbursement_mode,global_run_id FROM users_usdt_disbursements WHERE id=? LIMIT 1 FOR UPDATE",
       [jobId],
     );
     if (!rows.length || rows[0].status === "manual_review") return;
@@ -387,6 +401,14 @@ async function markManualReview(db, jobId, message, receipt = null) {
       [String(message).slice(0, 2000), now, jobId],
     );
     if (update.affectedRows === 1) {
+      if (rows[0].disbursement_mode === "global" && rows[0].global_run_id != null) {
+        await tx.query(
+          `UPDATE global_disbursement_participants
+           SET status='manual_review',updated_at_ms=?
+           WHERE run_id=? AND username=? AND status<>'resolved'`,
+          [now, String(rows[0].global_run_id), username],
+        );
+      }
       await queueTelegramMessageTx(
         tx,
         username,
@@ -484,11 +506,36 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
       "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
       [currentBalanceInitial.plus(job.gross_initial_asset).toFixed(30), date, time, username],
     );
+    const failedAt = String(Date.now());
     await tx.query(
       `UPDATE users_usdt_disbursements
        SET status='failed',last_error=?,updated_at_ms=? WHERE id=?`,
-      [String(message).slice(0, 2000), String(Date.now()), jobId],
+      [String(message).slice(0, 2000), failedAt, jobId],
     );
+    if (job.disbursement_mode === "global" && job.global_run_id != null) {
+      const restoredBalance = currentBalanceInitial.plus(job.gross_initial_asset);
+      const openRows = await tx.query(
+        `SELECT status,request_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE`,
+        [job.global_run_id],
+      );
+      const run = openRows[0]?.[0] || null;
+      const canRetry = run && run.status === "active" && Number(run.request_deadline_at_ms) > Date.now();
+      await tx.query(
+        `UPDATE global_disbursement_runs
+         SET admin_bonus_committed_initial_asset=GREATEST(0,admin_bonus_committed_initial_asset-?),
+             total_requested_initial_asset=GREATEST(0,total_requested_initial_asset-?),updated_at_ms=?
+         WHERE id=?`,
+        [String(job.bonus_initial_asset || "0"), String(job.gross_initial_asset), failedAt, job.global_run_id],
+      );
+      await tx.query(
+        `UPDATE global_disbursement_participants
+         SET requested_initial_asset=GREATEST(0,requested_initial_asset-?),
+             remaining_initial_asset=?,status=?,updated_at_ms=?
+         WHERE run_id=? AND username=?`,
+        [String(job.gross_initial_asset), restoredBalance.toFixed(30), canRetry ? "awaiting_request" : "manual_review",
+          failedAt, job.global_run_id, username],
+      );
+    }
     await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:failed`, [
       "OneX Disbursement Update",
       "Your disbursement transaction failed after blockchain finality. Your reserved XTU balance has been restored.",
@@ -584,6 +631,12 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     const backed = new BigNumber(common.backed_units);
     const inactive = new BigNumber(common.inactive_init_asset);
     const payoutAmount = new BigNumber(job.payout_amount);
+    // Every treasury transfer consumes both the BSC-USD sent to the user and
+    // the actual BNB gas paid for the transaction. For individual sales the
+    // gas is covered from gross tfees; for global payouts it was estimated and
+    // deducted from the token amount before submission. In both cases, the
+    // confirmed receipt cost must be included in common stock-value accounting.
+    const reserveExpenseAmount = payoutAmount.plus(actualFee.feeUsd);
     const soldInitialAssets = new BigNumber(job.sold_initial_asset);
     const grossInitialAsset = new BigNumber(job.gross_initial_asset);
     const priceValue = new BigNumber(job.price_value);
@@ -591,20 +644,31 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     const grossBalance = grossInitialAsset.multipliedBy(priceValue);
     const isGlobalDisbursement = job.disbursement_mode === "global";
     const bscFeeRecovered = new BigNumber(job.bsc_fee_recovered_usd || "0");
+    const bonusAmount = new BigNumber(job.bonus_amount || "0");
+    const bonusInitialAssets = new BigNumber(job.bonus_initial_asset || "0");
     const expectedPayoutAmount = (isGlobalDisbursement
-      ? grossBalance.minus(bscFeeRecovered)
+      ? grossBalance.plus(bonusAmount).minus(bscFeeRecovered)
       : soldInitialAssets.multipliedBy(priceValue))
       .decimalPlaces(18, BigNumber.ROUND_DOWN);
     const expectedFeeAmount = isGlobalDisbursement
       ? new BigNumber(0)
       : feeInitialAssets.multipliedBy(priceValue).decimalPlaces(18, BigNumber.ROUND_DOWN);
+    const actualBscFeeUsd = new BigNumber(actualFee.feeUsd);
+    const feeAllocation = isGlobalDisbursement
+      ? { coveredBscCost: new BigNumber(0), uncoveredBscCost: new BigNumber(0), retainedTfees: new BigNumber(0) }
+      : allocateBscCostFromTfees(expectedFeeAmount, actualBscFeeUsd);
+    const tfeesCoveredBscUsd = feeAllocation.coveredBscCost;
+    const tfeesUncoveredBscUsd = feeAllocation.uncoveredBscCost;
+    const netFeeInitialAssets = isGlobalDisbursement
+      ? new BigNumber(0)
+      : feeAllocation.retainedTfees.dividedBy(priceValue);
     const lockedAmountsTolerance = new BigNumber("0.000000000000000001");
     const grossInitialAssetMismatch = grossInitialAsset.minus(soldInitialAssets.plus(feeInitialAssets)).abs();
     const payoutAmountMismatch = payoutAmount.minus(expectedPayoutAmount).abs();
     const feeAmountMismatch = new BigNumber(job.fee_amount).minus(expectedFeeAmount).abs();
 
     if (
-      !total.isFinite() || !total.isGreaterThanOrEqualTo(payoutAmount) ||
+      !total.isFinite() || !total.isGreaterThanOrEqualTo(reserveExpenseAmount) ||
       !unitPrice.isFinite() || !unitPrice.isGreaterThan(0) ||
       !backed.isFinite() || backed.isNegative() ||
       !inactive.isFinite() || inactive.isNegative() ||
@@ -615,7 +679,11 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       !priceValue.isFinite() || !priceValue.isGreaterThan(0) ||
       !feeInitialAssets.isFinite() || feeInitialAssets.isNegative() ||
       !bscFeeRecovered.isFinite() || bscFeeRecovered.isNegative() ||
+      !bonusAmount.isFinite() || bonusAmount.isNegative() ||
+      !bonusInitialAssets.isFinite() || bonusInitialAssets.isNegative() ||
+      !actualBscFeeUsd.isFinite() || actualBscFeeUsd.isNegative() ||
       (isGlobalDisbursement && (!feeInitialAssets.isZero() || !new BigNumber(job.fee_amount).isZero())) ||
+      (!isGlobalDisbursement && (!bonusAmount.isZero() || !bonusInitialAssets.isZero())) ||
       new BigNumber(job.bsc_fee_recovered_usd || "0").isNegative() ||
       !new BigNumber(job.fee_amount).isFinite() || new BigNumber(job.fee_amount).isNegative() ||
       grossInitialAssetMismatch.gt(lockedAmountsTolerance) ||
@@ -637,10 +705,23 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       inactive,
       {
         payoutAmount,
+        reserveExpenseAmount,
         soldInitialAsset: soldInitialAssets,
-        feeInitialAsset: feeInitialAssets,
+        feeInitialAsset: isGlobalDisbursement ? new BigNumber(0) : netFeeInitialAssets,
+        bonusInitialAsset: isGlobalDisbursement ? bonusInitialAssets : new BigNumber(0),
       },
+      common.sys_inactive_init_asset || "0",
     );
+    if (isGlobalDisbursement) {
+      const remainingAdminReserve = calculateRemainingSystemAdminReserve(
+        INITIAL_STOCK_LIMIT,
+        SYSTEM_ADMIN_RESERVE_RATIO,
+        common.sys_inactive_init_asset || "0",
+      ).remainingInitialAsset;
+      if (bonusInitialAssets.gt(remainingAdminReserve)) {
+        throw new Error("Global bonus exceeds the remaining protected administrative reserve");
+      }
+    }
     const newTotal = reserveSettlement.newTotalUnitsPrice;
     const newInactive = reserveSettlement.newInactiveInitAsset;
     const newBacked = reserveSettlement.newBackedUnits;
@@ -659,12 +740,19 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username='ONEX'",
       [newSystemBalanceInitial.toFixed(30), date, time],
     );
-    const totalTfees = new BigNumber(common.total_tfees || "0").plus(feeInitialAssets);
+    const totalTfees = new BigNumber(common.total_tfees || "0").plus(
+      isGlobalDisbursement ? 0 : netFeeInitialAssets,
+    );
+    const totalTfeesBscCost = new BigNumber(common.total_tfees_bsc_cost_usd || "0").plus(tfeesCoveredBscUsd);
+    const totalTfeesBscUncovered = new BigNumber(common.total_tfees_bsc_uncovered_usd || "0").plus(tfeesUncoveredBscUsd);
     await insertCommonSnapshotTx(tx, common, {
       total_units_price: newTotal.toFixed(),
       backed_units: newBacked.toFixed(),
       inactive_init_asset: newInactive.toFixed(),
+      sys_inactive_init_asset: reserveSettlement.newSysInactiveInitAsset.toFixed(),
       total_tfees: totalTfees.toFixed(),
+      total_tfees_bsc_cost_usd: totalTfeesBscCost.toFixed(),
+      total_tfees_bsc_uncovered_usd: totalTfeesBscUncovered.toFixed(),
     }, date, time);
 
     const [existingActivityRows] = await tx.query(
@@ -673,9 +761,9 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     );
     if (existingActivityRows.length === 0) {
       await tx.query(
-        `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time)
-         VALUES(?,?,?,?,?,?,?,?,?)`,
-        [username, "ONEX", 3, soldInitialAssets.toFixed(), priceValue.toFixed(), feeInitialAssets.toFixed(), job.reference, date, time],
+        `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,bsc_fee_cost_usd,reference,record_date,record_time)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`,
+        [username, "ONEX", 3, soldInitialAssets.toFixed(), priceValue.toFixed(), feeInitialAssets.toFixed(), actualBscFeeUsd.toFixed(18), job.reference, date, time],
       );
     }
 
@@ -687,11 +775,33 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       [String(receipt.blockNumber), confirmedAt, confirmedAt, jobId],
     );
     if (job.disbursement_mode === "global" && job.global_run_id != null) {
+      const [globalRows] = await tx.query(
+        "SELECT status,request_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
+        [job.global_run_id],
+      );
+      const globalRun = globalRows[0] || null;
+      if (!globalRun) throw new Error("The global disbursement run for this confirmed payment is missing.");
+      const remainingInitial = new BigNumber(job.balance_after_reservation || "0");
+      const participantStatus = remainingInitial.isZero()
+        ? "paid"
+        : (globalRun.status === "active" && Number(globalRun.request_deadline_at_ms) > Date.now()
+          ? "awaiting_request" : "manual_review");
+      await tx.query(
+        `UPDATE global_disbursement_participants
+         SET paid_initial_asset=paid_initial_asset+?,remaining_initial_asset=?,status=?,updated_at_ms=?
+         WHERE run_id=? AND username=? AND status<>'resolved'`,
+        [String(job.sold_initial_asset), remainingInitial.toFixed(30), participantStatus,
+          confirmedAt, job.global_run_id, username],
+      );
       await tx.query(
         `UPDATE global_disbursement_runs
-         SET total_paid_bsc_usd=total_paid_bsc_usd+?,updated_at_ms=?
-         WHERE id=? AND status IN ('staging','settling')`,
-        [payoutAmount.toFixed(18), confirmedAt, job.global_run_id],
+         SET total_paid_bsc_usd=total_paid_bsc_usd+?,
+             total_bonus_paid_bsc_usd=total_bonus_paid_bsc_usd+?,
+             total_bonus_paid_initial_asset=total_bonus_paid_initial_asset+?,
+             total_bsc_gas_actual_usd=total_bsc_gas_actual_usd+?,
+             updated_at_ms=?
+         WHERE id=? AND status IN ('active','closed','manual_review')`,
+        [payoutAmount.toFixed(18), bonusAmount.toFixed(18), bonusInitialAssets.toFixed(30), actualFee.feeUsd.toFixed(18), confirmedAt, job.global_run_id],
       );
     }
     await queueTelegramMessageTx(tx, username, `disbursement:${jobId}:confirmed`, [
@@ -699,7 +809,8 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       "Your sale to OneX has been completed and the BSC-USD payment is confirmed.",
       `Actual BSC gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD).`,
       `Gross amount: ${grossBalance.toFixed(8)} XTU`,
-      `Fees: ${feeInitialAssets.multipliedBy(priceValue).toFixed(8)} XTU`,
+      `Fees: ${isGlobalDisbursement ? "0" : feeInitialAssets.multipliedBy(priceValue).toFixed(8)} XTU`,
+      ...(isGlobalDisbursement ? [`Automatic global bonus: ${bonusAmount.toFixed(8)} BSC-USD`] : [`BSC fee allocated from tfees: ${tfeesCoveredBscUsd.toFixed(8)} BSC-USD`, `Net tfees retained: ${netFeeInitialAssets.multipliedBy(priceValue).toFixed(8)} XTU`]),
       `Valuation price locked at request submission: ${priceValue.toFixed(12)} XTU per initial asset`,
       `Amount paid: ${payoutAmount.toFixed(8)} BSC-USD`,
       `Destination: ${job.payout_address}`,
@@ -743,7 +854,12 @@ async function processOneJob(db, job, activeRuntime) {
     try {
       await signQueuedJob(db, job, activeRuntime);
     } catch (error) {
-      await updateJobError(db, job.id, error);
+      const message = String(error?.message || error);
+      if (job.disbursement_mode === "global" && /too small to cover the estimated BSC network fee|rounds to zero after BSC gas recovery/i.test(message)) {
+        await markManualReview(db, job.id, `${message} The reserved request remains pending for administrative resolution.`);
+      } else {
+        await updateJobError(db, job.id, error);
+      }
       return;
     }
     const freshRows = await db.queryAsync(
@@ -1346,331 +1462,85 @@ async function processRefundQueue(db, activeRuntime) {
 }
 
 
-async function stageGlobalDisbursementBatch(db, activeRuntime) {
-  const batchSizeRaw = Number(process.env.GLOBAL_DISBURSEMENT_BATCH_SIZE || 100);
-  const batchSize = Number.isSafeInteger(batchSizeRaw) ? Math.max(10, Math.min(200, batchSizeRaw)) : 100;
-  const [runRows] = await db.queryAsync(
-    `SELECT * FROM global_disbursement_runs
-     WHERE status IN ('queued','staging') ORDER BY id ASC LIMIT 1`,
+async function closeExpiredGlobalDisbursement(db) {
+  const now = Date.now();
+  const [runs] = await db.queryAsync(
+    `SELECT id FROM global_disbursement_runs
+     WHERE status='active' AND CAST(request_deadline_at_ms AS UNSIGNED)<=?
+     ORDER BY id ASC LIMIT 10`,
+    [String(now)],
   );
-  if (!runRows.length) return { staged: 0 };
-  const run = runRows[0];
-  const snapshotPrice = new BigNumber(run.snapshot_unit_price);
-  if (!snapshotPrice.isFinite() || !snapshotPrice.isGreaterThan(0)) {
-    throw new Error(`Global disbursement ${run.id} has an invalid snapshot price.`);
-  }
-
-  const [otherTreasuryRows, refundRows, sellerPayoutRows] = await Promise.all([
-    db.queryAsync(
-      `SELECT id FROM users_usdt_disbursements
-       WHERE (global_run_id IS NULL OR global_run_id<>?)
-         AND status IN ('queued','signed','submitted') LIMIT 1`, [run.id],
-    ),
-    db.queryAsync("SELECT id FROM users_usdt_refunds WHERE status IN ('queued','signed','submitted','manual_review') LIMIT 1"),
-    db.queryAsync("SELECT id FROM users_usdt_seller_payouts WHERE status IN ('queued','signed','submitted') LIMIT 1"),
-  ]);
-  if (otherTreasuryRows.length || refundRows.length || sellerPayoutRows.length) {
-    return { staged: 0, blocked: "other_treasury_payments_pending" };
-  }
-
-  const page = await db.queryAsync(
-    `SELECT s.id,s.username,s.balance,s.seller_status,
-            a.status AS account_status,w.payout_address,w.account_status AS wallet_status
-     FROM users_stock s
-     LEFT JOIN auths a ON a.username=s.username
-     LEFT JOIN users_usdt_deposit_wallets w ON w.username=s.username
-     WHERE s.id>? AND s.id<=? AND s.username<>'ONEX'
-     ORDER BY s.id ASC LIMIT ?`,
-    [String(run.last_user_stock_id || 0), String(run.max_user_stock_id || 0), batchSize],
-  );
-  if (!page.length) {
+  let closed = 0;
+  for (const candidate of runs) {
     await withTransaction(db, async (tx) => {
-      await tx.query("SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE");
-      const [lockedRuns] = await tx.query(
-        "SELECT id,status FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE", [run.id],
+      const [lockRows] = await tx.query(
+        "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
       );
-      if (lockedRuns.length && ["queued", "staging"].includes(lockedRuns[0].status)) {
-        await tx.query(
-          "UPDATE global_disbursement_runs SET status='settling',last_error=NULL,updated_at_ms=? WHERE id=?",
-          [String(Date.now()), run.id],
-        );
-      }
-    });
-    return { staged: 0, stagingComplete: true };
-  }
-
-  const feeData = await activeRuntime.provider.getFeeData();
-  const gasPrice = feeData.gasPrice || BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
-  if (gasPrice <= 0n) throw new Error("The BSC RPC returned an invalid gas price for global disbursement.");
-  const bnbUsdPrice = getConfiguredBnbUsdPrice();
-  if (!bnbUsdPrice.isGreaterThan(0)) throw new Error("BNB_USD_PRICE must be positive for global disbursement.");
-  const estimatedGas = calculateEstimatedGasFee(
-    activeRuntime.gasLimit.toString(), gasPrice.toString(), bnbUsdPrice,
-  );
-  const gasRecoveryUsd = new BigNumber(estimatedGas.feeUsd);
-  const candidates = [];
-  let totalTokenRaw = 0n;
-  let payoutCount = 0;
-
-  for (const row of page) {
-    const balance = new BigNumber(row.balance);
-    if (!balance.isFinite() || balance.isNegative()) {
-      throw new Error(`Global disbursement encountered an invalid balance for ${row.username}.`);
-    }
-    if (balance.isZero()) {
-      candidates.push({ row, action: "skip", balance });
-      continue;
-    }
-    const grossValue = balance.multipliedBy(snapshotPrice);
-    let payoutAddress = "";
-    try {
-      payoutAddress = requiredAddress(row.payout_address, "User payout address");
-    } catch {
-      payoutAddress = "";
-    }
-    if (
-      Number(row.account_status || 0) <= 0 ||
-      row.wallet_status !== "active" ||
-      !payoutAddress ||
-      payoutAddress.toLowerCase() === activeRuntime.treasuryAddress.toLowerCase() ||
-      Number(row.seller_status || 0) !== 0
-    ) {
-      candidates.push({
-        row,
-        action: "manual_review",
-        balance,
-        grossValue,
-        reason: Number(row.seller_status || 0) !== 0
-          ? "The account still has an active seller status and requires seller-reserve reconciliation."
-          : "The account is disabled or has no valid registered BSC-USD payout address.",
-      });
-      continue;
-    }
-    let calculation;
-    try {
-      calculation = calculateGlobalDisbursement(balance, snapshotPrice, gasRecoveryUsd);
-    } catch {
-      candidates.push({
-        row,
-        action: "manual_review",
-        balance,
-        grossValue,
-        reason: "The account's global liquidation value does not cover the estimated BSC transaction gas fee.",
-      });
-      continue;
-    }
-    totalTokenRaw += BigInt(calculation.amountRaw);
-    payoutCount += 1;
-    candidates.push({
-      row,
-      action: "queue",
-      balance,
-      grossValue: calculation.grossBalance,
-      payoutAmount: calculation.payoutAmount,
-      amountRaw: calculation.amountRaw,
-      payoutAddress,
-    });
-  }
-
-  if (payoutCount > 0) {
-    const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
-    const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
-    const [pendingGlobalRows] = await db.queryAsync(
-      `SELECT amount_raw,estimated_fee_bnb FROM users_usdt_disbursements
-       WHERE global_run_id=? AND status IN ('queued','signed','submitted')`, [run.id],
-    );
-    const committedTokenRaw = pendingGlobalRows.reduce(
-      (sum, row) => sum + BigInt(String(row.amount_raw || "0")), 0n,
-    );
-    const committedGasWei = pendingGlobalRows.reduce((sum, row) => {
-      const feeBnb = new BigNumber(row.estimated_fee_bnb || "0");
-      if (!feeBnb.isFinite() || feeBnb.isNegative()) {
-        throw new Error(`Global disbursement ${run.id} has an invalid pending gas reservation.`);
-      }
-      const feeWei = feeBnb.shiftedBy(18).integerValue(BigNumber.ROUND_UP);
-      return sum + BigInt(feeWei.toFixed(0));
-    }, 0n);
-    const availableTokenRaw = tokenBalance > committedTokenRaw
-      ? tokenBalance - committedTokenRaw
-      : 0n;
-    const availableBnbWei = nativeBalance > committedGasWei
-      ? nativeBalance - committedGasWei
-      : 0n;
-    const requiredNativeBalance = activeRuntime.gasLimit * gasPrice * BigInt(payoutCount);
-    if (availableTokenRaw < totalTokenRaw) {
-      throw new Error(`Global disbursement ${run.id} is waiting for BSC-USD liquidity after outstanding global payout reservations.`);
-    }
-    if (availableBnbWei < requiredNativeBalance) {
-      throw new Error(`Global disbursement ${run.id} is waiting for BNB gas liquidity after outstanding global payout reservations.`);
-    }
-  }
-
-  await withTransaction(db, async (tx) => {
-    const [commonLockRows] = await tx.query(
-      "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
-    );
-    if (!commonLockRows.length) throw new Error("The common-state lock row is missing during global staging.");
-    await getLatestCommonTx(tx, true);
-    const [lockedRuns] = await tx.query(
-      "SELECT * FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE", [run.id],
-    );
-    if (!lockedRuns.length || !["queued", "staging"].includes(lockedRuns[0].status)) return;
-    if (!new BigNumber(lockedRuns[0].snapshot_unit_price).eq(snapshotPrice)) {
-      throw new Error("The global disbursement snapshot price changed unexpectedly.");
-    }
-
-    const [lockedPage] = await tx.query(
-      `SELECT s.id,s.username,s.balance,s.seller_status,
-              a.status AS account_status,w.payout_address,w.account_status AS wallet_status
-       FROM users_stock s
-       LEFT JOIN auths a ON a.username=s.username
-       LEFT JOIN users_usdt_deposit_wallets w ON w.username=s.username
-       WHERE s.id>? AND s.id<=? AND s.username<>'ONEX'
-       ORDER BY s.id ASC LIMIT ? FOR UPDATE`,
-      [String(lockedRuns[0].last_user_stock_id || 0), String(lockedRuns[0].max_user_stock_id || 0), batchSize],
-    );
-    if (lockedPage.length !== page.length || lockedPage.some((row, index) => {
-      const prepared = page[index];
-      return (
-        String(row.id) !== String(prepared.id) ||
-        !new BigNumber(row.balance).eq(prepared.balance) ||
-        Number(row.seller_status || 0) !== Number(prepared.seller_status || 0) ||
-        Number(row.account_status || 0) !== Number(prepared.account_status || 0) ||
-        String(row.wallet_status || "") !== String(prepared.wallet_status || "") ||
-        String(row.payout_address || "").toLowerCase() !== String(prepared.payout_address || "").toLowerCase()
+      if (!lockRows.length) throw new Error("The common-state lock row is missing during global closure.");
+      await getLatestCommonTx(tx, true);
+      const [runRows] = await tx.query(
+        "SELECT id,status,request_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
+        [candidate.id],
       );
-    })) {
-      throw new Error("Global disbursement user balances changed while a batch was being prepared; the batch will be retried.");
-    }
-
-    const now = Date.now();
-    const [date, time] = getDate();
-    let pageGrossInitial = new BigNumber(0);
-    let insertedCount = 0;
-    for (const candidate of candidates) {
-      if (candidate.action === "skip") continue;
-      const username = candidate.row.username;
-      const reference = `GDISB${crypto.randomBytes(16).toString("hex")}`;
-      if (candidate.action === "manual_review") {
-        const zeroAddress = "0x0000000000000000000000000000000000000000";
-        await tx.query(
-          `INSERT INTO users_usdt_disbursements
-           (username,payout_address,requested_amount,payout_amount,amount_raw,gross_initial_asset,
-            sold_initial_asset,fee_amount,fee_initial_asset,price_value,disbursement_mode,global_run_id,
-            balance_after_reservation,bsc_fee_recovered_usd,reference,status,last_error,created_at_ms,
-            reservation_expires_at_ms,updated_at_ms)
-           VALUES(?,?,?,0,'0',0,0,0,0,?,'global',?,?,0,?,'manual_review',?,?,?,?)`,
-          [
-            username,
-            zeroAddress,
-            candidate.grossValue.toFixed(18),
-            snapshotPrice.toFixed(30),
-            String(run.id),
-            candidate.balance.toFixed(30),
-            reference,
-            candidate.reason,
-            String(now),
-            String(now + 30 * 24 * 60 * 60 * 1000),
-            String(now),
-          ],
-        );
-        await queueTelegramMessageTx(tx, username, `global-disbursement:${run.id}:${username}:manual_review`, [
-          "OneX Global Disbursement Update",
-          "Your account requires manual review before its global disbursement can be processed.",
-          `Reason: ${candidate.reason}`,
-          "Your current balance has not been deducted.",
-          "Status: MANUAL REVIEW",
-        ].join("\n"));
-        insertedCount += 1;
-        continue;
-      }
-
-      const newBalance = candidate.balance.minus(candidate.balance);
+      if (!runRows.length || runRows[0].status !== "active" || Number(runRows[0].request_deadline_at_ms) > now) return;
+      const timestamp = String(now);
       await tx.query(
-        "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
-        [newBalance.toFixed(30), date, time, username],
+        `UPDATE global_disbursement_runs
+         SET status='closed',closed_at_ms=?,updated_at_ms=? WHERE id=? AND status='active'`,
+        [timestamp, timestamp, candidate.id],
       );
-      const [insertResult] = await tx.query(
-        `INSERT INTO users_usdt_disbursements
-         (username,payout_address,requested_amount,payout_amount,amount_raw,gross_initial_asset,
-          sold_initial_asset,fee_amount,fee_initial_asset,price_value,disbursement_mode,global_run_id,
-          balance_after_reservation,bsc_fee_recovered_usd,estimated_fee_bnb,estimated_fee_usd,
-          reference,status,created_at_ms,reservation_expires_at_ms,updated_at_ms)
-         VALUES(?,?,?,?,?,?,?,0,0,?,'global',?,0,?,?,?,?, 'queued',?,?,?)`,
-        [
-          username,
-          candidate.payoutAddress,
-          candidate.grossValue.toFixed(18),
-          candidate.payoutAmount.toFixed(18),
-          candidate.amountRaw,
-          candidate.balance.toFixed(30),
-          candidate.balance.toFixed(30),
-          snapshotPrice.toFixed(30),
-          String(run.id),
-          gasRecoveryUsd.toFixed(18),
-          estimatedGas.feeBnb.toFixed(30),
-          gasRecoveryUsd.toFixed(18),
-          reference,
-          String(now),
-          String(now + 24 * 60 * 60 * 1000),
-          String(now),
-        ],
+      await tx.query(
+        `UPDATE global_disbursement_participants
+         SET status='manual_review',updated_at_ms=?
+         WHERE run_id=? AND status='awaiting_request' AND remaining_initial_asset>0`,
+        [timestamp, candidate.id],
       );
-      await queueTelegramMessageTx(tx, username, `global-disbursement:${run.id}:${insertResult.insertId}:queued`, [
-        "OneX Global Disbursement Update",
-        "Your account has been queued for the platform-wide liquidation.",
-        `Gross value: ${candidate.grossValue.toFixed(8)} BSC-USD`,
-        `Estimated BSC gas recovery: ${gasRecoveryUsd.toFixed(8)} BSC-USD`,
-        `Expected payout: ${candidate.payoutAmount.toFixed(8)} BSC-USD`,
-        `Locked valuation price: ${snapshotPrice.toFixed(12)} XTU per initial asset`,
-        "No tfees are charged in global disbursement mode.",
-        "Status: PROCESSING",
-      ].join("\n"));
-      pageGrossInitial = pageGrossInitial.plus(candidate.balance);
-      insertedCount += 1;
-    }
-
-    const lastId = lockedPage[lockedPage.length - 1].id;
-    await tx.query(
-      `UPDATE global_disbursement_runs
-       SET status='staging',last_user_stock_id=?,processed_users=processed_users+?,
-           total_gross_initial_asset=total_gross_initial_asset+?,last_error=NULL,updated_at_ms=?
-       WHERE id=?`,
-      [String(lastId), String(lockedPage.length), pageGrossInitial.toFixed(30), String(now), run.id],
-    );
-  });
-  return { staged: insertedCount, pageCount: page.length };
+      closed += 1;
+    });
+  }
+  return { closed };
 }
 
 async function settleGlobalDisbursementRun(db) {
   const [runs] = await db.queryAsync(
     `SELECT id,status FROM global_disbursement_runs
-     WHERE status='settling' ORDER BY id ASC LIMIT 1`,
+     WHERE status IN ('closed','manual_review') ORDER BY id ASC LIMIT 10`,
   );
-  if (!runs.length) return { settled: false };
-  const runId = runs[0].id;
-  await withTransaction(db, async (tx) => {
-    const [runRows] = await tx.query(
-      "SELECT id,status FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE", [runId],
-    );
-    if (!runRows.length || runRows[0].status !== "settling") return;
-    const [pendingRows] = await tx.query(
-      `SELECT COUNT(*) AS count FROM users_usdt_disbursements
-       WHERE global_run_id=? AND status IN ('queued','signed','submitted')`, [runId],
-    );
-    if (Number(pendingRows[0]?.count || 0) > 0) return;
-    const [reviewRows] = await tx.query(
-      `SELECT COUNT(*) AS count FROM users_usdt_disbursements
-       WHERE global_run_id=? AND status IN ('manual_review','failed')`, [runId],
-    );
-    const now = String(Date.now());
-    const status = Number(reviewRows[0]?.count || 0) > 0 ? "manual_review" : "completed";
-    await tx.query(
-      "UPDATE global_disbursement_runs SET status=?,completed_at_ms=?,updated_at_ms=? WHERE id=?",
-      [status, now, now, runId],
-    );
-  });
-  return { settled: true, runId: String(runId) };
+  let settled = 0;
+  for (const run of runs) {
+    await withTransaction(db, async (tx) => {
+      const [lockRows] = await tx.query(
+        "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
+      );
+      if (!lockRows.length) throw new Error("The common-state lock row is missing during global settlement.");
+      await getLatestCommonTx(tx, true);
+      const [runRows] = await tx.query(
+        "SELECT id,status FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE", [run.id],
+      );
+      if (!runRows.length || !["closed", "manual_review"].includes(runRows[0].status)) return;
+      const [pendingRows] = await tx.query(
+        `SELECT COUNT(*) AS count FROM users_usdt_disbursements
+         WHERE global_run_id=? AND status IN ('queued','signed','submitted','manual_review')`, [run.id],
+      );
+      if (Number(pendingRows[0]?.count || 0) > 0) return;
+      const [participantRows] = await tx.query(
+        `SELECT COUNT(*) AS count FROM global_disbursement_participants
+         WHERE run_id=? AND status IN ('awaiting_request','request_pending','manual_review')`, [run.id],
+      );
+      const unresolved = Number(participantRows[0]?.count || 0);
+      const nextStatus = unresolved > 0 ? "manual_review" : "completed";
+      const timestamp = String(Date.now());
+      await tx.query(
+        `UPDATE global_disbursement_runs
+         SET status=?,admin_bonus_reserved_initial_asset=CASE WHEN ?='completed' THEN 0 ELSE admin_bonus_reserved_initial_asset END,
+             completed_at_ms=CASE WHEN ?='completed' THEN ? ELSE completed_at_ms END,
+             updated_at_ms=? WHERE id=?`,
+        [nextStatus, nextStatus, nextStatus, timestamp, timestamp, run.id],
+      );
+      settled += 1;
+    });
+  }
+  return { settled };
 }
 
 async function runDisbursementCycle(db, activeRuntime) {
@@ -1724,17 +1594,7 @@ async function runDisbursementCycle(db, activeRuntime) {
         console.error(`Seller payout ${payout.id} processing failed:`, error.message);
       }
     }
-    try {
-      await stageGlobalDisbursementBatch(db, activeRuntime);
-    } catch (stageError) {
-      const message = String(stageError?.message || stageError || "Global staging failed").slice(0, 2000);
-      await db.queryAsync(
-        `UPDATE global_disbursement_runs SET last_error=?,updated_at_ms=?
-         WHERE status IN ('queued','staging')`,
-        [message, String(Date.now())],
-      ).catch(() => {});
-      console.error("OneX global disbursement staging is waiting:", message);
-    }
+    await closeExpiredGlobalDisbursement(db);
     await settleGlobalDisbursementRun(db);
 
   } catch (error) {
@@ -1761,7 +1621,7 @@ async function startDisbursementWorker(db) {
     `SELECT
        (SELECT COUNT(*) FROM users_usdt_disbursements WHERE status IN ('queued','signed','submitted')) AS disbursements,
        (SELECT COUNT(*) FROM users_usdt_seller_payouts WHERE status IN ('queued','signed','submitted')) AS seller_payouts,
-       (SELECT COUNT(*) FROM global_disbursement_runs WHERE status IN ('queued','staging','settling')) AS global_runs`,
+       (SELECT COUNT(*) FROM global_disbursement_runs WHERE status IN ('active','closed','manual_review')) AS global_runs`,
   );
   const pendingWork = Number(pendingRows[0]?.disbursements || 0) > 0 ||
     Number(pendingRows[0]?.seller_payouts || 0) > 0 || Number(pendingRows[0]?.global_runs || 0) > 0;
@@ -1786,6 +1646,6 @@ async function startDisbursementWorker(db) {
 module.exports = {
   startDisbursementWorker,
   checkTreasuryLiquidity,
-  stageGlobalDisbursementBatch,
+  closeExpiredGlobalDisbursement,
   settleGlobalDisbursementRun,
 };

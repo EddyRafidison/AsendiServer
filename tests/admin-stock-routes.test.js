@@ -41,3 +41,16 @@ test("both administrative stock endpoints have independent HTTP rate-limit entri
   assert.match(limiterSource, /"POST \/admin\/update-user-stock": \{ limit: 20, windowMs: 5 \* 60_000/);
   assert.match(limiterSource, /"POST \/admin\/update-common-stock": \{ limit: 20, windowMs: 5 \* 60_000/);
 });
+
+
+test("administrative common history has a dedicated rate-limit entry", () => {
+  assert.ok(limiterSource.includes('"POST /admin/common-history": { limit: 10, windowMs: 5 * 60_000, authResponse: true }'));
+  const historyRoute = getRouteBlock(
+    routesSource,
+    "/admin/common-history",
+    'router.post("/admin/resolve-global-disbursement-review"',
+  );
+  assert.match(historyRoute, /LIMIT 50/);
+  assert.match(historyRoute, /columns\.join/);
+  assert.doesNotMatch(historyRoute, /req\.body\.(table|column)/);
+});

@@ -11,6 +11,7 @@ const {
   calculateDistributableInitialAssets,
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,
+  isUserBalanceWithinMaxStock,
 } = require("../stock-accounting");
 
 const fixed = (value) => value.toFixed();
@@ -116,4 +117,22 @@ test("top-up rejects invalid reserve quantities, inconsistent prices and invalid
   assert.throws(() => calculateTopUpReserveAllocation("10", "0", "2", "3", "10"), /unit_price/);
   assert.throws(() => calculateTopUpReserveAllocation("10", "1", "-1", "3", "10"), /negative/);
   assert.throws(() => calculateTopUpReserveAllocation("10", "2", "3", "3", "100"), /inconsistent/);
+});
+
+test("projected user stock accepts exactly 300 XTU and rejects any value above it", () => {
+  const atLimit = isUserBalanceWithinMaxStock("290", "10", "1", "300");
+  assert.equal(atLimit.allowed, true);
+  assert.equal(fixed(atLimit.projectedXtu), "300");
+
+  const aboveLimit = isUserBalanceWithinMaxStock("290", "10.000000000000000001", "1", "300");
+  assert.equal(aboveLimit.allowed, false);
+  assert.equal(aboveLimit.projectedXtu.gt("300"), true);
+
+  const P2PNetCredit = isUserBalanceWithinMaxStock("290", "9.7", "1", "300");
+  assert.equal(P2PNetCredit.allowed, true);
+  assert.equal(fixed(P2PNetCredit.projectedXtu), "299.7");
+
+  const adjustedPrice = isUserBalanceWithinMaxStock("100", "0", "3", "300");
+  assert.equal(adjustedPrice.allowed, true);
+  assert.equal(fixed(adjustedPrice.projectedXtu), "300");
 });

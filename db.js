@@ -10,9 +10,9 @@ const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
 const OneX = "ONEX";
 const maxStockDefault = MAX_DEFAULT_STOCK;
 const P2Pallowed = String(process.env.P2P_ALLOWED || "false").toLowerCase() === "true";
-const stock_limit = process.env.STOCK_LIMIT || "10000000";
-// The default launch configuration initializes 10,000,000 public XTU and
-// 10,000,000 backed initial assets, giving an initial global price of 1.
+const stock_limit = process.env.STOCK_LIMIT || "18000000";
+// The default launch configuration initializes 18,000,000 public XTU and
+// 18,000,000 backed initial assets, giving an initial global price of 1.
 // Operators may override these values; the price is always derived from T / B.
 const initial_backed_units = process.env.INITIAL_BACKED_UNITS || stock_limit;
 const tfees = Number(process.env.FEES || 0);
@@ -118,6 +118,7 @@ const TABLES = [
     amount DECIMAL(50,30) NOT NULL,
     unit_price DECIMAL(50,30) NOT NULL DEFAULT 0,
     fees DECIMAL(50,30) NOT NULL DEFAULT 0,
+    bsc_fee_cost_usd DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Actual BSC network cost allocated to this activity',
     reference VARCHAR(64) NULL,
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL,
@@ -131,9 +132,9 @@ const TABLES = [
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS common(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    total_units_price DECIMAL(50,30) NOT NULL DEFAULT 10000000,
+    total_units_price DECIMAL(50,30) NOT NULL DEFAULT 18000000,
     unit_price DECIMAL(50,30) NOT NULL DEFAULT 1,
-    backed_units DECIMAL(50,30) NOT NULL DEFAULT 10000000,
+    backed_units DECIMAL(50,30) NOT NULL DEFAULT 18000000,
     inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     sys_inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     sellers_res DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -143,6 +144,8 @@ const TABLES = [
     total_bnb_fee_actual_value DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_bnb_fee_estimated_value DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_tfees DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_tfees_bsc_cost_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_tfees_bsc_uncovered_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL
   ) ENGINE=InnoDB`,
@@ -292,6 +295,16 @@ const TABLES = [
     confirmed_at_ms BIGINT UNSIGNED NULL,
     UNIQUE KEY uq_bsc_fee_tx_hash(tx_hash),
     KEY idx_bsc_fee_operation(operation,created_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS bsc_fee_allocations(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    tx_hash CHAR(66) NOT NULL,
+    allocation_type VARCHAR(24) NOT NULL,
+    allocation_id BIGINT UNSIGNED NOT NULL,
+    allocated_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_bsc_fee_allocation(tx_hash,allocation_type,allocation_id),
+    KEY idx_bsc_fee_allocation_target(allocation_type,allocation_id,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS account_security_action_locks(
     username VARCHAR(30) NOT NULL,
@@ -450,6 +463,8 @@ const TABLES = [
     global_run_id BIGINT UNSIGNED NULL,
     balance_after_reservation DECIMAL(50,30) NOT NULL DEFAULT 0,
     bsc_fee_recovered_usd DECIMAL(36,18) NOT NULL DEFAULT 0,
+    bonus_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    bonus_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     estimated_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
     estimated_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
     actual_fee_bnb DECIMAL(50,30) NULL,
@@ -473,9 +488,16 @@ const TABLES = [
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS global_disbursement_runs(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    status VARCHAR(24) NOT NULL DEFAULT 'queued',
+    status VARCHAR(24) NOT NULL DEFAULT 'announced',
     trigger_reason TEXT NOT NULL,
     decision_reference VARCHAR(128) NOT NULL,
+    notice_method VARCHAR(24) NOT NULL DEFAULT 'external',
+    notice_reference VARCHAR(255) NOT NULL,
+    request_window_days SMALLINT UNSIGNED NOT NULL,
+    planned_activation_at_ms BIGINT UNSIGNED NOT NULL,
+    request_deadline_at_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    activated_at_ms BIGINT UNSIGNED NULL,
+    closed_at_ms BIGINT UNSIGNED NULL,
     snapshot_unit_price DECIMAL(50,30) NOT NULL,
     snapshot_total_units_price DECIMAL(50,30) NOT NULL,
     planned_total_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -484,13 +506,59 @@ const TABLES = [
     total_users BIGINT UNSIGNED NOT NULL DEFAULT 0,
     processed_users BIGINT UNSIGNED NOT NULL DEFAULT 0,
     total_gross_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_requested_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_paid_bsc_usd DECIMAL(50,18) NOT NULL DEFAULT 0,
+    bonus_rate_percent DECIMAL(20,10) NOT NULL DEFAULT 0,
+    admin_bonus_reserved_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    admin_bonus_committed_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_bonus_paid_bsc_usd DECIMAL(50,18) NOT NULL DEFAULT 0,
+    total_bonus_paid_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_bsc_gas_actual_usd DECIMAL(50,18) NOT NULL DEFAULT 0,
+    announced_at_ms BIGINT UNSIGNED NOT NULL,
+    effective_at_ms BIGINT UNSIGNED NOT NULL,
     last_error TEXT NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
     completed_at_ms BIGINT UNSIGNED NULL,
     UNIQUE KEY uq_global_disbursement_decision(decision_reference),
     KEY idx_global_disbursement_status(status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS global_disbursement_participants(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    run_id BIGINT UNSIGNED NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    snapshot_balance_initial DECIMAL(50,30) NOT NULL,
+    requested_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    paid_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    remaining_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    request_count INT UNSIGNED NOT NULL DEFAULT 0,
+    last_disbursement_id BIGINT UNSIGNED NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'awaiting_request',
+    resolution_action VARCHAR(40) NULL,
+    resolution_reference VARCHAR(255) NULL,
+    resolution_reason TEXT NULL,
+    resolved_at_ms BIGINT UNSIGNED NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_global_participant_run_user(run_id,username),
+    KEY idx_global_participant_run_status(run_id,status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS global_disbursement_email_outbox(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    run_id BIGINT UNSIGNED NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    recipient VARCHAR(254) NOT NULL,
+    subject VARCHAR(191) NOT NULL,
+    message_text TEXT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    next_attempt_at_ms BIGINT UNSIGNED NOT NULL,
+    claimed_at_ms BIGINT UNSIGNED NULL,
+    last_error TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    sent_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_global_notice_email(run_id,username),
+    KEY idx_global_notice_email_due(status,next_attempt_at_ms,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_refunds(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -555,7 +623,7 @@ async function assertLatestSchema() {
       "seller_activated_at_ms", "seller_expires_at_ms", "seller_last_p2p_at_ms", "record_date", "record_time",
     ],
     activities: [
-      "sender", "receiver", "type", "amount", "unit_price", "fees", "reference",
+      "sender", "receiver", "type", "amount", "unit_price", "fees", "bsc_fee_cost_usd", "reference",
       "record_date", "record_time",
     ],
     telegram_link_challenges: [
@@ -568,7 +636,7 @@ async function assertLatestSchema() {
     telegram_bot_state: ["state_key", "state_value", "updated_at_ms"],
     common: [
       "total_units_price", "unit_price", "backed_units", "inactive_init_asset", "sys_inactive_init_asset",
-      "sellers_res", "total_run_balance", "total_tfees", "total_bnb_fee_actual", "total_bnb_fee_estimated",
+      "sellers_res", "total_run_balance", "total_tfees", "total_tfees_bsc_cost_usd", "total_tfees_bsc_uncovered_usd", "total_bnb_fee_actual", "total_bnb_fee_estimated",
       "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "record_date", "record_time",
     ],
     common_price_events: ["old_price", "new_price", "status", "last_username", "processed_at_ms", "created_at_ms", "updated_at_ms"],
@@ -594,6 +662,7 @@ async function assertLatestSchema() {
       "tx_hash", "operation", "estimated_fee_bnb", "estimated_fee_usd", "bnb_usd_price", "gas_used",
       "effective_gas_price_wei", "actual_fee_bnb", "actual_fee_usd", "created_at_ms", "confirmed_at_ms",
     ],
+    bsc_fee_allocations: ["tx_hash", "allocation_type", "allocation_id", "allocated_fee_usd", "created_at_ms"],
     account_security_action_locks: ["username", "action", "updated_at_ms"],
     account_security_events: ["username", "action", "outcome", "created_at_ms"],
     account_api_rate_limits: ["username", "action", "window_start_ms", "request_count", "updated_at_ms"],
@@ -622,11 +691,14 @@ async function assertLatestSchema() {
       "username", "payout_address", "requested_amount", "payout_amount", "amount_raw",
       "gross_initial_asset", "sold_initial_asset", "fee_amount", "fee_initial_asset",
       "price_value", "disbursement_mode", "global_run_id", "balance_after_reservation", "bsc_fee_recovered_usd",
+      "bonus_amount", "bonus_initial_asset",
       "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd",
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number",
       "last_error", "created_at_ms", "reservation_expires_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
-    global_disbursement_runs: ["status", "trigger_reason", "decision_reference", "snapshot_unit_price", "snapshot_total_units_price", "planned_total_initial_asset", "last_user_stock_id", "max_user_stock_id", "total_users", "processed_users", "total_gross_initial_asset", "total_paid_bsc_usd", "last_error", "created_at_ms", "updated_at_ms", "completed_at_ms"],
+    global_disbursement_runs: ["status", "trigger_reason", "decision_reference", "notice_method", "notice_reference", "request_window_days", "planned_activation_at_ms", "request_deadline_at_ms", "activated_at_ms", "closed_at_ms", "snapshot_unit_price", "snapshot_total_units_price", "planned_total_initial_asset", "last_user_stock_id", "max_user_stock_id", "total_users", "processed_users", "total_gross_initial_asset", "total_requested_initial_asset", "total_paid_bsc_usd", "bonus_rate_percent", "admin_bonus_reserved_initial_asset", "admin_bonus_committed_initial_asset", "total_bonus_paid_bsc_usd", "total_bonus_paid_initial_asset", "total_bsc_gas_actual_usd", "announced_at_ms", "effective_at_ms", "last_error", "created_at_ms", "updated_at_ms", "completed_at_ms"],
+    global_disbursement_participants: ["run_id", "username", "snapshot_balance_initial", "requested_initial_asset", "paid_initial_asset", "remaining_initial_asset", "request_count", "last_disbursement_id", "status", "resolution_action", "resolution_reference", "resolution_reason", "resolved_at_ms", "created_at_ms", "updated_at_ms"],
+    global_disbursement_email_outbox: ["run_id", "username", "recipient", "subject", "message_text", "status", "attempts", "next_attempt_at_ms", "claimed_at_ms", "last_error", "created_at_ms", "sent_at_ms"],
     users_usdt_refunds: [
       "username", "batch_id", "payout_address", "amount", "gross_amount", "fee_amount", "amount_raw",
       "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd", "bnb_usd_price",

@@ -16,7 +16,7 @@ async function hasAcceptedTreasuryWork() {
        (SELECT COUNT(*) FROM users_usdt_disbursements WHERE status IN ('queued','signed','submitted')) AS disbursements,
        (SELECT COUNT(*) FROM users_usdt_seller_payouts WHERE status IN ('queued','signed','submitted')) AS seller_payouts,
        (SELECT COUNT(*) FROM users_usdt_refunds WHERE status IN ('queued','signed','submitted')) AS refunds,
-       (SELECT COUNT(*) FROM global_disbursement_runs WHERE status IN ('queued','staging','settling')) AS global_runs`,
+       (SELECT COUNT(*) FROM global_disbursement_runs WHERE status IN ('active','closed','manual_review')) AS global_runs`,
   );
   return Object.values(rows[0] || {}).some((value) => Number(value || 0) > 0);
 }

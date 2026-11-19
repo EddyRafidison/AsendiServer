@@ -12,6 +12,8 @@ const COMMON_NUMERIC_FIELDS = Object.freeze([
   "sellers_res",
   "total_run_balance",
   "total_tfees",
+  "total_tfees_bsc_cost_usd",
+  "total_tfees_bsc_uncovered_usd",
   "total_bnb_fee_actual",
   "total_bnb_fee_estimated",
   "total_bnb_fee_actual_value",
@@ -52,6 +54,16 @@ async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
     "total_tfees",
     currentRow?.total_tfees || "0",
     values.total_tfees,
+  );
+  assertCumulativeNonNegative(
+    "total_tfees_bsc_cost_usd",
+    currentRow?.total_tfees_bsc_cost_usd || "0",
+    values.total_tfees_bsc_cost_usd,
+  );
+  assertCumulativeNonNegative(
+    "total_tfees_bsc_uncovered_usd",
+    currentRow?.total_tfees_bsc_uncovered_usd || "0",
+    values.total_tfees_bsc_uncovered_usd,
   );
   const columns = [...COMMON_NUMERIC_FIELDS, "record_date", "record_time"];
   const placeholders = columns.map(() => "?").join(",");

@@ -117,22 +117,42 @@ function validateGlobalDisbursementCapacity(totalUnitsPriceValue, snapshotPriceV
   };
 }
 
-/** Global liquidation is fee-free; the caller subtracts the captured BSC gas estimate. */
-function calculateGlobalDisbursement(balanceInitialAssetValue, priceValue, gasRecoveryValue = 0) {
+/** Global liquidation is fee-free; the announced bonus is calculated on the net XTU amount. */
+function calculateGlobalDisbursement(balanceInitialAssetValue, priceValue, gasRecoveryValue = 0, bonusRateValue = 0) {
   const grossInitialAsset = finitePositive(balanceInitialAssetValue, "users_stock.balance");
   const price = finitePositive(priceValue, "common.unit_price");
   const gasRecovery = new BigNumber(gasRecoveryValue);
+  const bonusRate = new BigNumber(bonusRateValue);
   if (!gasRecovery.isFinite() || gasRecovery.isNegative()) {
     throw new RangeError("BSC fee recovery must be finite and non-negative");
   }
+  if (
+    !bonusRate.isFinite() || bonusRate.isNegative() ||
+    bonusRate.isGreaterThan(10)
+  ) {
+    throw new RangeError("GLOBAL_DISBURSEMENT_BONUS must be between 0 and 10 percent");
+  }
+
   const grossAmount = grossInitialAsset.multipliedBy(price);
-  const payoutAmount = grossAmount.minus(gasRecovery).decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
-  if (!payoutAmount.isGreaterThan(0)) throw new RangeError("Global disbursement is not sufficient to cover its BSC gas fee");
+  const bonusAmount = grossAmount.multipliedBy(bonusRate).dividedBy(100)
+    .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
+  const bonusInitialAsset = bonusAmount.dividedBy(price);
+  const payoutBeforeGas = grossAmount.plus(bonusAmount);
+  const payoutAmount = payoutBeforeGas.minus(gasRecovery)
+    .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
+  if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
+    throw new RangeError("Global disbursement is not sufficient to cover its BSC gas fee");
+  }
   const amountRawDecimal = payoutAmount.shiftedBy(TOKEN_DECIMALS);
   if (!amountRawDecimal.isInteger()) throw new RangeError("Global disbursement raw amount is invalid");
   return {
     grossInitialAsset,
     grossBalance: grossAmount,
+    netRequestedAmount: grossAmount,
+    bonusRatePercent: bonusRate,
+    bonusAmount,
+    bonusInitialAsset,
+    payoutBeforeGas,
     priceValue: price,
     payoutAmount,
     soldInitialAsset: grossInitialAsset,
@@ -148,32 +168,60 @@ function calculateDisbursementReserveSettlement(
   backedUnitsValue,
   inactiveInitAssetValue,
   disbursement,
+  sysInactiveInitAssetValue = "0",
 ) {
   const totalUnitsPrice = new BigNumber(totalUnitsPriceValue);
   const backedUnits = new BigNumber(backedUnitsValue);
   const inactiveInitAsset = new BigNumber(inactiveInitAssetValue);
+  const sysInactiveInitAsset = new BigNumber(sysInactiveInitAssetValue);
   if (
     !totalUnitsPrice.isFinite() || !totalUnitsPrice.isGreaterThan(0) ||
     !backedUnits.isFinite() || !backedUnits.isGreaterThan(0) ||
-    !inactiveInitAsset.isFinite() || inactiveInitAsset.isNegative()
+    !inactiveInitAsset.isFinite() || inactiveInitAsset.isNegative() ||
+    !sysInactiveInitAsset.isFinite() || sysInactiveInitAsset.isNegative()
   ) {
     throw new RangeError("Common reserve values must be finite and non-negative, with positive backing");
   }
 
   const payoutAmount = finitePositive(disbursement.payoutAmount, "payoutAmount");
+  const reserveExpenseAmount = finitePositive(
+    disbursement.reserveExpenseAmount ?? payoutAmount,
+    "reserveExpenseAmount",
+  );
   const soldInitialAsset = finitePositive(disbursement.soldInitialAsset, "soldInitialAsset");
   const feeInitialAsset = new BigNumber(disbursement.feeInitialAsset);
+  const bonusInitialAsset = new BigNumber(disbursement.bonusInitialAsset || "0");
   if (!feeInitialAsset.isFinite() || feeInitialAsset.isNegative()) {
     throw new RangeError("Disbursement fee initial-asset basis is invalid");
   }
+  if (!bonusInitialAsset.isFinite() || bonusInitialAsset.isNegative()) {
+    throw new RangeError("Disbursement bonus initial-asset basis is invalid");
+  }
+  if (bonusInitialAsset.isGreaterThan(backedUnits)) {
+    throw new RangeError("Administrative reserve is insufficient for the global bonus");
+  }
 
-  // Settlement uses the payout and valuation basis frozen at request time.
-  // The paid basis moves to inactive reserves; the retained fee basis remains backed.
-  const newTotalUnitsPrice = totalUnitsPrice.minus(payoutAmount);
+  // Principal is moved to the inactive reserve. The bonus is paid from the
+  // protected administrative backing and is therefore removed from backed_units.
+  // The treasury pays both the token amount sent to the user and the actual
+  // BNB gas expense. For global reimbursement, gas is deducted from the user's
+  // payout estimate, but the actual receipt cost must still be debited here.
+  const newTotalUnitsPrice = totalUnitsPrice.minus(reserveExpenseAmount);
   const newInactiveInitAsset = inactiveInitAsset.plus(soldInitialAsset);
-  const newBackedUnits = backedUnits.plus(feeInitialAsset);
+  const newBackedUnits = backedUnits.minus(bonusInitialAsset).plus(feeInitialAsset);
+  const newSysInactiveInitAsset = sysInactiveInitAsset.plus(bonusInitialAsset);
+  if (!newTotalUnitsPrice.isGreaterThan(0) || !newBackedUnits.isGreaterThan(0)) {
+    throw new RangeError("Disbursement would exhaust the common reserve or backing");
+  }
   const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits);
-  return { newTotalUnitsPrice, newInactiveInitAsset, newBackedUnits, newUnitPrice };
+  return {
+    newTotalUnitsPrice,
+    reserveExpenseAmount,
+    newInactiveInitAsset,
+    newBackedUnits,
+    newSysInactiveInitAsset,
+    newUnitPrice,
+  };
 }
 
 function isRequestedPayoutWithinTolerance(requestedValue, expectedValue) {

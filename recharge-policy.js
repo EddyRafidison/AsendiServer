@@ -3,23 +3,46 @@
 const BigNumber = require("bignumber.js");
 
 const MAX_DEFAULT_STOCK = "300";
-const MIN_RECHARGE_AMOUNT = new BigNumber("12");
-const MAX_RECHARGE_AMOUNT = new BigNumber("140");
+// Automatic deposit sessions are fixed to the published 10–100 BSC-USD range.
+const MIN_RECHARGE_AMOUNT = new BigNumber("10");
+const MAX_RECHARGE_AMOUNT = new BigNumber("100");
 const SYSTEM_ADMIN_RESERVE_RATIO = new BigNumber(
   process.env.SYSTEM_ADMIN_RESERVE_RATIO || "0.10",
 );
 const RECHARGE_COOLDOWN_DAYS = 7;
 const RECHARGE_BATCH_WINDOW_MINUTES = 60;
-const DEPOSIT_SWEEP_THRESHOLD = new BigNumber("70");
+const DEPOSIT_SWEEP_THRESHOLD = new BigNumber(process.env.USDT_SWEEP_THRESHOLD_BSC_USD || "100");
 const DEPOSIT_SWEEP_MAX_AGE_DAYS = 30;
 const DISBURSEMENT_COOLDOWN_DAYS = 30;
 const DISBURSEMENT_RESERVATION_MINUTES = 60;
+
+if (
+  !MIN_RECHARGE_AMOUNT.isFinite() || !MIN_RECHARGE_AMOUNT.isGreaterThan(0) ||
+  !MAX_RECHARGE_AMOUNT.isFinite() || MAX_RECHARGE_AMOUNT.lt(MIN_RECHARGE_AMOUNT) ||
+  !DEPOSIT_SWEEP_THRESHOLD.isFinite() || !DEPOSIT_SWEEP_THRESHOLD.isGreaterThan(0)
+) {
+  throw new RangeError("Recharge and deposit-sweep limits must be finite positive values with maximum >= minimum");
+}
 
 const RECHARGE_COOLDOWN_MS = RECHARGE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
 const RECHARGE_BATCH_WINDOW_MS = RECHARGE_BATCH_WINDOW_MINUTES * 60 * 1000;
 const DEPOSIT_SWEEP_MAX_AGE_MS = DEPOSIT_SWEEP_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 const DISBURSEMENT_COOLDOWN_MS = DISBURSEMENT_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
 const DISBURSEMENT_RESERVATION_MS = DISBURSEMENT_RESERVATION_MINUTES * 60 * 1000;
+
+function validateRechargeAmount(amountValue) {
+  const amount = new BigNumber(amountValue);
+  if (!amount.isFinite() || !amount.isGreaterThan(0)) {
+    return { allowed: false, reason: "invalid_amount" };
+  }
+  if (amount.isLessThan(MIN_RECHARGE_AMOUNT)) {
+    return { allowed: false, reason: "below_minimum" };
+  }
+  if (amount.isGreaterThan(MAX_RECHARGE_AMOUNT)) {
+    return { allowed: false, reason: "above_maximum" };
+  }
+  return { allowed: true, reason: null, amount };
+}
 
 function recordDateTimeToUtcMs(recordDate, recordTime) {
   const date = String(recordDate ?? "").replace(/\D/g, "").padStart(8, "0");
@@ -105,4 +128,5 @@ module.exports = {
   assessRechargeCooldown,
   formatUtcRecordDateTime,
   getWeeklyReleaseAt,
+  validateRechargeAmount,
 };

@@ -371,6 +371,26 @@ function calculateRechargeFundingAllocation(
   };
 }
 
+/** Check a user's projected XTU balance against the global stock cap. */
+function isUserBalanceWithinMaxStock(currentInitialAssetValue, creditInitialAssetValue, unitPriceValue, maximumXtuValue) {
+  const currentInitialAsset = asBigNumber(currentInitialAssetValue, "current user initial-asset balance");
+  const creditInitialAsset = asBigNumber(creditInitialAssetValue, "user credit initial-asset amount");
+  const unitPrice = asBigNumber(unitPriceValue, "common.unit_price");
+  const maximumXtu = asBigNumber(maximumXtuValue, "maximum user XTU balance");
+  if (currentInitialAsset.isNegative() || creditInitialAsset.isNegative()) {
+    throw new RangeError("User balances and credits cannot be negative");
+  }
+  if (!unitPrice.isGreaterThan(0) || !maximumXtu.isGreaterThan(0)) {
+    throw new RangeError("The global price and maximum user balance must be positive");
+  }
+  const projectedXtu = currentInitialAsset.plus(creditInitialAsset).multipliedBy(unitPrice);
+  return {
+    allowed: projectedXtu.isLessThanOrEqualTo(maximumXtu),
+    projectedXtu,
+    maximumXtu,
+  };
+}
+
 module.exports = {
   calculateGlobalUnitPrice,
   xtuToInitialAsset,
@@ -381,4 +401,5 @@ module.exports = {
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,
   calculateRechargeFundingAllocation,
+  isUserBalanceWithinMaxStock,
 };
