@@ -114,10 +114,12 @@ const { getPublicRechargeAvailability } = require("./recharge-availability");
 const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
 const {
   GLOBAL_DISBURSEMENT_NOTICE_MS,
+  resolveGlobalDisbursementRequestWindowDays,
+  resolveGlobalDisbursementExtensionDays,
+  resolveGlobalDisbursementPhase,
   resolveGlobalDisbursementBonus,
   calculateRequiredAdminBonusReserve,
   isGlobalDisbursementEffective,
-  isGlobalDisbursementRequestOpen,
   evaluateDisbursementMinimumXtu,
   isGlobalDisbursementPriceFrozen,
   validateGlobalAnnouncement,
@@ -126,6 +128,12 @@ const {
 const CONFIGURED_GLOBAL_DISBURSEMENT_BONUS = resolveGlobalDisbursementBonus(
   tfees,
   process.env.GLOBAL_DISBURSEMENT_BONUS,
+);
+const GLOBAL_DISBURSEMENT_REQUEST_WINDOW_DAYS = resolveGlobalDisbursementRequestWindowDays(
+  process.env.GLOBAL_DISBURSEMENT_REQUEST_WINDOW_DAYS,
+);
+const GLOBAL_DISBURSEMENT_EXTENSION_DAYS = resolveGlobalDisbursementExtensionDays(
+  process.env.GLOBAL_DISBURSEMENT_EXTENSION_DAYS,
 );
 
 const router = express.Router();
@@ -193,13 +201,14 @@ function requestTokenIsValid(req, token, password, username) {
 async function getUserActivityPasswordState(username, submittedPassword) {
   if (!username || typeof submittedPassword !== "string") return "incorrect";
   const rows = await db.queryAsync(
-    `SELECT password,consec_failed_auth,password_temp_expires_at_ms
+    `SELECT password,last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms
      FROM auths WHERE username=? LIMIT 1`,
     [username],
   );
   if (rows.length === 0) return "incorrect";
 
   const row = rows[0];
+  if (row.last_login_at_ms == null || Number(row.account_active) !== 1) return "not_allowed";
   // The lock persists after a temporary-password login. Only changing the
   // temporary password clears the marker and restores normal account activity.
   if (isPasswordProtectedActivityLocked({
@@ -351,7 +360,7 @@ async function assessUserRechargeAvailability(username) {
 
     const common = await getLatestCommonTx(tx, true);
     const [globalRows] = await tx.query(
-      `SELECT id,status,effective_at_ms,request_deadline_at_ms,bonus_rate_percent
+      `SELECT id,status,effective_at_ms,request_deadline_at_ms,extension_deadline_at_ms,bonus_rate_percent
        FROM global_disbursement_runs
        WHERE status IN ('announced','active','closed','manual_review','completed','resolved')
        ORDER BY id DESC LIMIT 1 FOR UPDATE`,
@@ -509,9 +518,9 @@ async function applyUserTopUp(
     return { error: "global disbursement in progress" };
   }
   const [authRows] = await tx.query(
-    "SELECT status FROM auths WHERE username=? FOR UPDATE", [username],
+    "SELECT last_login_at_ms,account_active FROM auths WHERE username=? FOR UPDATE", [username],
   );
-  if (!authRows.length || Number(authRows[0].status) <= 0) return { error: "user not found" };
+  if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { error: "user not found" };
   const [userRows] = await tx.query(
     "SELECT balance FROM users_stock WHERE username=? FOR UPDATE", [username],
   );
@@ -763,7 +772,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   if (!commonPrice.isFinite() || !commonPrice.isGreaterThan(0)) throw new Error("Invalid global unit price");
 
   const [runRows] = await tx.query(
-    `SELECT id,status,effective_at_ms,request_deadline_at_ms,snapshot_unit_price,
+    `SELECT id,status,effective_at_ms,request_deadline_at_ms,extension_deadline_at_ms,snapshot_unit_price,
             bonus_rate_percent,admin_bonus_reserved_initial_asset,admin_bonus_committed_initial_asset
      FROM global_disbursement_runs
      WHERE status IN ('announced','active','closed','manual_review','completed','resolved')
@@ -772,9 +781,15 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   const globalRun = runRows[0] || null;
   const now = Date.now();
   const globalEffective = Boolean(globalRun && isGlobalDisbursementEffective(globalRun.status));
-  const globalRequestOpen = Boolean(globalRun && isGlobalDisbursementRequestOpen(
-    globalRun.status, globalRun.request_deadline_at_ms, now,
-  ));
+  const globalPhase = globalRun
+    ? resolveGlobalDisbursementPhase(
+      globalRun.status,
+      globalRun.request_deadline_at_ms,
+      globalRun.extension_deadline_at_ms,
+      now,
+    )
+    : "closed";
+  const globalRequestOpen = globalPhase !== "closed";
   if (globalEffective && !globalRequestOpen) {
     return { transf: "global disbursement request window closed; administrative review required" };
   }
@@ -794,13 +809,13 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   }
 
   const [authRows] = await tx.query(
-    `SELECT status,password,consec_failed_auth,password_temp_expires_at_ms
+    `SELECT last_login_at_ms,account_active,password,consec_failed_auth,password_temp_expires_at_ms
      FROM auths WHERE username=? FOR UPDATE`, [username],
   );
   if (authRows.length && (
     Number(authRows[0].consec_failed_auth || 0) >= 3 || authRows[0].password_temp_expires_at_ms != null
   )) return { auth: "not allowed" };
-  if (!authRows.length || Number(authRows[0].status) <= 0 || authRows[0].password !== verifiedPasswordHash) {
+  if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1 || authRows[0].password !== verifiedPasswordHash) {
     return { transf: "failed" };
   }
 
@@ -869,7 +884,9 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
         requestedInitialAsset.gt(userBalanceInitial)) {
       return { transf: "insufficient user balance" };
     }
-    const bonusRate = new BigNumber(globalRun.bonus_rate_percent || "0");
+    const bonusRate = new BigNumber(
+      globalPhase === "primary" ? (globalRun.bonus_rate_percent || "0") : "0",
+    );
     const calculation = calculateGlobalDisbursement(
       requestedInitialAsset, requestPrice, 0, bonusRate,
     );
@@ -936,6 +953,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
       "Your global disbursement request to ONEX has been accepted.",
       `Net amount requested: ${calculation.grossBalance.toFixed(8)} XTU`,
       `Global bonus: ${calculation.bonusAmount.toFixed(8)} BSC-USD`,
+      ...(globalPhase === "extension" ? ["The 30-day extension is active; no bonus applies to new requests."] : []),
       "No tfees are charged in global disbursement mode. BSC network gas is deducted separately.",
       `Locked global valuation: ${requestPrice.toFixed(12)} XTU per initial asset`,
       `Reference: ${reference}`,
@@ -1130,7 +1148,7 @@ async function processConfirmedUsdtPayment(event) {
     if (eventInsert.affectedRows !== 1) return { duplicate: true };
 
     const [authRows] = await tx.query(
-      "SELECT status FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
+      "SELECT last_login_at_ms,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
     );
     const [stockRows] = await tx.query(
       "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [username],
@@ -1175,7 +1193,7 @@ async function processConfirmedUsdtPayment(event) {
     let initialReasons = transferAfterCutoff
       ? ["received_after_global_disbursement_cutoff"]
       : (manualRechargeSuspended ? ["manual_recharge_suspended"] : []);
-    if (!transferAfterCutoff && (wallet.account_status !== "active" || !authRows.length || Number(authRows[0].status) <= 0 || !stockRows.length)) {
+    if (!transferAfterCutoff && (wallet.account_status !== "active" || !authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1 || !stockRows.length)) {
       initialStatus = "pending_support";
       initialReasons.push("account_unavailable");
     }
@@ -1673,13 +1691,13 @@ router.post("/app/signup", async (req, res) => {
     return res.status(400).send({ msg: "invalid input" });
   }
 
-  const Email = email.trim();
+  const Email = email.trim().toLowerCase();
   const Birth = birth.trim();
   const rawAddress = addr.trim();
   const rawName = name.trim();
   const rawIdentityNumber = identity.identityNumber;
   if (
-    !Email || Buffer.byteLength(Email, "utf8") > 254 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(Email) || Buffer.byteLength(Email, "utf8") > 254 ||
     !Birth || Buffer.byteLength(Birth, "utf8") > 20 ||
     !rawAddress || Buffer.byteLength(rawAddress, "utf8") > 100 ||
     !rawName || Buffer.byteLength(rawName, "utf8") > 100 ||
@@ -1712,6 +1730,13 @@ router.post("/app/signup", async (req, res) => {
 
   const Address = latinAddress;
   const Name = latinName;
+  const existingEmailRows = await db.queryAsync(
+    "SELECT username FROM auths WHERE email=? LIMIT 1",
+    [Email],
+  );
+  if (existingEmailRows.length) {
+    return res.status(409).send({ msg: "email already registered" });
+  }
   const encryptedIdentityNumber = encrypt(rawIdentityNumber, DB_CONFIG.password);
   const passwordValue = pswd;
   const seedValue = seed;
@@ -1769,6 +1794,15 @@ router.post("/app/signup", async (req, res) => {
           "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
         );
         if (!signupLockRows.length) throw new Error("The common-state lock row has not been initialized during signup");
+        const [emailRows] = await connection.query(
+          "SELECT username FROM auths WHERE email=? LIMIT 1 FOR UPDATE",
+          [Email],
+        );
+        if (emailRows.length) {
+          const emailConflict = new Error("The email address is already registered.");
+          emailConflict.code = "ONEX_EMAIL_ALREADY_REGISTERED";
+          throw emailConflict;
+        }
         const [globalRunRows] = await connection.query(
           "SELECT status FROM global_disbursement_runs WHERE status IN ('active','closed','manual_review','completed','resolved') ORDER BY id DESC LIMIT 1 FOR UPDATE",
         );
@@ -1776,9 +1810,10 @@ router.post("/app/signup", async (req, res) => {
           await connection.rollback();
           return res.status(423).send({ msg: "signup suspended during global disbursement" });
         }
+        const createdAtMs = String(Date.now());
         await connection.query(
-          "INSERT INTO auths(username,password,name,email,birthdate,nationality,residence_country,identity_document_type,identity_document_number,address,seed,status,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          [U, PWD, Name, Email, Birth, identity.nationality, identity.residenceCountry, identity.identityType, encryptedIdentityNumber, Address, SEED, 0, date, time],
+          "INSERT INTO auths(username,password,name,email,birthdate,nationality,residence_country,identity_document_type,identity_document_number,address,seed,created_at_ms,last_login_at_ms,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          [U, PWD, Name, Email, Birth, identity.nationality, identity.residenceCountry, identity.identityType, encryptedIdentityNumber, Address, SEED, createdAtMs, null, date, time],
         );
         await connection.query(
           "INSERT INTO users_stock(username,balance,record_date,record_time) VALUES(?,?,?,?)",
@@ -1794,7 +1829,19 @@ router.post("/app/signup", async (req, res) => {
           }
         }
 
-        if (insertError.code === "ER_DUP_ENTRY") continue;
+        if (insertError.code === "ONEX_EMAIL_ALREADY_REGISTERED") {
+          return res.status(409).send({ msg: "email already registered" });
+        }
+        if (insertError.code === "ER_DUP_ENTRY") {
+          const duplicateEmailRows = await db.queryAsync(
+            "SELECT username FROM auths WHERE email=? LIMIT 1",
+            [Email],
+          );
+          if (duplicateEmailRows.length) {
+            return res.status(409).send({ msg: "email already registered" });
+          }
+          continue;
+        }
         throw insertError;
       } finally {
         if (conn) conn.release();
@@ -1807,12 +1854,12 @@ router.post("/app/signup", async (req, res) => {
 
     res.send({ msg: "ok" });
 
-    // Send the welcome email after the account is committed.
+    // Send only the generated username to the address supplied during signup.
     mailQueue.sendMail({
       from: SERVER_MAIL,
       to: Email,
-      subject: "New member",
-      text: `Welcome to OneX.\nYour username: ${U}`,
+      subject: "OneX username",
+      text: U,
     }).catch((mailError) => {
       console.error("Welcome email failed:", mailError);
     });
@@ -1869,7 +1916,7 @@ router.post("/app/signin", async (req, res) => {
   try {
     const result = await withTransaction(async (tx) => {
       const [rows] = await tx.query(
-        `SELECT id,password,seed,status,consec_failed_auth,password_temp_expires_at_ms,tg_userId,tg_chat_id
+        `SELECT id,password,seed,account_active,consec_failed_auth,password_temp_expires_at_ms,tg_userId,tg_chat_id
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
         [U],
       );
@@ -1878,6 +1925,9 @@ router.post("/app/signin", async (req, res) => {
       }
 
       const row = rows[0];
+      if (Number(row.account_active) !== 1) {
+        return { response: { msg: "account disabled", ua: "", tg_botLink: null } };
+      }
       const authDecision = evaluatePasswordAuthentication({
         failedCount: Number(row.consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: row.password_temp_expires_at_ms,
@@ -1917,17 +1967,17 @@ router.post("/app/signin", async (req, res) => {
         );
       }
 
-      let status = Number(row.status);
-      if (status === 0) {
-        await tx.query("UPDATE auths SET status=1 WHERE username=?", [U]);
-        status = 1;
-      }
+      const loginAtMs = String(Date.now());
+      await tx.query(
+        "UPDATE auths SET last_login_at_ms=? WHERE username=? AND account_active=1",
+        [loginAtMs, U],
+      );
 
       const encUA = encrypt(ua, P + U);
       const tgBotLink = await createTelegramBotLinkTx(tx, U, row);
       return {
         response: {
-          msg: status,
+          msg: 1,
           ua: encUA,
           tg_botLink: tgBotLink,
           password_change_required: isTemporaryPassword,
@@ -1992,7 +2042,15 @@ router.post("/app/user-last-stock", async (req, res) => {
 
     const globalRun = rechargeAvailability.globalRun || null;
     const globalEffective = Boolean(rechargeAvailability.globalEffective);
-    const globalRequestOpen = Boolean(globalRun && isGlobalDisbursementRequestOpen(globalRun.status, globalRun.request_deadline_at_ms, Date.now()));
+    const globalPhase = globalRun
+      ? resolveGlobalDisbursementPhase(
+        globalRun.status,
+        globalRun.request_deadline_at_ms,
+        globalRun.extension_deadline_at_ms,
+        Date.now(),
+      )
+      : "closed";
+    const globalRequestOpen = globalPhase !== "closed";
     const masterDisbursementEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
     const individualDisbursementEnabled = String(process.env.USDT_INDIVIDUAL_DISBURSEMENT_ENABLED || "false").toLowerCase() === "true";
     const globalDisbursementEnabled = String(process.env.USDT_GLOBAL_DISBURSEMENT_ENABLED || "false").toLowerCase() === "true";
@@ -2018,6 +2076,8 @@ router.post("/app/user-last-stock", async (req, res) => {
         status: globalRun.status,
         effective_at_ms: Number(globalRun.effective_at_ms),
         request_deadline_at_ms: globalRun.request_deadline_at_ms == null ? null : Number(globalRun.request_deadline_at_ms),
+        extension_deadline_at_ms: globalRun.extension_deadline_at_ms == null ? null : Number(globalRun.extension_deadline_at_ms),
+        request_phase: globalPhase,
         effective: Boolean(globalEffective || rechargeAvailability.globalEffective),
         recharge_allowed: Boolean(depositAddress),
         p2p_allowed: !(globalEffective || rechargeAvailability.globalEffective),
@@ -2026,7 +2086,9 @@ router.post("/app/user-last-stock", async (req, res) => {
         individual_sale_to_onex_allowed: onexDisbursementAllowed,
         individual_sale_minimum_xtu: globalRequestOpen ? "1" : (globalEffective ? null : "200"),
         disbursement_mode: globalRequestOpen ? "global" : (globalEffective ? null : "individual"),
-        global_disbursement_bonus_percent: String(globalRun.bonus_rate_percent || "0"),
+        global_disbursement_bonus_percent: globalPhase === "primary"
+          ? String(globalRun.bonus_rate_percent || "0")
+          : "0",
       } : null,
       unit_price: unitPrice.toFixed(30),
       balance_initial_asset: balanceInitial.toFixed(30),
@@ -2200,21 +2262,22 @@ router.post("/app/set-payout-address", async (req, res) => {
       ? String(depositWalletRows[0].wallet_address || "")
       : "";
     const payoutAddress = checksumEvmAddress(address);
+    const normalizedPayoutAddress = payoutAddress.toLowerCase();
     if (
-      (depositAddress && payoutAddress.toLowerCase() === depositAddress.toLowerCase()) ||
-      payoutAddress.toLowerCase() === String(process.env.USDT_BEP20_TREASURY_ADDRESS || "").toLowerCase()
+      (depositAddress && normalizedPayoutAddress === depositAddress.toLowerCase()) ||
+      normalizedPayoutAddress === String(process.env.USDT_BEP20_TREASURY_ADDRESS || "").toLowerCase()
     ) return res.send({ auth: "invalid address" });
     const depositCollision = await db.queryAsync(
-      "SELECT id FROM users_usdt_deposit_wallets WHERE wallet_address=? LIMIT 1",
-      [payoutAddress],
+      "SELECT id FROM users_usdt_deposit_wallets WHERE LOWER(wallet_address)=? LIMIT 1",
+      [normalizedPayoutAddress],
     );
     if (depositCollision.length) return res.send({ auth: "invalid address" });
     const result = await withTransaction(async (tx) => {
       const [authRows] = await tx.query(
-        "SELECT username,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
+        "SELECT username,last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
         [U],
       );
-      if (!authRows.length) return { auth: "error" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { auth: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -2224,14 +2287,22 @@ router.post("/app/set-payout-address", async (req, res) => {
          WHERE username=? AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`, [U],
       );
       if (pendingRows.length) return { auth: "disbursement pending" };
-      await tx.query(
-        "UPDATE users_usdt_deposit_wallets SET payout_address=? WHERE username=? AND account_status='active'",
-        [payoutAddress, U],
+      const [duplicatePayoutRows] = await tx.query(
+        `SELECT username FROM users_usdt_deposit_wallets
+         WHERE payout_address=? AND account_status='active' AND username<>? LIMIT 1 FOR UPDATE`,
+        [normalizedPayoutAddress, U],
       );
+      if (duplicatePayoutRows.length) return { auth: "address already in use" };
+      const [updatedRows] = await tx.query(
+        "UPDATE users_usdt_deposit_wallets SET payout_address=? WHERE username=? AND account_status='active'",
+        [normalizedPayoutAddress, U],
+      );
+      if (updatedRows.affectedRows !== 1) return { auth: "deposit wallet unavailable" };
       return { auth: "updated", payout_address: payoutAddress };
     });
     return res.send(result);
   } catch (error) {
+    if (error.code === "ER_DUP_ENTRY") return res.send({ auth: "address already in use" });
     console.error("Payout-address update failed:", error.message);
     return res.send({ auth: "error" });
   }
@@ -2263,10 +2334,10 @@ router.post("/app/join-system-sellers", async (req, res) => {
       }
       const unitPrice = new BigNumber(common.unit_price);
       const [authRows] = await tx.query(
-        "SELECT status,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
+        "SELECT last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
         [U],
       );
-      if (!authRows.length || Number(authRows[0].status) <= 0) return { msg: "not allowed" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { msg: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -2416,10 +2487,10 @@ router.post("/app/cancel-system-sellers", async (req, res) => {
     if (await accountApiLimitReached(res, U, "cancel_system_sellers", 3, DAY_MS)) return;
     const result = await withTransaction(async (tx) => {
       const [authRows] = await tx.query(
-        "SELECT status,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
+        "SELECT last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
         [U],
       );
-      if (!authRows.length || Number(authRows[0].status) <= 0) return { msg: "not allowed" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { msg: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -2531,8 +2602,8 @@ router.post("/app/transactions-history", async (req, res) => {
   }
 });
 
-// near-transfer
-router.post("/app/near-transfer", async (req, res) => {
+// xtu-transfer
+router.post("/app/xtu-transfer", async (req, res) => {
   const { sender, pswd, dest, amount, tkn } = req.body || {};
   const senderInput = normalizeUsername(sender);
   const P = normalizeFormValue(pswd);
@@ -2634,7 +2705,7 @@ router.post("/app/near-transfer", async (req, res) => {
       const authByName = new Map();
       for (const username of authNames) {
         const [rows] = await tx.query(
-          "SELECT username,status,password,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
+          "SELECT username,last_login_at_ms,account_active,password,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
           [username],
         );
         if (rows.length > 0) authByName.set(username, rows[0]);
@@ -2648,10 +2719,9 @@ router.post("/app/near-transfer", async (req, res) => {
       )) return { auth: "not allowed" };
       if (
         !senderAuth ||
-        Number(senderAuth.status) <= 0 ||
+        senderAuth.last_login_at_ms == null || Number(senderAuth.account_active) !== 1 ||
         senderAuth.password !== verifiedPasswordHash ||
-        !destinationAuth ||
-        Number(destinationAuth.status) <= 0
+        !destinationAuth || destinationAuth.last_login_at_ms == null || Number(destinationAuth.account_active) !== 1
       ) {
         return { transf: "failed" };
       }
@@ -3219,7 +3289,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
 
     const result = await withTransaction(async (tx) => {
       const [authRows] = await tx.query(
-        "SELECT status FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
+        "SELECT last_login_at_ms,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
       );
       const [stockRows] = await tx.query(
         "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [username],
@@ -3229,7 +3299,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
          FROM users_usdt_disbursements WHERE id=? AND username=? LIMIT 1 FOR UPDATE`,
         [id, username],
       );
-      if (!authRows.length || Number(authRows[0].status) <= 0 || !stockRows.length || jobRows.length === 0) {
+      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1 || !stockRows.length || jobRows.length === 0) {
         return { transf: "account unavailable" };
       }
       const job = jobRows[0];
@@ -3405,10 +3475,10 @@ router.post("/app/delete-user", async (req, res) => {
       if (activeGlobalRuns.length) return { auth: "global_disbursement_in_progress" };
 
       const [authRows] = await tx.query(
-        "SELECT username,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
+        "SELECT username,last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
         [U],
       );
-      if (!authRows.length) return { auth: "error" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { auth: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -3638,7 +3708,7 @@ router.post("/app/modify-seed", async (req, res) => {
 // environment flags only authorize this endpoint; they never start a run by themselves.
 router.post("/admin/start-global-disbursement", async (req, res) => {
   const { pswd, pin, reason, decision_reference, notice_method, notice_reference,
-    activation_at_ms, request_window_days } = req.body || {};
+    activation_at_ms } = req.body || {};
   if (
     pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
     pin !== decrypt(admin_pin, DB_CONFIG.password)
@@ -3652,7 +3722,8 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
   const decisionReference = typeof decision_reference === "string" ? decision_reference.trim() : "";
   const notificationMethod = String(notice_method || "external").trim().toLowerCase();
   const notificationReference = typeof notice_reference === "string" ? notice_reference.trim() : "";
-  const windowDays = Number(request_window_days);
+  const windowDays = GLOBAL_DISBURSEMENT_REQUEST_WINDOW_DAYS;
+  const extensionDays = GLOBAL_DISBURSEMENT_EXTENSION_DAYS;
   const now = Date.now();
   const activationAt = activation_at_ms == null || String(activation_at_ms).trim() === ""
     ? now + GLOBAL_DISBURSEMENT_NOTICE_MS
@@ -3664,7 +3735,12 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
     notificationReference.length < 4 || notificationReference.length > 255
   ) return res.status(400).send({ error: "invalid decision or notice details" });
   try {
-    validateGlobalAnnouncement({ announcedAtMs: now, activationAtMs: activationAt, requestWindowDays: windowDays });
+    validateGlobalAnnouncement({
+      announcedAtMs: now,
+      activationAtMs: activationAt,
+      requestWindowDays: windowDays,
+      extensionDays,
+    });
   } catch (error) {
     return res.status(400).send({ error: error.message });
   }
@@ -3725,11 +3801,13 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
         "OneX Global Disbursement Announcement",
         "OneX has announced a definitive global disbursement decision.",
         `Planned activation (UTC): ${new Date(activationAt).toISOString()}`,
-        `The request window will remain open for ${windowDays} day(s) after explicit administrative activation.`,
-        `Global reimbursement bonus: ${bonusRate.toFixed(2)}% of each accepted net request, subject to the announced terms and administrative reserve.`,
+        `The primary request period will remain open for ${windowDays} days after explicit administrative activation.`,
+        `A further ${extensionDays}-day extension follows the primary period. New requests during the extension receive no global bonus.`,
+        `The global bonus during the primary period is ${bonusRate.toFixed(2)}% of each accepted net request, subject to the administrative reserve.`,
         "After activation, new recharges and user-to-user P2P transfers will be suspended.",
-        "Each user must submit a disbursement request addressed to ONEX before the request deadline. The minimum request during the global window is 1 XTU.",
-        "Requests not submitted by the deadline, and unresolved residual balances, will require administrative intervention. No balance is automatically paid without a user request.",
+        "Each user must submit a disbursement request addressed to ONEX before the final extension deadline. The minimum request during both global periods is 1 XTU.",
+        "Requests accepted during the primary period retain their bonus even if paid during the extension. Requests accepted during the extension receive no bonus. Accepted but unpaid requests remain protected.",
+        "After the extension, no new requests are accepted. Unclaimed balances may then be subject to a separately recorded administrative reallocation.",
         "BSC network fees are deducted separately. No tfees apply to global disbursement requests.",
       ].join("\n");
       let emailCount = 0;
@@ -3750,18 +3828,19 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
       }
       const [insertResult] = await tx.query(
         `INSERT INTO global_disbursement_runs
-         (status,trigger_reason,decision_reference,notice_method,notice_reference,request_window_days,
-          planned_activation_at_ms,request_deadline_at_ms,activated_at_ms,closed_at_ms,
+         (status,trigger_reason,decision_reference,notice_method,notice_reference,request_window_days,extension_days,
+          planned_activation_at_ms,request_deadline_at_ms,extension_deadline_at_ms,activated_at_ms,closed_at_ms,
           snapshot_unit_price,snapshot_total_units_price,planned_total_initial_asset,
           last_user_stock_id,max_user_stock_id,total_users,processed_users,total_gross_initial_asset,
           total_requested_initial_asset,total_paid_bsc_usd,bonus_rate_percent,
           admin_bonus_reserved_initial_asset,admin_bonus_committed_initial_asset,
           total_bonus_paid_bsc_usd,total_bonus_paid_initial_asset,total_bsc_gas_actual_usd,
           announced_at_ms,effective_at_ms,last_error,created_at_ms,updated_at_ms)
-         VALUES('announced',?,?,?,?,?,?,0,NULL,NULL,?,?,?,0,?,?,0,0,0,0,?,?,0,0,0,0,?,?,NULL,?,?)`,
+         VALUES('announced',?,?,?,?,?,?,?,0,0,NULL,NULL,?,?,?,0,?,?,0,0,0,0,?,?,0,0,0,0,?,?,NULL,?,?)`,
         [
-          triggerReason, decisionReference, notificationMethod, notificationReference, String(windowDays),
-          String(activationAt), snapshotPrice.toFixed(30), snapshotTotal.toFixed(30), plannedTotal.toFixed(30),
+          triggerReason, decisionReference, notificationMethod, notificationReference,
+          String(windowDays), String(extensionDays), String(activationAt),
+          snapshotPrice.toFixed(30), snapshotTotal.toFixed(30), plannedTotal.toFixed(30),
           String(snapshotRows[0]?.max_id || 0), String(totalUsers), bonusRate.toFixed(10),
           provisionalBonusReserve.toFixed(30), String(now), String(activationAt), String(now), String(now),
         ],
@@ -3796,6 +3875,7 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
         planned_activation_at_ms: activationAt,
         notice_period_days: 7,
         request_window_days: windowDays,
+        extension_days: extensionDays,
         bonus_rate_percent: bonusRate.toFixed(10),
         provisional_bonus_reserve_initial_asset: provisionalBonusReserve.toFixed(30),
         notification_recipients: { email: emailCount, telegram: telegramCount },
@@ -3904,7 +3984,16 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
       const capacity = validateGlobalDisbursementCapacity(snapshotTotal, snapshotPrice, totalLiability);
       if (!capacity.available) return { auth: "global_liability_exceeds_stock_value" };
 
-      const deadline = getGlobalRequestDeadline(now, Number(run.request_window_days));
+      let requestWindowDays;
+      let extensionDays;
+      try {
+        requestWindowDays = resolveGlobalDisbursementRequestWindowDays(run.request_window_days);
+        extensionDays = resolveGlobalDisbursementExtensionDays(run.extension_days);
+      } catch (durationError) {
+        return { auth: "invalid_global_disbursement_duration", reason: durationError.message };
+      }
+      const deadline = getGlobalRequestDeadline(now, requestWindowDays);
+      const extensionDeadline = getGlobalRequestDeadline(deadline, extensionDays);
       await tx.query(
         `INSERT INTO global_disbursement_participants
          (run_id,username,snapshot_balance_initial,requested_initial_asset,paid_initial_asset,
@@ -3920,18 +4009,20 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
              planned_total_initial_asset=?,last_user_stock_id=0,max_user_stock_id=?,
              total_users=?,processed_users=0,total_gross_initial_asset=0,total_requested_initial_asset=0,
              admin_bonus_reserved_initial_asset=?,admin_bonus_committed_initial_asset=0,
-             effective_at_ms=?,activated_at_ms=?,request_deadline_at_ms=?,last_error=NULL,updated_at_ms=?
+             effective_at_ms=?,activated_at_ms=?,request_deadline_at_ms=?,extension_deadline_at_ms=?,last_error=NULL,updated_at_ms=?
          WHERE id=? AND status='announced'`,
         [snapshotPrice.toFixed(30), snapshotTotal.toFixed(30), totalInitial.toFixed(30),
           String(snapshotRows[0]?.max_id || 0), String(totalUsers), requiredBonusReserve.toFixed(30),
-          String(now), String(now), String(deadline), String(now), runId],
+          String(now), String(now), String(deadline), String(extensionDeadline), String(now), runId],
       );
       return {
         auth: "global_disbursement_activated",
         run_id: runId,
         activated_at_ms: now,
         request_deadline_at_ms: deadline,
-        request_window_days: Number(run.request_window_days),
+        extension_deadline_at_ms: extensionDeadline,
+        request_window_days: requestWindowDays,
+        extension_days: extensionDays,
         snapshot_unit_price: snapshotPrice.toFixed(30),
         participants: totalUsers,
         reserved_bonus_initial_asset: requiredBonusReserve.toFixed(30),
@@ -4009,7 +4100,7 @@ router.post("/admin/resolve-global-disbursement-participant", async (req, res) =
       if (!lockRows.length) throw new Error("The common-state lock row has not been initialized");
       await getLatestCommonTx(tx, true);
       const [runRows] = await tx.query(
-        "SELECT id,status,request_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
+        "SELECT id,status,request_deadline_at_ms,extension_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
         [runId],
       );
       if (!runRows.length || !["closed", "manual_review"].includes(runRows[0].status)) {
@@ -4244,7 +4335,7 @@ router.post("/admin/send-temp-pswd", async (req, res) => {
   }
 });
 
-// set-user-status
+// set-user-access-status
 router.post("/admin/set-user-status", async (req, res) => {
   const { pswd, pin, user, status } = req.body;
   if (
@@ -4258,11 +4349,9 @@ router.post("/admin/set-user-status", async (req, res) => {
   if (!U || !Number.isSafeInteger(stat)) return res.status(400).send({ error: "invalid status or user" });
 
   try {
-    await db.queryAsync("UPDATE auths SET status=? WHERE username=?", [
-      stat,
-      U,
-    ]);
-    res.send({ account: "updated" });
+    if (stat !== 0 && stat !== 1) return res.status(400).send({ error: "status must be 0 or 1" });
+    const result = await db.queryAsync("UPDATE auths SET account_active=? WHERE username=?", [stat, U]);
+    res.send({ account: result.affectedRows === 1 ? "updated" : "not found", account_active: stat });
   } catch {
     res.send({ error: "error" });
   }

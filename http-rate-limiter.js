@@ -19,7 +19,7 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /app/join-system-sellers": { limit: 5, windowMs: 15 * 60_000, authResponse: true },
   "POST /app/cancel-system-sellers": { limit: 5, windowMs: 15 * 60_000, authResponse: true },
   "POST /app/transactions-history": { limit: 30, windowMs: 60_000, authResponse: true },
-  "POST /app/near-transfer": { limit: 10, windowMs: 60_000, authResponse: true },
+  "POST /app/xtu-transfer": { limit: 10, windowMs: 60_000, authResponse: true },
   "POST /app/disbursement/status": { limit: 30, windowMs: 60_000, authResponse: true },
   "POST /app/modify-pin-or-password": { limit: 8, windowMs: 15 * 60_000, authResponse: true },
   "POST /app/modify-seed": { limit: 8, windowMs: 15 * 60_000, authResponse: true },

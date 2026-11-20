@@ -9,6 +9,9 @@ const {
   calculateRequiredAdminBonusReserve,
   isGlobalDisbursementEffective,
   isGlobalDisbursementRequestOpen,
+  resolveGlobalDisbursementPhase,
+  resolveGlobalDisbursementRequestWindowDays,
+  resolveGlobalDisbursementExtensionDays,
   resolveDisbursementMinimumXtu,
   evaluateDisbursementMinimumXtu,
   isGlobalDisbursementPriceFrozen,
@@ -73,17 +76,37 @@ test("individual minimum is 200 XTU and global minimum is 1 XTU only while reque
   assert.throws(() => evaluateDisbursementMinimumXtu("NaN", false), /must be finite and positive/);
 });
 
-test("global announcement requires seven full days and a bounded request window", () => {
+test("global announcement requires seven full days and a 90-day minimum primary window", () => {
   const announcedAtMs = Date.UTC(2026, 10, 19, 10, 0, 0);
+  const activationAtMs = announcedAtMs + GLOBAL_DISBURSEMENT_NOTICE_MS;
   assert.throws(() => validateGlobalAnnouncement({
-    announcedAtMs, activationAtMs: announcedAtMs + GLOBAL_DISBURSEMENT_NOTICE_MS - 1, requestWindowDays: 7,
+    announcedAtMs, activationAtMs: activationAtMs - 1, requestWindowDays: 90,
   }), /seven full days/);
+  assert.equal(resolveGlobalDisbursementRequestWindowDays(undefined), 90);
+  assert.equal(resolveGlobalDisbursementRequestWindowDays("120"), 120);
+  assert.throws(() => resolveGlobalDisbursementRequestWindowDays("89"), /cannot be reduced below 90 days/);
+  assert.throws(() => resolveGlobalDisbursementRequestWindowDays("366"), /between 90 and 365/);
+  assert.equal(resolveGlobalDisbursementExtensionDays(undefined), 30);
+  assert.equal(resolveGlobalDisbursementExtensionDays("45"), 45);
+  assert.throws(() => resolveGlobalDisbursementExtensionDays("29"), /between 30 and 365/);
+
   const valid = validateGlobalAnnouncement({
-    announcedAtMs, activationAtMs: announcedAtMs + GLOBAL_DISBURSEMENT_NOTICE_MS, requestWindowDays: 14,
+    announcedAtMs, activationAtMs, requestWindowDays: 90, extensionDays: 30,
   });
-  assert.equal(valid.activationAtMs, announcedAtMs + GLOBAL_DISBURSEMENT_NOTICE_MS);
-  assert.equal(getGlobalRequestDeadline(valid.activationAtMs, 14), valid.activationAtMs + 14 * 86400000);
+  assert.equal(valid.activationAtMs, activationAtMs);
+  const primaryDeadline = getGlobalRequestDeadline(valid.activationAtMs, valid.requestWindowDays);
+  const extensionDeadline = getGlobalRequestDeadline(primaryDeadline, valid.extensionDays);
+  assert.equal(primaryDeadline, activationAtMs + 90 * 86400000);
+  assert.equal(extensionDeadline, primaryDeadline + 30 * 86400000);
+  assert.equal(resolveGlobalDisbursementPhase("active", primaryDeadline, extensionDeadline, primaryDeadline - 1), "primary");
+  assert.equal(resolveGlobalDisbursementPhase("active", primaryDeadline, extensionDeadline, primaryDeadline), "extension");
+  assert.equal(resolveGlobalDisbursementPhase("active", primaryDeadline, extensionDeadline, extensionDeadline - 1), "extension");
+  assert.equal(resolveGlobalDisbursementPhase("active", primaryDeadline, extensionDeadline, extensionDeadline), "closed");
+  assert.equal(resolveGlobalDisbursementPhase("closed", primaryDeadline, extensionDeadline, primaryDeadline), "closed");
   assert.throws(() => validateGlobalAnnouncement({
-    announcedAtMs, activationAtMs: announcedAtMs + GLOBAL_DISBURSEMENT_NOTICE_MS, requestWindowDays: 0,
-  }), /between 1 and 365/);
+    announcedAtMs, activationAtMs, requestWindowDays: 89, extensionDays: 30,
+  }), /between 90 and 365/);
+  assert.throws(() => validateGlobalAnnouncement({
+    announcedAtMs, activationAtMs, requestWindowDays: 90, extensionDays: 29,
+  }), /between 30 and 365/);
 });

@@ -85,7 +85,9 @@ const TABLES = [
     identity_document_number VARCHAR(255) NOT NULL COMMENT 'Encrypted national ID card or passport number',
     address VARCHAR(100) NOT NULL,
     seed TEXT NOT NULL,
-    status INT NOT NULL DEFAULT 1,
+    account_active TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT 'Administrative account access switch',
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    last_login_at_ms BIGINT UNSIGNED NULL,
     consec_failed_auth INT UNSIGNED NOT NULL DEFAULT 0,
     password_temp_expires_at_ms BIGINT UNSIGNED NULL,
     tg_userId VARCHAR(32) NULL,
@@ -93,6 +95,8 @@ const TABLES = [
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL,
     UNIQUE KEY uq_auths_username(username),
+    UNIQUE KEY uq_auths_email(email),
+    KEY idx_auths_first_login_cleanup(last_login_at_ms,created_at_ms),
     UNIQUE KEY uq_auths_tg_user_id(tg_userId),
     UNIQUE KEY uq_auths_tg_chat_id(tg_chat_id),
     KEY idx_auths_failed_auth(consec_failed_auth)
@@ -347,6 +351,13 @@ const TABLES = [
     created_at_ms BIGINT UNSIGNED NOT NULL,
     KEY idx_recharge_control_events_created(created_at_ms,id)
   ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS account_cleanup_holds(
+    username VARCHAR(30) PRIMARY KEY,
+    reason_codes VARCHAR(1000) NOT NULL,
+    first_detected_at_ms BIGINT UNSIGNED NOT NULL,
+    last_checked_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_account_cleanup_holds_checked(last_checked_at_ms)
+  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS system_locks(
     lock_name VARCHAR(64) PRIMARY KEY
   ) ENGINE=InnoDB`,
@@ -396,6 +407,7 @@ const TABLES = [
     account_status VARCHAR(16) NOT NULL DEFAULT 'active',
     UNIQUE KEY uq_usdt_deposit_username(username),
     UNIQUE KEY uq_usdt_deposit_address(wallet_address),
+    UNIQUE KEY uq_usdt_deposit_payout_address(payout_address),
     UNIQUE KEY uq_usdt_deposit_derivation_index(derivation_index),
     KEY idx_usdt_deposit_scan(id,last_scanned_block),
     KEY idx_usdt_deposit_status(account_status,id)
@@ -513,8 +525,10 @@ const TABLES = [
     notice_method VARCHAR(24) NOT NULL DEFAULT 'external',
     notice_reference VARCHAR(255) NOT NULL,
     request_window_days SMALLINT UNSIGNED NOT NULL,
+    extension_days SMALLINT UNSIGNED NOT NULL DEFAULT 30,
     planned_activation_at_ms BIGINT UNSIGNED NOT NULL,
     request_deadline_at_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    extension_deadline_at_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
     activated_at_ms BIGINT UNSIGNED NULL,
     closed_at_ms BIGINT UNSIGNED NULL,
     snapshot_unit_price DECIMAL(50,30) NOT NULL,
@@ -634,7 +648,7 @@ async function assertLatestSchema() {
   const requiredColumns = {
     auths: [
       "username", "password", "name", "email", "birthdate", "nationality", "residence_country", "identity_document_type", "identity_document_number", "address",
-      "seed", "status", "consec_failed_auth", "password_temp_expires_at_ms",
+      "seed", "account_active", "created_at_ms", "last_login_at_ms", "consec_failed_auth", "password_temp_expires_at_ms",
       "tg_userId", "tg_chat_id", "record_date", "record_time",
     ],
     users_stock: [
@@ -683,6 +697,7 @@ async function assertLatestSchema() {
     ],
     bsc_fee_allocations: ["tx_hash", "allocation_type", "allocation_id", "allocated_fee_usd", "created_at_ms"],
     account_security_action_locks: ["username", "action", "updated_at_ms"],
+    account_cleanup_holds: ["username", "reason_codes", "first_detected_at_ms", "last_checked_at_ms"],
     account_security_events: ["username", "action", "outcome", "created_at_ms"],
     account_api_rate_limits: ["username", "action", "window_start_ms", "request_count", "updated_at_ms"],
     recharge_service_control: ["control_id", "is_suspended", "suspension_reason", "changed_by", "updated_at_ms"],
@@ -717,7 +732,7 @@ async function assertLatestSchema() {
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number",
       "last_error", "created_at_ms", "reservation_expires_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
-    global_disbursement_runs: ["status", "trigger_reason", "decision_reference", "notice_method", "notice_reference", "request_window_days", "planned_activation_at_ms", "request_deadline_at_ms", "activated_at_ms", "closed_at_ms", "snapshot_unit_price", "snapshot_total_units_price", "planned_total_initial_asset", "last_user_stock_id", "max_user_stock_id", "total_users", "processed_users", "total_gross_initial_asset", "total_requested_initial_asset", "total_paid_bsc_usd", "bonus_rate_percent", "admin_bonus_reserved_initial_asset", "admin_bonus_committed_initial_asset", "total_bonus_paid_bsc_usd", "total_bonus_paid_initial_asset", "total_bsc_gas_actual_usd", "announced_at_ms", "effective_at_ms", "last_error", "created_at_ms", "updated_at_ms", "completed_at_ms"],
+    global_disbursement_runs: ["status", "trigger_reason", "decision_reference", "notice_method", "notice_reference", "request_window_days", "extension_days", "planned_activation_at_ms", "request_deadline_at_ms", "extension_deadline_at_ms", "activated_at_ms", "closed_at_ms", "snapshot_unit_price", "snapshot_total_units_price", "planned_total_initial_asset", "last_user_stock_id", "max_user_stock_id", "total_users", "processed_users", "total_gross_initial_asset", "total_requested_initial_asset", "total_paid_bsc_usd", "bonus_rate_percent", "admin_bonus_reserved_initial_asset", "admin_bonus_committed_initial_asset", "total_bonus_paid_bsc_usd", "total_bonus_paid_initial_asset", "total_bsc_gas_actual_usd", "announced_at_ms", "effective_at_ms", "last_error", "created_at_ms", "updated_at_ms", "completed_at_ms"],
     global_disbursement_participants: ["run_id", "username", "snapshot_balance_initial", "requested_initial_asset", "paid_initial_asset", "remaining_initial_asset", "request_count", "last_disbursement_id", "status", "resolution_action", "resolution_reference", "resolution_reason", "resolved_at_ms", "created_at_ms", "updated_at_ms"],
     global_disbursement_email_outbox: ["run_id", "username", "recipient", "subject", "message_text", "status", "attempts", "next_attempt_at_ms", "claimed_at_ms", "last_error", "created_at_ms", "sent_at_ms"],
     users_usdt_refunds: [
@@ -747,6 +762,8 @@ async function assertLatestSchema() {
   }
 
   const requiredIndexes = {
+    auths: ["uq_auths_email", "idx_auths_first_login_cleanup"],
+    users_usdt_deposit_wallets: ["uq_usdt_deposit_payout_address"],
     activities: [
       "idx_activities_sender_id",
       "idx_activities_receiver_id",
@@ -850,35 +867,167 @@ async function initDbIfEmpty() {
   console.log(`OneX database ready. UTC time: ${date} ${time}`);
 }
 
+async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
+  const cutoff = nowMs - 7 * 24 * 60 * 60 * 1000;
+  const candidates = await db.queryAsync(
+    `SELECT username FROM auths
+     WHERE last_login_at_ms IS NULL
+       AND created_at_ms<=?
+     ORDER BY created_at_ms ASC LIMIT 100`,
+    [String(cutoff)],
+  );
+
+  let deleted = 0;
+  let held = 0;
+  for (const candidate of candidates) {
+    let connection;
+    try {
+      connection = await new Promise((resolve, reject) => {
+        db.getConnection((error, conn) => error ? reject(error) : resolve(conn));
+      });
+      const tx = connection.promise();
+      await tx.beginTransaction();
+
+      const [authRows] = await tx.query(
+        `SELECT username,created_at_ms,last_login_at_ms
+         FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
+        [candidate.username],
+      );
+      if (!authRows.length) {
+        await tx.commit();
+        continue;
+      }
+      const auth = authRows[0];
+      if (
+        auth.last_login_at_ms != null ||
+        Number(auth.created_at_ms) > cutoff
+      ) {
+        await tx.query("DELETE FROM account_cleanup_holds WHERE username=?", [candidate.username]);
+        await tx.commit();
+        continue;
+      }
+
+      const reasons = [];
+      const [stockRows] = await tx.query(
+        `SELECT balance,run_balance,seller_status FROM users_stock
+         WHERE username=? LIMIT 1 FOR UPDATE`,
+        [candidate.username],
+      );
+      if (!stockRows.length) {
+        reasons.push("missing_stock_record");
+      } else {
+        const balance = new BigNumber(stockRows[0].balance);
+        const runBalance = new BigNumber(stockRows[0].run_balance);
+        if (!balance.isFinite() || !balance.isZero()) reasons.push("nonzero_or_invalid_balance");
+        if (!runBalance.isFinite() || !runBalance.isZero()) reasons.push("seller_run_balance_present");
+        if (Number(stockRows[0].seller_status || 0) !== 0) reasons.push("seller_status_active");
+      }
+
+      const financialChecks = [
+        ["activities", "SELECT id FROM activities WHERE sender=? OR receiver=? LIMIT 1 FOR UPDATE", [candidate.username, candidate.username]],
+        ["deposit_batches", "SELECT id FROM users_usdt_deposit_batches WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["deposit_events", "SELECT id FROM users_usdt_transfer_events WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["disbursements", "SELECT id FROM users_usdt_disbursements WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["refunds", "SELECT id FROM users_usdt_refunds WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["seller_campaigns", "SELECT id FROM users_seller_campaigns WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["seller_reserve_lots", "SELECT id FROM users_seller_reserve_lots WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["seller_payouts", "SELECT id FROM users_usdt_seller_payouts WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["global_participation", "SELECT id FROM global_disbursement_participants WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["admin_resolutions", "SELECT id FROM admin_payment_resolutions WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["pending_global_email_notice", "SELECT id FROM global_disbursement_email_outbox WHERE username=? AND status IN ('pending','sending') LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["pending_global_telegram_notice", "SELECT id FROM telegram_outbox WHERE username=? AND event_key LIKE 'global-announcement:%' AND status NOT IN ('sent','skipped','failed') LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["price_cycle_state", "SELECT username FROM user_price_state WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["price_cycle_history", "SELECT id FROM user_price_cycle_history WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["deposit_sweeps", `SELECT s.id FROM users_usdt_sweeps s
+          INNER JOIN users_usdt_deposit_wallets w ON w.id=s.deposit_wallet_id
+          WHERE w.username=? LIMIT 1 FOR UPDATE`, [candidate.username]],
+      ];
+      for (const [reason, sql, params] of financialChecks) {
+        const [rows] = await tx.query(sql, params);
+        if (rows.length) reasons.push(`${reason}_present`);
+      }
+
+      if (reasons.length) {
+        const timestamp = String(nowMs);
+        await tx.query(
+          `INSERT INTO account_cleanup_holds
+           (username,reason_codes,first_detected_at_ms,last_checked_at_ms)
+           VALUES(?,?,?,?)
+           ON DUPLICATE KEY UPDATE reason_codes=VALUES(reason_codes),last_checked_at_ms=VALUES(last_checked_at_ms)`,
+          [candidate.username, reasons.join(",").slice(0, 1000), timestamp, timestamp],
+        );
+        await tx.commit();
+        held += 1;
+        continue;
+      }
+
+      // Retain every assigned deposit address permanently; only disable its account association.
+      await tx.query(
+        `UPDATE users_usdt_deposit_wallets
+         SET account_status='deleted',payout_address=NULL
+         WHERE username=?`,
+        [candidate.username],
+      );
+      await tx.query("DELETE FROM user_price_state WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM account_security_action_locks WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM account_security_events WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM account_api_rate_limits WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM telegram_link_challenges WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM telegram_outbox WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM global_disbursement_email_outbox WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM users_stock WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM auths WHERE username=? AND last_login_at_ms IS NULL", [candidate.username]);
+      await tx.query("DELETE FROM account_cleanup_holds WHERE username=?", [candidate.username]);
+      await tx.commit();
+      deleted += 1;
+    } catch (error) {
+      if (connection) {
+        try { await connection.promise().rollback(); } catch (rollbackError) {
+          console.error("Automatic account cleanup rollback failed:", rollbackError.message);
+        }
+      }
+      console.error(`Automatic cleanup could not process ${candidate.username}:`, error.message);
+    } finally {
+      if (connection) connection.release();
+    }
+  }
+  return { candidates: candidates.length, deleted, held };
+}
+
 async function cleanup() {
-  const [cutoffDate] = getDateBefore(90);
   try {
-    // Financial ledgers and blockchain evidence are never deleted by routine cleanup.
-    // Sent Telegram delivery rows are transient queue records, not notification history.
+    const now = Date.now();
     await db.queryAsync(
       "DELETE FROM telegram_outbox WHERE status IN ('sent','skipped','failed') AND created_at_ms<?",
-      [String(Date.now() - 14 * 24 * 60 * 60 * 1000)],
+      [String(now - 14 * 24 * 60 * 60 * 1000)],
     );
     await db.queryAsync(
       "DELETE FROM telegram_link_challenges WHERE expires_at_ms<? OR used_at_ms IS NOT NULL",
-      [String(Date.now() - 24 * 60 * 60 * 1000)],
+      [String(now - 24 * 60 * 60 * 1000)],
     );
     await db.queryAsync(
       "DELETE FROM account_security_events WHERE created_at_ms<?",
-      [String(Date.now() - 8 * 24 * 60 * 60 * 1000)],
+      [String(now - 8 * 24 * 60 * 60 * 1000)],
     );
     await db.queryAsync(
       "DELETE FROM account_api_rate_limits WHERE window_start_ms<?",
-      [String(Date.now() - 2 * 24 * 60 * 60 * 1000)],
+      [String(now - 2 * 24 * 60 * 60 * 1000)],
     );
     await db.queryAsync(
       `DELETE action_lock FROM account_security_action_locks AS action_lock
        LEFT JOIN auths ON auths.username=action_lock.username
        WHERE auths.username IS NULL AND action_lock.updated_at_ms<?`,
-      [String(Date.now() - 30 * 24 * 60 * 60 * 1000)],
+      [String(now - 30 * 24 * 60 * 60 * 1000)],
     );
+
+    const accountCleanup = await cleanupNeverSignedInAccounts(now);
+    if (accountCleanup.deleted || accountCleanup.held) {
+      console.log("Automatic account cleanup:", accountCleanup);
+    }
+    return accountCleanup;
   } catch (error) {
     console.error("Database cleanup failed:", error.message);
+    return { error: error.message };
   }
 }
 

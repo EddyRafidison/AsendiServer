@@ -29,7 +29,9 @@ const {
 const { calculateSellerPayoutNet } = require("./seller-accounting");
 const { SYSTEM_ADMIN_RESERVE_RATIO } = require("./recharge-policy");
 const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
-const { calculateRequiredAdminBonusReserve } = require("./global-disbursement-policy");
+const {
+  calculateRequiredAdminBonusReserve,
+} = require("./global-disbursement-policy");
 const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
 
 const INITIAL_STOCK_LIMIT = process.env.STOCK_LIMIT || "18000000";
@@ -515,11 +517,11 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
     if (job.disbursement_mode === "global" && job.global_run_id != null) {
       const restoredBalance = currentBalanceInitial.plus(job.gross_initial_asset);
       const openRows = await tx.query(
-        `SELECT status,request_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE`,
+        `SELECT status,request_deadline_at_ms,extension_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE`,
         [job.global_run_id],
       );
       const run = openRows[0]?.[0] || null;
-      const canRetry = run && run.status === "active" && Number(run.request_deadline_at_ms) > Date.now();
+      const canRetry = run && run.status === "active" && Number(run.extension_deadline_at_ms || run.request_deadline_at_ms) > Date.now();
       await tx.query(
         `UPDATE global_disbursement_runs
          SET admin_bonus_committed_initial_asset=GREATEST(0,admin_bonus_committed_initial_asset-?),
@@ -776,7 +778,7 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     );
     if (job.disbursement_mode === "global" && job.global_run_id != null) {
       const [globalRows] = await tx.query(
-        "SELECT status,request_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
+        "SELECT status,request_deadline_at_ms,extension_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
         [job.global_run_id],
       );
       const globalRun = globalRows[0] || null;
@@ -784,7 +786,7 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       const remainingInitial = new BigNumber(job.balance_after_reservation || "0");
       const participantStatus = remainingInitial.isZero()
         ? "paid"
-        : (globalRun.status === "active" && Number(globalRun.request_deadline_at_ms) > Date.now()
+        : (globalRun.status === "active" && Number(globalRun.extension_deadline_at_ms || globalRun.request_deadline_at_ms) > Date.now()
           ? "awaiting_request" : "manual_review");
       await tx.query(
         `UPDATE global_disbursement_participants
@@ -1466,7 +1468,7 @@ async function closeExpiredGlobalDisbursement(db) {
   const now = Date.now();
   const [runs] = await db.queryAsync(
     `SELECT id FROM global_disbursement_runs
-     WHERE status='active' AND CAST(request_deadline_at_ms AS UNSIGNED)<=?
+     WHERE status='active' AND CAST(CASE WHEN extension_deadline_at_ms>0 THEN extension_deadline_at_ms ELSE request_deadline_at_ms END AS UNSIGNED)<=?
      ORDER BY id ASC LIMIT 10`,
     [String(now)],
   );
@@ -1479,10 +1481,10 @@ async function closeExpiredGlobalDisbursement(db) {
       if (!lockRows.length) throw new Error("The common-state lock row is missing during global closure.");
       await getLatestCommonTx(tx, true);
       const [runRows] = await tx.query(
-        "SELECT id,status,request_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
+        "SELECT id,status,request_deadline_at_ms,extension_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
         [candidate.id],
       );
-      if (!runRows.length || runRows[0].status !== "active" || Number(runRows[0].request_deadline_at_ms) > now) return;
+      if (!runRows.length || runRows[0].status !== "active" || Number(runRows[0].extension_deadline_at_ms || runRows[0].request_deadline_at_ms) > now) return;
       const timestamp = String(now);
       await tx.query(
         `UPDATE global_disbursement_runs

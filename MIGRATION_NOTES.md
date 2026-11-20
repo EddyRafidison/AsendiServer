@@ -11,6 +11,17 @@
 
 Cette version définit le schéma cible pour une première mise en production. Elle ne migre pas les anciennes tables et ne convertit pas les anciens soldes. Créer une base MySQL neuve et vide. `db.js` crée les tables, vérifie les colonnes et valide le prix global au démarrage. Une ancienne structure qui ne correspond pas au schéma cible provoque une erreur explicite; ne pas la réutiliser sans une migration distincte, auditée et sauvegardée.
 
+## Activation du compte, email et nettoyage automatique
+
+- L'email fourni à l'inscription est normalisé (suppression des espaces périphériques et minuscules) et rendu unique dans `auths`.
+- L'email envoyé à l'utilisateur contient uniquement son username. Aucun lien ni code de vérification email n'est envoyé ; le mot de passe est choisi pendant l'inscription.
+- `auths.last_login_at_ms` est mis à jour après chaque connexion réussie. Sa valeur NULL indique que le compte n'a jamais été connecté. C'est cette colonne qui remplace l'ancien `auths.status`, évitant de maintenir deux marqueurs de première connexion.
+- `auths.account_active` sépare l'activation administrative du fait d'avoir effectué une première connexion. L'endpoint historique `/admin/set-user-status` conserve son paramètre `status` (0 = désactivé, 1 = actif), mais écrit désormais dans `account_active`.
+- `cleanup()` s'exécute au démarrage puis toutes les heures. Il examine les comptes dont `last_login_at_ms IS NULL` et dont l'inscription date d'au moins sept jours. Il verrouille et revérifie chaque compte avant suppression.
+- Un compte avec solde, réserve vendeur, activité financière, recharge, dépôt, demande de paiement, remboursement ou autre historique financier est conservé pour examen dans `account_cleanup_holds`. Aucune trace financière ou blockchain n'est supprimée en cascade.
+- Lorsqu'un compte peut être supprimé sans risque, son adresse de dépôt attribuée reste conservée dans `users_usdt_deposit_wallets` et passe à `account_status='deleted'`. L'adresse et son index de dérivation ne sont jamais réattribués.
+- L'adresse de paiement BSC est validée au niveau du format, sans preuve cryptographique de propriété. Une adresse normalisée ne peut être enregistrée pour deux comptes à la fois ; l'unicité est protégée par un index unique en base de données. Les demandes de paiement acceptées conservent l'adresse enregistrée au moment de leur acceptation.
+
 Par défaut, une nouvelle base initialise `common.total_units_price=18000000`, `common.backed_units=18000000`, et donc `common.unit_price=1`. `STOCK_LIMIT` et `INITIAL_BACKED_UNITS` règlent les valeurs initiales. La quantité d'actifs déclarée doit correspondre aux actifs réellement détenus. `INITIAL_BACKED_UNITS` doit couvrir le quota administratif initial de 10 %.
 
 ## Convention d'unités
@@ -95,13 +106,13 @@ Les lots vendeurs sont consommés en FIFO. La consommation débite le solde vend
 
 ## Transferts P2P et frais
 
-`POST /app/near-transfer` reçoit un montant public XTU. Le prix global unique est lu sous le verrou `common_state`, puis le montant est converti en actifs initiaux. L'expéditeur est débité du montant brut initial; le destinataire reçoit le montant initial net après déduction de la totalité des `tfees`. Le destinataire supporte les frais; aucun gas BSC n'est appliqué aux transferts P2P.
+`POST /app/xtu-transfer` reçoit un montant public XTU. Le prix global unique est lu sous le verrou `common_state`, puis le montant est converti en actifs initiaux. L'expéditeur est débité du montant brut initial; le destinataire reçoit le montant initial net après déduction de la totalité des `tfees`. Le destinataire supporte les frais; aucun gas BSC n'est appliqué aux transferts P2P.
 
 Pour un transfert P2P, l'intégralité des `tfees` est conservée par OneX, puisqu'aucun coût de gas BSC ne s'applique. Pour les recharges et les décaissements individuels, le coût BSC réel admissible est d'abord imputé sur les `tfees` bruts. Seul le reliquat augmente les réserves système et `common.total_tfees`. À la confirmation d'un paiement de trésorerie, la valeur de stock commune est également débitée du montant BSC-USD réellement transféré et du coût BNB réel valorisé en BSC-USD. `common.total_tfees_bsc_cost_usd` suit les frais BSC couverts par `tfees`; `common.total_tfees_bsc_uncovered_usd` suit les coûts dépassant les `tfees` disponibles et absorbés par OneX. `bsc_fee_allocations` distribue de façon idempotente les coûts de sweep aux lots de recharge.
 
 ## Disbursement individuel et disbursement global
 
-Les deux modes utilisent le même parcours utilisateur : `POST /app/near-transfer` avec `dest=ONEX`. Le client ne choisit pas le mode ; le serveur le détermine sous verrou `common_state` selon l'état du run global.
+Les deux modes utilisent le même parcours utilisateur : `POST /app/xtu-transfer` avec `dest=ONEX`. Le client ne choisit pas le mode ; le serveur le détermine sous verrou `common_state` selon l'état du run global.
 
 Le **disbursement individuel habituel** est périodique et initié par l'utilisateur. Le montant brut minimal est de **200 XTU** (`DISBURSEMENT_INDIVIDUAL_MINIMUM_XTU`). Le compte doit également disposer d'au moins 290 XTU de solde public, d'une adresse BSC valide, ne présenter aucun engagement vendeur actif ni autre paiement non résolu et respecter le délai glissant de 30 jours après un décaissement individuel confirmé. Le prix courant est figé à l'acceptation, les `tfees` habituels s'appliquent et aucun bonus global n'est accordé.
 
@@ -111,7 +122,9 @@ Pendant le préavis, les opérations normales continuent. À l'activation explic
 
 Une demande globale est enregistrée avec `disbursement_mode='global'` et son `global_run_id`. Elle utilise le prix figé à l'activation, ne prélève aucun `tfees` et applique le bonus annoncé, calculé sur le montant net XTU demandé. Le bonus suit `FEES` lorsque `GLOBAL_DISBURSEMENT_BONUS` est absent ou vide, et ne peut jamais dépasser 10 %. Exemple : 200 XTU avec un bonus de 3 % donnent 6 BSC-USD de bonus et 206 BSC-USD avant récupération du gas BSC. Le coût estimé est déduit du paiement puis rapproché du gas réellement payé. Le bonus est financé par la réserve administrative protégée, sous réserve des contrôles de réserve et de liquidité.
 
-À l'expiration, aucune nouvelle demande globale n'est acceptée. Les paiements déjà acceptés continuent leur traitement. Aucun remboursement automatique n'est créé pour les comptes n'ayant pas demandé le disbursement ou pour les soldes résiduels. Ces comptes et montants passent en `manual_review` pour résolution administrative individuelle, sans débit automatique. Le run n'est `completed` qu'après règlement des paiements acceptés et résolution des participants en examen. Le cutoff global reste en vigueur après clôture : les recharges et les P2P ordinaires ne reprennent pas automatiquement.
+La période principale dure au minimum 90 jours. `GLOBAL_DISBURSEMENT_REQUEST_WINDOW_DAYS` vaut 90 par défaut et ne peut être configuré qu'à 90 jours ou davantage (maximum 365). Elle est suivie d'une extension de 30 jours minimum ; `GLOBAL_DISBURSEMENT_EXTENSION_DAYS` vaut 30 par défaut et peut être augmenté (maximum 365). Le minimum de demande de 1 XTU s'applique pendant les deux périodes. Le bonus global s'applique uniquement aux demandes acceptées pendant la période principale ; les nouvelles demandes de l'extension n'ont aucun bonus. Une demande acceptée pendant la période principale conserve son bonus même si son paiement est exécuté pendant l'extension.
+
+À la fin de l'extension, aucune nouvelle demande n'est acceptée. Les paiements déjà acceptés, y compris ceux qui restent impayés, continuent leur traitement et restent protégés. Les soldes non réclamés et les soldes résiduels non couverts par une demande acceptée ne peuvent être réaffectés qu'au moyen d'une décision administrative distincte, enregistrée et traçable. Le cutoff global reste en vigueur après clôture : les recharges et les P2P ordinaires ne reprennent pas automatiquement.
 
 ## Historique et frais
 
@@ -201,7 +214,7 @@ Un run global conserve le prix global, le total `common.total_units_price` et le
 
 L'administration choisit elle-même comment informer les utilisateurs ; le serveur peut enregistrer la date, la référence et le canal déclaré, mais l'annonce n'a pas à être expédiée par OneX. Le préavis minimal est de sept jours calendaires complets. Aucun worker ne transforme automatiquement une annonce en activation. Seule l'action administrative explicite active le mode, fige le prix et ouvre la période de demandes.
 
-Les utilisateurs doivent chacun présenter leur demande à `ONEX` via `/app/near-transfer`. Le mode global est choisi côté serveur, le minimum brut est de 1 XTU, aucun `tfees` n'est prélevé et le bonus s'applique au montant XTU demandé. Le worker traite uniquement les décaissements réellement créés à la suite d'une demande utilisateur ; il ne parcourt pas les soldes pour générer des paiements. À la date limite, les demandes nouvelles sont fermées. Les soldes non demandés et résiduels passent en `manual_review` sans débit ou remboursement automatique.
+Les utilisateurs doivent chacun présenter leur demande à `ONEX` via `/app/xtu-transfer`. Le mode global est choisi côté serveur, le minimum brut est de 1 XTU, aucun `tfees` n'est prélevé et le bonus s'applique au montant XTU demandé. Le worker traite uniquement les décaissements réellement créés à la suite d'une demande utilisateur ; il ne parcourt pas les soldes pour générer des paiements. À la date limite, les demandes nouvelles sont fermées. Les soldes non demandés et résiduels passent en `manual_review` sans débit ou remboursement automatique.
 
 Le bonus est financé par la réserve administrative protégée de 10 % des actifs initiaux. Le taux est figé à l'annonce, hérite de `FEES` s'il est absent ou vide et reste plafonné à 10 %. Les coûts BSC sont comptabilisés séparément du bonus et rapprochés avec les reçus de blockchain.
 

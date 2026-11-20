@@ -69,7 +69,7 @@ test("sensitive routes have explicit IP-level limits", () => {
   assert.ok(ROUTE_LIMITS["POST /app/signin"].limit > 0);
   assert.ok(ROUTE_LIMITS["POST /app/signup"].limit > 0);
   assert.ok(ROUTE_LIMITS["POST /app/recover-account"].limit > 0);
-  assert.ok(ROUTE_LIMITS["POST /app/near-transfer"].limit > 0);
+  assert.ok(ROUTE_LIMITS["POST /app/xtu-transfer"].limit > 0);
   assert.ok(ROUTE_LIMITS["POST /app/transactions-history"].limit > 0);
   assert.ok(ROUTE_LIMITS["POST /admin/send-temp-pswd"].limit > 0);
   assert.ok(ROUTE_LIMITS["POST /admin/set-user-status"].limit > 0);

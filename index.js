@@ -103,7 +103,8 @@ async function startServer() {
 
   const server = app.listen(PORT_SERVER, () => {
     console.log(`Server on port ${PORT_SERVER}`);
-    setInterval(cleanup, 10_800_000);
+    void cleanup();
+    setInterval(() => { void cleanup(); }, 3_600_000);
   });
   const requestTimeoutMs = boundedIntegerEnv("HTTP_REQUEST_TIMEOUT_MS", 60_000, 5_000, 120_000);
   const headersTimeoutMs = boundedIntegerEnv("HTTP_HEADERS_TIMEOUT_MS", 15_000, 5_000, 60_000);

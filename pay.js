@@ -338,9 +338,9 @@ async function getOrCreateUserDepositAddress(db, username) {
   const currentBlock = BigInt(await rpcCall("eth_blockNumber", []));
   const wallet = await runDbTransaction(db, async (tx) => {
     const [authRows] = await tx.query(
-      "SELECT status FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
+      "SELECT last_login_at_ms,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
     );
-    if (!authRows.length || Number(authRows[0].status) <= 0) {
+    if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) {
       throw new Error("Cannot assign a deposit address to an inactive account.");
     }
     const [stockRows] = await tx.query(
