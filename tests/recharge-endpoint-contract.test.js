@@ -9,6 +9,11 @@ const root = path.join(__dirname, "..");
 const routesSource = fs.readFileSync(path.join(root, "routes.js"), "utf8");
 const limiterSource = fs.readFileSync(path.join(root, "http-rate-limiter.js"), "utf8");
 const dbSource = fs.readFileSync(path.join(root, "db.js"), "utf8");
+const rechargePolicySource = fs.readFileSync(path.join(root, "recharge-policy.js"), "utf8");
+const feePolicySource = fs.readFileSync(path.join(root, "bsc-transaction-policy.js"), "utf8");
+const feeAccountingSource = fs.readFileSync(path.join(root, "bsc-fee-accounting.js"), "utf8");
+const disbursementSource = fs.readFileSync(path.join(root, "disbursement.js"), "utf8");
+const envExample = fs.readFileSync(path.join(root, ".env.example"), "utf8");
 
 function getRouteBlock(routePath, nextRoutePath) {
   const startMarker = `router.post("${routePath}"`;
@@ -60,4 +65,20 @@ test("public reserve availability endpoint is authenticated, cached and separate
   assert.doesNotMatch(availabilityRoute, /unit_price|recharge_available|availability_reason|updated_at_ms|refresh_after_ms/);
   assert.doesNotMatch(availabilityRoute, /getOrCreateUserDepositAddress/);
   assert.match(limiterSource, /POST \/app\/recharge\/availability/);
+});
+
+
+test("minimum automatic recharge is 20 BSC-USD across validation and API metadata", () => {
+  assert.match(rechargePolicySource, /const MIN_RECHARGE_AMOUNT = new BigNumber\("20"\)/);
+  assert.match(routesSource, /below_minimum: "The total received during the 60-minute session is below 20 BSC-USD\."/);
+  assert.match(routesSource, /minimum_recharge_amount_bsc_usd: MIN_RECHARGE_AMOUNT\.toFixed\(0\)/);
+  assert.match(envExample, /^BSC_MAX_TX_FEE_BSC_USD=0\.4$/m);
+});
+
+test("HTTP startup rejects an invalid BSC gas cap and workers use a positive BNB/USD quote", () => {
+  assert.match(routesSource, /getConfiguredMaxBscTxFeeUsd\(\);/);
+  assert.match(feePolicySource, /ABSOLUTE_MAX_BSC_TX_FEE_USD = new BigNumber\("0\.4"\)/);
+  assert.match(feeAccountingSource, /!price\.isGreaterThan\(0\)/);
+  assert.match(disbursementSource, /estimateNetBscTokenTransfer/);
+  assert.match(disbursementSource, /BSC_GAS_FEE_LIMIT_EXCEEDED|createBscFeeLimitError/);
 });

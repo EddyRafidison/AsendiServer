@@ -29,7 +29,7 @@ const {
 const fixed = (value) => value.toFixed();
 
 test("current OneX business limits are centralized", () => {
-  assert.equal(fixed(MIN_RECHARGE_AMOUNT), "10");
+  assert.equal(fixed(MIN_RECHARGE_AMOUNT), "20");
   assert.equal(fixed(MAX_RECHARGE_AMOUNT), "100");
   assert.equal(MAX_DEFAULT_STOCK, "300");
   assert.equal(fixed(SYSTEM_ADMIN_RESERVE_RATIO), "0.1");

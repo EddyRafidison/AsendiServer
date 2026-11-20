@@ -4,6 +4,8 @@ const BigNumber = require("bignumber.js");
 
 BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP });
 const { getLatestCommonTx, insertCommonSnapshotTx } = require("./common-accounting");
+const { evaluateBscTxFee } = require("./bsc-transaction-policy");
+const { getCachedBnbUsdPrice } = require("./bsc-price-oracle");
 
 function getUtcRecordDateTime() {
   const now = new Date();
@@ -15,8 +17,7 @@ function getUtcRecordDateTime() {
 }
 
 function getConfiguredBnbUsdPrice() {
-  const value = new BigNumber(process.env.BNB_USD_PRICE || "0");
-  return value.isFinite() && value.isGreaterThan(0) ? value : new BigNumber(0);
+  return getCachedBnbUsdPrice();
 }
 
 function calculateEstimatedGasFee(gasLimit, gasPriceWei, bnbUsdPrice = getConfiguredBnbUsdPrice()) {
@@ -26,12 +27,58 @@ function calculateEstimatedGasFee(gasLimit, gasPriceWei, bnbUsdPrice = getConfig
   if (!limit.isInteger() || !limit.isGreaterThan(0) || !gasPrice.isInteger() || !gasPrice.isGreaterThan(0)) {
     throw new RangeError("Gas limit and gas price must be positive integers");
   }
-  if (!price.isFinite() || price.isNegative()) throw new RangeError("BNB/USD price is invalid");
+  if (!price.isFinite() || !price.isGreaterThan(0)) throw new RangeError("BNB/USD price must be positive and valid");
   const feeBnb = limit.multipliedBy(gasPrice).shiftedBy(-18);
   return {
     feeBnb,
     feeUsd: feeBnb.multipliedBy(price),
     bnbUsdPrice: price,
+  };
+}
+
+
+async function estimateBscTokenTransfer({
+  provider,
+  fromAddress,
+  tokenAddress,
+  data,
+  maximumGasLimit,
+  bnbUsdPrice = getConfiguredBnbUsdPrice(),
+}) {
+  if (!provider || typeof provider.estimateGas !== "function") {
+    throw new TypeError("A BSC JSON-RPC provider with estimateGas support is required");
+  }
+  const feeData = await provider.getFeeData();
+  let gasPrice = feeData?.gasPrice;
+  if (gasPrice == null || gasPrice <= 0n) {
+    gasPrice = BigInt(await provider.send("eth_gasPrice", []));
+  }
+  if (gasPrice <= 0n) throw new Error("The BSC RPC returned an invalid gas price.");
+
+  const gasLimit = BigInt(await provider.estimateGas({
+    from: String(fromAddress),
+    to: String(tokenAddress),
+    data: String(data),
+    value: 0n,
+  }));
+  if (gasLimit <= 0n) throw new Error("The BSC RPC returned an invalid estimated gas limit.");
+  if (maximumGasLimit != null && gasLimit > BigInt(maximumGasLimit)) {
+    throw new RangeError(
+      `The estimated token-transfer gas ${gasLimit.toString()} exceeds the configured gas ceiling ${String(maximumGasLimit)}.`,
+    );
+  }
+
+  const fee = calculateEstimatedGasFee(gasLimit.toString(), gasPrice.toString(), bnbUsdPrice);
+  const decision = evaluateBscTxFee(fee.feeUsd);
+  return {
+    gasLimit,
+    gasPrice,
+    feeBnb: fee.feeBnb,
+    feeUsd: fee.feeUsd,
+    bnbUsdPrice: fee.bnbUsdPrice,
+    allowed: decision.allowed,
+    maximumFeeUsd: decision.maximumFeeUsd,
+    excessFeeUsd: decision.excessFeeUsd,
   };
 }
 
@@ -109,8 +156,12 @@ async function recordActualBscFeeTx(tx, {
     [hash],
   );
   if (existingRows.length && existingRows[0].actual_fee_bnb != null) return { duplicate: true };
+  const historicalPrice = existingRows[0]?.bnb_usd_price;
+  const hasHistoricalPrice = historicalPrice != null &&
+    new BigNumber(String(historicalPrice)).isFinite() &&
+    new BigNumber(String(historicalPrice)).isGreaterThan(0);
   const configuredPrice = bnbUsdPrice == null
-    ? (existingRows[0]?.bnb_usd_price || getConfiguredBnbUsdPrice())
+    ? (hasHistoricalPrice ? historicalPrice : getConfiguredBnbUsdPrice())
     : bnbUsdPrice;
   const fee = calculateActualGasFee(receipt, configuredPrice);
   await tx.query(
@@ -144,6 +195,7 @@ async function recordActualBscFeeTx(tx, {
 module.exports = {
   getConfiguredBnbUsdPrice,
   calculateEstimatedGasFee,
+  estimateBscTokenTransfer,
   calculateActualGasFee,
   recordEstimatedBscFeeTx,
   recordActualBscFeeTx,

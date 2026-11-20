@@ -79,6 +79,8 @@ const {
 } = require("./pay");
 const { startDepositSweeper } = require("./sweep");
 const { checkTreasuryLiquidity } = require("./disbursement");
+const { getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
+getConfiguredMaxBscTxFeeUsd();
 const { createTelegramBotLinkTx, queueTelegramMessageTx } = require("./telegram");
 const { resetUserPriceBasisTx, triggerUserPriceThresholdTx, recordUserP2PSaleTx } = require("./user-price-accounting");
 const {
@@ -1260,7 +1262,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
 }
 
 const RECHARGE_HOLD_REASON_TEXT = {
-  below_minimum: "The total received during the 60-minute session is below 10 BSC-USD.",
+  below_minimum: "The total received during the 60-minute session is below 20 BSC-USD.",
   above_maximum: "The total received during the 60-minute session exceeds 100 BSC-USD.",
   weekly_limit: "ONEX reserves cannot be used yet. The system may retry earlier if seller reserve becomes sufficient; otherwise it retries at the displayed release time.",
   maximum_user_balance: "Crediting this recharge would exceed the maximum account balance of 300 XTU.",
@@ -3304,7 +3306,7 @@ router.post("/admin/recharge/control", async (req, res) => {
 
 // Exceptional administrative credit of a support-held recharge batch.
 // Normal weekly cooldown, 300 XTU stock cap and common reserve checks remain enforced.
-// The administrator may bypass the automatic 10-100 BSC-USD session range after a support review.
+// The administrator may bypass the automatic 20-100 BSC-USD session range after a support review.
 router.post("/admin/recharge/credit", async (req, res) => {
   const { pswd, pin, username, batch_id, reason } = req.body || {};
   if (
@@ -3441,21 +3443,24 @@ router.post("/admin/recharge/refund", async (req, res) => {
     if (!grossRaw.isInteger() || grossRaw.isLessThanOrEqualTo(0)) {
       return res.send({ transf: "invalid refund amount" });
     }
-    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0));
-    const bscFeeRecovery = new BigNumber(liquidityEstimate.estimatedFeeUsd || "0");
-    const amount = grossAmount.minus(bscFeeRecovery);
-    if (!amount.isFinite() || amount.isLessThan(10)) {
-      return res.send({ transf: "minimum net refund is 10 BSC-USD", gross_amount: grossAmount.toFixed(18), gas_fee_estimated: bscFeeRecovery.toFixed(18) });
+    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0), snapshot.payout_address);
+    const maximumGasRecovery = getConfiguredMaxBscTxFeeUsd();
+    if (grossAmount.minus(maximumGasRecovery).isLessThan(10)) {
+      return res.send({
+        transf: "gross refund is too small to guarantee a 10 BSC-USD net refund within the configured gas-fee cap",
+        gross_amount: grossAmount.toFixed(18),
+        maximum_gas_recovery: maximumGasRecovery.toFixed(18),
+      });
     }
-    const amountRawDecimal = amount.shiftedBy(18);
-    if (!amountRawDecimal.isInteger() || amountRawDecimal.isLessThanOrEqualTo(0)) {
-      return res.send({ transf: "invalid refund amount" });
+    if (!liquidityEstimate.tokenAvailable) {
+      return res.send({ transf: "insufficient treasury BSC-USD balance", liquidity: liquidityEstimate });
     }
-    const amountRaw = amountRawDecimal.toFixed(0);
-    const liquidity = await checkTreasuryLiquidity(amountRaw);
-    if (!liquidity.available) {
-      return res.send({ transf: "insufficient treasury liquidity", liquidity });
-    }
+    // The final gas recovery and net payout are calculated by the worker only
+    // when the estimated fee is within the configured cap.
+    const bscFeeRecovery = new BigNumber(0);
+    const amount = grossAmount;
+    const amountRaw = grossRaw.toFixed(0);
+    const liquidity = liquidityEstimate;
 
     const result = await withTransaction(async (tx) => {
       const [walletRows] = await tx.query(
@@ -3485,7 +3490,7 @@ router.post("/admin/recharge/refund", async (req, res) => {
          (username,batch_id,payout_address,amount,gross_amount,fee_amount,amount_raw,estimated_fee_bnb,estimated_fee_usd,bnb_usd_price,reference,status,created_at_ms,updated_at_ms)
          VALUES(?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)`,
         [U, batchId, snapshot.payout_address, amount.toFixed(18), grossAmount.toFixed(18), bscFeeRecovery.toFixed(18), amountRaw,
-          liquidity.estimatedFeeBnb || "0", bscFeeRecovery.toFixed(18), liquidity.bnbUsdPrice || "0", reference, now, now],
+          "0", "0", liquidity.bnbUsdPrice || "0", reference, now, now],
       );
       await tx.query(
         "UPDATE users_usdt_deposit_batches SET status='refund_queued',updated_at_ms=? WHERE id=?",
@@ -3509,17 +3514,19 @@ router.post("/admin/recharge/refund", async (req, res) => {
           "OneX Refund Update",
           "Your BSC-USD refund has been accepted and queued for processing.",
           `Gross amount: ${grossAmount.toFixed(8)} BSC-USD`,
-          `BSC gas recovery: ${bscFeeRecovery.toFixed(8)} BSC-USD`,
-          `Net refund: ${amount.toFixed(8)} BSC-USD`,
+          `Maximum permitted estimated gas recovery: ${maximumGasRecovery.toFixed(8)} BSC-USD`,
+          "The final gas recovery and net refund will be calculated when the estimated network fee is within this limit.",
           `Refund ID: ${refundInsert.insertId}`,
           `Destination: ${snapshot.payout_address}`,
-          "Status: PROCESSING",
+          "Status: QUEUED",
         ].join("\n"),
       );
       return {
         transf: "refund_processing",
         refund_id: String(refundInsert.insertId),
-        amount: amount.toFixed(18),
+        amount: null,
+        gross_amount: grossAmount.toFixed(18),
+        maximum_gas_recovery: maximumGasRecovery.toFixed(18),
         payout_address: snapshot.payout_address,
       };
     });
@@ -3566,7 +3573,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
     if (!isEvmAddress(snapshot.payout_address)) return res.send({ transf: "invalid payout address" });
 
     // The HTTP process checks balances only; the isolated worker owns the signing key.
-    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw);
+    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw, snapshot.payout_address);
     if (!liquidity.available) {
       return res.send({ transf: "insufficient treasury liquidity", liquidity });
     }
@@ -4946,7 +4953,7 @@ async function initializeRechargePayments() {
     // Run consolidation in a separate process by default so the HTTP server
     // never needs the deposit-wallet extended private key in its environment.
     if (String(process.env.USDT_SWEEP_IN_MAIN_PROCESS || "false").toLowerCase() === "true") {
-      startDepositSweeper(db);
+      await startDepositSweeper(db);
     }
     startUsdtPaymentWatcher(db, processConfirmedUsdtPayment, processRechargeBatchQueue);
   }

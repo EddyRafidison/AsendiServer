@@ -40,7 +40,7 @@ async function start() {
     const envFile = process.env.USDT_DISBURSEMENT_ENV_FILE || ".env.disbursement";
     const envResult = require("dotenv").config({
       path: path.resolve(process.cwd(), envFile),
-      // Keep feature flags and BNB_USD_PRICE from the main environment.
+      // Keep feature flags and Chainlink BNB/USD feed settings from the main environment.
     });
     if (envResult.error) {
       throw new Error(`Unable to load disbursement secrets from ${envFile}: ${envResult.error.message}`);

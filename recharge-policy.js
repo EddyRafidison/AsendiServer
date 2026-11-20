@@ -4,8 +4,8 @@ const BigNumber = require("bignumber.js");
 const { calculateGlobalUnitPrice, calculateRechargeFundingAllocation } = require("./stock-accounting");
 
 const MAX_DEFAULT_STOCK = "300";
-// Automatic deposit sessions are fixed to the published 10–100 BSC-USD range.
-const MIN_RECHARGE_AMOUNT = new BigNumber("10");
+// Automatic deposit sessions are fixed to the published 20–100 BSC-USD range.
+const MIN_RECHARGE_AMOUNT = new BigNumber("20");
 const MAX_RECHARGE_AMOUNT = new BigNumber("100");
 const SYSTEM_ADMIN_RESERVE_RATIO = new BigNumber(
   process.env.SYSTEM_ADMIN_RESERVE_RATIO || "0.10",

@@ -79,14 +79,14 @@ Le numérateur et le dénominateur diminuent proportionnellement : le prix est d
 
 Chaque compte possède une adresse individuelle de dépôt BSC-USD. Les dépôts finalisés sont identifiés par hash de transaction et index du journal d'événement puis regroupés dans une session de recharge de 60 minutes.
 
-- Le montant total d'une session automatique doit être compris entre **10 et 100 BSC-USD inclus**. En dehors de cette plage, la session passe en `pending_support` et n'est pas créditée partiellement.
+- Le montant total d'une session automatique doit être compris entre **20 et 100 BSC-USD inclus**. En dehors de cette plage, la session passe en `pending_support` et n'est pas créditée partiellement.
 - Le seuil de sweep du portefeuille de dépôt est de **100 BSC-USD**. Les dépôts finalisés non balayés sont également traités après 30 jours.
 - Le cooldown de sept jours s'applique uniquement à la part nécessitant un financement par les réserves système ONEX. Les financements provenant des lots vendeurs n'utilisent pas ce cooldown système.
 - Le solde public de l'utilisateur après crédit ne doit jamais dépasser 300 XTU, au prix global recalculé après l'opération.
 - Le crédit net est `montant reçu - tfees`. Les coûts BSC réels des transactions de financement et de sweep sont répartis au prorata entre les sessions concernées. Ils sont imputés sur les `tfees` bruts ; seul le reliquat augmente les réserves et `common.total_tfees`. Tout dépassement de coûts BSC est enregistré comme coût OneX et n'est pas facturé une seconde fois à l'utilisateur.
 - Priorité de financement : `common.inactive_init_asset`, puis lots vendeurs actifs en FIFO, puis `common.backed_units` au-delà du quota administratif restant. Les réservations de décaissement réduisent la capacité finançable.
 - Un crédit financé par un lot vendeur transfère les actifs initiaux du lot vers le bénéficiaire ; le lot vendeur du bénéficiaire est exclu de son propre financement.
-- Une recharge qui dépasse le plafond utilisateur est mise en attente pour support, sans crédit. Les opérations administratives de crédit exceptionnel peuvent contourner la plage automatique 10–100 après examen, mais ne contournent pas le plafond utilisateur ni les protections de réserve.
+- Une recharge qui dépasse le plafond utilisateur est mise en attente pour support, sans crédit. Les opérations administratives de crédit exceptionnel peuvent contourner la plage automatique 20–100 après examen, mais ne contournent pas le plafond utilisateur ni les protections de réserve.
 
 ## Rémunération individuelle et campagnes vendeurs
 
@@ -109,6 +109,11 @@ Les lots vendeurs sont consommés en FIFO. La consommation débite le solde vend
 `POST /app/xtu-transfer` reçoit un montant public XTU. Le prix global unique est lu sous le verrou `common_state`, puis le montant est converti en actifs initiaux. L'expéditeur est débité du montant brut initial; le destinataire reçoit le montant initial net après déduction de la totalité des `tfees`. Le destinataire supporte les frais; aucun gas BSC n'est appliqué aux transferts P2P.
 
 Pour un transfert P2P, l'intégralité des `tfees` est conservée par OneX, puisqu'aucun coût de gas BSC ne s'applique. Pour les recharges et les décaissements individuels, le coût BSC réel admissible est d'abord imputé sur les `tfees` bruts. Seul le reliquat augmente les réserves système et `common.total_tfees`. À la confirmation d'un paiement de trésorerie, la valeur de stock commune est également débitée du montant BSC-USD réellement transféré et du coût BNB réel valorisé en BSC-USD. `common.total_tfees_bsc_cost_usd` suit les frais BSC couverts par `tfees`; `common.total_tfees_bsc_uncovered_usd` suit les coûts dépassant les `tfees` disponibles et absorbés par OneX. `bsc_fee_allocations` distribue de façon idempotente les coûts de sweep aux lots de recharge.
+
+
+## Plafond des frais réseau BSC
+
+Avant de signer ou diffuser un transfert sortant BSC-USD (disbursement individuel/global, paiement vendeur ou remboursement), le worker appelle `eth_estimateGas` sur les données exactes du transfert ERC-20 et convertit le coût estimé de BNB vers BSC-USD au moyen du flux Chainlink BNB/USD lu directement sur BNB Smart Chain Mainnet par `latestRoundData()`. La limite `BSC_MAX_TX_FEE_BSC_USD` vaut 0.4 par défaut et ne peut pas être configurée au-dessus de 0.4 ; cette configuration est validée dès le démarrage du serveur HTTP. Si le coût estimé est supérieur à la limite, le job reste `queued`, sans transaction signée ni hash diffusé, et sera réévalué au prochain cycle du worker. Le seuil est inclusif : une estimation exactement égale à 0.4 est acceptée. Le sweeper des dépôts applique aussi le même plafond, avec une estimation prudente basée sur la limite de gas configurée pour le transfert de jetons et, si nécessaire, sur les 21 000 unités de gas du transfert de financement BNB ; il réessaie au cycle de balayage suivant. La limite porte sur le coût estimé ; les frais finaux dépendent du `gasUsed` et de l'`effectiveGasPrice` réellement inscrits dans le reçu. Le module `bsc-price-oracle.js` actualise ce cours en mémoire toutes les 60 secondes par défaut. Il lit `decimals()` et `latestRoundData()`, vérifie que la réponse est positive et que `updatedAt` ne dépasse pas `BSC_PRICE_MAX_AGE_SECONDS` (300 secondes par défaut). Si le flux RPC est indisponible ou que le cours devient périmé, les nouvelles transactions sortantes sont suspendues jusqu'au retour d'une cotation fraîche ; aucun dernier cours périmé n'est réutilisé.
 
 ## Disbursement individuel et disbursement global
 
@@ -141,7 +146,7 @@ Les remboursements de recharge approuvés n'appliquent aucun `tfees`; seule la r
 
 ## Déploiement et frais généraux
 
-`BNB_USD_PRICE` doit être une cotation BNB/USD positive capturée avant l'activation des workers BSC. Les frais BNB estimés et réels restent distincts et sont conservés dans `bsc_fee_ledger`. Les clés privées restent dans les fichiers d'environnement dédiés aux workers; ne jamais distribuer de vrais fichiers `.env`.
+Le prix BNB/USD provient de Chainlink sur BNB Smart Chain Mainnet via `BSC_BNB_USD_FEED_ADDRESS` (flux par défaut `0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE`). `BSC_PRICE_REFRESH_INTERVAL_MS` règle la fréquence de lecture (60 000 ms par défaut) et `BSC_PRICE_MAX_AGE_SECONDS` la fraîcheur maximale acceptée (300 secondes par défaut). Le contrat doit être lu sur le chain ID 56. L’ancienne variable manuelle `BNB_USD_PRICE` n’est plus utilisée et doit être retirée des fichiers `.env` existants. Les frais BNB estimés et réels restent distincts et sont conservés dans `bsc_fee_ledger`. Les clés privées restent dans les fichiers d'environnement dédiés aux workers; ne jamais distribuer de vrais fichiers `.env`.
 
 ## Telegram et SMTP
 
@@ -155,7 +160,7 @@ Les fichiers `.env` réels ne doivent jamais être distribués. Fournir uniqueme
 
 - HTTP + scanner : aucune clé privée de wallet.
 - `npm run sweep` : clé HD des adresses de dépôt et clé du financeur gas dans `.env.sweeper`.
-- `npm run disburse` : clé du treasury dans `.env.disbursement`; les flags opérationnels et `BNB_USD_PRICE` viennent du `.env` principal. Le worker traite uniquement les disbursements, remboursements et paiements vendeurs.
+- `npm run disburse` : clé du treasury dans `.env.disbursement`; les flags opérationnels et la configuration du flux Chainlink BNB/USD viennent du `.env` principal. Le worker traite uniquement les disbursements, remboursements et paiements vendeurs.
 - Le worker de cycle de vie vendeur et de préparation des lots de paiement est lancé par `npm start`; il nécessite uniquement la base de données, sans clé privée. Il utilise un verrou MySQL pour éviter le double traitement.
 
 ## Authentification et récupération
@@ -223,7 +228,7 @@ Le bonus est financé par la réserve administrative protégée de 10 % des acti
 
 ## Deposit-address availability guard
 
-`/app/user-last-stock` returns a deposit address only when the account can accept at least one minimum 10 BSC-USD recharge after the configured `FEES`/`tfees` deduction without exceeding the 300 XTU maximum. `/app/recharge` does not return or create the address. The check is performed under the shared `common_state` lock and uses a conservative projection of the post-recharge global price when current reserves can fund the minimum recharge. The actual recharge credit path remains authoritative and rechecks the projected balance inside its own transaction.
+`/app/user-last-stock` returns a deposit address only when the account can accept at least one minimum 20 BSC-USD recharge after the configured `FEES`/`tfees` deduction without exceeding the 300 XTU maximum. `/app/recharge` does not return or create the address. The check is performed under the shared `common_state` lock and uses a conservative projection of the post-recharge global price when current reserves can fund the minimum recharge. The actual recharge credit path remains authoritative and rechecks the projected balance inside its own transaction.
 
 As soon as a global disbursement is effective, these endpoints return no deposit address and mark recharge as unavailable. `/app/signin` itself does not issue deposit addresses; the post-login balance endpoint is `/app/user-last-stock`.
 

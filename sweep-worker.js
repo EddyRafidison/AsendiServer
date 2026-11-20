@@ -24,7 +24,7 @@ async function main() {
   await db.queryAsync("SELECT 1");
   await db.queryAsync("SELECT id FROM users_usdt_deposit_wallets LIMIT 1");
 
-  const result = startDepositSweeper(db);
+  const result = await startDepositSweeper(db);
   if (!result || !result.enabled) {
     throw new Error("The automatic BSC deposit sweeper did not start.");
   }

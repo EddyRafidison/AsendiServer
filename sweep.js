@@ -15,9 +15,12 @@ const {
 } = require("./recharge-policy");
 const {
   getConfiguredBnbUsdPrice,
+  calculateEstimatedGasFee,
   recordEstimatedBscFeeTx,
   recordActualBscFeeTx,
 } = require("./bsc-fee-accounting");
+const { startBnbUsdPriceOracle } = require("./bsc-price-oracle");
+const { getConfiguredMaxBscTxFeeUsd, evaluateBscTxFee } = require("./bsc-transaction-policy");
 
 const CHAIN_ID = 56;
 const CHAIN_ID_BIGINT = 56n;
@@ -51,9 +54,7 @@ function getSweepRuntime() {
   const minConfirmations = Number(process.env.USDT_MIN_CONFIRMATIONS || 15);
   const tokenGasLimit = BigInt(process.env.USDT_SWEEP_TOKEN_GAS_LIMIT || "100000");
 
-  if (!getConfiguredBnbUsdPrice().isGreaterThan(0)) {
-    throw new Error("BNB_USD_PRICE must be set to a positive captured BNB/USD quote before deposit sweeping is enabled.");
-  }
+  getConfiguredMaxBscTxFeeUsd();
   if (!xprv || !xpub || !funderPrivateKey || !rpcUrl || !treasuryAddress) {
     throw new Error(
       "USDT_SWEEP_ENABLED requires BSC_DEPOSIT_XPRV, BSC_DEPOSIT_XPUB, BSC_SWEEP_FUNDER_PRIVATE_KEY, BSC_RPC_URL and the treasury address.",
@@ -322,13 +323,31 @@ async function prepareSweep(db, walletRow, runtime) {
     const fundingValue = topUpTarget > currentDepositBnb
       ? topUpTarget - currentDepositBnb
       : 0n;
+    const funderGas = 21000n;
+    const totalEstimatedGasLimit = gasLimit + (fundingValue > 0n ? funderGas : 0n);
+    const bnbUsdPrice = getConfiguredBnbUsdPrice();
+    const estimatedTotalFee = calculateEstimatedGasFee(
+      totalEstimatedGasLimit.toString(),
+      gasPrice.toString(),
+      bnbUsdPrice,
+    );
+    const feeDecision = evaluateBscTxFee(estimatedTotalFee.feeUsd);
+    if (!feeDecision.allowed) {
+      await db.queryAsync(
+        "UPDATE users_usdt_deposit_wallets SET sweep_lock_until_ms=0 WHERE id=?",
+        [walletRow.id],
+      );
+      console.info(
+        `Deposit sweep for wallet ${walletRow.id} remains queued: estimated combined BSC gas is ${estimatedTotalFee.feeUsd.toFixed(8)} BSC-USD, above the ${feeDecision.maximumFeeUsd.toFixed(8)} BSC-USD cap.`,
+      );
+      return null;
+    }
 
     let fundRawTx = null;
     let fundTxHash = null;
     if (fundingValue > 0n) {
       const funderNonce = await runtime.provider.getTransactionCount(runtime.funder.address, "pending");
       const funderBalance = await runtime.provider.getBalance(runtime.funder.address);
-      const funderGas = 21000n;
       const requiredFunderBalance = fundingValue + funderGas * gasPrice;
       if (funderBalance < requiredFunderBalance) {
         throw new Error("The BNB gas-funding wallet does not have enough BNB.");
@@ -376,7 +395,6 @@ async function prepareSweep(db, walletRow, runtime) {
       ],
     );
     await withTransaction(db, async (tx) => {
-      const bnbUsdPrice = getConfiguredBnbUsdPrice();
       if (fundTxHash) {
         await recordEstimatedBscFeeTx(tx, {
           txHash: fundTxHash,
@@ -568,7 +586,7 @@ async function sweepWallet(db, walletRow, runtime) {
   if (sweepRow) await resumeSweep(db, walletRow, sweepRow, runtime);
 }
 
-function startDepositSweeper(db) {
+async function startDepositSweeper(db) {
   if (!isEnabled()) {
     console.log("Automatic BSC deposit consolidation is disabled.");
     return { enabled: false };
@@ -576,6 +594,15 @@ function startDepositSweeper(db) {
   if (timer) return { enabled: true };
 
   const runtime = getSweepRuntime();
+  const priceSnapshot = await startBnbUsdPriceOracle(runtime.provider);
+  if (priceSnapshot) {
+    console.log(
+      `OneX BSC deposit sweeper connected to Chainlink BNB/USD: ${priceSnapshot.price} ` +
+      `(updated ${new Date(priceSnapshot.updatedAt * 1000).toISOString()}).`,
+    );
+  } else {
+    console.warn("OneX BSC deposit sweeper is ready, but no fresh Chainlink BNB/USD quote is available. Sweeps will remain queued.");
+  }
   let sweepRunning = false;
   let networkValidated = false;
 

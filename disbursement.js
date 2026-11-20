@@ -22,11 +22,12 @@ const {
 } = require("./common-accounting");
 const {
   getConfiguredBnbUsdPrice,
-  calculateEstimatedGasFee,
+  estimateBscTokenTransfer,
   recordEstimatedBscFeeTx,
   recordActualBscFeeTx,
 } = require("./bsc-fee-accounting");
-const { calculateSellerPayoutNet } = require("./seller-accounting");
+const { getBnbUsdPrice, startBnbUsdPriceOracle } = require("./bsc-price-oracle");
+const { createBscFeeLimitError, getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
 const { SYSTEM_ADMIN_RESERVE_RATIO } = require("./recharge-policy");
 const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
 const {
@@ -63,6 +64,63 @@ function requiredAddress(value, label) {
   }
 }
 
+async function estimateNetBscTokenTransfer({
+  provider,
+  fromAddress,
+  tokenAddress,
+  payoutAddress,
+  grossAmount,
+  tokenBalanceRaw,
+  maximumGasLimit,
+  bnbUsdPrice,
+}) {
+  const gross = new BigNumber(grossAmount);
+  const availableRaw = BigInt(tokenBalanceRaw);
+  if (!gross.isFinite() || !gross.isGreaterThan(0) || availableRaw <= 0n) {
+    throw new Error("The BSC-USD payout amount and treasury balance must be positive.");
+  }
+  const grossRaw = BigInt(gross.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0));
+  let candidateRaw = availableRaw < grossRaw ? availableRaw : grossRaw;
+  if (candidateRaw <= 0n) {
+    throw new Error("The BSC-USD payout amount rounds to zero.");
+  }
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, candidateRaw]);
+    const estimate = await estimateBscTokenTransfer({
+      provider,
+      fromAddress,
+      tokenAddress,
+      data,
+      maximumGasLimit,
+      bnbUsdPrice,
+    });
+    if (!estimate.allowed) {
+      throw createBscFeeLimitError(estimate.feeUsd, estimate.maximumFeeUsd);
+    }
+
+    const payoutAmount = gross.minus(estimate.feeUsd).decimalPlaces(18, BigNumber.ROUND_DOWN);
+    if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
+      return { payoutAmount, amountRaw: 0n, data: null, estimate };
+    }
+    const nextRaw = BigInt(payoutAmount.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0));
+    if (nextRaw <= 0n) {
+      return { payoutAmount, amountRaw: 0n, data: null, estimate };
+    }
+    if (availableRaw < nextRaw) {
+      throw new Error("The OneX treasury has insufficient BSC-USD for the net payout amount.");
+    }
+
+    const nextData = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, nextRaw]);
+    if (nextData === data) {
+      return { payoutAmount, amountRaw: nextRaw, data, estimate };
+    }
+    candidateRaw = nextRaw;
+  }
+
+  throw new Error("The BSC-USD payout amount and gas estimate did not converge; the queued job will be re-evaluated.");
+}
+
 function makeRuntime(forcePendingWork = false) {
   if (runtime) return runtime;
 
@@ -71,9 +129,7 @@ function makeRuntime(forcePendingWork = false) {
   const globalEnabled = masterEnabled && String(process.env.USDT_GLOBAL_DISBURSEMENT_ENABLED || "false").toLowerCase() === "true";
   const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
   if (!individualEnabled && !globalEnabled && !sellerPayoutsEnabled && !forcePendingWork) return null;
-  if (!getConfiguredBnbUsdPrice().isGreaterThan(0)) {
-    throw new Error("BNB_USD_PRICE must be set to a positive captured BNB/USD quote before treasury payouts are enabled.");
-  }
+  getConfiguredMaxBscTxFeeUsd();
 
   const privateKey = String(process.env.BSC_DISBURSEMENT_PRIVATE_KEY || "").trim();
   const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
@@ -150,7 +206,7 @@ async function validateRuntime(activeRuntime) {
   }
 }
 
-async function checkTreasuryLiquidity(amountRaw) {
+async function checkTreasuryLiquidity(amountRaw, payoutAddress) {
   const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
   const tokenAddress = requiredAddress(
     process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
@@ -160,12 +216,13 @@ async function checkTreasuryLiquidity(amountRaw) {
     process.env.USDT_BEP20_TREASURY_ADDRESS || "",
     "OneX treasury address",
   );
-  const gasLimit = BigInt(process.env.USDT_DISBURSEMENT_GAS_LIMIT || "100000");
+  const gasLimitCeiling = BigInt(process.env.USDT_DISBURSEMENT_GAS_LIMIT || "100000");
   const amount = BigInt(amountRaw);
+  const destination = requiredAddress(payoutAddress, "BSC-USD payout address");
   if (!rpcUrl || amount <= 0n || tokenAddress.toLowerCase() !== CANONICAL_BSC_USD_CONTRACT.toLowerCase()) {
     throw new Error("Treasury liquidity check is not correctly configured.");
   }
-  if (gasLimit < 60000n || gasLimit > 200000n) {
+  if (gasLimitCeiling < 60000n || gasLimitCeiling > 200000n) {
     throw new Error("USDT_DISBURSEMENT_GAS_LIMIT is outside the permitted range.");
   }
 
@@ -177,27 +234,36 @@ async function checkTreasuryLiquidity(amountRaw) {
     if (!code || code === "0x") throw new Error("The approved BSC-USD contract is unavailable.");
     const token = new Contract(tokenAddress, ["function balanceOf(address account) view returns (uint256)"], provider);
     const tokenBalance = await token.balanceOf(treasuryAddress);
-    const spendableTokenBalance = tokenBalance;
-    const feeData = await provider.getFeeData();
-    const gasPrice = feeData.gasPrice || BigInt(await provider.send("eth_gasPrice", []));
+    const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [destination, amount]);
+    const bnbUsdPrice = await getBnbUsdPrice(provider);
+    const estimate = await estimateBscTokenTransfer({
+      provider,
+      fromAddress: treasuryAddress,
+      tokenAddress,
+      data,
+      maximumGasLimit: gasLimitCeiling,
+      bnbUsdPrice,
+    });
     const bnbBalance = await provider.getBalance(treasuryAddress);
-    const gasRequired = gasLimit * gasPrice;
-    const bnbUsdPrice = getConfiguredBnbUsdPrice();
-    if (!bnbUsdPrice.isGreaterThan(0)) {
-      throw new Error("BNB_USD_PRICE must be positive so BSC gas recovery can be calculated.");
-    }
-    const estimatedFee = calculateEstimatedGasFee(gasLimit.toString(), gasPrice.toString(), bnbUsdPrice);
+    const requiredGas = estimate.gasLimit * estimate.gasPrice;
+    const tokenAvailable = tokenBalance >= amount;
+    const bnbAvailable = bnbBalance >= requiredGas;
     return {
-      available: spendableTokenBalance >= amount && bnbBalance >= gasRequired,
+      available: tokenAvailable && bnbAvailable,
+      tokenAvailable,
+      bnbAvailable,
+      feeWithinLimit: estimate.allowed,
+      maximumFeeUsd: estimate.maximumFeeUsd.toFixed(18),
       tokenBalanceRaw: tokenBalance.toString(),
-      spendableTokenBalanceRaw: spendableTokenBalance.toString(),
+      spendableTokenBalanceRaw: tokenBalance.toString(),
       requiredTokenRaw: amount.toString(),
       bnbBalanceWei: bnbBalance.toString(),
-      requiredBnbWei: gasRequired.toString(),
-      gasPriceWei: gasPrice.toString(),
-      estimatedFeeBnb: estimatedFee.feeBnb.toFixed(30),
-      estimatedFeeUsd: estimatedFee.feeUsd.toFixed(18),
-      bnbUsdPrice: bnbUsdPrice.toFixed(12),
+      requiredBnbWei: requiredGas.toString(),
+      gasLimit: estimate.gasLimit.toString(),
+      gasPriceWei: estimate.gasPrice.toString(),
+      estimatedFeeBnb: estimate.feeBnb.toFixed(30),
+      estimatedFeeUsd: estimate.feeUsd.toFixed(18),
+      bnbUsdPrice: estimate.bnbUsdPrice.toFixed(12),
     };
   } finally {
     await provider.destroy();
@@ -289,48 +355,71 @@ async function signQueuedJob(db, job, activeRuntime) {
     throw new Error("The payout address cannot be the OneX treasury address.");
   }
 
-  const feeData = await activeRuntime.provider.getFeeData();
-  let gasPrice = feeData.gasPrice;
-  if (!gasPrice || gasPrice <= 0n) gasPrice = BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
-  if (gasPrice <= 0n) throw new Error("The BSC RPC returned an invalid gas price.");
-  const estimate = calculateEstimatedGasFee(
-    activeRuntime.gasLimit.toString(), gasPrice.toString(), getConfiguredBnbUsdPrice(),
-  );
-
   let amountRaw;
   let payoutAmount = new BigNumber(job.payout_amount);
   let bscFeeRecovered = new BigNumber(job.bsc_fee_recovered_usd || "0");
+  let estimate;
+  let data;
+  const tokenBalanceRaw = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
+  const grossBase = job.disbursement_mode === "global"
+    ? new BigNumber(job.gross_initial_asset).multipliedBy(new BigNumber(job.price_value)).plus(new BigNumber(job.bonus_amount || "0"))
+    : null;
+
   if (job.disbursement_mode === "global") {
-    const gross = new BigNumber(job.gross_initial_asset).multipliedBy(new BigNumber(job.price_value));
-    const bonus = new BigNumber(job.bonus_amount || "0");
-    payoutAmount = gross.plus(bonus).minus(estimate.feeUsd).decimalPlaces(18, BigNumber.ROUND_DOWN);
-    bscFeeRecovered = estimate.feeUsd;
-    if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
+    if (!grossBase.isFinite() || !grossBase.isGreaterThan(0)) {
+      throw new Error("The global disbursement gross amount must be positive.");
+    }
+    const payout = await estimateNetBscTokenTransfer({
+      provider: activeRuntime.provider,
+      fromAddress: activeRuntime.treasuryAddress,
+      tokenAddress: activeRuntime.tokenAddress,
+      payoutAddress,
+      grossAmount: grossBase,
+      tokenBalanceRaw,
+      maximumGasLimit: activeRuntime.gasLimit,
+      bnbUsdPrice: getConfiguredBnbUsdPrice(),
+    });
+    if (!payout.payoutAmount.isGreaterThan(0) || payout.amountRaw <= 0n || !payout.data) {
       throw new Error("The global request is too small to cover the estimated BSC network fee.");
     }
-    const rawDecimal = payoutAmount.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN);
-    if (!rawDecimal.isGreaterThan(0)) throw new Error("Global payout rounds to zero after BSC gas recovery.");
-    amountRaw = BigInt(rawDecimal.toFixed(0));
+    payoutAmount = payout.payoutAmount;
+    amountRaw = payout.amountRaw;
+    data = payout.data;
+    estimate = payout.estimate;
+    bscFeeRecovered = estimate.feeUsd;
   } else {
     if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
       throw new Error("The individual disbursement amount must be positive.");
     }
     amountRaw = BigInt(job.amount_raw);
     if (amountRaw <= 0n) throw new Error("The disbursement token amount must be positive.");
+    if (tokenBalanceRaw < amountRaw) {
+      throw new Error("The OneX treasury does not have enough BSC-USD for this disbursement.");
+    }
+    data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
+    estimate = await estimateBscTokenTransfer({
+      provider: activeRuntime.provider,
+      fromAddress: activeRuntime.treasuryAddress,
+      tokenAddress: activeRuntime.tokenAddress,
+      data,
+      maximumGasLimit: activeRuntime.gasLimit,
+      bnbUsdPrice: getConfiguredBnbUsdPrice(),
+    });
+    if (!estimate.allowed) {
+      throw createBscFeeLimitError(estimate.feeUsd, estimate.maximumFeeUsd);
+    }
   }
 
-  const tokenBalanceRaw = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
   if (tokenBalanceRaw < amountRaw) {
     throw new Error("The OneX treasury does not have enough BSC-USD for this disbursement.");
   }
   const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
-  const requiredGasBalance = activeRuntime.gasLimit * gasPrice;
+  const requiredGasBalance = estimate.gasLimit * estimate.gasPrice;
   if (nativeBalance < requiredGasBalance) {
     throw new Error("The OneX treasury does not have enough BNB to pay the disbursement transaction fee.");
   }
 
   const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
-  const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
   const rawTransaction = await activeRuntime.signer.signTransaction({
     type: 0,
     chainId: Number(CHAIN_ID),
@@ -338,8 +427,8 @@ async function signQueuedJob(db, job, activeRuntime) {
     to: activeRuntime.tokenAddress,
     value: 0n,
     data,
-    gasLimit: activeRuntime.gasLimit,
-    gasPrice,
+    gasLimit: estimate.gasLimit,
+    gasPrice: estimate.gasPrice,
   });
   const transactionHash = keccak256(rawTransaction);
   const result = await db.queryAsync(
@@ -359,8 +448,8 @@ async function signQueuedJob(db, job, activeRuntime) {
     await recordEstimatedBscFeeTx(tx, {
       txHash: transactionHash,
       operation: "system_disbursement",
-      gasLimit: activeRuntime.gasLimit.toString(),
-      gasPriceWei: gasPrice.toString(),
+      gasLimit: estimate.gasLimit.toString(),
+      gasPriceWei: estimate.gasPrice.toString(),
       bnbUsdPrice: estimate.bnbUsdPrice,
     });
   });
@@ -963,32 +1052,31 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
   const gross = new BigNumber(job.gross_amount);
   if (!gross.isFinite() || !gross.isGreaterThan(0)) throw new Error("Invalid seller payout gross amount.");
 
-  const feeData = await activeRuntime.provider.getFeeData();
-  const gasPrice = feeData.gasPrice || BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
   const bnbUsdPrice = getConfiguredBnbUsdPrice();
   if (!bnbUsdPrice.isGreaterThan(0)) {
-    throw new Error("BNB_USD_PRICE must be configured to recover the seller's BSC gas cost.");
+    throw new Error("A fresh Chainlink BNB/USD price is required to recover the seller's BSC gas cost.");
   }
-  const estimatedFee = calculateEstimatedGasFee(
-    activeRuntime.gasLimit.toString(),
-    gasPrice.toString(),
-    bnbUsdPrice,
-  );
-  const { payoutAmount } = calculateSellerPayoutNet(gross, estimatedFee.feeUsd);
-  const amountRawDecimal = payoutAmount.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN);
-  if (!amountRawDecimal.isGreaterThan(0)) throw new Error("Seller payout is too small after BSC gas recovery.");
-  const amountRaw = BigInt(amountRawDecimal.toFixed(0));
   const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
-  if (tokenBalance < amountRaw) {
-    throw new Error("The OneX treasury has insufficient BSC-USD for seller payouts.");
+  const payout = await estimateNetBscTokenTransfer({
+    provider: activeRuntime.provider,
+    fromAddress: activeRuntime.treasuryAddress,
+    tokenAddress: activeRuntime.tokenAddress,
+    payoutAddress,
+    grossAmount: gross,
+    tokenBalanceRaw: tokenBalance,
+    maximumGasLimit: activeRuntime.gasLimit,
+    bnbUsdPrice,
+  });
+  const { payoutAmount, amountRaw, data, estimate: finalEstimate } = payout;
+  if (!payoutAmount.isGreaterThan(0) || amountRaw <= 0n || !data) {
+    throw new Error("Seller payout is too small after BSC gas recovery.");
   }
   const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
-  if (nativeBalance < activeRuntime.gasLimit * gasPrice) {
+  if (nativeBalance < finalEstimate.gasLimit * finalEstimate.gasPrice) {
     throw new Error("The OneX treasury has insufficient BNB for the seller payout gas.");
   }
 
   const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
-  const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
   const rawTransaction = await activeRuntime.signer.signTransaction({
     type: 0,
     chainId: Number(CHAIN_ID),
@@ -996,8 +1084,8 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
     to: activeRuntime.tokenAddress,
     value: 0n,
     data,
-    gasLimit: activeRuntime.gasLimit,
-    gasPrice,
+    gasLimit: finalEstimate.gasLimit,
+    gasPrice: finalEstimate.gasPrice,
   });
   const transactionHash = keccak256(rawTransaction);
   const update = await db.queryAsync(
@@ -1009,7 +1097,7 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
       rawTransaction,
       transactionHash,
       String(nonce),
-      estimatedFee.feeUsd.toFixed(18),
+      finalEstimate.feeUsd.toFixed(18),
       payoutAmount.toFixed(18),
       amountRaw.toString(),
       bnbUsdPrice.toFixed(12),
@@ -1023,8 +1111,8 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
     await recordEstimatedBscFeeTx(tx, {
       txHash: transactionHash,
       operation: "seller_payout",
-      gasLimit: activeRuntime.gasLimit.toString(),
-      gasPriceWei: gasPrice.toString(),
+      gasLimit: finalEstimate.gasLimit.toString(),
+      gasPriceWei: finalEstimate.gasPrice.toString(),
       bnbUsdPrice,
     });
   });
@@ -1284,61 +1372,129 @@ async function finalizeRefund(db, refundId, receipt) {
   });
 }
 
+async function markRefundManualReview(db, job, reason) {
+  return withTransaction(db, async (tx) => {
+    const [refundRows] = await tx.query(
+      "SELECT id,username,batch_id,status FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE",
+      [job.id],
+    );
+    if (!refundRows.length || refundRows[0].status !== "queued") return;
+    const refund = refundRows[0];
+    const now = String(Date.now());
+    await tx.query(
+      "UPDATE users_usdt_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=? AND status='queued'",
+      [String(reason).slice(0, 2000), now, job.id],
+    );
+    await tx.query(
+      "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=?",
+      [now, refund.batch_id],
+    );
+    await tx.query(
+      "UPDATE admin_payment_resolutions SET action='refund_manual_review',reason=? WHERE batch_id=? AND action='refund_queued'",
+      [String(reason).slice(0, 1000), refund.batch_id],
+    );
+    await queueTelegramMessageTx(tx, refund.username, `refund:${job.id}:manual_review`, [
+      "OneX Refund Update",
+      "The refund requires manual review because its net amount would be below the permitted minimum.",
+      `Refund ID: ${job.id}`,
+      `Reason: ${String(reason).slice(0, 500)}`,
+      "Status: MANUAL REVIEW",
+    ].join("\n"));
+  });
+}
+
 async function processOneRefundJob(db, job, activeRuntime) {
   if (job.status === "queued") {
-    const amountRaw = BigInt(job.amount_raw);
-    if (amountRaw <= 0n) throw new Error("The refund amount must be positive.");
     const payoutAddress = requiredAddress(job.payout_address, "Refund payout address");
     if (payoutAddress.toLowerCase() === activeRuntime.treasuryAddress.toLowerCase()) {
       throw new Error("Refund destination cannot be the OneX treasury address.");
     }
+    const grossAmount = new BigNumber(job.gross_amount || job.amount);
+    if (!grossAmount.isFinite() || !grossAmount.isGreaterThan(0)) {
+      throw new Error("The refund gross amount must be positive.");
+    }
     const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
-    if (tokenBalance < amountRaw) {
+    const payout = await estimateNetBscTokenTransfer({
+      provider: activeRuntime.provider,
+      fromAddress: activeRuntime.treasuryAddress,
+      tokenAddress: activeRuntime.tokenAddress,
+      payoutAddress,
+      grossAmount,
+      tokenBalanceRaw: tokenBalance,
+      maximumGasLimit: activeRuntime.gasLimit,
+      bnbUsdPrice: getConfiguredBnbUsdPrice(),
+    });
+    const { payoutAmount: finalPayoutAmount, amountRaw: finalAmountRaw, data: signedData, estimate: finalEstimate } = payout;
+    if (!finalPayoutAmount.isGreaterThanOrEqualTo(10) || finalAmountRaw <= 0n || !signedData) {
+      await markRefundManualReview(
+        db,
+        job,
+        "The estimated network-fee deduction would reduce the net refund below 10 BSC-USD.",
+      );
+      return;
+    }
+    if (tokenBalance < finalAmountRaw) {
       throw new Error("The OneX treasury has insufficient BSC-USD for this refund.");
     }
-    const feeData = await activeRuntime.provider.getFeeData();
-    const gasPrice = feeData.gasPrice || BigInt(await activeRuntime.provider.send("eth_gasPrice", []));
     const bnbBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
-    if (bnbBalance < activeRuntime.gasLimit * gasPrice) {
+    if (bnbBalance < finalEstimate.gasLimit * finalEstimate.gasPrice) {
       throw new Error("The OneX treasury has insufficient BNB for the refund transaction gas.");
     }
     const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
-    const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
     const rawTransaction = await activeRuntime.signer.signTransaction({
       type: 0,
       chainId: Number(CHAIN_ID),
       nonce,
       to: activeRuntime.tokenAddress,
       value: 0n,
-      data,
-      gasLimit: activeRuntime.gasLimit,
-      gasPrice,
+      data: signedData,
+      gasLimit: finalEstimate.gasLimit,
+      gasPrice: finalEstimate.gasPrice,
     });
     const transactionHash = keccak256(rawTransaction);
     const update = await db.queryAsync(
       `UPDATE users_usdt_refunds
-       SET raw_tx=?,tx_hash=?,nonce=?,status='signed',last_error=NULL,updated_at_ms=?
+       SET raw_tx=?,tx_hash=?,nonce=?,status='signed',amount=?,fee_amount=?,amount_raw=?,
+           estimated_fee_bnb=?,estimated_fee_usd=?,bnb_usd_price=?,last_error=NULL,updated_at_ms=?
        WHERE id=? AND status='queued' AND raw_tx IS NULL AND tx_hash IS NULL`,
-      [rawTransaction, transactionHash, String(nonce), String(Date.now()), job.id],
+      [
+        rawTransaction,
+        transactionHash,
+        String(nonce),
+        finalPayoutAmount.toFixed(18),
+        finalEstimate.feeUsd.toFixed(18),
+        finalAmountRaw.toString(),
+        finalEstimate.feeBnb.toFixed(30),
+        finalEstimate.feeUsd.toFixed(18),
+        finalEstimate.bnbUsdPrice.toFixed(12),
+        String(Date.now()),
+        job.id,
+      ],
     );
     if (update.affectedRows !== 1) return;
-    const estimate = calculateEstimatedGasFee(
-      activeRuntime.gasLimit.toString(),
-      gasPrice.toString(),
-      getConfiguredBnbUsdPrice(),
-    );
     await withTransaction(db, async (tx) => {
       await recordEstimatedBscFeeTx(tx, {
         txHash: transactionHash,
         operation: "refund",
-        gasLimit: activeRuntime.gasLimit.toString(),
-        gasPriceWei: gasPrice.toString(),
-        bnbUsdPrice: estimate.bnbUsdPrice,
+        gasLimit: finalEstimate.gasLimit.toString(),
+        gasPriceWei: finalEstimate.gasPrice.toString(),
+        bnbUsdPrice: finalEstimate.bnbUsdPrice,
       });
       await tx.query(
-        "UPDATE users_usdt_refunds SET estimated_fee_bnb=?,estimated_fee_usd=?,bnb_usd_price=? WHERE id=? AND tx_hash=?",
-        [estimate.feeBnb.toFixed(30), estimate.feeUsd.toFixed(18), estimate.bnbUsdPrice.toFixed(12), job.id, transactionHash],
+        `UPDATE admin_payment_resolutions
+         SET fee_amount=?,net_amount=?
+         WHERE batch_id=? AND action='refund_queued'`,
+        [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), job.batch_id],
       );
+      await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:gas_accepted`, [
+        "OneX Refund Update",
+        "The estimated BSC network fee is within the permitted limit. Your refund transaction has been signed and queued for blockchain submission.",
+        `Gross amount: ${grossAmount.toFixed(8)} BSC-USD`,
+        `Estimated gas recovery: ${finalEstimate.feeUsd.toFixed(8)} BSC-USD`,
+        `Net refund: ${finalPayoutAmount.toFixed(8)} BSC-USD`,
+        `Refund ID: ${job.id}`,
+        "Status: PROCESSING",
+      ].join("\n"));
     });
     job = { ...job, raw_tx: rawTransaction, tx_hash: transactionHash, status: "signed" };
   }
@@ -1634,8 +1790,16 @@ async function startDisbursementWorker(db) {
 
   const activeRuntime = makeRuntime(pendingWork);
   if (!activeRuntime) return { enabled: false };
+  const priceSnapshot = await startBnbUsdPriceOracle(activeRuntime.provider);
   await validateRuntime(activeRuntime);
-  console.log(`OneX BSC treasury worker ready. Treasury: ${activeRuntime.treasuryAddress}`);
+  if (priceSnapshot) {
+    console.log(
+      `OneX BSC treasury worker ready. Treasury: ${activeRuntime.treasuryAddress}. ` +
+      `Chainlink BNB/USD: ${priceSnapshot.price} (updated ${new Date(priceSnapshot.updatedAt * 1000).toISOString()}).`,
+    );
+  } else {
+    console.warn("OneX BSC treasury worker is ready, but no fresh Chainlink BNB/USD quote is available. Outgoing jobs will remain queued.");
+  }
 
   const run = async () => {
     await runDisbursementCycle(db, activeRuntime);

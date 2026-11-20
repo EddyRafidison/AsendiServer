@@ -9,7 +9,7 @@ const {
 
 const fixed = (value) => value.toFixed(18);
 
-test("estimated BNB gas fee uses gas limit, gas price and captured BNB/USD quote", () => {
+test("estimated BNB gas fee uses gas limit, gas price and a Chainlink BNB/USD price snapshot", () => {
   const result = calculateEstimatedGasFee("100000", "3000000000", "600");
   assert.equal(fixed(result.feeBnb), "0.000300000000000000");
   assert.equal(fixed(result.feeUsd), "0.180000000000000000");
