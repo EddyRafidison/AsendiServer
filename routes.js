@@ -72,12 +72,12 @@ const {
 
 const {
   initializePaymentProvider,
-  getOrCreateUserDepositAddress,
   startPaymentWatcher: startUsdtPaymentWatcher,
   getPaymentPublicConfig,
+  getIncomingScannerStatus,
+  reconcileIncomingScanner,
   isAddress: isEvmAddress,
 } = require("./pay");
-const { startDepositSweeper } = require("./sweep");
 const { checkTreasuryLiquidity } = require("./disbursement");
 const { getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
 getConfiguredMaxBscTxFeeUsd();
@@ -112,7 +112,6 @@ const {
 } = require("./security-limits");
 const { validateSignupIdentity } = require("./identity-policy");
 const { resolveRechargeAvailability, getVisibleDepositAddress } = require("./recharge-service-control");
-const { getRechargeBatchBscFeeCostTx } = require("./bsc-fee-allocations");
 const { getPublicRechargeAvailability } = require("./recharge-availability");
 const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
 const {
@@ -757,12 +756,9 @@ async function applyUserTopUp(
     return { error: "fees exceed the received recharge amount" };
   }
 
-  let actualBscFeeUsd = new BigNumber(0);
-  if (options.rechargeBatchId != null) {
-    const feeAllocation = await getRechargeBatchBscFeeCostTx(tx, options.rechargeBatchId);
-    if (!feeAllocation.ready) return { error: "BSC sweep fees are not finalized" };
-    actualBscFeeUsd = feeAllocation.actualFeeUsd;
-  }
+  // Incoming deposits are sent directly to the treasury; no per-user sweep or
+  // deposit-consolidation gas is incurred by OneX for a recharge batch.
+  const actualBscFeeUsd = new BigNumber(0);
   const feeAllocation = allocateBscCostFromTfees(feeAmountXtu, actualBscFeeUsd);
   const bscFeeCoveredUsd = feeAllocation.coveredBscCost;
   const bscFeeUncoveredUsd = feeAllocation.uncoveredBscCost;
@@ -1028,9 +1024,9 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   if (Number(stockRows[0].seller_status || 0) !== 0) return { transf: "seller campaign active" };
 
   const [walletRows] = await tx.query(
-    `SELECT payout_address FROM users_usdt_deposit_wallets WHERE username=? LIMIT 1 FOR UPDATE`, [username],
+    `SELECT wallet_address FROM auths WHERE username=? AND account_active=1 LIMIT 1 FOR UPDATE`, [username],
   );
-  const payoutAddress = walletRows[0]?.payout_address || "";
+  const payoutAddress = walletRows[0]?.wallet_address || "";
   if (!isEvmAddress(payoutAddress) || /^0x0{40}$/i.test(payoutAddress) ||
       String(payoutAddress).toLowerCase() === String(process.env.USDT_BEP20_TREASURY_ADDRESS).toLowerCase()) {
     return { transf: "payout wallet not registered" };
@@ -1315,27 +1311,48 @@ async function processConfirmedUsdtPayment(event) {
       "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
     );
     if (!commonLockRows.length) throw new Error("The common-state lock row has not been initialized");
-    const [walletRows] = await tx.query(
-      `SELECT id,username,wallet_address,account_status
-       FROM users_usdt_deposit_wallets
-       WHERE id=? AND wallet_address=? LIMIT 1 FOR UPDATE`,
-      [event.depositWalletId, event.depositAddress],
+    const [authRows] = await tx.query(
+      `SELECT username,wallet_address,created_at_ms,last_login_at_ms,account_active
+       FROM auths WHERE LOWER(wallet_address)=? LIMIT 1 FOR UPDATE`,
+      [String(event.fromAddress || "").toLowerCase()],
     );
-    if (!walletRows.length) {
-      throw new Error("The confirmed transfer does not match a registered OneX deposit address.");
-    }
+    if (!authRows.length) return { unknown: true };
 
-    const wallet = walletRows[0];
-    const username = wallet.username;
+    const account = authRows[0];
+    const username = account.username;
+    if (!event.unknownTransferId) {
+      const createdAtMs = Number(account.created_at_ms);
+      const eventTimestampMs = Number(event.blockTimestampMs);
+      if (
+        !Number.isSafeInteger(createdAtMs) || createdAtMs <= 0 ||
+        !Number.isSafeInteger(eventTimestampMs) || eventTimestampMs <= 0 ||
+        eventTimestampMs < Math.ceil(createdAtMs / 1000) * 1000
+      ) {
+        return { unknown: true, reason: "transfer_precedes_or_may_precede_wallet_registration" };
+      }
+    }
+    if (event.unknownTransferId) {
+      const [unknownRows] = await tx.query(
+        `SELECT id,from_address,tx_hash,log_index,amount_raw,status
+         FROM bsc_unknown_incoming_transfers WHERE id=? LIMIT 1 FOR UPDATE`,
+        [event.unknownTransferId],
+      );
+      if (!unknownRows.length || unknownRows[0].status !== "pending_admin" ||
+          String(unknownRows[0].from_address).toLowerCase() !== String(event.fromAddress).toLowerCase() ||
+          String(unknownRows[0].tx_hash).toLowerCase() !== String(event.txHash).toLowerCase() ||
+          Number(unknownRows[0].log_index) !== Number(event.logIndex) ||
+          String(unknownRows[0].amount_raw) !== String(event.amountRaw)) {
+        return { unknown: true, reason: "unknown_transfer_changed_or_already_resolved" };
+      }
+    }
     const [eventInsert] = await tx.query(
       `INSERT IGNORE INTO users_usdt_transfer_events
-       (username,deposit_wallet_id,batch_id,deposit_address,from_address,amount,amount_raw,tx_hash,log_index,
+       (username,batch_id,treasury_address,from_address,amount,amount_raw,tx_hash,log_index,
         block_number,block_hash,block_timestamp_ms,status,reason_codes,created_at_ms)
-       VALUES(?,?,NULL,?,?,?,?,?,?,?,?,?,'detected',NULL,?)`,
+       VALUES(?,NULL,?,?,?,?,?,?,?,?,?,'detected',NULL,?)`,
       [
         username,
-        event.depositWalletId,
-        event.depositAddress,
+        event.treasuryAddress,
         event.fromAddress,
         amountValue.toFixed(18),
         event.amountRaw,
@@ -1349,9 +1366,6 @@ async function processConfirmedUsdtPayment(event) {
     );
     if (eventInsert.affectedRows !== 1) return { duplicate: true };
 
-    const [authRows] = await tx.query(
-      "SELECT last_login_at_ms,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
-    );
     const [stockRows] = await tx.query(
       "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [username],
     );
@@ -1395,7 +1409,7 @@ async function processConfirmedUsdtPayment(event) {
     let initialReasons = transferAfterCutoff
       ? ["received_after_global_disbursement_cutoff"]
       : (manualRechargeSuspended ? ["manual_recharge_suspended"] : []);
-    if (!transferAfterCutoff && (wallet.account_status !== "active" || !authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1 || !stockRows.length)) {
+    if (!transferAfterCutoff && (account.last_login_at_ms == null || Number(account.account_active) !== 1 || !stockRows.length)) {
       initialStatus = "pending_support";
       initialReasons.push("account_unavailable");
     }
@@ -1416,13 +1430,12 @@ async function processConfirmedUsdtPayment(event) {
       const expiresAt = openedAt + RECHARGE_BATCH_WINDOW_MS;
       const [batchInsert] = await tx.query(
         `INSERT INTO users_usdt_deposit_batches
-         (username,deposit_wallet_id,deposit_address,opened_at_ms,expires_at_ms,total_amount,total_amount_raw,
+         (username,treasury_address,opened_at_ms,expires_at_ms,total_amount,total_amount_raw,
           transfer_count,status,reason_codes,created_at_ms,updated_at_ms)
-         VALUES(?,?,?,?,?,0,0,1,?,?,?,?)`,
+         VALUES(?,?,?,?,0,0,1,?,?,?,?)`,
         [
           username,
-          event.depositWalletId,
-          event.depositAddress,
+          event.treasuryAddress,
           String(openedAt),
           String(expiresAt),
           initialStatus,
@@ -1470,7 +1483,7 @@ async function processConfirmedUsdtPayment(event) {
       `deposit:${event.txHash}:${event.logIndex}:received`,
       [
         "OneX Deposit Update",
-        "A BSC-USD transfer to your OneX deposit address has been finalized.",
+        "A BSC-USD transfer to the OneX treasury address has been finalized.",
         `Amount received: ${amountValue.toFixed(8)} BSC-USD`,
         `Session total: ${batchTotal.toFixed(8)} BSC-USD`,
         `Batch: ${batch.id}`,
@@ -1480,6 +1493,24 @@ async function processConfirmedUsdtPayment(event) {
     );
     if (nextStatus === "pending_support" || nextStatus === "pending_global") {
       await queueRechargeBatchStatusTx(tx, username, batch.id, nextStatus, reasonCodes);
+    }
+    if (event.unknownTransferId) {
+      const decisionReason = String(event.adminResolutionReason || "Wallet matched registered account");
+      const adminUsername = String(event.adminUsername || "configured_admin");
+      await tx.query(
+        `UPDATE bsc_unknown_incoming_transfers
+         SET status='assigned_to_account',decision_action='assign',decision_username=?,
+             decision_reason=?,decided_by=?,decided_at_ms=?,updated_at_ms=?
+         WHERE id=? AND status='pending_admin'`,
+        [username, decisionReason, adminUsername, String(now), String(now), String(event.unknownTransferId)],
+      );
+      await tx.query(
+        `INSERT INTO admin_payment_resolutions
+         (admin_username,username,batch_id,unknown_transfer_id,action,initial_asset_amount,gross_amount,fee_amount,net_amount,payout_address,tx_hash,reason,created_at_ms)
+         VALUES(?, ?, NULL, ?, 'unknown_assigned', 0, ?, 0, ?, NULL, ?, ?, ?)`,
+        [adminUsername, username, event.unknownTransferId, amountValue.toFixed(18), amountValue.toFixed(18),
+          event.txHash, decisionReason, String(now)],
+      );
     }
 
     return {
@@ -1504,7 +1535,7 @@ async function updateBatchEventStatus(tx, batchId, status, reasonCodes = null) {
 async function processOneRechargeBatch(batchId) {
   return withTransaction(async (tx) => {
     const [snapshotRows] = await tx.query(
-      "SELECT username,deposit_wallet_id FROM users_usdt_deposit_batches WHERE id=? LIMIT 1",
+      "SELECT username FROM users_usdt_deposit_batches WHERE id=? LIMIT 1",
       [batchId],
     );
     if (!snapshotRows.length) return { skipped: true };
@@ -1583,16 +1614,6 @@ async function processOneRechargeBatch(batchId) {
       { rechargeBatchId: batchId, preEffectiveBatch: true },
     );
     if (creditResult?.transf !== "sent") {
-      if (creditResult?.error === "BSC sweep fees are not finalized") {
-        const retryAt = now + 60 * 1000;
-        await tx.query(
-          `UPDATE users_usdt_deposit_batches SET status='finalizing',next_attempt_at_ms=?,
-             reason_codes=?,updated_at_ms=? WHERE id=?`,
-          [String(retryAt), safeJson(['awaiting_actual_bsc_fee_reconciliation']), String(now), batchId],
-        );
-        await updateBatchEventStatus(tx, batchId, 'finalizing', ['awaiting_actual_bsc_fee_reconciliation']);
-        return { waiting: true, reason: 'awaiting_actual_bsc_fee_reconciliation', retryAtMs: retryAt };
-      }
       if (creditResult?.error === "payment service disabled") {
         const reasonCodes = ["payment_service_unavailable"];
         await tx.query(
@@ -1870,6 +1891,8 @@ router.post("/app/signup", async (req, res) => {
     cni,
     pswd,
     seed,
+    wallet_address,
+    wallet,
     cniimg1,
     cniimg2,
   } = req.body || {};
@@ -1887,6 +1910,24 @@ router.post("/app/signup", async (req, res) => {
   });
   if (identity.error) {
     return res.status(400).send({ msg: identity.error });
+  }
+
+  const submittedWalletAddress = typeof wallet_address === "string" ? wallet_address.trim() :
+    (typeof wallet === "string" ? wallet.trim() : "");
+  let WalletAddress = "";
+  if (!isEvmAddress(submittedWalletAddress) || /^0x0{40}$/i.test(submittedWalletAddress)) {
+    return res.status(400).send({ auths: "addr error" });
+  }
+  try {
+    WalletAddress = checksumEvmAddress(submittedWalletAddress);
+  } catch {
+    return res.status(400).send({ auths: "addr error" });
+  }
+  const treasuryAddressForSignup = String(
+    process.env.USDT_BEP20_TREASURY_ADDRESS || process.env.USDT_BEP20_RECEIVER_ADDRESS || "",
+  ).trim();
+  if (treasuryAddressForSignup && WalletAddress.toLowerCase() === treasuryAddressForSignup.toLowerCase()) {
+    return res.status(400).send({ auths: "addr error" });
   }
 
   const requiredTextValues = [email, birth, addr, name, pswd, seed];
@@ -1987,11 +2028,9 @@ router.post("/app/signup", async (req, res) => {
       const collisions = await db.queryAsync(
         `SELECT 1 AS collision FROM auths WHERE username=?
          UNION ALL
-         SELECT 1 AS collision FROM users_usdt_deposit_wallets WHERE username=?
-         UNION ALL
          SELECT 1 AS collision FROM activities WHERE sender=? OR receiver=?
          LIMIT 1`,
-        [U, U, U, U],
+        [U, U, U],
       );
       if (collisions.length) continue;
 
@@ -2019,6 +2058,16 @@ router.post("/app/signup", async (req, res) => {
           emailConflict.code = "ONEX_EMAIL_ALREADY_REGISTERED";
           throw emailConflict;
         }
+        const walletLower = WalletAddress.toLowerCase();
+        const [walletRows] = await connection.query(
+          "SELECT username FROM bsc_wallet_address_registry WHERE wallet_address_lower=? LIMIT 1 FOR UPDATE",
+          [walletLower],
+        );
+        if (walletRows.length) {
+          const walletConflict = new Error("The BSC wallet address has already been registered.");
+          walletConflict.code = "ONEX_WALLET_ALREADY_REGISTERED";
+          throw walletConflict;
+        }
         const [globalRunRows] = await connection.query(
           "SELECT status FROM global_disbursement_runs WHERE status IN ('active','closed','manual_review','completed','resolved') ORDER BY id DESC LIMIT 1 FOR UPDATE",
         );
@@ -2044,14 +2093,19 @@ router.post("/app/signup", async (req, res) => {
 
         const createdAtMs = String(Date.now());
         await connection.query(
+          `INSERT INTO bsc_wallet_address_registry(wallet_address_lower,wallet_address,username,registered_at_ms)
+           VALUES(?,?,?,?)`,
+          [WalletAddress.toLowerCase(), WalletAddress, U, createdAtMs],
+        );
+        await connection.query(
           `INSERT INTO auths(
              registration_sequence,username,password,name,email,birthdate,nationality,residence_country,identity_document_type,
-             identity_document_number,address,seed,welcome_bonus_email_hash,welcome_bonus_identity_hash,
+             identity_document_number,address,seed,wallet_address,welcome_bonus_email_hash,welcome_bonus_identity_hash,
              created_at_ms,last_login_at_ms,record_date,record_time
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
             registrationSequence, U, PWD, Name, Email, Birth, identity.nationality, identity.residenceCountry,
-            identity.identityType, encryptedIdentityNumber, Address, SEED,
+            identity.identityType, encryptedIdentityNumber, Address, SEED, WalletAddress,
             welcomeBonusSubjectHashes.emailHash, welcomeBonusSubjectHashes.identityHash,
             createdAtMs, null, date, time,
           ],
@@ -2073,6 +2127,9 @@ router.post("/app/signup", async (req, res) => {
         if (insertError.code === "ONEX_EMAIL_ALREADY_REGISTERED") {
           return res.status(409).send({ msg: "email already registered" });
         }
+        if (insertError.code === "ONEX_WALLET_ALREADY_REGISTERED") {
+          return res.status(409).send({ auths: "addr used" });
+        }
         if (insertError.code === "ER_DUP_ENTRY") {
           const duplicateEmailRows = await db.queryAsync(
             "SELECT username FROM auths WHERE email=? LIMIT 1",
@@ -2081,6 +2138,11 @@ router.post("/app/signup", async (req, res) => {
           if (duplicateEmailRows.length) {
             return res.status(409).send({ msg: "email already registered" });
           }
+          const duplicateWalletRows = await db.queryAsync(
+            "SELECT username FROM bsc_wallet_address_registry WHERE wallet_address_lower=? LIMIT 1",
+            [WalletAddress.toLowerCase()],
+          );
+          if (duplicateWalletRows.length) return res.status(409).send({ auths: "addr used" });
           continue;
         }
         throw insertError;
@@ -2274,14 +2336,28 @@ router.post("/app/user-last-stock", async (req, res) => {
     if (await accountApiLimitReached(res, U, "user_last_stock", 60, 60_000)) return;
 
     let rechargeAvailability = await assessUserRechargeAvailability(U);
-    const storedDepositAddress = rechargeAvailability.allowed
-      ? await getOrCreateUserDepositAddress(db, U)
+    const paymentConfig = getPaymentPublicConfig();
+    const scannerStatus = paymentConfig.enabled
+      ? await getIncomingScannerStatus(db)
+      : { initialized: false, health_status: "disabled" };
+    let scannerCaughtUp = false;
+    if (scannerStatus.initialized && scannerStatus.last_finalized_block != null) {
+      const scannedBlock = scannerStatus.last_scanned_block == null
+        ? -1n : BigInt(String(scannerStatus.last_scanned_block));
+      const finalizedBlock = BigInt(String(scannerStatus.last_finalized_block));
+      scannerCaughtUp = scannedBlock >= finalizedBlock;
+    }
+    const depositScannerReady = Boolean(
+      scannerStatus.initialized && scannerStatus.health_status === "healthy" && scannerCaughtUp,
+    );
+    const sharedTreasuryAddress = rechargeAvailability.allowed && paymentConfig.enabled && depositScannerReady
+      ? paymentConfig.treasuryAddress
       : null;
-    let depositAddress = getVisibleDepositAddress(rechargeAvailability, storedDepositAddress);
+    let depositAddress = getVisibleDepositAddress(rechargeAvailability, sharedTreasuryAddress);
     if (depositAddress) {
       const latestAvailability = await assessUserRechargeAvailability(U);
       rechargeAvailability = latestAvailability;
-      depositAddress = getVisibleDepositAddress(latestAvailability, storedDepositAddress);
+      depositAddress = getVisibleDepositAddress(latestAvailability, sharedTreasuryAddress);
     }
     const stockRow = rechargeAvailability.stock;
     const commonRow = rechargeAvailability.common;
@@ -2331,7 +2407,13 @@ router.post("/app/user-last-stock", async (req, res) => {
       deposit_addr: depositAddress,
       deposit_status: depositAddress ? "available" : "unavailable",
       recharge_allowed: Boolean(depositAddress),
-      recharge_unavailable_reason: depositAddress ? null : (rechargeAvailability.reason || "deposit_service_unavailable"),
+      recharge_unavailable_reason: depositAddress ? null : (
+        !depositScannerReady && paymentConfig.enabled
+          ? (scannerStatus.health_status === "manual_review"
+            ? "deposit_scanner_manual_review"
+            : (scannerStatus.initialized ? "deposit_scanner_catching_up" : "deposit_scanner_initializing"))
+          : (rechargeAvailability.reason || "deposit_service_unavailable")
+      ),
       minimum_recharge_amount: MIN_RECHARGE_AMOUNT.toFixed(0),
       minimum_recharge_net_amount: rechargeAvailability.minimumNetAmount
         ? rechargeAvailability.minimumNetAmount.toFixed(18)
@@ -2420,7 +2502,6 @@ router.post("/app/recharge", async (req, res) => {
       minimum_amount: MIN_RECHARGE_AMOUNT.toFixed(0),
       maximum_amount: MAX_RECHARGE_AMOUNT.toFixed(0),
       maximum_system_funded_amount: MAX_RECHARGE_AMOUNT.toFixed(0),
-      sweep_threshold_amount: require("./recharge-policy").DEPOSIT_SWEEP_THRESHOLD.toFixed(0),
       seller_funding_priority: true,
       maximum_user_stock: maxStockDefault,
       batch_window_minutes: 60,
@@ -2514,72 +2595,25 @@ router.post("/app/recharge/status", async (req, res) => {
   }
 });
 
-// Users declare their BSC payout address themselves. OneX does not claim to verify address ownership.
+// The BSC wallet is fixed at signup and is used for deposits and all outgoing payments.
 router.post("/app/set-payout-address", async (req, res) => {
-  const { user, pswd, address, tkn } = req.body || {};
+  const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
-  if (!isEvmAddress(address) || /^0x0{40}$/i.test(String(address))) {
-    return res.send({ auth: "invalid address" });
-  }
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
-    if (await accountApiLimitReached(res, U, "set_payout_address", 3, DAY_MS)) return;
-    const depositWalletRows = await db.queryAsync(
-      "SELECT wallet_address,account_status FROM users_usdt_deposit_wallets WHERE username=? LIMIT 1",
+    const [rows] = await db.queryAsync(
+      "SELECT wallet_address FROM auths WHERE username=? AND account_active=1 LIMIT 1",
       [U],
     );
-    const depositAddress = depositWalletRows[0]?.account_status === "active"
-      ? String(depositWalletRows[0].wallet_address || "")
-      : "";
-    const payoutAddress = checksumEvmAddress(address);
-    const normalizedPayoutAddress = payoutAddress.toLowerCase();
-    if (
-      (depositAddress && normalizedPayoutAddress === depositAddress.toLowerCase()) ||
-      normalizedPayoutAddress === String(process.env.USDT_BEP20_TREASURY_ADDRESS || "").toLowerCase()
-    ) return res.send({ auth: "invalid address" });
-    const depositCollision = await db.queryAsync(
-      "SELECT id FROM users_usdt_deposit_wallets WHERE LOWER(wallet_address)=? LIMIT 1",
-      [normalizedPayoutAddress],
-    );
-    if (depositCollision.length) return res.send({ auth: "invalid address" });
-    const result = await withTransaction(async (tx) => {
-      const [authRows] = await tx.query(
-        "SELECT username,last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
-        [U],
-      );
-      if (authRows.length && Number(authRows[0].account_active) !== 1) return { auths: "deactivated" };
-      if (!authRows.length || authRows[0].last_login_at_ms == null) return { auth: "not allowed" };
-      if (isPasswordProtectedActivityLocked({
-        failedCount: Number(authRows[0].consec_failed_auth || 0),
-        temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
-      })) return { auth: "not allowed" };
-      const [pendingRows] = await tx.query(
-        `SELECT id FROM users_usdt_disbursements
-         WHERE username=? AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`, [U],
-      );
-      if (pendingRows.length) return { auth: "disbursement pending" };
-      const [duplicatePayoutRows] = await tx.query(
-        `SELECT username FROM users_usdt_deposit_wallets
-         WHERE payout_address=? AND account_status='active' AND username<>? LIMIT 1 FOR UPDATE`,
-        [normalizedPayoutAddress, U],
-      );
-      if (duplicatePayoutRows.length) return { auth: "address already in use" };
-      const [updatedRows] = await tx.query(
-        "UPDATE users_usdt_deposit_wallets SET payout_address=? WHERE username=? AND account_status='active'",
-        [normalizedPayoutAddress, U],
-      );
-      if (updatedRows.affectedRows !== 1) return { auth: "deposit wallet unavailable" };
-      return { auth: "updated", payout_address: payoutAddress };
-    });
-    return res.send(result);
+    if (!rows.length) return res.send({ auth: "not allowed" });
+    return res.send({ auth: "wallet fixed at signup", wallet_address: rows[0].wallet_address });
   } catch (error) {
-    if (error.code === "ER_DUP_ENTRY") return res.send({ auth: "address already in use" });
-    console.error("Payout-address update failed:", error.message);
+    console.error("Fixed wallet lookup failed:", error.message);
     return res.send({ auth: "error" });
   }
 });
@@ -2657,12 +2691,12 @@ router.post("/app/join-system-sellers", async (req, res) => {
       if (previousRows.length) return { msg: "not allowed", reason: "campaign_already_used_for_price_cycle" };
 
       const [walletRows] = await tx.query(
-        `SELECT payout_address,account_status FROM users_usdt_deposit_wallets
+        `SELECT wallet_address,account_active FROM auths
          WHERE username=? LIMIT 1 FOR UPDATE`, [U],
       );
-      const payoutAddress = walletRows[0]?.payout_address || "";
+      const payoutAddress = walletRows[0]?.wallet_address || "";
       if (
-        !walletRows.length || walletRows[0].account_status !== "active" ||
+        !walletRows.length || Number(walletRows[0].account_active) !== 1 ||
         !isEvmAddress(payoutAddress) || /^0x0{40}$/i.test(payoutAddress)
       ) return { msg: "not allowed", reason: "payout_wallet_required" };
 
@@ -3401,6 +3435,205 @@ router.post("/admin/recharge/credit", async (req, res) => {
   }
 });
 
+// List incoming BSC-USD transfers whose sender address is not registered to an account.
+// Read the persisted state of the shared-treasury incoming scanner.
+router.post("/admin/bsc/incoming-scanner/status", async (req, res) => {
+  const { pswd, pin } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ scanner: "incorrect admin credentials" });
+  try {
+    const state = await getIncomingScannerStatus(db);
+    return res.send({ scanner: "ok", state });
+  } catch (error) {
+    console.error("BSC incoming scanner status failed:", error.message);
+    return res.send({ scanner: "error" });
+  }
+});
+
+// Resume the scanner only after an administrator has reconciled a canonical finalized block.
+router.post("/admin/bsc/incoming-scanner/reconcile", async (req, res) => {
+  const { pswd, pin, resume_after_block, reason } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ scanner: "incorrect admin credentials" });
+  try {
+    const result = await reconcileIncomingScanner(db, {
+      resumeAfterBlock: resume_after_block,
+      reason,
+      adminUsername: "configured_admin",
+    });
+    return res.send({ scanner: "resumed", ...result });
+  } catch (error) {
+    if (error.code === "ONEX_BSC_SCANNER_BUSY") return res.status(409).send({ scanner: "busy" });
+    console.error("BSC incoming scanner reconciliation failed:", error.message);
+    return res.status(400).send({ scanner: "reconciliation rejected", reason: error.message });
+  }
+});
+
+router.post("/admin/bsc/unknown-transfers/list", async (req, res) => {
+  const { pswd, pin, limit } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ transf: "incorrect admin credentials" });
+  const requestedLimit = Number(limit || 100);
+  const safeLimit = Number.isInteger(requestedLimit) ? Math.min(200, Math.max(1, requestedLimit)) : 100;
+  try {
+    const rows = await db.queryAsync(
+      `SELECT id,from_address,to_address,amount,tx_hash,log_index,block_number,block_timestamp_ms,
+              previous_username,status,decision_action,decision_username,decision_reason,refund_id,created_at_ms
+       FROM bsc_unknown_incoming_transfers
+       ORDER BY CASE WHEN status='pending_admin' THEN 0 ELSE 1 END,id DESC
+       LIMIT ?`,
+      [safeLimit],
+    );
+    return res.send({ transf: "ok", items: rows.map((row) => ({ ...row, id: String(row.id) })) });
+  } catch (error) {
+    console.error("Unknown BSC transfer listing failed:", error.message);
+    return res.send({ transf: "error" });
+  }
+});
+
+// Resolve an unknown incoming transfer by assigning it to the matching registered wallet,
+// refunding it to the observed sender, or retaining it as an uncredited administrative case.
+router.post("/admin/bsc/unknown-transfers/resolve", async (req, res) => {
+  const { pswd, pin, transfer_id, action, username, reason } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ transf: "incorrect admin credentials" });
+  const transferId = String(transfer_id ?? "").trim();
+  const requestedAction = String(action || "").trim().toLowerCase();
+  const targetUsername = normalizeUsername(username);
+  const resolutionReason = typeof reason === "string" ? reason.trim() : "";
+  if (!/^\d{1,20}$/.test(transferId) || !["assign", "refund", "retain"].includes(requestedAction) ||
+      resolutionReason.length < 5 || resolutionReason.length > 1000) {
+    return res.status(400).send({ transf: "invalid request" });
+  }
+
+  try {
+    const [transferRows] = await db.queryAsync(
+      `SELECT * FROM bsc_unknown_incoming_transfers WHERE id=? AND status='pending_admin' LIMIT 1`,
+      [transferId],
+    );
+    if (!transferRows.length) return res.send({ transf: "transfer not available" });
+    const transfer = transferRows[0];
+    const now = String(Date.now());
+
+    if (requestedAction === "assign") {
+      if (!targetUsername) return res.status(400).send({ transf: "username required" });
+      const [accountRows] = await db.queryAsync(
+        `SELECT username,wallet_address FROM auths WHERE username=? LIMIT 1`, [targetUsername],
+      );
+      if (!accountRows.length ||
+          String(accountRows[0].wallet_address).toLowerCase() !== String(transfer.from_address).toLowerCase()) {
+        return res.send({ transf: "sender does not match the selected account wallet" });
+      }
+      const assigned = await processConfirmedUsdtPayment({
+        username: targetUsername,
+        treasuryAddress: transfer.to_address,
+        fromAddress: transfer.from_address,
+        amount: transfer.amount,
+        amountRaw: String(transfer.amount_raw),
+        txHash: transfer.tx_hash,
+        logIndex: Number(transfer.log_index),
+        blockNumber: String(transfer.block_number),
+        blockHash: transfer.block_hash,
+        blockTimestampMs: Number(transfer.block_timestamp_ms),
+        unknownTransferId: transferId,
+        adminUsername: "configured_admin",
+        adminResolutionReason: resolutionReason,
+      });
+      if (assigned?.unknown || assigned?.duplicate) {
+        return res.send({ transf: "transfer changed or already processed", details: assigned });
+      }
+      return res.send({ transf: "assigned", ...assigned });
+    }
+
+    if (requestedAction === "retain") {
+      const result = await withTransaction(async (tx) => {
+        const [rows] = await tx.query(
+          `SELECT * FROM bsc_unknown_incoming_transfers WHERE id=? AND status='pending_admin' LIMIT 1 FOR UPDATE`,
+          [transferId],
+        );
+        if (!rows.length) return { transf: "transfer not available" };
+        await tx.query(
+          `UPDATE bsc_unknown_incoming_transfers
+           SET status='resolved_uncredited',decision_action='retain',decision_reason=?,decided_by='configured_admin',
+               decided_at_ms=?,updated_at_ms=? WHERE id=? AND status='pending_admin'`,
+          [resolutionReason, now, now, transferId],
+        );
+        await tx.query(
+          `INSERT INTO admin_payment_resolutions
+           (admin_username,username,batch_id,unknown_transfer_id,action,initial_asset_amount,gross_amount,fee_amount,net_amount,payout_address,tx_hash,reason,created_at_ms)
+           VALUES('configured_admin','ONEX',NULL,?,'unknown_retained',0,?,0,0,NULL,?,?,?)`,
+          [transferId, String(rows[0].amount), rows[0].tx_hash, resolutionReason, now],
+        );
+        return { transf: "retained_uncredited", transfer_id: transferId };
+      });
+      return res.send(result);
+    }
+
+    if (String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() !== "true") {
+      return res.send({ transf: "treasury payout service disabled" });
+    }
+    const grossAmount = new BigNumber(transfer.amount);
+    const grossRaw = new BigNumber(String(transfer.amount_raw));
+    const maximumGasRecovery = getConfiguredMaxBscTxFeeUsd();
+    if (!grossAmount.isFinite() || !grossAmount.isGreaterThan(0) ||
+        !grossRaw.isFinite() || !grossRaw.isInteger() ||
+        grossAmount.minus(maximumGasRecovery).isLessThan(10)) {
+      return res.send({ transf: "unknown transfer is below the minimum refundable net amount" });
+    }
+    const liquidity = await checkTreasuryLiquidity(grossRaw.toFixed(0), transfer.from_address);
+    if (!liquidity.tokenAvailable) {
+      return res.send({ transf: "insufficient treasury BSC-USD balance", liquidity });
+    }
+    const refundResult = await withTransaction(async (tx) => {
+      const [rows] = await tx.query(
+        `SELECT * FROM bsc_unknown_incoming_transfers WHERE id=? AND status='pending_admin' LIMIT 1 FOR UPDATE`,
+        [transferId],
+      );
+      if (!rows.length) return { transf: "transfer not available" };
+      const [existingRows] = await tx.query(
+        `SELECT id FROM users_usdt_refunds WHERE unknown_transfer_id=?
+         AND status IN ('queued','signed','submitted','confirmed','manual_review') LIMIT 1 FOR UPDATE`,
+        [transferId],
+      );
+      if (existingRows.length) return { transf: "refund already exists", refund_id: String(existingRows[0].id) };
+      const reference = createFinancialReference("UNKREF");
+      const [refundInsert] = await tx.query(
+        `INSERT INTO users_usdt_refunds
+         (username,batch_id,unknown_transfer_id,payout_address,amount,gross_amount,fee_amount,amount_raw,
+          estimated_fee_bnb,estimated_fee_usd,bnb_usd_price,reference,status,created_at_ms,updated_at_ms)
+         VALUES('ONEX',NULL,?,?,?,?,?, ?,0,0,0,?,'queued',?,?)`,
+        [transferId, rows[0].from_address, grossAmount.toFixed(18), grossAmount.toFixed(18), "0", grossRaw.toFixed(0), reference, now, now],
+      );
+      await tx.query(
+        `UPDATE bsc_unknown_incoming_transfers
+         SET status='refund_queued',decision_action='refund',decision_reason=?,decided_by='configured_admin',
+             decided_at_ms=?,refund_id=?,updated_at_ms=? WHERE id=? AND status='pending_admin'`,
+        [resolutionReason, now, String(refundInsert.insertId), now, transferId],
+      );
+      await tx.query(
+        `INSERT INTO admin_payment_resolutions
+         (admin_username,username,batch_id,unknown_transfer_id,action,initial_asset_amount,gross_amount,fee_amount,net_amount,payout_address,tx_hash,reason,created_at_ms)
+         VALUES('configured_admin','ONEX',NULL,?,'unknown_refund_queued',0,?,0,?, ?,NULL,?,?)`,
+        [transferId, grossAmount.toFixed(18), grossAmount.toFixed(18), rows[0].from_address, resolutionReason, now],
+      );
+      return { transf: "refund_queued", refund_id: String(refundInsert.insertId), amount: grossAmount.toFixed(18) };
+    });
+    return res.send(refundResult);
+  } catch (error) {
+    console.error("Unknown BSC transfer resolution failed:", error.message);
+    if (error.code === "ER_DUP_ENTRY") return res.send({ transf: "refund already exists" });
+    return res.send({ transf: "error" });
+  }
+});
+
 // Administrative refund of a recharge batch held for support.
 // The refund is queued for the isolated treasury worker; gas is paid separately in BNB.
 router.post("/admin/recharge/refund", async (req, res) => {
@@ -3422,9 +3655,9 @@ router.post("/admin/recharge/refund", async (req, res) => {
       return res.send({ transf: "treasury payout service disabled" });
     }
     const snapshotRows = await db.queryAsync(
-      `SELECT b.id,b.username,b.total_amount,b.status,w.payout_address
+      `SELECT b.id,b.username,b.total_amount,b.status,a.wallet_address AS payout_address
        FROM users_usdt_deposit_batches b
-       JOIN users_usdt_deposit_wallets w ON w.id=b.deposit_wallet_id
+       JOIN auths a ON a.username=b.username AND a.account_active=1
        WHERE b.id=? AND b.username=? LIMIT 1`,
       [batchId, U],
     );
@@ -3464,16 +3697,16 @@ router.post("/admin/recharge/refund", async (req, res) => {
 
     const result = await withTransaction(async (tx) => {
       const [walletRows] = await tx.query(
-        "SELECT payout_address,account_status FROM users_usdt_deposit_wallets WHERE username=? LIMIT 1 FOR UPDATE",
+        "SELECT wallet_address,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
         [U],
       );
       const [batchRows] = await tx.query(
-        "SELECT id,username,total_amount,status,deposit_wallet_id FROM users_usdt_deposit_batches WHERE id=? AND username=? LIMIT 1 FOR UPDATE",
+        "SELECT id,username,total_amount,status FROM users_usdt_deposit_batches WHERE id=? AND username=? LIMIT 1 FOR UPDATE",
         [batchId, U],
       );
       if (!batchRows.length || batchRows[0].status !== "pending_support") return { transf: "batch not refundable" };
-      if (!walletRows.length || walletRows[0].account_status !== "active" ||
-          String(walletRows[0].payout_address || "").toLowerCase() !== String(snapshot.payout_address).toLowerCase()) {
+      if (!walletRows.length || Number(walletRows[0].account_active) !== 1 ||
+          String(walletRows[0].wallet_address || "").toLowerCase() !== String(snapshot.payout_address).toLowerCase()) {
         return { transf: "payout wallet changed or account unavailable" };
       }
 
@@ -3836,11 +4069,8 @@ router.post("/app/delete-user", async (req, res) => {
         sellerLotRows.length || sellerPayoutRows.length
       ) return { auth: "failed, seller reserve pending" };
 
-      // Keep the deposit address reserved forever; remove personal account data and disable payout.
-      await tx.query(
-        `UPDATE users_usdt_deposit_wallets
-         SET account_status='deleted',payout_address=NULL WHERE username=?`, [U],
-      );
+      // Keep the public wallet address permanently reserved in bsc_wallet_address_registry.
+      // The account row is removed only after all financial operations have been settled.
       await tx.query("DELETE FROM user_price_state WHERE username=?", [U]);
       await tx.query("DELETE FROM users_stock WHERE username=?", [U]);
       await tx.query("DELETE FROM auths WHERE username=?", [U]);
@@ -4253,11 +4483,9 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
         ["seller_allocations", `SELECT id FROM users_seller_payout_allocations WHERE status='reserved' LIMIT 1 FOR UPDATE`],
         ["refunds", `SELECT id FROM users_usdt_refunds WHERE status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`],
         ["recharge_batches", `SELECT id FROM users_usdt_deposit_batches WHERE status IN ('collecting','batched','ready','finalizing','pending_weekly','pending_reserve','pending_support','refund_queued') LIMIT 1 FOR UPDATE`],
-        ["deposit_sweeps", `SELECT id FROM users_usdt_sweeps WHERE status IN ('prepared','funded','submitted') LIMIT 1 FOR UPDATE`],
-        ["locked_deposit_wallets", `SELECT id FROM users_usdt_deposit_wallets WHERE CAST(sweep_lock_until_ms AS UNSIGNED)>? LIMIT 1 FOR UPDATE`],
       ];
       for (const [name, sql] of blockers) {
-        const [rows] = name === "locked_deposit_wallets" ? await tx.query(sql, [String(now)]) : await tx.query(sql);
+        const [rows] = await tx.query(sql);
         if (rows.length) return { auth: "global_activation_waiting_for_operations", blocker: name };
       }
 
@@ -4950,10 +5178,16 @@ async function initializeRechargePayments() {
   startGlobalDisbursementEmailOutbox();
   const providerInfo = await initializePaymentProvider();
   if (providerInfo.enabled) {
-    // Run consolidation in a separate process by default so the HTTP server
-    // never needs the deposit-wallet extended private key in its environment.
-    if (String(process.env.USDT_SWEEP_IN_MAIN_PROCESS || "false").toLowerCase() === "true") {
-      await startDepositSweeper(db);
+    const treasuryLower = String(providerInfo.treasuryAddress || "").toLowerCase();
+    const [walletCollisionRows] = await db.queryAsync(
+      `SELECT username FROM bsc_wallet_address_registry
+       WHERE wallet_address_lower=? LIMIT 1`,
+      [treasuryLower],
+    );
+    if (walletCollisionRows.length) {
+      throw new Error(
+        `The configured OneX treasury address is permanently registered as a user wallet (${walletCollisionRows[0].username}). Choose a different treasury address.`,
+      );
     }
     startUsdtPaymentWatcher(db, processConfirmedUsdtPayment, processRechargeBatchQueue);
   }

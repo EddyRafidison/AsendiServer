@@ -21,7 +21,7 @@ function resolveRechargeAvailability({
   return { allowed: true, reason: null };
 }
 
-// Hiding an address never deletes or changes its persisted deposit wallet.
+// Hiding recharge availability never changes the shared treasury address configured by the server.
 function getVisibleDepositAddress(availability, storedAddress) {
   if (!availability || availability.allowed !== true || !storedAddress) return null;
   return storedAddress;

@@ -1,9 +1,8 @@
 "use strict";
 
 const https = require("https");
-const { URL } = require("url");
+const { getAddress, WebSocketProvider } = require("ethers");
 const BigNumber = require("bignumber.js");
-const { HDNodeWallet, getAddress } = require("ethers");
 
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -13,15 +12,18 @@ const CANONICAL_BSC_USD_CONTRACT =
 const TOKEN_DECIMALS = 18;
 const RPC_TIMEOUT_MS = 12000;
 const RPC_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const TREASURY_SCAN_LOCK = "onex_bsc_treasury_incoming_scanner";
 
 let paymentConfig = null;
 let rpcCounter = 0;
 let watcherTimer = null;
 let watcherRunning = false;
+let watcherWakeRequested = false;
 let watcherDatabase = null;
 let transferHandler = null;
 let maintenanceHandler = null;
-let lastWalletCursorId = 0;
+let watcherWsProvider = null;
+let validatedRpcUrls = new Set();
 
 function isAddress(value) {
   return typeof value === "string" && /^0x[a-fA-F0-9]{40}$/.test(value);
@@ -40,36 +42,34 @@ function toQuantity(value) {
   return `0x${BigInt(value).toString(16)}`;
 }
 
-function minBigInt(a, b) {
-  return a < b ? a : b;
+function minBigInt(left, right) {
+  return left < right ? left : right;
 }
 
 function getPaymentConfigFromEnvironment() {
   const enabled = String(process.env.USDT_PAYMENTS_ENABLED || "false").toLowerCase() === "true";
   if (!enabled) return { enabled: false };
 
-  const rpcCandidates = [process.env.BSC_RPC_URL, process.env.BSC_RPC_FALLBACK_URL]
+  const rpcUrls = [process.env.BSC_RPC_URL, process.env.BSC_RPC_FALLBACK_URL]
     .map((value) => String(value || "").trim())
     .filter(Boolean);
+  const websocketRpcUrl = String(process.env.BSC_WS_RPC_URL || "").trim();
   const tokenAddress = String(
     process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
   ).trim();
   const treasuryAddress = String(
     process.env.USDT_BEP20_TREASURY_ADDRESS || process.env.USDT_BEP20_RECEIVER_ADDRESS || "",
   ).trim();
-  const depositXpub = String(process.env.BSC_DEPOSIT_XPUB || "").trim();
   const minConfirmations = Number(process.env.USDT_MIN_CONFIRMATIONS || 15);
   const pollIntervalMs = Number(process.env.USDT_PAYMENT_POLL_MS || 5000);
   const maxLogBlockRange = Number(process.env.USDT_MAX_LOG_BLOCK_RANGE || 250);
-  const maxWalletsPerPoll = Number(process.env.USDT_MAX_WALLETS_PER_POLL || 25);
+  const configuredStartBlock = String(process.env.USDT_INCOMING_START_BLOCK || "").trim();
+  const startBlock = configuredStartBlock === "" ? null : BigInt(configuredStartBlock);
 
-  if (!rpcCandidates.length || !treasuryAddress || !depositXpub) {
-    throw new Error(
-      "USDT payments require BSC_RPC_URL, USDT_BEP20_TREASURY_ADDRESS and BSC_DEPOSIT_XPUB.",
-    );
+  if (!rpcUrls.length || !treasuryAddress) {
+    throw new Error("USDT payments require BSC_RPC_URL and USDT_BEP20_TREASURY_ADDRESS.");
   }
-
-  const rpcUrls = rpcCandidates.map((value, index) => {
+  for (const [index, value] of rpcUrls.entries()) {
     let parsed;
     try {
       parsed = new URL(value);
@@ -79,9 +79,18 @@ function getPaymentConfigFromEnvironment() {
     if (parsed.protocol !== "https:") {
       throw new Error(`BSC RPC endpoint ${index + 1} must use HTTPS.`);
     }
-    return parsed;
-  });
-
+  }
+  if (websocketRpcUrl) {
+    let parsed;
+    try {
+      parsed = new URL(websocketRpcUrl);
+    } catch {
+      throw new Error("BSC_WS_RPC_URL is not a valid URL.");
+    }
+    if (parsed.protocol !== "wss:") {
+      throw new Error("BSC_WS_RPC_URL must use secure WebSocket (wss).");
+    }
+  }
   if (!isAddress(tokenAddress) || !isAddress(treasuryAddress)) {
     throw new Error("The approved token contract or treasury address is invalid.");
   }
@@ -100,48 +109,27 @@ function getPaymentConfigFromEnvironment() {
   if (!Number.isInteger(maxLogBlockRange) || maxLogBlockRange < 1 || maxLogBlockRange > 2000) {
     throw new Error("USDT_MAX_LOG_BLOCK_RANGE must be an integer between 1 and 2000.");
   }
-  if (!Number.isInteger(maxWalletsPerPoll) || maxWalletsPerPoll < 1 || maxWalletsPerPoll > 500) {
-    throw new Error("USDT_MAX_WALLETS_PER_POLL must be between 1 and 500.");
-  }
-
-  let publicRoot;
-  try {
-    publicRoot = HDNodeWallet.fromExtendedKey(depositXpub);
-  } catch {
-    throw new Error("BSC_DEPOSIT_XPUB is not a valid extended public key.");
-  }
-  if (publicRoot.privateKey) {
-    throw new Error("BSC_DEPOSIT_XPUB must be an extended public key, not a private key.");
+  if (startBlock !== null && (startBlock < 0n || startBlock > 0xffffffffffffffffn)) {
+    throw new Error("USDT_INCOMING_START_BLOCK must be a valid non-negative block number.");
   }
 
   return {
     enabled: true,
     rpcUrls,
+    websocketRpcUrl: websocketRpcUrl || null,
     currentRpcIndex: 0,
     tokenAddress: checksumAddress(tokenAddress),
     tokenAddressLower: tokenAddress.toLowerCase(),
     treasuryAddress: checksumAddress(treasuryAddress),
     treasuryAddressLower: treasuryAddress.toLowerCase(),
-    publicRoot,
     minConfirmations: BigInt(minConfirmations),
     minConfirmationsNumber: minConfirmations,
     pollIntervalMs,
     maxLogBlockRange: BigInt(maxLogBlockRange),
-    maxWalletsPerPoll,
+    configuredStartBlock: startBlock,
     decimals: TOKEN_DECIMALS,
     decimalFactor: new BigNumber(10).pow(TOKEN_DECIMALS),
   };
-}
-
-function deriveDepositAddress(index) {
-  if (!paymentConfig || !paymentConfig.enabled) {
-    throw new Error("BEP-20 payment provider is not initialized.");
-  }
-  const childIndex = Number(index);
-  if (!Number.isSafeInteger(childIndex) || childIndex < 0 || childIndex > 0x7fffffff) {
-    throw new RangeError("Invalid BSC deposit derivation index.");
-  }
-  return paymentConfig.publicRoot.deriveChild(childIndex).address;
 }
 
 function rpcCallAt(rpcUrl, method, params = []) {
@@ -194,6 +182,24 @@ function rpcCallAt(rpcUrl, method, params = []) {
   });
 }
 
+async function validateRpcEndpoint(rpcUrl) {
+  const chainId = BigInt(await rpcCallAt(rpcUrl, "eth_chainId", []));
+  if (chainId !== CHAIN_ID) {
+    throw new Error(`RPC endpoint is on chain ${chainId}, not BNB Smart Chain mainnet 56.`);
+  }
+  const code = await rpcCallAt(rpcUrl, "eth_getCode", [paymentConfig.tokenAddress, "latest"]);
+  if (typeof code !== "string" || code === "0x" || code === "0x0") {
+    throw new Error("The approved BSC-USD contract is not deployed on the RPC endpoint.");
+  }
+  const decimalsResult = await rpcCallAt(rpcUrl, "eth_call", [
+    { to: paymentConfig.tokenAddress, data: "0x313ce567" }, "latest",
+  ]);
+  if (Number(BigInt(decimalsResult)) !== TOKEN_DECIMALS) {
+    throw new Error("The approved Binance-Peg BSC-USD token must use 18 decimals.");
+  }
+  validatedRpcUrls.add(rpcUrl);
+}
+
 async function rpcCall(method, params = []) {
   if (!paymentConfig || !paymentConfig.enabled) {
     throw new Error("BEP-20 payment provider is not initialized.");
@@ -203,8 +209,10 @@ async function rpcCall(method, params = []) {
   const start = paymentConfig.currentRpcIndex || 0;
   for (let offset = 0; offset < count; offset += 1) {
     const index = (start + offset) % count;
+    const rpcUrl = paymentConfig.rpcUrls[index];
     try {
-      const result = await rpcCallAt(paymentConfig.rpcUrls[index], method, params);
+      if (!validatedRpcUrls.has(rpcUrl)) await validateRpcEndpoint(rpcUrl);
+      const result = await rpcCallAt(rpcUrl, method, params);
       paymentConfig.currentRpcIndex = index;
       return result;
     } catch (error) {
@@ -219,34 +227,33 @@ async function initializePaymentProvider() {
   const config = getPaymentConfigFromEnvironment();
   if (!config.enabled) {
     paymentConfig = config;
+    validatedRpcUrls = new Set();
     console.log("BEP-20 payment monitoring is disabled.");
     return { enabled: false };
   }
+
   paymentConfig = config;
+  validatedRpcUrls = new Set();
   try {
-    for (let index = 0; index < config.rpcUrls.length; index += 1) {
-      const rpcUrl = config.rpcUrls[index];
-      const chainId = BigInt(await rpcCallAt(rpcUrl, "eth_chainId", []));
-      if (chainId !== CHAIN_ID) {
-        throw new Error(`RPC endpoint is on chain ${chainId}, not BNB Smart Chain mainnet 56.`);
-      }
-      const code = await rpcCallAt(rpcUrl, "eth_getCode", [config.tokenAddress, "latest"]);
-      if (typeof code !== "string" || code === "0x" || code === "0x0") {
-        throw new Error("The approved BSC-USD contract is not deployed on the RPC endpoint.");
-      }
-      const decimalsResult = await rpcCallAt(rpcUrl, "eth_call", [
-        { to: config.tokenAddress, data: "0x313ce567" }, "latest",
-      ]);
-      if (Number(BigInt(decimalsResult)) !== TOKEN_DECIMALS) {
-        throw new Error("The approved Binance-Peg BSC-USD token must use 18 decimals.");
-      }
-    }
-    const blockNumber = BigInt(await rpcCall("eth_blockNumber", []));
-    console.log(`BEP-20 payment provider ready. BSC block: ${blockNumber}`);
-    return { enabled: true, chainId: 56, tokenAddress: config.tokenAddress };
+    const latestBlock = BigInt(await rpcCall("eth_blockNumber", []));
+    console.log(`BEP-20 treasury watcher ready. BSC block: ${latestBlock}; treasury: ${config.treasuryAddress}`);
+    return {
+      enabled: true,
+      chainId: 56,
+      tokenAddress: config.tokenAddress,
+      treasuryAddress: config.treasuryAddress,
+      rpcValidated: true,
+    };
   } catch (error) {
-    paymentConfig = null;
-    throw error;
+    // Keep the watcher active so it can retry RPC discovery after a temporary outage.
+    console.warn("No configured BSC RPC endpoint is currently usable. The payment scanner will remain active and retry without advancing its database cursor:", error.message);
+    return {
+      enabled: true,
+      chainId: 56,
+      tokenAddress: config.tokenAddress,
+      treasuryAddress: config.treasuryAddress,
+      rpcValidated: false,
+    };
   }
 }
 
@@ -256,100 +263,108 @@ function getConnection(db) {
   });
 }
 
-async function runDbTransaction(db, work, maxAttempts = 3) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const connection = await getConnection(db);
-    const tx = connection.promise();
-    let started = false;
-    let retry = false;
-    try {
-      await tx.beginTransaction();
-      started = true;
-      const result = await work(tx);
-      await tx.commit();
-      started = false;
-      return result;
-    } catch (error) {
-      if (started) await tx.rollback().catch((rollbackError) => console.error("Deposit wallet rollback failed:", rollbackError));
-      const retryable = error && ["ER_LOCK_DEADLOCK", "ER_LOCK_WAIT_TIMEOUT"].includes(error.code);
-      if (!retryable || attempt === maxAttempts) throw error;
-      retry = true;
-    } finally {
+async function acquireScannerLock(db) {
+  const connection = await getConnection(db);
+  const queryable = connection.promise();
+  try {
+    const [rows] = await queryable.query("SELECT GET_LOCK(?,0) AS acquired", [TREASURY_SCAN_LOCK]);
+    if (Number(rows[0]?.acquired) !== 1) {
       connection.release();
+      return null;
     }
-    if (retry) await new Promise((resolve) => setTimeout(resolve, attempt * 50));
+    return async () => {
+      try {
+        await queryable.query("SELECT RELEASE_LOCK(?)", [TREASURY_SCAN_LOCK]);
+      } finally {
+        connection.release();
+      }
+    };
+  } catch (error) {
+    connection.release();
+    throw error;
   }
-  throw new Error("Deposit wallet transaction retry limit reached.");
 }
 
-async function getOrCreateDepositWallet(tx, username, currentBlock) {
-  const [existingRows] = await tx.query(
-    `SELECT id,username,wallet_address,derivation_index,created_block,last_scanned_block
-     FROM users_usdt_deposit_wallets WHERE username=? LIMIT 1 FOR UPDATE`,
-    [username],
-  );
-  if (existingRows.length) return existingRows[0];
-
-  const [lockRows] = await tx.query(
-    "SELECT lock_name FROM system_locks WHERE lock_name='deposit_wallet_index' FOR UPDATE",
-  );
-  if (!lockRows.length) throw new Error("The deposit-wallet derivation lock is not initialized.");
-
-  const [indexRows] = await tx.query(
-    "SELECT COALESCE(MAX(derivation_index),-1)+1 AS next_index FROM users_usdt_deposit_wallets",
-  );
-  const nextIndex = Number(indexRows[0].next_index);
-  if (!Number.isSafeInteger(nextIndex) || nextIndex < 0 || nextIndex > 0x7fffffff) {
-    throw new Error("The BSC deposit-wallet derivation index is exhausted or invalid.");
+async function getSafeBlock() {
+  try {
+    const finalized = await rpcCall("eth_getBlockByNumber", ["finalized", false]);
+    if (finalized && finalized.number != null && /^0x[0-9a-f]+$/i.test(String(finalized.number))) {
+      return { number: BigInt(finalized.number), hash: String(finalized.hash || "").toLowerCase(), method: "finalized" };
+    }
+  } catch (error) {
+    console.warn("BSC RPC does not provide the finalized block tag; using the confirmation fallback:", error.message);
   }
 
-  const walletAddress = checksumAddress(deriveDepositAddress(nextIndex));
-  const now = String(Date.now());
-  const [insertResult] = await tx.query(
-    `INSERT INTO users_usdt_deposit_wallets
-     (username,wallet_address,derivation_index,created_block,last_scanned_block,created_at_ms,sweep_lock_until_ms,account_status)
-     VALUES(?,?,?,?,?,?,0,'active')`,
-    [username, walletAddress, nextIndex, String(currentBlock), String(currentBlock), now],
-  );
-  return {
-    id: insertResult.insertId,
-    username,
-    wallet_address: walletAddress,
-    derivation_index: nextIndex,
-    created_block: String(currentBlock),
-    last_scanned_block: String(currentBlock),
-    account_status: "active",
-  };
+  const latest = BigInt(await rpcCall("eth_blockNumber", []));
+  const subtract = paymentConfig.minConfirmations - 1n;
+  const number = latest >= subtract ? latest - subtract : 0n;
+  const block = await rpcCall("eth_getBlockByNumber", [toQuantity(number), false]);
+  if (!block || !block.hash) throw new Error("Unable to verify the BSC confirmation fallback block.");
+  return { number, hash: String(block.hash).toLowerCase(), method: "confirmations" };
 }
 
-async function getOrCreateUserDepositAddress(db, username) {
-  if (typeof username !== "string" || username.length === 0) {
-    throw new TypeError("A valid username is required to retrieve a deposit address.");
-  }
+async function initializeScanState(db, safeBlock) {
   const rows = await db.queryAsync(
-    "SELECT wallet_address,account_status FROM users_usdt_deposit_wallets WHERE username=? LIMIT 1",
-    [username],
+    "SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1",
   );
   if (rows.length) {
-    if (rows[0].account_status !== "active") return null;
-    return checksumAddress(rows[0].wallet_address);
-  }
-  if (!paymentConfig || !paymentConfig.enabled) return null;
-  const currentBlock = BigInt(await rpcCall("eth_blockNumber", []));
-  const wallet = await runDbTransaction(db, async (tx) => {
-    const [authRows] = await tx.query(
-      "SELECT last_login_at_ms,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [username],
-    );
-    if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) {
-      throw new Error("Cannot assign a deposit address to an inactive account.");
+    const row = rows[0];
+    if (
+      Number(row.chain_id) !== 56 ||
+      String(row.token_contract).toLowerCase() !== paymentConfig.tokenAddressLower ||
+      String(row.treasury_address).toLowerCase() !== paymentConfig.treasuryAddressLower
+    ) {
+      const message = "BSC incoming scan state belongs to another chain, token or treasury address. Automatic crediting is halted until the configured scanner identity is reviewed.";
+      await db.queryAsync(
+        `UPDATE bsc_incoming_scan_state SET health_status='manual_review',last_error=?,updated_at_ms=? WHERE singleton_id=1`,
+        [message, String(Date.now())],
+      );
+      throw new Error(message);
     }
-    const [stockRows] = await tx.query(
-      "SELECT username FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [username],
+    return row;
+  }
+
+  const startBlock = paymentConfig.configuredStartBlock === null
+    ? safeBlock.number
+    : paymentConfig.configuredStartBlock;
+  if (startBlock > safeBlock.number) {
+    throw new RangeError(
+      `USDT_INCOMING_START_BLOCK (${startBlock}) is newer than the latest finalized BSC block (${safeBlock.number}). ` +
+      "The scanner will keep retrying and the treasury address will remain hidden until the configuration is corrected.",
     );
-    if (!stockRows.length) throw new Error("Cannot assign a deposit address without a user stock account.");
-    return getOrCreateDepositWallet(tx, username, currentBlock);
-  });
-  return checksumAddress(wallet.wallet_address);
+  }
+  const initialCursor = startBlock === 0n ? null : startBlock - 1n;
+  const initialCursorHash = initialCursor === null
+    ? null
+    : String((await rpcCall("eth_getBlockByNumber", [toQuantity(initialCursor), false]))?.hash || "").toLowerCase();
+  if (initialCursor !== null && !/^0x[0-9a-f]{64}$/i.test(initialCursorHash)) {
+    throw new Error("Unable to obtain the initial BSC scan cursor block hash.");
+  }
+
+  await db.queryAsync(
+    `INSERT INTO bsc_incoming_scan_state
+     (singleton_id,chain_id,token_contract,treasury_address,scan_start_block,last_scanned_block,
+      last_scanned_block_hash,last_finalized_block,finality_method,health_status,last_error,updated_at_ms)
+     VALUES(1,56,?,?,?,?,?,?,?,'healthy',NULL,?)`,
+    [
+      paymentConfig.tokenAddress,
+      paymentConfig.treasuryAddress,
+      startBlock.toString(),
+      initialCursor === null ? null : initialCursor.toString(),
+      initialCursorHash || null,
+      safeBlock.number.toString(),
+      safeBlock.method,
+      String(Date.now()),
+    ],
+  );
+  if (paymentConfig.configuredStartBlock === null) {
+    console.warn(
+      `BSC incoming scanner initialized at finalized block ${startBlock}. ` +
+      "Set USDT_INCOMING_START_BLOCK explicitly when historical treasury deposits must also be indexed.",
+    );
+  }
+  const [created] = await db.queryAsync("SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1");
+  return created;
 }
 
 async function verifyFinalizedTransfer(log) {
@@ -395,112 +410,313 @@ async function verifyFinalizedTransfer(log) {
 
   const amountRaw = BigInt(log.data);
   if (amountRaw <= 0n) return { ignored: true };
+  const fromAddress = getAddress(`0x${String(log.topics[1]).slice(-40)}`);
+  const toAddress = getAddress(`0x${String(log.topics[2]).slice(-40)}`);
+  if (/^0x0{40}$/i.test(fromAddress)) return { ignored: true };
+  if (toAddress.toLowerCase() !== paymentConfig.treasuryAddressLower) return null;
   return {
     txHash,
     logIndex,
     blockNumber: blockNumber.toString(),
     blockHash,
     blockTimestampMs,
-    fromAddress: getAddress(`0x${String(log.topics[1]).slice(-40)}`),
-    depositAddress: getAddress(`0x${String(log.topics[2]).slice(-40)}`),
+    fromAddress,
+    treasuryAddress: toAddress,
     amountRaw: amountRaw.toString(),
     amount: new BigNumber(amountRaw.toString()).shiftedBy(-TOKEN_DECIMALS).toFixed(TOKEN_DECIMALS),
   };
 }
 
-async function scanOneDepositWallet(db, wallet, safeBlock, onTransfer) {
-  const cursor = BigInt(wallet.last_scanned_block);
-  const createdBlock = BigInt(wallet.created_block);
-  const fromBlock = cursor > createdBlock ? cursor + 1n : createdBlock + 1n;
-  if (safeBlock < fromBlock) return;
+async function persistUnknownTransfer(db, event) {
+  const [registryRows] = await db.queryAsync(
+    "SELECT username FROM bsc_wallet_address_registry WHERE wallet_address_lower=? LIMIT 1",
+    [event.fromAddress.toLowerCase()],
+  );
+  await db.queryAsync(
+    `INSERT IGNORE INTO bsc_unknown_incoming_transfers
+     (token_contract,from_address,to_address,amount,amount_raw,tx_hash,log_index,block_number,block_hash,
+      block_timestamp_ms,previous_username,status,decision_action,created_at_ms,updated_at_ms)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,'pending_admin',NULL,?,?)`,
+    [
+      paymentConfig.tokenAddress,
+      event.fromAddress,
+      event.treasuryAddress,
+      event.amount,
+      event.amountRaw,
+      event.txHash,
+      event.logIndex,
+      event.blockNumber,
+      event.blockHash,
+      String(event.blockTimestampMs),
+      registryRows[0]?.username || null,
+      String(Date.now()),
+      String(Date.now()),
+    ],
+  );
+}
 
-  const toBlock = minBigInt(safeBlock, fromBlock + paymentConfig.maxLogBlockRange - 1n);
+async function scanTreasury(db, safeBlock) {
+  let state = await initializeScanState(db, safeBlock);
+  if (state.health_status !== "healthy") {
+    throw new Error(`BSC incoming scanner requires review: ${state.last_error || state.health_status}`);
+  }
+
+  if (state.last_scanned_block !== null && state.last_scanned_block_hash) {
+    const cursorBlock = await rpcCall("eth_getBlockByNumber", [toQuantity(state.last_scanned_block), false]);
+    if (!cursorBlock || String(cursorBlock.hash || "").toLowerCase() !== String(state.last_scanned_block_hash).toLowerCase()) {
+      const message = "The stored BSC scan cursor no longer matches the canonical block. Automatic crediting has been halted for administrative reconciliation.";
+      await db.queryAsync(
+        `UPDATE bsc_incoming_scan_state SET health_status='manual_review',last_error=?,updated_at_ms=? WHERE singleton_id=1`,
+        [message, String(Date.now())],
+      );
+      throw new Error(message);
+    }
+  }
+
+  const fromBlock = state.last_scanned_block === null
+    ? BigInt(state.scan_start_block)
+    : BigInt(state.last_scanned_block) + 1n;
+  if (safeBlock.number < fromBlock) return { scanned: false, reason: "awaiting_finality" };
+
+  const toBlock = minBigInt(safeBlock.number, fromBlock + paymentConfig.maxLogBlockRange - 1n);
   const logs = await rpcCall("eth_getLogs", [{
     fromBlock: toQuantity(fromBlock),
     toBlock: toQuantity(toBlock),
     address: paymentConfig.tokenAddress,
-    topics: [TRANSFER_TOPIC, null, addressTopic(wallet.wallet_address)],
+    topics: [TRANSFER_TOPIC, null, addressTopic(paymentConfig.treasuryAddress)],
   }]);
   if (!Array.isArray(logs)) throw new Error("BSC RPC returned an invalid eth_getLogs result.");
-  logs.sort((a, b) => {
-    const blockDiff = BigInt(a.blockNumber) - BigInt(b.blockNumber);
+
+  logs.sort((left, right) => {
+    const blockDiff = BigInt(left.blockNumber) - BigInt(right.blockNumber);
     if (blockDiff !== 0n) return blockDiff < 0n ? -1 : 1;
-    return Number(BigInt(a.logIndex)) - Number(BigInt(b.logIndex));
+    return Number(BigInt(left.logIndex)) - Number(BigInt(right.logIndex));
   });
 
+  let processed = 0;
   for (const log of logs) {
-    const verified = await verifyFinalizedTransfer(log);
-    if (verified?.pending) return;
-    if (!verified || verified.ignored) continue;
-    if (verified.depositAddress.toLowerCase() !== wallet.wallet_address.toLowerCase()) continue;
-    await onTransfer({
-      username: wallet.username,
-      depositWalletId: Number(wallet.id),
-      depositAccountStatus: wallet.account_status,
-      ...verified,
+    const event = await verifyFinalizedTransfer(log);
+    if (event?.pending) throw new Error("A BSC transfer receipt or canonical block is not yet consistent; the scan cursor was not advanced.");
+    if (!event || event.ignored) continue;
+
+    const [accountRows] = await db.queryAsync(
+      `SELECT username FROM auths WHERE LOWER(wallet_address)=? LIMIT 1`,
+      [event.fromAddress.toLowerCase()],
+    );
+    if (!accountRows.length) {
+      await persistUnknownTransfer(db, event);
+      processed += 1;
+      continue;
+    }
+
+    const handled = await transferHandler({
+      username: accountRows[0].username,
+      depositAccountStatus: "active",
+      ...event,
     });
+    if (handled?.unknown) await persistUnknownTransfer(db, event);
+    processed += 1;
   }
 
+  const cursorBlock = await rpcCall("eth_getBlockByNumber", [toQuantity(toBlock), false]);
+  if (!cursorBlock || !/^0x[0-9a-f]{64}$/i.test(String(cursorBlock.hash || ""))) {
+    throw new Error("BSC RPC did not return a canonical hash for the scanned range endpoint.");
+  }
   await db.queryAsync(
-    "UPDATE users_usdt_deposit_wallets SET last_scanned_block=? WHERE id=? AND CAST(last_scanned_block AS UNSIGNED)<=?",
-    [toBlock.toString(), wallet.id, toBlock.toString()],
+    `UPDATE bsc_incoming_scan_state
+     SET last_scanned_block=?,last_scanned_block_hash=?,last_finalized_block=?,finality_method=?,
+         health_status='healthy',last_error=NULL,updated_at_ms=?
+     WHERE singleton_id=1`,
+    [
+      toBlock.toString(),
+      String(cursorBlock.hash).toLowerCase(),
+      safeBlock.number.toString(),
+      safeBlock.method,
+      String(Date.now()),
+    ],
   );
+  return { scanned: true, fromBlock: fromBlock.toString(), toBlock: toBlock.toString(), events: processed };
 }
 
 function startPaymentWatcher(db, onTransfer, onMaintenance) {
-  if (!paymentConfig || !paymentConfig.enabled) return;
-  if (watcherTimer) return;
+  if (!paymentConfig || !paymentConfig.enabled) return { enabled: false };
+  if (watcherTimer) return { enabled: true };
   if (typeof onTransfer !== "function") throw new TypeError("A confirmed-transfer handler is required.");
 
   watcherDatabase = db;
   transferHandler = onTransfer;
   maintenanceHandler = typeof onMaintenance === "function" ? onMaintenance : null;
 
-  const scan = async () => {
-    if (watcherRunning) return;
-    watcherRunning = true;
-    try {
-      const latestBlock = BigInt(await rpcCall("eth_blockNumber", []));
-      const subtract = paymentConfig.minConfirmations - 1n;
-      const safeBlock = latestBlock >= subtract ? latestBlock - subtract : 0n;
+  const scheduleScan = (delayMs) => {
+    if (watcherTimer) clearTimeout(watcherTimer);
+    watcherTimer = setTimeout(() => {
+      watcherTimer = null;
+      void scan();
+    }, delayMs);
+    if (typeof watcherTimer.unref === "function") watcherTimer.unref();
+  };
 
-      let rows = await watcherDatabase.queryAsync(
-        `SELECT id,username,wallet_address,account_status,created_block,last_scanned_block
-         FROM users_usdt_deposit_wallets WHERE id>? ORDER BY id ASC LIMIT ?`,
-        [lastWalletCursorId, paymentConfig.maxWalletsPerPoll],
-      );
-      if (!rows.length && lastWalletCursorId > 0) {
-        lastWalletCursorId = 0;
-        rows = await watcherDatabase.queryAsync(
-          `SELECT id,username,wallet_address,account_status,created_block,last_scanned_block
-           FROM users_usdt_deposit_wallets ORDER BY id ASC LIMIT ?`,
-          [paymentConfig.maxWalletsPerPoll],
-        );
+  const scan = async () => {
+    if (watcherRunning) {
+      watcherWakeRequested = true;
+      return;
+    }
+    watcherRunning = true;
+    let releaseLock = null;
+    try {
+      releaseLock = await acquireScannerLock(watcherDatabase);
+      if (!releaseLock) return;
+      const safeBlock = await getSafeBlock();
+      const result = await scanTreasury(watcherDatabase, safeBlock);
+      if (result.scanned && result.events > 0) {
+        console.log(`BSC treasury scanner processed ${result.events} incoming event(s) in blocks ${result.fromBlock}-${result.toBlock}.`);
       }
-      for (const wallet of rows) {
-        lastWalletCursorId = Number(wallet.id);
-        try {
-          await scanOneDepositWallet(watcherDatabase, wallet, safeBlock, transferHandler);
-        } catch (error) {
-          console.error(`BEP-20 scan failed for deposit wallet ${wallet.id}:`, error.message);
-        }
-      }
-      if (maintenanceHandler) {
-        try {
-          await maintenanceHandler();
-        } catch (error) {
-          console.error("Recharge batch worker failed:", error.message);
-        }
-      }
+      if (maintenanceHandler) await maintenanceHandler();
     } catch (error) {
-      console.error("BEP-20 deposit watcher failed:", error);
+      console.error("BSC treasury incoming scanner failed; the stored block cursor was preserved:", error.message);
     } finally {
+      if (releaseLock) await releaseLock().catch((error) => console.error("BSC scanner lock release failed:", error.message));
       watcherRunning = false;
-      watcherTimer = setTimeout(scan, paymentConfig.pollIntervalMs);
-      if (typeof watcherTimer.unref === "function") watcherTimer.unref();
+      const nextDelay = watcherWakeRequested ? 0 : (paymentConfig?.pollIntervalMs || 5000);
+      watcherWakeRequested = false;
+      scheduleScan(nextDelay);
     }
   };
-  void scan();
+
+  scheduleScan(0);
+  if (paymentConfig.websocketRpcUrl) {
+    try {
+      const wsProvider = new WebSocketProvider(paymentConfig.websocketRpcUrl);
+      void wsProvider.getNetwork().then((network) => {
+        if (BigInt(network.chainId) !== CHAIN_ID) {
+          throw new Error(`WebSocket RPC is on chain ${network.chainId}, not BNB Smart Chain mainnet 56.`);
+        }
+        watcherWsProvider = wsProvider;
+        wsProvider.on("block", () => {
+          if (watcherRunning) watcherWakeRequested = true;
+          else scheduleScan(0);
+        });
+        wsProvider.on("error", (error) => {
+          console.warn("BSC WebSocket hint failed; the durable HTTP scanner remains active:", error?.message || "unknown error");
+        });
+        console.log("BSC WebSocket new-block hint connected; the HTTP log scanner remains the recovery source of truth.");
+      }).catch((error) => {
+        console.warn("Unable to start optional BSC WebSocket hint; the durable HTTP scanner remains active:", error.message);
+        wsProvider.destroy();
+      });
+    } catch (error) {
+      console.warn("Unable to create optional BSC WebSocket hint; the durable HTTP scanner remains active:", error.message);
+    }
+  }
+  return { enabled: true, treasuryAddress: paymentConfig.treasuryAddress, websocketHint: Boolean(paymentConfig.websocketRpcUrl) };
+}
+
+
+async function getIncomingScannerStatus(db) {
+  const rows = await db.queryAsync(
+    "SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1",
+  );
+  if (!rows.length) return { initialized: false };
+  return { initialized: true, ...rows[0] };
+}
+
+async function reconcileIncomingScanner(db, options = {}) {
+  const resumeAfterBlockValue = String(options.resumeAfterBlock ?? "").trim();
+  const reason = String(options.reason || "").trim();
+  const adminUsername = String(options.adminUsername || "configured_admin").trim();
+  if (!/^\d{1,20}$/.test(resumeAfterBlockValue)) {
+    throw new TypeError("resume_after_block must be a non-negative integer block number");
+  }
+  if (reason.length < 5 || reason.length > 1000) {
+    throw new RangeError("A reconciliation reason of 5 to 1000 characters is required");
+  }
+  if (!adminUsername || adminUsername.length > 64) {
+    throw new TypeError("Invalid administrator identifier");
+  }
+
+  const releaseLock = await acquireScannerLock(db);
+  if (!releaseLock) {
+    const error = new Error("The BSC incoming scanner is currently processing a block range");
+    error.code = "ONEX_BSC_SCANNER_BUSY";
+    throw error;
+  }
+
+  try {
+    if (!paymentConfig || !paymentConfig.enabled) {
+      throw new Error("BSC payment monitoring is not enabled");
+    }
+    const stateRows = await db.queryAsync(
+      "SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1",
+    );
+    if (!stateRows.length) throw new Error("The BSC incoming scanner has not initialized its cursor yet");
+    const state = stateRows[0];
+    if (state.health_status !== "manual_review") {
+      throw new Error("Scanner reconciliation is allowed only while health_status is manual_review");
+    }
+
+    const resumeAfterBlock = BigInt(resumeAfterBlockValue);
+    const safeBlock = await getSafeBlock();
+    if (resumeAfterBlock > safeBlock.number) {
+      throw new RangeError("The resume cursor cannot be newer than the latest finalized block");
+    }
+    const block = await rpcCall("eth_getBlockByNumber", [toQuantity(resumeAfterBlock), false]);
+    const canonicalHash = String(block?.hash || "").toLowerCase();
+    if (
+      !block || BigInt(block.number) !== resumeAfterBlock ||
+      !/^0x[0-9a-f]{64}$/.test(canonicalHash)
+    ) {
+      throw new Error("The selected resume block is not available as a canonical BSC block");
+    }
+
+    const connection = await getConnection(db);
+    const tx = connection.promise();
+    try {
+      await tx.beginTransaction();
+      const [lockedRows] = await tx.query(
+        "SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1 FOR UPDATE",
+      );
+      if (!lockedRows.length || lockedRows[0].health_status !== "manual_review") {
+        throw new Error("The scanner state changed during administrative reconciliation");
+      }
+      const previousBlock = lockedRows[0].last_scanned_block == null
+        ? null : String(lockedRows[0].last_scanned_block);
+      const previousHash = lockedRows[0].last_scanned_block_hash || null;
+      if (previousBlock === null || resumeAfterBlock >= BigInt(previousBlock)) {
+        throw new RangeError("Reconciliation may only roll the cursor back to a block earlier than the stored cursor; it cannot skip incoming transfers.");
+      }
+      const now = String(Date.now());
+      await tx.query(
+        `UPDATE bsc_incoming_scan_state
+         SET last_scanned_block=?,last_scanned_block_hash=?,last_finalized_block=?,finality_method=?,
+             health_status='healthy',last_error=NULL,updated_at_ms=?
+         WHERE singleton_id=1 AND health_status='manual_review'`,
+        [resumeAfterBlock.toString(), canonicalHash, safeBlock.number.toString(), safeBlock.method, now],
+      );
+      await tx.query(
+        `INSERT INTO bsc_scan_admin_events
+         (admin_username,action,previous_block,previous_block_hash,resume_after_block,resume_block_hash,
+          observed_finalized_block,reason,created_at_ms)
+         VALUES(?,'resume_cursor',?,?,?,?,?,?,?)`,
+        [adminUsername, previousBlock, previousHash, resumeAfterBlock.toString(), canonicalHash,
+          safeBlock.number.toString(), reason, now],
+      );
+      await tx.commit();
+      return {
+        resumed: true,
+        resume_after_block: resumeAfterBlock.toString(),
+        resume_block_hash: canonicalHash,
+        observed_finalized_block: safeBlock.number.toString(),
+        finality_method: safeBlock.method,
+      };
+    } catch (error) {
+      await tx.rollback().catch((rollbackError) => console.error("BSC scanner reconciliation rollback failed:", rollbackError.message));
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } finally {
+    await releaseLock();
+  }
 }
 
 function getPaymentPublicConfig() {
@@ -518,10 +734,10 @@ function getPaymentPublicConfig() {
 
 module.exports = {
   initializePaymentProvider,
-  getOrCreateUserDepositAddress,
   startPaymentWatcher,
   getPaymentPublicConfig,
+  getIncomingScannerStatus,
+  reconcileIncomingScanner,
   isAddress,
-  deriveDepositAddress,
-  rpcCall,
+  checksumAddress,
 };

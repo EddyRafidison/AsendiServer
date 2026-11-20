@@ -7,7 +7,7 @@ BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP })
 
 const PRICE_DECIMALS = 30;
 const INITIAL_ASSET_DECIMALS = 30;
-const USER_PRICE_TRIGGER_RATIO = new BigNumber(2);
+const USER_PRICE_TRIGGER_RATIO = new BigNumber(3);
 const USER_PRICE_SALE_RATIO = new BigNumber("0.5");
 
 function finiteNonNegative(value, fieldName) {
@@ -353,6 +353,46 @@ async function initializeUserPriceStateTx(tx, username, basePriceValue, feeRateV
   return { initialized: true };
 }
 
+async function recalculateWatchingPriceTargets(pool) {
+  const connection = await new Promise((resolve, reject) => {
+    pool.getConnection((error, value) => error ? reject(error) : resolve(value));
+  });
+  const tx = connection.promise();
+  let started = false;
+  try {
+    await tx.beginTransaction();
+    started = true;
+    const [rows] = await tx.query(
+      `SELECT username,cycle_number,base_price,tfees_rate
+       FROM user_price_state WHERE status='watching' ORDER BY username ASC FOR UPDATE`,
+    );
+    let updated = 0;
+    const now = String(Date.now());
+    for (const row of rows) {
+      const target = calculateIndividualTargetPrice(row.base_price, row.tfees_rate);
+      await tx.query(
+        `UPDATE user_price_state SET target_price=?,updated_at_ms=?
+         WHERE username=? AND status='watching'`,
+        [target.toFixed(PRICE_DECIMALS), now, row.username],
+      );
+      await tx.query(
+        `UPDATE user_price_cycle_history SET target_price=?,updated_at_ms=?
+         WHERE username=? AND cycle_number=? AND resumed_at_ms IS NULL`,
+        [target.toFixed(PRICE_DECIMALS), now, row.username, String(row.cycle_number)],
+      );
+      updated += 1;
+    }
+    await tx.commit();
+    started = false;
+    return { updated };
+  } catch (error) {
+    if (started) await tx.rollback().catch((rollbackError) => console.error("Individual price recalculation rollback failed:", rollbackError.message));
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 async function processPriceEventBatch(pool, batchSize = 500) {
   const connection = await new Promise((resolve, reject) => {
     pool.getConnection((error, result) => error ? reject(error) : resolve(result));
@@ -442,4 +482,5 @@ module.exports = {
   recordUserP2PSaleTx,
   initializeUserPriceStateTx,
   processPriceEventBatch,
+  recalculateWatchingPriceTargets,
 };

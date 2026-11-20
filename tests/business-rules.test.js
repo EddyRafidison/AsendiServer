@@ -20,8 +20,6 @@ const {
   MAX_DEFAULT_STOCK,
   SYSTEM_ADMIN_RESERVE_RATIO,
   RECHARGE_BATCH_WINDOW_MS,
-  DEPOSIT_SWEEP_THRESHOLD,
-  DEPOSIT_SWEEP_MAX_AGE_MS,
   getWeeklyReleaseAt,
   recordDateTimeToUtcMs,
 } = require("../recharge-policy");
@@ -34,8 +32,6 @@ test("current OneX business limits are centralized", () => {
   assert.equal(MAX_DEFAULT_STOCK, "300");
   assert.equal(fixed(SYSTEM_ADMIN_RESERVE_RATIO), "0.1");
   assert.equal(RECHARGE_BATCH_WINDOW_MS, 60 * 60 * 1000);
-  assert.equal(fixed(DEPOSIT_SWEEP_THRESHOLD), "100");
-  assert.equal(DEPOSIT_SWEEP_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000);
   assert.equal(DISBURSEMENT_COOLDOWN_MS, 30 * 24 * 60 * 60 * 1000);
 });
 

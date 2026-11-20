@@ -24,10 +24,11 @@ function getRouteBlock(routePath, nextRoutePath) {
   return routesSource.slice(start, end);
 }
 
-test("user-last-stock is the only app endpoint that creates and returns a deposit address", () => {
+test("user-last-stock is the only app endpoint that returns the shared treasury deposit address", () => {
   const stockRoute = getRouteBlock("/app/user-last-stock", "/app/recharge");
   const rechargeRoute = getRouteBlock("/app/recharge", "/app/recharge/status");
-  assert.match(stockRoute, /getOrCreateUserDepositAddress\(db, U\)/);
+  assert.match(stockRoute, /paymentConfig\.treasuryAddress/);
+  assert.doesNotMatch(stockRoute, /getOrCreateUserDepositAddress/);
   assert.match(stockRoute, /deposit_addr:\s*depositAddress/);
   assert.match(stockRoute, /getVisibleDepositAddress/);
   assert.doesNotMatch(rechargeRoute, /getOrCreateUserDepositAddress/);

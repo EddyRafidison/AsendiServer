@@ -86,6 +86,7 @@ const TABLES = [
     identity_document_number VARCHAR(255) NOT NULL COMMENT 'Encrypted national ID card or passport number',
     address VARCHAR(100) NOT NULL,
     seed TEXT NOT NULL,
+    wallet_address CHAR(42) NOT NULL COMMENT 'User-declared fixed BNB Smart Chain wallet; ownership is not cryptographically verified',
     account_active TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT 'Administrative account access switch',
     account_deactivation_reason VARCHAR(1000) NULL,
     account_deactivated_at_ms BIGINT UNSIGNED NULL,
@@ -109,6 +110,7 @@ const TABLES = [
     UNIQUE KEY uq_auths_username(username),
     UNIQUE KEY uq_auths_registration_sequence(registration_sequence),
     UNIQUE KEY uq_auths_email(email),
+    UNIQUE KEY uq_auths_wallet_address(wallet_address),
     KEY idx_auths_first_login_cleanup(last_login_at_ms,created_at_ms),
     KEY idx_auths_welcome_email_hash(welcome_bonus_email_hash),
     KEY idx_auths_welcome_identity_hash(welcome_bonus_identity_hash),
@@ -316,16 +318,6 @@ const TABLES = [
     UNIQUE KEY uq_bsc_fee_tx_hash(tx_hash),
     KEY idx_bsc_fee_operation(operation,created_at_ms)
   ) ENGINE=InnoDB`,
-  `CREATE TABLE IF NOT EXISTS bsc_fee_allocations(
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    tx_hash CHAR(66) NOT NULL,
-    allocation_type VARCHAR(24) NOT NULL,
-    allocation_id BIGINT UNSIGNED NOT NULL,
-    allocated_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
-    created_at_ms BIGINT UNSIGNED NOT NULL,
-    UNIQUE KEY uq_bsc_fee_allocation(tx_hash,allocation_type,allocation_id),
-    KEY idx_bsc_fee_allocation_target(allocation_type,allocation_id,id)
-  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS account_security_action_locks(
     username VARCHAR(30) NOT NULL,
     action VARCHAR(32) NOT NULL,
@@ -400,6 +392,66 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS system_locks(
     lock_name VARCHAR(64) PRIMARY KEY
   ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS bsc_wallet_address_registry(
+    wallet_address_lower CHAR(42) PRIMARY KEY,
+    wallet_address CHAR(42) NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    registered_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_bsc_wallet_registry_username(username)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS bsc_incoming_scan_state(
+    singleton_id TINYINT UNSIGNED PRIMARY KEY,
+    chain_id SMALLINT UNSIGNED NOT NULL,
+    token_contract CHAR(42) NOT NULL,
+    treasury_address CHAR(42) NOT NULL,
+    scan_start_block BIGINT UNSIGNED NOT NULL,
+    last_scanned_block BIGINT UNSIGNED NULL,
+    last_scanned_block_hash CHAR(66) NULL,
+    last_finalized_block BIGINT UNSIGNED NULL,
+    finality_method VARCHAR(16) NOT NULL DEFAULT 'confirmations',
+    health_status VARCHAR(24) NOT NULL DEFAULT 'healthy',
+    last_error TEXT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS bsc_unknown_incoming_transfers(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    token_contract CHAR(42) NOT NULL,
+    from_address CHAR(42) NOT NULL,
+    to_address CHAR(42) NOT NULL,
+    amount DECIMAL(36,18) NOT NULL,
+    amount_raw DECIMAL(65,0) NOT NULL,
+    tx_hash CHAR(66) NOT NULL,
+    log_index INT UNSIGNED NOT NULL,
+    block_number BIGINT UNSIGNED NOT NULL,
+    block_hash CHAR(66) NOT NULL,
+    block_timestamp_ms BIGINT UNSIGNED NOT NULL,
+    previous_username VARCHAR(30) NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending_admin',
+    decision_action VARCHAR(32) NULL,
+    decision_username VARCHAR(30) NULL,
+    decision_reason TEXT NULL,
+    decided_by VARCHAR(64) NULL,
+    decided_at_ms BIGINT UNSIGNED NULL,
+    refund_id BIGINT UNSIGNED NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_bsc_unknown_transfer(tx_hash,log_index),
+    KEY idx_bsc_unknown_status(status,id),
+    KEY idx_bsc_unknown_sender(from_address,block_number)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS bsc_scan_admin_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    admin_username VARCHAR(64) NOT NULL,
+    action VARCHAR(32) NOT NULL,
+    previous_block BIGINT UNSIGNED NULL,
+    previous_block_hash CHAR(66) NULL,
+    resume_after_block BIGINT UNSIGNED NOT NULL,
+    resume_block_hash CHAR(66) NOT NULL,
+    observed_finalized_block BIGINT UNSIGNED NOT NULL,
+    reason TEXT NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_bsc_scan_admin_events_created(created_at_ms,id)
+  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS telegram_link_challenges(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
@@ -432,30 +484,10 @@ const TABLES = [
     state_value BIGINT UNSIGNED NOT NULL DEFAULT 0,
     updated_at_ms BIGINT UNSIGNED NOT NULL
   ) ENGINE=InnoDB`,
-  `CREATE TABLE IF NOT EXISTS users_usdt_deposit_wallets(
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(30) NOT NULL,
-    wallet_address CHAR(42) NOT NULL,
-    payout_address CHAR(42) NULL,
-    derivation_index BIGINT UNSIGNED NOT NULL,
-    created_block BIGINT UNSIGNED NOT NULL,
-    last_scanned_block BIGINT UNSIGNED NOT NULL,
-    created_at_ms BIGINT UNSIGNED NOT NULL,
-    last_sweep_at_ms BIGINT UNSIGNED NULL,
-    sweep_lock_until_ms BIGINT UNSIGNED NOT NULL DEFAULT 0,
-    account_status VARCHAR(16) NOT NULL DEFAULT 'active',
-    UNIQUE KEY uq_usdt_deposit_username(username),
-    UNIQUE KEY uq_usdt_deposit_address(wallet_address),
-    UNIQUE KEY uq_usdt_deposit_payout_address(payout_address),
-    UNIQUE KEY uq_usdt_deposit_derivation_index(derivation_index),
-    KEY idx_usdt_deposit_scan(id,last_scanned_block),
-    KEY idx_usdt_deposit_status(account_status,id)
-  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_deposit_batches(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
-    deposit_wallet_id BIGINT UNSIGNED NOT NULL,
-    deposit_address CHAR(42) NOT NULL,
+    treasury_address CHAR(42) NOT NULL,
     opened_at_ms BIGINT UNSIGNED NOT NULL,
     expires_at_ms BIGINT UNSIGNED NOT NULL,
     total_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
@@ -470,15 +502,13 @@ const TABLES = [
     created_at_ms BIGINT UNSIGNED NOT NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
     KEY idx_deposit_batches_user_status(username,status,id),
-    KEY idx_deposit_batches_due(status,expires_at_ms,release_at_ms,next_attempt_at_ms),
-    KEY idx_deposit_batches_wallet(deposit_wallet_id,opened_at_ms)
+    KEY idx_deposit_batches_due(status,expires_at_ms,release_at_ms,next_attempt_at_ms)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_transfer_events(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
-    deposit_wallet_id BIGINT UNSIGNED NOT NULL,
     batch_id BIGINT UNSIGNED NULL,
-    deposit_address CHAR(42) NOT NULL,
+    treasury_address CHAR(42) NOT NULL,
     from_address CHAR(42) NOT NULL,
     amount DECIMAL(36,18) NOT NULL,
     amount_raw DECIMAL(65,0) NOT NULL,
@@ -489,32 +519,11 @@ const TABLES = [
     block_timestamp_ms BIGINT UNSIGNED NOT NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'detected',
     reason_codes TEXT NULL,
-    swept_at_ms BIGINT UNSIGNED NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     UNIQUE KEY uq_usdt_transfer_event(tx_hash,log_index),
     KEY idx_usdt_transfer_user_status(username,status,id),
     KEY idx_usdt_transfer_batch(batch_id,status,id),
-    KEY idx_usdt_transfer_sweep(deposit_address,swept_at_ms,status),
     KEY idx_usdt_transfer_block(block_number)
-  ) ENGINE=InnoDB`,
-  `CREATE TABLE IF NOT EXISTS users_usdt_sweeps(
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    deposit_wallet_id BIGINT UNSIGNED NOT NULL,
-    deposit_address CHAR(42) NOT NULL,
-    snapshot_block BIGINT UNSIGNED NOT NULL,
-    amount_raw DECIMAL(65,0) NOT NULL,
-    fund_raw_tx LONGTEXT NULL,
-    token_raw_tx LONGTEXT NOT NULL,
-    fund_tx_hash CHAR(66) NULL,
-    token_tx_hash CHAR(66) NOT NULL,
-    status VARCHAR(24) NOT NULL,
-    attempts INT UNSIGNED NOT NULL DEFAULT 0,
-    last_error TEXT NULL,
-    created_at_ms BIGINT UNSIGNED NOT NULL,
-    updated_at_ms BIGINT UNSIGNED NOT NULL,
-    confirmed_at_ms BIGINT UNSIGNED NULL,
-    UNIQUE KEY uq_usdt_sweep_token_hash(token_tx_hash),
-    KEY idx_usdt_sweeps_wallet_status(deposit_wallet_id,status,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_disbursements(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -635,7 +644,8 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS users_usdt_refunds(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
-    batch_id BIGINT UNSIGNED NOT NULL,
+    batch_id BIGINT UNSIGNED NULL,
+    unknown_transfer_id BIGINT UNSIGNED NULL,
     payout_address CHAR(42) NOT NULL,
     amount DECIMAL(36,18) NOT NULL,
     gross_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
@@ -658,6 +668,7 @@ const TABLES = [
     confirmed_at_ms BIGINT UNSIGNED NULL,
     UNIQUE KEY uq_usdt_refund_reference(reference),
     UNIQUE KEY uq_usdt_refund_tx_hash(tx_hash),
+    UNIQUE KEY uq_usdt_refund_unknown_transfer(unknown_transfer_id),
     KEY idx_usdt_refund_batch(batch_id,status,id),
     KEY idx_usdt_refund_status(status,id)
   ) ENGINE=InnoDB`,
@@ -666,6 +677,7 @@ const TABLES = [
     admin_username VARCHAR(64) NOT NULL,
     username VARCHAR(30) NOT NULL,
     batch_id BIGINT UNSIGNED NULL,
+    unknown_transfer_id BIGINT UNSIGNED NULL,
     action VARCHAR(32) NOT NULL,
     initial_asset_amount DECIMAL(50,30) NOT NULL DEFAULT 0,
     gross_amount DECIMAL(36,18) NOT NULL,
@@ -687,7 +699,7 @@ async function assertLatestSchema() {
   const requiredColumns = {
     auths: [
       "username", "registration_sequence", "password", "name", "email", "birthdate", "nationality", "residence_country", "identity_document_type", "identity_document_number", "address",
-      "seed", "account_active", "account_deactivation_reason", "account_deactivated_at_ms", "account_deactivated_by",
+      "seed", "wallet_address", "account_active", "account_deactivation_reason", "account_deactivated_at_ms", "account_deactivated_by",
       "welcome_bonus_status", "welcome_bonus_amount_xtu", "welcome_bonus_initial_asset",
       "welcome_bonus_email_hash", "welcome_bonus_identity_hash", "welcome_bonus_unit_price",
       "welcome_bonus_decided_at_ms", "welcome_bonus_credited_at_ms",
@@ -738,7 +750,6 @@ async function assertLatestSchema() {
       "tx_hash", "operation", "estimated_fee_bnb", "estimated_fee_usd", "bnb_usd_price", "gas_used",
       "effective_gas_price_wei", "actual_fee_bnb", "actual_fee_usd", "created_at_ms", "confirmed_at_ms",
     ],
-    bsc_fee_allocations: ["tx_hash", "allocation_type", "allocation_id", "allocated_fee_usd", "created_at_ms"],
     account_security_action_locks: ["username", "action", "updated_at_ms"],
     account_cleanup_holds: ["username", "reason_codes", "first_detected_at_ms", "last_checked_at_ms"],
     account_access_events: ["username", "action", "reason", "changed_by", "created_at_ms"],
@@ -749,25 +760,20 @@ async function assertLatestSchema() {
     recharge_service_control: ["control_id", "is_suspended", "suspension_reason", "changed_by", "updated_at_ms"],
     recharge_service_control_events: ["action", "previous_suspended", "current_suspended", "reason", "changed_by", "created_at_ms"],
     system_locks: ["lock_name"],
-    users_usdt_deposit_wallets: [
-      "username", "wallet_address", "payout_address", "derivation_index", "created_block",
-      "last_scanned_block", "created_at_ms", "last_sweep_at_ms", "sweep_lock_until_ms", "account_status",
-    ],
+    bsc_wallet_address_registry: ["wallet_address_lower", "wallet_address", "username", "registered_at_ms"],
+    bsc_incoming_scan_state: ["chain_id", "token_contract", "treasury_address", "scan_start_block", "last_scanned_block", "last_scanned_block_hash", "last_finalized_block", "finality_method", "health_status", "last_error", "updated_at_ms"],
+    bsc_scan_admin_events: ["admin_username", "action", "previous_block", "previous_block_hash", "resume_after_block", "resume_block_hash", "observed_finalized_block", "reason", "created_at_ms"],
+    bsc_unknown_incoming_transfers: ["token_contract", "from_address", "to_address", "amount", "amount_raw", "tx_hash", "log_index", "block_number", "block_hash", "block_timestamp_ms", "previous_username", "status", "decision_action", "decision_username", "decision_reason", "decided_by", "decided_at_ms", "refund_id", "created_at_ms", "updated_at_ms"],
     users_usdt_deposit_batches: [
-      "username", "deposit_wallet_id", "deposit_address", "opened_at_ms", "expires_at_ms",
+      "username", "treasury_address", "opened_at_ms", "expires_at_ms",
       "total_amount", "total_amount_raw", "transfer_count", "status", "pending_since_ms",
       "release_at_ms", "next_attempt_at_ms", "reason_codes", "credited_at_ms", "created_at_ms",
       "updated_at_ms",
     ],
     users_usdt_transfer_events: [
-      "username", "deposit_wallet_id", "batch_id", "deposit_address", "from_address", "amount",
+      "username", "batch_id", "treasury_address", "from_address", "amount",
       "amount_raw", "tx_hash", "log_index", "block_number", "block_hash", "block_timestamp_ms",
-      "status", "reason_codes", "swept_at_ms", "created_at_ms",
-    ],
-    users_usdt_sweeps: [
-      "deposit_wallet_id", "deposit_address", "snapshot_block", "amount_raw", "fund_raw_tx",
-      "token_raw_tx", "fund_tx_hash", "token_tx_hash", "status", "attempts", "last_error",
-      "created_at_ms", "updated_at_ms", "confirmed_at_ms",
+      "status", "reason_codes", "created_at_ms",
     ],
     users_usdt_disbursements: [
       "username", "payout_address", "requested_amount", "payout_amount", "amount_raw",
@@ -782,13 +788,13 @@ async function assertLatestSchema() {
     global_disbursement_participants: ["run_id", "username", "snapshot_balance_initial", "requested_initial_asset", "paid_initial_asset", "remaining_initial_asset", "request_count", "last_disbursement_id", "status", "resolution_action", "resolution_reference", "resolution_reason", "resolved_at_ms", "created_at_ms", "updated_at_ms"],
     global_disbursement_email_outbox: ["run_id", "username", "recipient", "subject", "message_text", "status", "attempts", "next_attempt_at_ms", "claimed_at_ms", "last_error", "created_at_ms", "sent_at_ms"],
     users_usdt_refunds: [
-      "username", "batch_id", "payout_address", "amount", "gross_amount", "fee_amount", "amount_raw",
+      "username", "batch_id", "unknown_transfer_id", "payout_address", "amount", "gross_amount", "fee_amount", "amount_raw",
       "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd", "bnb_usd_price",
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number", "last_error",
       "created_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
     admin_payment_resolutions: [
-      "admin_username", "username", "batch_id", "action", "initial_asset_amount", "gross_amount", "fee_amount",
+      "admin_username", "username", "batch_id", "unknown_transfer_id", "action", "initial_asset_amount", "gross_amount", "fee_amount",
       "net_amount", "payout_address", "tx_hash", "reason", "created_at_ms",
     ],
   };
@@ -808,8 +814,8 @@ async function assertLatestSchema() {
   }
 
   const requiredIndexes = {
-    auths: ["uq_auths_email", "uq_auths_registration_sequence", "idx_auths_first_login_cleanup"],
-    users_usdt_deposit_wallets: ["uq_usdt_deposit_payout_address"],
+    auths: ["uq_auths_email", "uq_auths_wallet_address", "uq_auths_registration_sequence", "idx_auths_first_login_cleanup"],
+    bsc_unknown_incoming_transfers: ["uq_bsc_unknown_transfer", "idx_bsc_unknown_status"],
     activities: [
       "idx_activities_sender_id",
       "idx_activities_receiver_id",
@@ -858,8 +864,8 @@ async function initDbIfEmpty() {
     [String(Date.now())],
   );
   await db.queryAsync(
-    "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?),(?),(?)",
-    ["common_state", "deposit_wallet_index", "onex_bsc_disbursement_worker", "onex_bsc_sweeper_global"],
+    "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?)",
+    ["common_state", "onex_bsc_disbursement_worker"],
   );
   await db.queryAsync(
     "INSERT IGNORE INTO telegram_bot_state(state_key,state_value,updated_at_ms) VALUES('update_offset',0,?)",
@@ -986,9 +992,6 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
         ["pending_global_telegram_notice", "SELECT id FROM telegram_outbox WHERE username=? AND event_key LIKE 'global-announcement:%' AND status NOT IN ('sent','skipped','failed') LIMIT 1 FOR UPDATE", [candidate.username]],
         ["price_cycle_state", "SELECT username FROM user_price_state WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
         ["price_cycle_history", "SELECT id FROM user_price_cycle_history WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
-        ["deposit_sweeps", `SELECT s.id FROM users_usdt_sweeps s
-          INNER JOIN users_usdt_deposit_wallets w ON w.id=s.deposit_wallet_id
-          WHERE w.username=? LIMIT 1 FOR UPDATE`, [candidate.username]],
       ];
       for (const [reason, sql, params] of financialChecks) {
         const [rows] = await tx.query(sql, params);
@@ -1009,13 +1012,7 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
         continue;
       }
 
-      // Retain every assigned deposit address permanently; only disable its account association.
-      await tx.query(
-        `UPDATE users_usdt_deposit_wallets
-         SET account_status='deleted',payout_address=NULL
-         WHERE username=?`,
-        [candidate.username],
-      );
+      // Keep the wallet-address registry permanently so the same wallet cannot be reassigned.
       await tx.query("DELETE FROM user_price_state WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM account_security_action_locks WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM account_security_events WHERE username=?", [candidate.username]);

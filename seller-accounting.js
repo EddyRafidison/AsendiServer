@@ -189,11 +189,11 @@ async function queueSellerPayoutBatchesTx(tx) {
   for (let batchIndex = 0; batchIndex < 10; batchIndex += 1) {
     const [rows] = await tx.query(
       `SELECT l.id,l.username,l.payout_pending_initial_asset,l.payout_reserved_initial_asset,
-              l.unit_price,w.payout_address
+              l.unit_price,a.wallet_address AS payout_address
        FROM users_seller_reserve_lots l
-       JOIN users_usdt_deposit_wallets w ON w.username=l.username
+       JOIN auths a ON a.username=l.username
        WHERE l.payout_pending_initial_asset>l.payout_reserved_initial_asset
-         AND w.account_status='active' AND w.payout_address IS NOT NULL AND w.payout_address<>''
+         AND a.account_active=1 AND a.wallet_address IS NOT NULL AND a.wallet_address<>''
        ORDER BY l.activated_at_ms ASC,l.id ASC
        FOR UPDATE`,
     );

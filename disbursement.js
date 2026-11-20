@@ -1298,12 +1298,16 @@ async function markRefundError(db, refundId, error) {
 async function finalizeRefund(db, refundId, receipt) {
   return withTransaction(db, async (tx) => {
     const [preRows] = await tx.query(
-      "SELECT batch_id FROM users_usdt_refunds WHERE id=? LIMIT 1", [refundId],
+      "SELECT batch_id,unknown_transfer_id FROM users_usdt_refunds WHERE id=? LIMIT 1", [refundId],
     );
     if (!preRows.length) throw new Error(`Refund ${refundId} does not exist.`);
     const batchId = preRows[0].batch_id;
-    const [batchRows] = await tx.query(
+    const unknownTransferId = preRows[0].unknown_transfer_id;
+    const [batchRows] = batchId == null ? [[]] : await tx.query(
       "SELECT id,status FROM users_usdt_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [batchId],
+    );
+    const [unknownRows] = unknownTransferId == null ? [[]] : await tx.query(
+      "SELECT id,status FROM bsc_unknown_incoming_transfers WHERE id=? LIMIT 1 FOR UPDATE", [unknownTransferId],
     );
     const [refundRows] = await tx.query(
       "SELECT * FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE", [refundId],
@@ -1320,8 +1324,11 @@ async function finalizeRefund(db, refundId, receipt) {
       "UPDATE users_usdt_refunds SET actual_fee_bnb=?,actual_fee_usd=? WHERE id=?",
       [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), refundId],
     );
-    if (!batchRows.length || batchRows[0].status !== "refund_queued") {
-      const reviewReason = "The refund was confirmed on-chain but its recharge batch is not in refund_queued state.";
+    const sourceIsQueued = batchId != null
+      ? batchRows.length > 0 && batchRows[0].status === "refund_queued"
+      : unknownRows.length > 0 && unknownRows[0].status === "refund_queued";
+    if (!sourceIsQueued) {
+      const reviewReason = "The refund was confirmed on-chain but its source payment is not in refund_queued state.";
       await tx.query(
         "UPDATE users_usdt_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
         [reviewReason, String(Date.now()), refundId],
@@ -1342,20 +1349,32 @@ async function finalizeRefund(db, refundId, receipt) {
        WHERE id=?`,
       [String(receipt.blockNumber), now, now, refundId],
     );
-    await tx.query(
-      "UPDATE users_usdt_deposit_batches SET status='refunded',updated_at_ms=? WHERE id=? AND status='refund_queued'",
-      [now, batchId],
-    );
-    await tx.query(
-      "UPDATE users_usdt_transfer_events SET status='refunded' WHERE batch_id=?",
-      [batchId],
-    );
-    await tx.query(
-      `UPDATE admin_payment_resolutions
-       SET action='refund_confirmed',tx_hash=?
-       WHERE batch_id=? AND action='refund_queued' AND tx_hash IS NULL`,
-      [refund.tx_hash, batchId],
-    );
+    if (batchId != null) {
+      await tx.query(
+        "UPDATE users_usdt_deposit_batches SET status='refunded',updated_at_ms=? WHERE id=? AND status='refund_queued'",
+        [now, batchId],
+      );
+      await tx.query(
+        "UPDATE users_usdt_transfer_events SET status='refunded' WHERE batch_id=?",
+        [batchId],
+      );
+      await tx.query(
+        `UPDATE admin_payment_resolutions
+         SET action='refund_confirmed',tx_hash=?
+         WHERE batch_id=? AND action='refund_queued' AND tx_hash IS NULL`,
+        [refund.tx_hash, batchId],
+      );
+    } else {
+      await tx.query(
+        `UPDATE bsc_unknown_incoming_transfers SET status='refunded',updated_at_ms=? WHERE id=? AND status='refund_queued'`,
+        [now, unknownTransferId],
+      );
+      await tx.query(
+        `UPDATE admin_payment_resolutions SET action='refund_confirmed',tx_hash=?
+         WHERE unknown_transfer_id=? AND action='unknown_refund_queued' AND tx_hash IS NULL`,
+        [refund.tx_hash, unknownTransferId],
+      );
+    }
     await queueTelegramMessageTx(tx, refund.username, `refund:${refundId}:confirmed`, [
       "OneX Refund Update",
       "Your BSC-USD refund has been transferred successfully.",
@@ -1375,7 +1394,7 @@ async function finalizeRefund(db, refundId, receipt) {
 async function markRefundManualReview(db, job, reason) {
   return withTransaction(db, async (tx) => {
     const [refundRows] = await tx.query(
-      "SELECT id,username,batch_id,status FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE",
+      "SELECT id,username,batch_id,unknown_transfer_id,status FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE",
       [job.id],
     );
     if (!refundRows.length || refundRows[0].status !== "queued") return;
@@ -1385,14 +1404,26 @@ async function markRefundManualReview(db, job, reason) {
       "UPDATE users_usdt_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=? AND status='queued'",
       [String(reason).slice(0, 2000), now, job.id],
     );
-    await tx.query(
-      "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=?",
-      [now, refund.batch_id],
-    );
-    await tx.query(
-      "UPDATE admin_payment_resolutions SET action='refund_manual_review',reason=? WHERE batch_id=? AND action='refund_queued'",
-      [String(reason).slice(0, 1000), refund.batch_id],
-    );
+    if (refund.batch_id != null) {
+      await tx.query(
+        "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=?",
+        [now, refund.batch_id],
+      );
+      await tx.query(
+        "UPDATE admin_payment_resolutions SET action='refund_manual_review',reason=? WHERE batch_id=? AND action='refund_queued'",
+        [String(reason).slice(0, 1000), refund.batch_id],
+      );
+    } else if (refund.unknown_transfer_id != null) {
+      await tx.query(
+        `UPDATE bsc_unknown_incoming_transfers SET status='refund_manual_review',updated_at_ms=? WHERE id=?`,
+        [now, refund.unknown_transfer_id],
+      );
+      await tx.query(
+        `UPDATE admin_payment_resolutions SET action='refund_manual_review',reason=?
+         WHERE unknown_transfer_id=? AND action='unknown_refund_queued'`,
+        [String(reason).slice(0, 1000), refund.unknown_transfer_id],
+      );
+    }
     await queueTelegramMessageTx(tx, refund.username, `refund:${job.id}:manual_review`, [
       "OneX Refund Update",
       "The refund requires manual review because its net amount would be below the permitted minimum.",
@@ -1480,12 +1511,19 @@ async function processOneRefundJob(db, job, activeRuntime) {
         gasPriceWei: finalEstimate.gasPrice.toString(),
         bnbUsdPrice: finalEstimate.bnbUsdPrice,
       });
-      await tx.query(
-        `UPDATE admin_payment_resolutions
-         SET fee_amount=?,net_amount=?
-         WHERE batch_id=? AND action='refund_queued'`,
-        [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), job.batch_id],
-      );
+      if (job.batch_id != null) {
+        await tx.query(
+          `UPDATE admin_payment_resolutions SET fee_amount=?,net_amount=?
+           WHERE batch_id=? AND action='refund_queued'`,
+          [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), job.batch_id],
+        );
+      } else {
+        await tx.query(
+          `UPDATE admin_payment_resolutions SET fee_amount=?,net_amount=?
+           WHERE unknown_transfer_id=? AND action='unknown_refund_queued'`,
+          [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), job.unknown_transfer_id],
+        );
+      }
       await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:gas_accepted`, [
         "OneX Refund Update",
         "The estimated BSC network fee is within the permitted limit. Your refund transaction has been signed and queued for blockchain submission.",
@@ -1548,18 +1586,30 @@ async function processOneRefundJob(db, job, activeRuntime) {
         "UPDATE users_usdt_refunds SET status='failed',actual_fee_bnb=?,actual_fee_usd=?,last_error=?,updated_at_ms=? WHERE id=?",
         [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), "The refund transaction was finalized but reverted on BNB Smart Chain.", now, job.id],
       );
-      await tx.query(
-        "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=? AND status='refund_queued'",
-        [now, job.batch_id],
-      );
-      await tx.query(
-        "UPDATE users_usdt_transfer_events SET status='pending_support' WHERE batch_id=?",
-        [job.batch_id],
-      );
-      await tx.query(
-        "UPDATE admin_payment_resolutions SET action='refund_failed' WHERE batch_id=? AND action='refund_queued'",
-        [job.batch_id],
-      );
+      if (job.batch_id != null) {
+        await tx.query(
+          "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=? AND status='refund_queued'",
+          [now, job.batch_id],
+        );
+        await tx.query(
+          "UPDATE users_usdt_transfer_events SET status='pending_support' WHERE batch_id=?",
+          [job.batch_id],
+        );
+        await tx.query(
+          "UPDATE admin_payment_resolutions SET action='refund_failed' WHERE batch_id=? AND action='refund_queued'",
+          [job.batch_id],
+        );
+      } else if (job.unknown_transfer_id != null) {
+        await tx.query(
+          `UPDATE bsc_unknown_incoming_transfers SET status='refund_failed',updated_at_ms=? WHERE id=?`,
+          [now, job.unknown_transfer_id],
+        );
+        await tx.query(
+          `UPDATE admin_payment_resolutions SET action='refund_failed'
+           WHERE unknown_transfer_id=? AND action='unknown_refund_queued'`,
+          [job.unknown_transfer_id],
+        );
+      }
       await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:failed`, [
         "OneX Refund Update",
         "Your refund transaction failed after blockchain finality. The support case has been reopened.",
@@ -1582,14 +1632,26 @@ async function processOneRefundJob(db, job, activeRuntime) {
         "UPDATE users_usdt_refunds SET status='manual_review',actual_fee_bnb=?,actual_fee_usd=?,last_error=?,updated_at_ms=? WHERE id=?",
         [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), "The refund transaction succeeded but did not contain the expected BSC-USD Transfer event.", now, job.id],
       );
-      await tx.query(
-        "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=?",
-        [now, job.batch_id],
-      );
-      await tx.query(
-        "UPDATE admin_payment_resolutions SET action='refund_manual_review' WHERE batch_id=? AND action='refund_queued'",
-        [job.batch_id],
-      );
+      if (job.batch_id != null) {
+        await tx.query(
+          "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=?",
+          [now, job.batch_id],
+        );
+        await tx.query(
+          "UPDATE admin_payment_resolutions SET action='refund_manual_review' WHERE batch_id=? AND action='refund_queued'",
+          [job.batch_id],
+        );
+      } else if (job.unknown_transfer_id != null) {
+        await tx.query(
+          `UPDATE bsc_unknown_incoming_transfers SET status='refund_manual_review',updated_at_ms=? WHERE id=?`,
+          [now, job.unknown_transfer_id],
+        );
+        await tx.query(
+          `UPDATE admin_payment_resolutions SET action='refund_manual_review'
+           WHERE unknown_transfer_id=? AND action='unknown_refund_queued'`,
+          [job.unknown_transfer_id],
+        );
+      }
       await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:manual_review`, [
         "OneX Refund Update",
         "The refund transaction requires manual review because its receipt does not match the expected transfer.",

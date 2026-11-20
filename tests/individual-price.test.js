@@ -6,10 +6,10 @@ const { calculateIndividualTargetPrice } = require("../user-price-accounting");
 
 const fixed = (value) => value.toFixed();
 
-test("individual target B equals A plus twice the applied transfer-fee rate", () => {
-  assert.equal(fixed(calculateIndividualTargetPrice("1.25", "3")), "1.325");
+test("individual target B equals A plus three times the applied transfer-fee rate", () => {
+  assert.equal(fixed(calculateIndividualTargetPrice("1.25", "3")), "1.3625");
   assert.equal(fixed(calculateIndividualTargetPrice("2", "0")), "2");
-  assert.equal(fixed(calculateIndividualTargetPrice("1.125", "2.5")), "1.18125");
+  assert.equal(fixed(calculateIndividualTargetPrice("1.125", "2.5")), "1.209375");
 });
 
 test("individual target calculation rejects invalid price or fee rates", () => {

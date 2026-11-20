@@ -5,7 +5,6 @@ const assert = require("node:assert/strict");
 const {
   MIN_RECHARGE_AMOUNT,
   MAX_RECHARGE_AMOUNT,
-  DEPOSIT_SWEEP_THRESHOLD,
   RECHARGE_BATCH_WINDOW_MINUTES,
   validateRechargeAmount,
   calculateMinimumRechargeCapacity,
@@ -14,7 +13,6 @@ const {
 test("automatic recharge session bounds are fixed at 20 and 100 BSC-USD", () => {
   assert.equal(MIN_RECHARGE_AMOUNT.toFixed(), "20");
   assert.equal(MAX_RECHARGE_AMOUNT.toFixed(), "100");
-  assert.equal(DEPOSIT_SWEEP_THRESHOLD.toFixed(), "100");
   assert.equal(RECHARGE_BATCH_WINDOW_MINUTES, 60);
 });
 
