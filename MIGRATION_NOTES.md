@@ -16,7 +16,7 @@ Cette version définit le schéma cible pour une première mise en production. E
 - L'email fourni à l'inscription est normalisé (suppression des espaces périphériques et minuscules) et rendu unique dans `auths`.
 - L'email envoyé à l'utilisateur contient uniquement son username. Aucun lien ni code de vérification email n'est envoyé ; le mot de passe est choisi pendant l'inscription.
 - `auths.last_login_at_ms` est mis à jour après chaque connexion réussie. Sa valeur NULL indique que le compte n'a jamais été connecté. C'est cette colonne qui remplace l'ancien `auths.status`, évitant de maintenir deux marqueurs de première connexion.
-- `auths.account_active` sépare l'activation administrative du fait d'avoir effectué une première connexion. L'endpoint historique `/admin/set-user-status` conserve son paramètre `status` (0 = désactivé, 1 = actif), mais écrit désormais dans `account_active`.
+- `auths.account_active` est le commutateur de contrôle administratif, distinct de `last_login_at_ms`. `POST /admin/deactivate-account` exige un motif de 5 à 1000 caractères et journalise la désactivation dans `account_access_events`; `POST /admin/activate-account` journalise la réactivation. Ces deux routes utilisent les paramètres administrateur existants `pswd` et `pin`, ainsi que `username` (ou `user`); le motif de réactivation est facultatif. Les comptes désactivés répondent `{ "auths": "deactivated" }` lorsqu'un utilisateur présente le bon mot de passe et ne peuvent effectuer aucune activité authentifiée.
 - `cleanup()` s'exécute au démarrage puis toutes les heures. Il examine les comptes dont `last_login_at_ms IS NULL` et dont l'inscription date d'au moins sept jours. Il verrouille et revérifie chaque compte avant suppression.
 - Un compte avec solde, réserve vendeur, activité financière, recharge, dépôt, demande de paiement, remboursement ou autre historique financier est conservé pour examen dans `account_cleanup_holds`. Aucune trace financière ou blockchain n'est supprimée en cascade.
 - Lorsqu'un compte peut être supprimé sans risque, son adresse de dépôt attribuée reste conservée dans `users_usdt_deposit_wallets` et passe à `account_status='deleted'`. L'adresse et son index de dérivation ne sont jamais réattribués.
@@ -90,7 +90,7 @@ Chaque compte possède une adresse individuelle de dépôt BSC-USD. Les dépôts
 
 ## Rémunération individuelle et campagnes vendeurs
 
-Aucun bonus séparé n'est distribué. Chaque compte possède un prix de référence `A` et un seuil individuel `B` calculé avec le taux `tfees` réellement appliqué à sa dernière acquisition :
+Le crédit de bienvenue optionnel est distinct de la rémunération individuelle. Il est décidé une seule fois lors de la première connexion réussie, pour les premiers comptes inscrits selon `WELCOME_BONUS_BENEFICIARIES` (1000 par défaut, 0 désactive le groupe), à partir d’un compteur transactionnel sans trous conservé après suppression des comptes. `WELCOME_BONUS_AMOUNT_XTU` vaut 0 par défaut et désactive les crédits jusqu'à configuration d'un montant positif. Le résultat (crédité, désactivé, non éligible, déjà crédité à vie, réserve insuffisante ou plafond atteint) est persisté dans `auths`; un crédit réussi est journalisé avec le type d'activité `4` et financé via les réserves distribuables. `WELCOME_BONUS_CLAIM_SECRET` sert à calculer des empreintes HMAC pseudonymisées de l'email et du document d'identité afin d'empêcher un second bonus après suppression/réinscription. Cette clé doit rester stable ; si elle est omise, le mot de passe DB sert de clé de repli. Chaque compte possède également un prix de référence `A` et un seuil individuel `B` calculé avec le taux `tfees` réellement appliqué à sa dernière acquisition :
 
 ```text
 B = A * (1 + 2 * tfees / 100)
@@ -170,7 +170,7 @@ Les fichiers `.env` réels ne doivent jamais être distribués. Fournir uniqueme
 - `npm run check` : contrôle de syntaxe des fichiers JavaScript.
 - `npm test` : tests unitaires des politiques et fonctions comptables.
 - Les tests unitaires ne remplacent pas les tests d'intégration sur une base MySQL neuve, le testnet BSC, les tests SMTP/Telegram et la répétition des scénarios de reprise après redémarrage.
-- Aucun bonus individuel n'est généré ou accumulé. Le seul bonus configuré est le bonus de remboursement automatique réservé au disbursement global.
+- Le bonus de bienvenue est optionnel, ponctuel et distinct du bonus global de disbursement. Le bonus de disbursement global demeure une composante séparée des règlements globaux.
 
 ## API hardening update (2026-11-15)
 

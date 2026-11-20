@@ -74,6 +74,7 @@ db.executeAsync = (sql, params = []) => new Promise((resolve, reject) => {
 const TABLES = [
   `CREATE TABLE IF NOT EXISTS auths(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    registration_sequence BIGINT UNSIGNED NOT NULL,
     username VARCHAR(30) NOT NULL,
     password VARCHAR(255) NOT NULL,
     name VARCHAR(50) NOT NULL,
@@ -86,6 +87,17 @@ const TABLES = [
     address VARCHAR(100) NOT NULL,
     seed TEXT NOT NULL,
     account_active TINYINT UNSIGNED NOT NULL DEFAULT 1 COMMENT 'Administrative account access switch',
+    account_deactivation_reason VARCHAR(1000) NULL,
+    account_deactivated_at_ms BIGINT UNSIGNED NULL,
+    account_deactivated_by VARCHAR(64) NULL,
+    welcome_bonus_status VARCHAR(24) NOT NULL DEFAULT 'pending',
+    welcome_bonus_amount_xtu DECIMAL(36,18) NOT NULL DEFAULT 0,
+    welcome_bonus_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    welcome_bonus_email_hash CHAR(64) NOT NULL,
+    welcome_bonus_identity_hash CHAR(64) NOT NULL,
+    welcome_bonus_unit_price DECIMAL(50,30) NULL,
+    welcome_bonus_decided_at_ms BIGINT UNSIGNED NULL,
+    welcome_bonus_credited_at_ms BIGINT UNSIGNED NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     last_login_at_ms BIGINT UNSIGNED NULL,
     consec_failed_auth INT UNSIGNED NOT NULL DEFAULT 0,
@@ -95,8 +107,11 @@ const TABLES = [
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL,
     UNIQUE KEY uq_auths_username(username),
+    UNIQUE KEY uq_auths_registration_sequence(registration_sequence),
     UNIQUE KEY uq_auths_email(email),
     KEY idx_auths_first_login_cleanup(last_login_at_ms,created_at_ms),
+    KEY idx_auths_welcome_email_hash(welcome_bonus_email_hash),
+    KEY idx_auths_welcome_identity_hash(welcome_bonus_identity_hash),
     UNIQUE KEY uq_auths_tg_user_id(tg_userId),
     UNIQUE KEY uq_auths_tg_chat_id(tg_chat_id),
     KEY idx_auths_failed_auth(consec_failed_auth)
@@ -357,6 +372,30 @@ const TABLES = [
     first_detected_at_ms BIGINT UNSIGNED NOT NULL,
     last_checked_at_ms BIGINT UNSIGNED NOT NULL,
     KEY idx_account_cleanup_holds_checked(last_checked_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS welcome_bonus_claims(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    subject_type ENUM('email','identity') NOT NULL,
+    subject_hash CHAR(64) NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    amount_xtu DECIMAL(36,18) NOT NULL,
+    credited_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_welcome_bonus_subject(subject_type,subject_hash),
+    KEY idx_welcome_bonus_claim_username(username,credited_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS account_registration_counters(
+    counter_name VARCHAR(64) PRIMARY KEY,
+    last_value BIGINT UNSIGNED NOT NULL DEFAULT 0
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS account_access_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(30) NOT NULL,
+    action VARCHAR(24) NOT NULL,
+    reason VARCHAR(1000) NOT NULL,
+    changed_by VARCHAR(64) NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_account_access_events_user(username,id),
+    KEY idx_account_access_events_created(created_at_ms,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS system_locks(
     lock_name VARCHAR(64) PRIMARY KEY
@@ -647,8 +686,12 @@ async function assertLatestSchema() {
   // fail fast unless the database was created from the current schema below.
   const requiredColumns = {
     auths: [
-      "username", "password", "name", "email", "birthdate", "nationality", "residence_country", "identity_document_type", "identity_document_number", "address",
-      "seed", "account_active", "created_at_ms", "last_login_at_ms", "consec_failed_auth", "password_temp_expires_at_ms",
+      "username", "registration_sequence", "password", "name", "email", "birthdate", "nationality", "residence_country", "identity_document_type", "identity_document_number", "address",
+      "seed", "account_active", "account_deactivation_reason", "account_deactivated_at_ms", "account_deactivated_by",
+      "welcome_bonus_status", "welcome_bonus_amount_xtu", "welcome_bonus_initial_asset",
+      "welcome_bonus_email_hash", "welcome_bonus_identity_hash", "welcome_bonus_unit_price",
+      "welcome_bonus_decided_at_ms", "welcome_bonus_credited_at_ms",
+      "created_at_ms", "last_login_at_ms", "consec_failed_auth", "password_temp_expires_at_ms",
       "tg_userId", "tg_chat_id", "record_date", "record_time",
     ],
     users_stock: [
@@ -698,6 +741,9 @@ async function assertLatestSchema() {
     bsc_fee_allocations: ["tx_hash", "allocation_type", "allocation_id", "allocated_fee_usd", "created_at_ms"],
     account_security_action_locks: ["username", "action", "updated_at_ms"],
     account_cleanup_holds: ["username", "reason_codes", "first_detected_at_ms", "last_checked_at_ms"],
+    account_access_events: ["username", "action", "reason", "changed_by", "created_at_ms"],
+    account_registration_counters: ["counter_name", "last_value"],
+    welcome_bonus_claims: ["subject_type", "subject_hash", "username", "amount_xtu", "credited_at_ms"],
     account_security_events: ["username", "action", "outcome", "created_at_ms"],
     account_api_rate_limits: ["username", "action", "window_start_ms", "request_count", "updated_at_ms"],
     recharge_service_control: ["control_id", "is_suspended", "suspension_reason", "changed_by", "updated_at_ms"],
@@ -762,7 +808,7 @@ async function assertLatestSchema() {
   }
 
   const requiredIndexes = {
-    auths: ["uq_auths_email", "idx_auths_first_login_cleanup"],
+    auths: ["uq_auths_email", "uq_auths_registration_sequence", "idx_auths_first_login_cleanup"],
     users_usdt_deposit_wallets: ["uq_usdt_deposit_payout_address"],
     activities: [
       "idx_activities_sender_id",
@@ -872,6 +918,7 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
   const candidates = await db.queryAsync(
     `SELECT username FROM auths
      WHERE last_login_at_ms IS NULL
+       AND account_active=1
        AND created_at_ms<=?
      ORDER BY created_at_ms ASC LIMIT 100`,
     [String(cutoff)],
@@ -889,7 +936,7 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
       await tx.beginTransaction();
 
       const [authRows] = await tx.query(
-        `SELECT username,created_at_ms,last_login_at_ms
+        `SELECT username,created_at_ms,last_login_at_ms,account_active
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
         [candidate.username],
       );
@@ -900,6 +947,7 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
       const auth = authRows[0];
       if (
         auth.last_login_at_ms != null ||
+        Number(auth.account_active) !== 1 ||
         Number(auth.created_at_ms) > cutoff
       ) {
         await tx.query("DELETE FROM account_cleanup_holds WHERE username=?", [candidate.username]);

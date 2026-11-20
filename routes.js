@@ -17,6 +17,7 @@ const {
   calculateRemainingSystemAdminReserve,
   calculateAdminCommonStockUpdate,
   calculateUnreservedDistributableInitialAssets,
+  calculateTopUpReserveAllocation,
 } = require("./stock-accounting");
 const {
   MIN_RECHARGE_AMOUNT,
@@ -135,6 +136,21 @@ const GLOBAL_DISBURSEMENT_REQUEST_WINDOW_DAYS = resolveGlobalDisbursementRequest
 const GLOBAL_DISBURSEMENT_EXTENSION_DAYS = resolveGlobalDisbursementExtensionDays(
   process.env.GLOBAL_DISBURSEMENT_EXTENSION_DAYS,
 );
+const {
+  resolveWelcomeBonusBeneficiaries,
+  resolveWelcomeBonusAmount,
+  createWelcomeBonusSubjectHashes,
+  decideWelcomeBonus,
+} = require("./welcome-bonus-policy");
+const WELCOME_BONUS_BENEFICIARIES = resolveWelcomeBonusBeneficiaries(
+  process.env.WELCOME_BONUS_BENEFICIARIES,
+);
+const WELCOME_BONUS_AMOUNT_XTU = resolveWelcomeBonusAmount(
+  process.env.WELCOME_BONUS_AMOUNT_XTU,
+);
+const WELCOME_BONUS_CLAIM_SECRET = String(
+  process.env.WELCOME_BONUS_CLAIM_SECRET || DB_CONFIG.password || "",
+);
 
 const router = express.Router();
 
@@ -208,7 +224,9 @@ async function getUserActivityPasswordState(username, submittedPassword) {
   if (rows.length === 0) return "incorrect";
 
   const row = rows[0];
-  if (row.last_login_at_ms == null || Number(row.account_active) !== 1) return "not_allowed";
+  if (!(await verifySecret(row.password, submittedPassword))) return "incorrect";
+  if (Number(row.account_active) !== 1) return "deactivated";
+  if (row.last_login_at_ms == null) return "not_allowed";
   // The lock persists after a temporary-password login. Only changing the
   // temporary password clears the marker and restores normal account activity.
   if (isPasswordProtectedActivityLocked({
@@ -216,7 +234,185 @@ async function getUserActivityPasswordState(username, submittedPassword) {
     temporaryPasswordExpiresAtMs: row.password_temp_expires_at_ms,
   })) return "not_allowed";
 
-  return (await verifySecret(row.password, submittedPassword)) ? "ok" : "incorrect";
+  return "ok";
+}
+
+async function applyWelcomeBonusAtFirstLoginTx(tx, authRow, nowMs) {
+  const decision = decideWelcomeBonus({
+    registrationSequence: authRow.registration_sequence,
+    currentStatus: authRow.welcome_bonus_status,
+    beneficiaryLimit: WELCOME_BONUS_BENEFICIARIES,
+    amountXtu: WELCOME_BONUS_AMOUNT_XTU,
+  });
+
+  if (decision.reason === "already_decided") {
+    return {
+      status: decision.status,
+      amount_xtu: String(authRow.welcome_bonus_amount_xtu || "0"),
+      credited: decision.status === "credited",
+    };
+  }
+
+  const configuredAmount = decision.shouldCredit
+    ? WELCOME_BONUS_AMOUNT_XTU
+    : new BigNumber(0);
+  const now = String(nowMs);
+  if (decision.shouldCredit) {
+    const [claimRows] = await tx.query(
+      `SELECT subject_type FROM welcome_bonus_claims
+       WHERE (subject_type='email' AND subject_hash=?)
+          OR (subject_type='identity' AND subject_hash=?)
+       LIMIT 1 FOR UPDATE`,
+      [authRow.welcome_bonus_email_hash, authRow.welcome_bonus_identity_hash],
+    );
+    if (claimRows.length) {
+      await tx.query(
+        `UPDATE auths
+         SET welcome_bonus_status='previously_credited',welcome_bonus_amount_xtu='0',
+             welcome_bonus_initial_asset='0',welcome_bonus_unit_price=NULL,
+             welcome_bonus_decided_at_ms=?,welcome_bonus_credited_at_ms=NULL
+         WHERE id=? AND welcome_bonus_status='pending'`,
+        [now, String(authRow.id)],
+      );
+      return { status: "previously_credited", amount_xtu: "0", credited: false };
+    }
+  }
+  if (!decision.shouldCredit) {
+    await tx.query(
+      `UPDATE auths
+       SET welcome_bonus_status=?,welcome_bonus_amount_xtu=?,welcome_bonus_initial_asset='0',
+           welcome_bonus_unit_price=NULL,welcome_bonus_decided_at_ms=?,welcome_bonus_credited_at_ms=NULL
+       WHERE id=? AND welcome_bonus_status='pending'`,
+      [decision.status, configuredAmount.toFixed(18), now, String(authRow.id)],
+    );
+    return { status: decision.status, amount_xtu: "0", credited: false };
+  }
+
+  const [commonLockRows] = await tx.query(
+    "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
+  );
+  if (!commonLockRows.length) throw new Error("The common-state lock row has not been initialized for welcome bonus credit");
+
+  const common = await getLatestCommonTx(tx, true);
+  const unitPrice = new BigNumber(common.unit_price);
+  const protectedFloor = calculateRemainingSystemAdminReserve(
+    stock_limit,
+    SYSTEM_ADMIN_RESERVE_RATIO,
+    common.sys_inactive_init_asset || "0",
+  ).remainingInitialAsset;
+  if (!unitPrice.isFinite() || !unitPrice.isGreaterThan(0)) {
+    throw new Error("The global XTU price is invalid during welcome bonus credit");
+  }
+
+  const allocation = calculateTopUpReserveAllocation(
+    configuredAmount,
+    unitPrice,
+    common.backed_units,
+    common.inactive_init_asset,
+    common.total_units_price,
+    protectedFloor,
+  );
+  if (!allocation.available) {
+    await tx.query(
+      `UPDATE auths
+       SET welcome_bonus_status='reserve_unavailable',welcome_bonus_amount_xtu=?,
+           welcome_bonus_initial_asset='0',welcome_bonus_unit_price=?,
+           welcome_bonus_decided_at_ms=?,welcome_bonus_credited_at_ms=NULL
+       WHERE id=? AND welcome_bonus_status='pending'`,
+      [configuredAmount.toFixed(18), unitPrice.toFixed(30), now, String(authRow.id)],
+    );
+    return { status: "reserve_unavailable", amount_xtu: "0", credited: false };
+  }
+
+  const [stockRows] = await tx.query(
+    "SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE",
+    [authRow.username],
+  );
+  if (!stockRows.length) throw new Error(`Missing stock row for welcome bonus beneficiary ${authRow.username}`);
+  const currentBalance = new BigNumber(stockRows[0].balance);
+  if (!currentBalance.isFinite() || currentBalance.isNegative()) {
+    throw new Error("Invalid user balance during welcome bonus credit");
+  }
+  const stockLimit = isUserBalanceWithinMaxStock(
+    currentBalance,
+    allocation.activityAmount,
+    allocation.newUnitPrice,
+    maxStockDefault,
+  );
+  if (!stockLimit.allowed) {
+    await tx.query(
+      `UPDATE auths
+       SET welcome_bonus_status='balance_limit',welcome_bonus_amount_xtu=?,
+           welcome_bonus_initial_asset='0',welcome_bonus_unit_price=?,
+           welcome_bonus_decided_at_ms=?,welcome_bonus_credited_at_ms=NULL
+       WHERE id=? AND welcome_bonus_status='pending'`,
+      [configuredAmount.toFixed(18), unitPrice.toFixed(30), now, String(authRow.id)],
+    );
+    return { status: "balance_limit", amount_xtu: "0", credited: false };
+  }
+
+  const [date, time] = getDate();
+  const reference = createFinancialReference("WELCOME");
+  const newBalance = currentBalance.plus(allocation.activityAmount);
+  await tx.query(
+    `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,bsc_fee_cost_usd,reference,record_date,record_time)
+     VALUES(?,?,4,?,?,0,0,?,?,?)`,
+    [OneX, authRow.username, allocation.activityAmount.toFixed(30), unitPrice.toFixed(30), reference, date, time],
+  );
+  await tx.query(
+    "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
+    [newBalance.toFixed(30), date, time, authRow.username],
+  );
+  await insertCommonSnapshotTx(tx, common, {
+    total_units_price: allocation.newTotalUnitsPrice.toFixed(30),
+    backed_units: allocation.newBacked.toFixed(30),
+    inactive_init_asset: allocation.newInactive.toFixed(30),
+  }, date, time);
+
+  const resultingPrice = calculateGlobalUnitPrice(
+    allocation.newTotalUnitsPrice,
+    allocation.newBacked,
+  );
+  await resetUserPriceBasisTx(tx, authRow.username, resultingPrice, tfees);
+  await tx.query(
+    `INSERT INTO welcome_bonus_claims(subject_type,subject_hash,username,amount_xtu,credited_at_ms)
+     VALUES('email',?,?,?,?),('identity',?,?,?,?)`,
+    [
+      authRow.welcome_bonus_email_hash, authRow.username, configuredAmount.toFixed(18), now,
+      authRow.welcome_bonus_identity_hash, authRow.username, configuredAmount.toFixed(18), now,
+    ],
+  );
+  await tx.query(
+    `UPDATE auths
+     SET welcome_bonus_status='credited',welcome_bonus_amount_xtu=?,welcome_bonus_initial_asset=?,
+         welcome_bonus_unit_price=?,welcome_bonus_decided_at_ms=?,welcome_bonus_credited_at_ms=?
+     WHERE id=? AND welcome_bonus_status='pending'`,
+    [
+      configuredAmount.toFixed(18),
+      allocation.activityAmount.toFixed(30),
+      unitPrice.toFixed(30),
+      now,
+      now,
+      String(authRow.id),
+    ],
+  );
+  await queueTelegramMessageTx(
+    tx,
+    authRow.username,
+    `welcome-bonus:${reference}`,
+    [
+      "OneX Welcome Bonus",
+      `Your one-time welcome credit of ${configuredAmount.toFixed(8)} XTU has been added to your balance.`,
+      `Reference: ${reference}`,
+      "Status: SUCCESS",
+    ].join("\n"),
+  );
+  return {
+    status: "credited",
+    amount_xtu: configuredAmount.toFixed(18),
+    credited: true,
+    reference,
+  };
 }
 
 async function verifyUserSeed(username, submittedSeed) {
@@ -244,13 +440,14 @@ async function issueTemporaryPassword(username, email, subject, warningText) {
 
   const reservation = await withTransaction(async (tx) => {
     const [rows] = await tx.query(
-      `SELECT password,password_temp_expires_at_ms,email
+      `SELECT password,password_temp_expires_at_ms,email,account_active
        FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
       [username],
     );
     if (!rows.length) return { ok: false, reason: "account_not_found" };
 
     const row = rows[0];
+    if (Number(row.account_active) !== 1) return { ok: false, reason: "account_deactivated" };
     if (String(row.email || "").trim().toLowerCase() !== normalizedEmail.toLowerCase()) {
       return { ok: false, reason: "email_changed" };
     }
@@ -812,10 +1009,13 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     `SELECT last_login_at_ms,account_active,password,consec_failed_auth,password_temp_expires_at_ms
      FROM auths WHERE username=? FOR UPDATE`, [username],
   );
+  if (authRows.length && Number(authRows[0].account_active) !== 1) {
+    return { auths: "deactivated" };
+  }
   if (authRows.length && (
     Number(authRows[0].consec_failed_auth || 0) >= 3 || authRows[0].password_temp_expires_at_ms != null
   )) return { auth: "not allowed" };
-  if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1 || authRows[0].password !== verifiedPasswordHash) {
+  if (!authRows.length || authRows[0].last_login_at_ms == null || authRows[0].password !== verifiedPasswordHash) {
     return { transf: "failed" };
   }
 
@@ -1624,6 +1824,7 @@ router.post("/app/contact-onex", async (req, res) => {
 
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ status: "error" });
     if (await accountApiLimitReached(res, U, "contact_onex", 3, DAY_MS)) return;
@@ -1738,6 +1939,19 @@ router.post("/app/signup", async (req, res) => {
     return res.status(409).send({ msg: "email already registered" });
   }
   const encryptedIdentityNumber = encrypt(rawIdentityNumber, DB_CONFIG.password);
+  let welcomeBonusSubjectHashes;
+  try {
+    welcomeBonusSubjectHashes = createWelcomeBonusSubjectHashes({
+      email: Email,
+      identityType: identity.identityType,
+      nationality: identity.nationality,
+      identityNumber: rawIdentityNumber,
+      secret: WELCOME_BONUS_CLAIM_SECRET,
+    });
+  } catch (hashError) {
+    console.error("Welcome-bonus lifetime identifier preparation failed:", hashError.message);
+    return res.status(503).send({ msg: "signup temporarily unavailable" });
+  }
   const passwordValue = pswd;
   const seedValue = seed;
   if (encryptedIdentityNumber.length > 255) {
@@ -1810,10 +2024,35 @@ router.post("/app/signup", async (req, res) => {
           await connection.rollback();
           return res.status(423).send({ msg: "signup suspended during global disbursement" });
         }
+        await connection.query(
+          `INSERT IGNORE INTO account_registration_counters(counter_name,last_value)
+           VALUES('registered_users',0)`,
+        );
+        const [registrationCounterRows] = await connection.query(
+          `SELECT last_value FROM account_registration_counters
+           WHERE counter_name='registered_users' LIMIT 1 FOR UPDATE`,
+        );
+        if (!registrationCounterRows.length) throw new Error("The account registration counter was not initialized");
+        const registrationSequence = (BigInt(String(registrationCounterRows[0].last_value)) + 1n).toString();
+        await connection.query(
+          `UPDATE account_registration_counters SET last_value=?
+           WHERE counter_name='registered_users'`,
+          [registrationSequence],
+        );
+
         const createdAtMs = String(Date.now());
         await connection.query(
-          "INSERT INTO auths(username,password,name,email,birthdate,nationality,residence_country,identity_document_type,identity_document_number,address,seed,created_at_ms,last_login_at_ms,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          [U, PWD, Name, Email, Birth, identity.nationality, identity.residenceCountry, identity.identityType, encryptedIdentityNumber, Address, SEED, createdAtMs, null, date, time],
+          `INSERT INTO auths(
+             registration_sequence,username,password,name,email,birthdate,nationality,residence_country,identity_document_type,
+             identity_document_number,address,seed,welcome_bonus_email_hash,welcome_bonus_identity_hash,
+             created_at_ms,last_login_at_ms,record_date,record_time
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            registrationSequence, U, PWD, Name, Email, Birth, identity.nationality, identity.residenceCountry,
+            identity.identityType, encryptedIdentityNumber, Address, SEED,
+            welcomeBonusSubjectHashes.emailHash, welcomeBonusSubjectHashes.identityHash,
+            createdAtMs, null, date, time,
+          ],
         );
         await connection.query(
           "INSERT INTO users_stock(username,balance,record_date,record_time) VALUES(?,?,?,?)",
@@ -1914,9 +2153,30 @@ router.post("/app/signin", async (req, res) => {
   }
 
   try {
+    const bonusSnapshotRows = await db.queryAsync(
+      "SELECT id,registration_sequence,welcome_bonus_status FROM auths WHERE username=? LIMIT 1",
+      [U],
+    );
+    const bonusSnapshot = bonusSnapshotRows[0] || null;
+    const mustLockCommonForBonus = Boolean(
+      bonusSnapshot &&
+      bonusSnapshot.welcome_bonus_status === "pending" &&
+      Number(bonusSnapshot.registration_sequence) <= WELCOME_BONUS_BENEFICIARIES &&
+      WELCOME_BONUS_AMOUNT_XTU.isGreaterThan(0)
+    );
+
     const result = await withTransaction(async (tx) => {
+      if (mustLockCommonForBonus) {
+        const [commonLockRows] = await tx.query(
+          "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
+        );
+        if (!commonLockRows.length) throw new Error("The common-state lock row has not been initialized");
+      }
+
       const [rows] = await tx.query(
-        `SELECT id,password,seed,account_active,consec_failed_auth,password_temp_expires_at_ms,tg_userId,tg_chat_id
+        `SELECT id,registration_sequence,username,password,seed,account_active,welcome_bonus_status,welcome_bonus_amount_xtu,
+                welcome_bonus_email_hash,welcome_bonus_identity_hash,
+                consec_failed_auth,password_temp_expires_at_ms,tg_userId,tg_chat_id
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
         [U],
       );
@@ -1925,13 +2185,15 @@ router.post("/app/signin", async (req, res) => {
       }
 
       const row = rows[0];
-      if (Number(row.account_active) !== 1) {
-        return { response: { msg: "account disabled", ua: "", tg_botLink: null } };
+      const passwordMatches = await verifySecret(row.password, P);
+      if (passwordMatches && Number(row.account_active) !== 1) {
+        return { response: { auths: "deactivated" } };
       }
+
       const authDecision = evaluatePasswordAuthentication({
         failedCount: Number(row.consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: row.password_temp_expires_at_ms,
-        passwordMatches: await verifySecret(row.password, P),
+        passwordMatches,
         nowMs: Date.now(),
       });
 
@@ -1960,6 +2222,7 @@ router.post("/app/signin", async (req, res) => {
       }
 
       const isTemporaryPassword = authDecision.passwordChangeRequired;
+      const welcomeBonus = await applyWelcomeBonusAtFirstLoginTx(tx, row, Date.now());
       if (authDecision.resetFailedAuthCount) {
         await tx.query(
           "UPDATE auths SET consec_failed_auth=0 WHERE username=?",
@@ -1981,6 +2244,7 @@ router.post("/app/signin", async (req, res) => {
           ua: encUA,
           tg_botLink: tgBotLink,
           password_change_required: isTemporaryPassword,
+          welcome_bonus: welcomeBonus,
         },
       };
     });
@@ -2002,6 +2266,7 @@ router.post("/app/user-last-stock", async (req, res) => {
 
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "error" });
     if (await accountApiLimitReached(res, U, "user_last_stock", 60, 60_000)) return;
@@ -2110,6 +2375,7 @@ router.post("/app/recharge", async (req, res) => {
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "not allowed" });
     if (await accountApiLimitReached(res, U, "recharge_info", 10, 60_000)) return;
@@ -2176,9 +2442,14 @@ router.post("/app/recharge/availability", async (req, res) => {
   }
 
   try {
+    const accountRows = await db.queryAsync(
+      "SELECT account_active FROM auths WHERE username=? LIMIT 1",
+      [U],
+    );
+    if (accountRows.length && Number(accountRows[0].account_active) !== 1) {
+      return res.send({ auths: "deactivated" });
+    }
     // This endpoint exposes only the aggregate public indicator, not account data.
-    // The session token is validated above; account eligibility is enforced by
-    // the address-disclosure and actual recharge-credit endpoints.
     const snapshot = await getPublicRechargeAvailability(db, {
       stockLimit,
       adminReserveRatio: SYSTEM_ADMIN_RESERVE_RATIO.toString(),
@@ -2208,6 +2479,7 @@ router.post("/app/recharge/status", async (req, res) => {
   if (id && !/^\d{1,20}$/.test(id)) return res.status(400).send({ transf: "invalid request" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
     if (await accountApiLimitReached(res, U, "recharge_status", 30, 60_000)) return;
@@ -2251,6 +2523,7 @@ router.post("/app/set-payout-address", async (req, res) => {
   }
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
     if (await accountApiLimitReached(res, U, "set_payout_address", 3, DAY_MS)) return;
@@ -2277,7 +2550,8 @@ router.post("/app/set-payout-address", async (req, res) => {
         "SELECT username,last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
         [U],
       );
-      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { auth: "not allowed" };
+      if (authRows.length && Number(authRows[0].account_active) !== 1) return { auths: "deactivated" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null) return { auth: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -2316,6 +2590,7 @@ router.post("/app/join-system-sellers", async (req, res) => {
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "not allowed" });
     if (await accountApiLimitReached(res, U, "join_system_sellers", 3, DAY_MS)) return;
@@ -2337,7 +2612,8 @@ router.post("/app/join-system-sellers", async (req, res) => {
         "SELECT last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
         [U],
       );
-      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { msg: "not allowed" };
+      if (authRows.length && Number(authRows[0].account_active) !== 1) return { auths: "deactivated" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null) return { msg: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -2482,6 +2758,7 @@ router.post("/app/cancel-system-sellers", async (req, res) => {
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ msg: "not allowed" });
     if (await accountApiLimitReached(res, U, "cancel_system_sellers", 3, DAY_MS)) return;
@@ -2490,7 +2767,8 @@ router.post("/app/cancel-system-sellers", async (req, res) => {
         "SELECT last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
         [U],
       );
-      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { msg: "not allowed" };
+      if (authRows.length && Number(authRows[0].account_active) !== 1) return { auths: "deactivated" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null) return { msg: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -2544,6 +2822,7 @@ router.post("/app/transactions-history", async (req, res) => {
 
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ trans: "error" });
     if (await accountApiLimitReached(res, U, "transactions_history", 20, 60_000)) return;
@@ -2713,15 +2992,19 @@ router.post("/app/xtu-transfer", async (req, res) => {
 
       const senderAuth = authByName.get(S);
       const destinationAuth = authByName.get(D);
+      if (
+        (senderAuth && Number(senderAuth.account_active) !== 1) ||
+        (destinationAuth && Number(destinationAuth.account_active) !== 1)
+      ) return { auths: "deactivated" };
       if (senderAuth && (
         Number(senderAuth.consec_failed_auth || 0) >= 3 ||
         senderAuth.password_temp_expires_at_ms != null
       )) return { auth: "not allowed" };
       if (
         !senderAuth ||
-        senderAuth.last_login_at_ms == null || Number(senderAuth.account_active) !== 1 ||
+        senderAuth.last_login_at_ms == null ||
         senderAuth.password !== verifiedPasswordHash ||
-        !destinationAuth || destinationAuth.last_login_at_ms == null || Number(destinationAuth.account_active) !== 1
+        !destinationAuth || destinationAuth.last_login_at_ms == null
       ) {
         return { transf: "failed" };
       }
@@ -2896,7 +3179,7 @@ router.post("/app/xtu-transfer", async (req, res) => {
       return { transf: "sent" };
     });
 
-    if (result?.transf && result.transf !== "sent" && result.auth !== "not allowed") {
+    if (result?.transf && result.transf !== "sent" && result.auth !== "not allowed" && result.auths !== "deactivated") {
       await queueUserTransactionStatus(S, "p2p", "failed", [
         `Your P2P transfer could not be completed: ${String(result.transf).slice(0, 160)}.`,
       ]);
@@ -2926,6 +3209,7 @@ router.post("/app/disbursement/status", async (req, res) => {
 
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ transf: "failed" });
     if (await accountApiLimitReached(res, U, "disbursement_status", 20, 60_000)) return;
@@ -3358,11 +3642,16 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
   try {
     // Perform Argon2 work before opening a transaction so account rows are not locked while hashing.
     const snapshotRows = await db.queryAsync(
-      `SELECT password,password_temp_expires_at_ms,consec_failed_auth
+      `SELECT password,password_temp_expires_at_ms,consec_failed_auth,account_active
        FROM auths WHERE username=? LIMIT 1`,
       [U],
     );
     if (!snapshotRows.length) return res.send({ auth: "incorrect" });
+    const snapshot = snapshotRows[0];
+    const passwordMatches = await verifySecret(snapshot.password, P1);
+    if (Number(snapshot.account_active) !== 1) {
+      return res.send(passwordMatches ? { auths: "deactivated" } : { auth: "incorrect" });
+    }
 
     const successEvents = await db.queryAsync(
       `SELECT id FROM account_security_events
@@ -3372,7 +3661,6 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
     );
     if (successEvents.length) return res.send({ auth: "limit reached" });
 
-    const snapshot = snapshotRows[0];
     const snapshotIsTemporary = snapshot.password_temp_expires_at_ms != null;
     const snapshotNow = Date.now();
     if (Number(snapshot.consec_failed_auth || 0) >= 3 && !snapshotIsTemporary) {
@@ -3385,14 +3673,13 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
       }
     }
 
-    const passwordMatches = await verifySecret(snapshot.password, P1);
     const samePassword = P2 === P1;
     const passwordHash = passwordMatches && !samePassword ? await hashSecret(P2) : null;
 
     const result = await withTransaction(async (tx) => {
       const now = Date.now();
       const [rows] = await tx.query(
-        `SELECT password,password_temp_expires_at_ms,consec_failed_auth
+        `SELECT password,password_temp_expires_at_ms,consec_failed_auth,account_active
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
         [U],
       );
@@ -3404,6 +3691,7 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
       if (!actionDecision.allowed) return { auth: "limit reached" };
 
       const current = rows[0];
+      if (Number(current.account_active) !== 1) return { auths: "deactivated" };
       // Reject a stale credential snapshot rather than applying a result verified against an old password.
       if (current.password !== snapshot.password) return { auth: "incorrect" };
 
@@ -3457,6 +3745,7 @@ router.post("/app/delete-user", async (req, res) => {
   if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
+    if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
     if (await accountApiLimitReached(res, U, "delete_user", 2, DAY_MS)) return;
@@ -3478,7 +3767,8 @@ router.post("/app/delete-user", async (req, res) => {
         "SELECT username,last_login_at_ms,account_active,consec_failed_auth,password_temp_expires_at_ms FROM auths WHERE username=? FOR UPDATE",
         [U],
       );
-      if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { auth: "not allowed" };
+      if (authRows.length && Number(authRows[0].account_active) !== 1) return { auths: "deactivated" };
+      if (!authRows.length || authRows[0].last_login_at_ms == null) return { auth: "not allowed" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(authRows[0].consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: authRows[0].password_temp_expires_at_ms,
@@ -3574,6 +3864,10 @@ router.post("/app/recover-account", async (req, res) => {
 
     const quotaResult = await withTransaction(async (tx) => {
       const now = Date.now();
+      const [accessRows] = await tx.query(
+        "SELECT username FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [U],
+      );
+      if (!accessRows.length) return { allowed: false };
       await lockAccountSecurityActionTx(tx, U, "account_recovery");
       const counts = await getRecentAccountSecurityEventsTx(tx, U, "account_recovery", now);
       if (!evaluateAccountActionLimit("account_recovery", counts).allowed) {
@@ -3586,12 +3880,13 @@ router.post("/app/recover-account", async (req, res) => {
     if (!quotaResult.allowed) return res.send({ auth: "limit reached" });
 
     const rows = await db.queryAsync(
-      "SELECT email,seed FROM auths WHERE username=? LIMIT 1",
+      "SELECT email,seed,account_active FROM auths WHERE username=? LIMIT 1",
       [U],
     );
     if (!rows.length || !(await verifySecret(rows[0].seed, S))) {
       return res.send({ auth: "incorrect" });
     }
+    if (Number(rows[0].account_active) !== 1) return res.send({ auths: "deactivated" });
 
     const issue = await issueTemporaryPassword(
       U,
@@ -3638,11 +3933,16 @@ router.post("/app/modify-seed", async (req, res) => {
   try {
     // Verify and hash outside the transaction to keep MySQL row locks short-lived.
     const snapshotRows = await db.queryAsync(
-      `SELECT password,consec_failed_auth,password_temp_expires_at_ms
+      `SELECT password,consec_failed_auth,password_temp_expires_at_ms,account_active
        FROM auths WHERE username=? LIMIT 1`,
       [U],
     );
     if (!snapshotRows.length) return res.send({ auth: "incorrect" });
+    const snapshot = snapshotRows[0];
+    const passwordMatches = await verifySecret(snapshot.password, P);
+    if (Number(snapshot.account_active) !== 1) {
+      return res.send(passwordMatches ? { auths: "deactivated" } : { auth: "incorrect" });
+    }
 
     const successEvents = await db.queryAsync(
       `SELECT id FROM account_security_events
@@ -3652,19 +3952,17 @@ router.post("/app/modify-seed", async (req, res) => {
     );
     if (successEvents.length) return res.send({ auth: "limit reached" });
 
-    const snapshot = snapshotRows[0];
     if (isPasswordProtectedActivityLocked({
       failedCount: Number(snapshot.consec_failed_auth || 0),
       temporaryPasswordExpiresAtMs: snapshot.password_temp_expires_at_ms,
     })) return res.send({ auth: "not allowed" });
 
-    const passwordMatches = await verifySecret(snapshot.password, P);
     const seedHash = passwordMatches ? await hashSecret(S) : null;
 
     const result = await withTransaction(async (tx) => {
       const now = Date.now();
       const [rows] = await tx.query(
-        `SELECT password,consec_failed_auth,password_temp_expires_at_ms
+        `SELECT password,consec_failed_auth,password_temp_expires_at_ms,account_active
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
         [U],
       );
@@ -3676,6 +3974,7 @@ router.post("/app/modify-seed", async (req, res) => {
       if (!actionDecision.allowed) return { auth: "limit reached" };
 
       const current = rows[0];
+      if (Number(current.account_active) !== 1) return { auths: "deactivated" };
       if (current.password !== snapshot.password) return { auth: "incorrect" };
       if (isPasswordProtectedActivityLocked({
         failedCount: Number(current.consec_failed_auth || 0),
@@ -4324,6 +4623,7 @@ router.post("/admin/send-temp-pswd", async (req, res) => {
         account_not_found: "user not found",
         email_changed: "email changed; retry with the current account email",
         temporary_password_active: "temporary password already active",
+        account_deactivated: "deactivated",
       };
       return res.send({ auth: messages[issue.reason] || "error" });
     }
@@ -4335,26 +4635,86 @@ router.post("/admin/send-temp-pswd", async (req, res) => {
   }
 });
 
-// set-user-access-status
-router.post("/admin/set-user-status", async (req, res) => {
-  const { pswd, pin, user, status } = req.body;
+// Account access changes are always recorded with the administrator-provided reason.
+async function changeAccountAccess(req, res, action) {
+  const { pswd, pin, user, username, reason } = req.body || {};
   if (
     pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
     pin !== decrypt(admin_pin, DB_CONFIG.password)
-  )
-    return res.send({ auth: "incorrect" });
+  ) return res.send({ auth: "incorrect" });
 
-  const U = normalizeUsername(user);
-  const stat = Number(status);
-  if (!U || !Number.isSafeInteger(stat)) return res.status(400).send({ error: "invalid status or user" });
+  const U = normalizeUsername(username || user);
+  const normalizedReason = typeof reason === "string" ? reason.trim() : "";
+  if (!U || U.length > 30) {
+    return res.status(400).send({ auth: "invalid username" });
+  }
+  if (action === "deactivated" && (normalizedReason.length < 5 || normalizedReason.length > 1000)) {
+    return res.status(400).send({ auth: "invalid reason" });
+  }
+  if (action === "activated" && normalizedReason.length > 1000) {
+    return res.status(400).send({ auth: "invalid reason" });
+  }
 
   try {
-    if (stat !== 0 && stat !== 1) return res.status(400).send({ error: "status must be 0 or 1" });
-    const result = await db.queryAsync("UPDATE auths SET account_active=? WHERE username=?", [stat, U]);
-    res.send({ account: result.affectedRows === 1 ? "updated" : "not found", account_active: stat });
-  } catch {
-    res.send({ error: "error" });
+    const result = await withTransaction(async (tx) => {
+      const [authRows] = await tx.query(
+        "SELECT username,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
+        [U],
+      );
+      if (!authRows.length) return { account: "not found" };
+
+      const currentlyActive = Number(authRows[0].account_active) === 1;
+      if (action === "deactivated" && !currentlyActive) {
+        return { account: "already deactivated", account_active: 0 };
+      }
+      if (action === "activated" && currentlyActive) {
+        return { account: "already active", account_active: 1 };
+      }
+
+      const now = String(Date.now());
+      const auditReason = action === "deactivated"
+        ? normalizedReason
+        : (normalizedReason || "Account reactivated by an administrator.");
+      if (action === "deactivated") {
+        await tx.query(
+          `UPDATE auths
+           SET account_active=0,account_deactivation_reason=?,account_deactivated_at_ms=?,account_deactivated_by='admin'
+           WHERE username=? AND account_active=1`,
+          [normalizedReason, now, U],
+        );
+      } else {
+        await tx.query(
+          `UPDATE auths
+           SET account_active=1,account_deactivation_reason=NULL,account_deactivated_at_ms=NULL,account_deactivated_by=NULL
+           WHERE username=? AND account_active=0`,
+          [U],
+        );
+      }
+      await tx.query(
+        `INSERT INTO account_access_events(username,action,reason,changed_by,created_at_ms)
+         VALUES(?,?,?,?,?)`,
+        [U, action, auditReason, "admin", now],
+      );
+      return {
+        account: action,
+        account_active: action === "activated" ? 1 : 0,
+        reason: auditReason,
+        changed_at_ms: Number(now),
+      };
+    });
+    return res.send(result);
+  } catch (error) {
+    console.error(`Account ${action} operation failed:`, error.message);
+    return res.status(500).send({ auth: "error" });
   }
+}
+
+router.post("/admin/deactivate-account", async (req, res) => {
+  return changeAccountAccess(req, res, "deactivated");
+});
+
+router.post("/admin/activate-account", async (req, res) => {
+  return changeAccountAccess(req, res, "activated");
 });
 
 // Admin unlock releases only the seller lot's remaining units; sold units remain in payout settlement.

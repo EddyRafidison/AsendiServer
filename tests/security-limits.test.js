@@ -72,7 +72,9 @@ test("sensitive routes have explicit IP-level limits", () => {
   assert.ok(ROUTE_LIMITS["POST /app/xtu-transfer"].limit > 0);
   assert.ok(ROUTE_LIMITS["POST /app/transactions-history"].limit > 0);
   assert.ok(ROUTE_LIMITS["POST /admin/send-temp-pswd"].limit > 0);
-  assert.ok(ROUTE_LIMITS["POST /admin/set-user-status"].limit > 0);
+  assert.ok(ROUTE_LIMITS["POST /admin/deactivate-account"].limit > 0);
+  assert.ok(ROUTE_LIMITS["POST /admin/activate-account"].limit > 0);
+  assert.equal(ROUTE_LIMITS["POST /admin/set-user-status"], undefined);
   assert.ok(ROUTE_LIMITS["POST /admin/unlock-system-seller"].limit > 0);
 });
 
