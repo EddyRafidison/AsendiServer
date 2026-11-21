@@ -18,9 +18,19 @@ Cette version est destinée à une **base MySQL neuve**. Le projet n'étant pas 
 - Le watcher filtre exclusivement le contrat Binance-Peg BSC-USD approuvé, sur BNB Smart Chain Mainnet (chain ID 56), et les événements BEP-20 `Transfer` dont `to` est la trésorerie.
 - L'utilisateur est identifié par `Transfer.from`, jamais par `transaction.from`.
 - Un transfert n'est crédité automatiquement que si son horodatage de bloc est postérieur à l'inscription du compte, avec arrondi conservateur à la seconde suivante ; les transferts antérieurs ou ambigus sont enregistrés pour examen administratif.
-- Les dépôts de comptes identifiés gardent les règles existantes de sessions de 60 minutes, minimum 20, maximum 100 BSC-USD, plafond de solde 300 XTU, limites hebdomadaires, réserves et contrôle de suspension.
+- Les dépôts de comptes identifiés sont regroupés par sessions de 60 minutes. Le seuil initial est de 20 BSC-USD ; le plafond de 100 BSC-USD ne limite que la première tranche de crédit. Tout reliquat reste en attente et peut être crédité par tranches ultérieures sans nouveau plafond de 100 ni nouveau minimum de 20, sous réserve du plafond de compte de 300 XTU, des réserves, du cooldown hebdomadaire et des contrôles de service.
 - Les transferts dont l'expéditeur n'est pas enregistré dans `auths.wallet_address` sont enregistrés dans `bsc_unknown_incoming_transfers`. Ils ne sont jamais crédités automatiquement. L'administration peut les lister et les résoudre via `/admin/bsc/unknown-transfers/list` et `/admin/bsc/unknown-transfers/resolve` : affectation uniquement si l'adresse correspond exactement au portefeuille d'un compte, conservation sans crédit, ou mise en file d'un remboursement.
 - La contrainte `UNIQUE(tx_hash,log_index)` assure l'idempotence de chaque événement.
+
+## Recharges partielles et reprises
+
+- Chaque session fige le taux `tfees` lors du premier transfert finalisé. Le taux est appliqué séparément à chaque tranche brute effectivement créditée ; aucun gas BSC payé par OneX n'est déduit d'une recharge entrante.
+- `users_usdt_deposit_batches` conserve les montants reçus, crédités, remboursés et restants. `users_usdt_recharge_credits` journalise chaque tranche, son taux `tfees`, son montant brut/net, son prix XTU et sa référence unique.
+- Le premier crédit est limité à 100 BSC-USD au maximum, mais peut être inférieur si le plafond de 300 XTU ou les réserves ne permettent pas davantage. Après la première tranche, le reliquat n'est plus soumis au plafond de 100 ni au minimum initial de 20 BSC-USD.
+- Les reliquats sont conservés sans expiration et traités en FIFO. Les changements de solde du compte les rendent immédiatement éligibles à une nouvelle tentative ; la disponibilité des réserves est également réévaluée périodiquement.
+- `/app/user-last-stock` retourne `has_pending_recharge` sous forme booléenne seulement ; aucun montant ni détail de session n'est exposé par ce champ.
+- Chaque transfert entrant finalisé et reconnu entraîne une notification dans `telegram_outbox` au sein de la transaction SQL qui enregistre le paiement. Le worker Telegram dépile la file toutes les secondes et réessaie les échecs transitoires. La livraison à l'utilisateur nécessite une association Telegram active.
+- Les recharges reçues ne sont pas annulables ordinairement. `/app/recharge/refund-request` enregistre une demande exceptionnelle portant uniquement sur le reliquat non crédité. Le seuil de 200 BSC-USD ou l'approbation administrative d'une urgence sont exigés avant que `/admin/recharge/refund` puisse mettre le remboursement en file.
 
 ## Résilience et reprise du scanner
 

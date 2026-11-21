@@ -16,11 +16,14 @@ test("automatic recharge session bounds are fixed at 20 and 100 BSC-USD", () => 
   assert.equal(RECHARGE_BATCH_WINDOW_MINUTES, 60);
 });
 
-test("the recharge minimum and maximum are inclusive", () => {
+test("the initial recharge minimum is enforced while amounts above 100 remain receivable", () => {
   assert.equal(validateRechargeAmount("20").allowed, true);
   assert.equal(validateRechargeAmount("100").allowed, true);
   assert.equal(validateRechargeAmount("19.999999999999999999").reason, "below_minimum");
-  assert.equal(validateRechargeAmount("100.000000000000000001").reason, "above_maximum");
+  const oversized = validateRechargeAmount("250");
+  assert.equal(oversized.allowed, true);
+  assert.equal(oversized.exceedsInitialCreditLimit, true);
+  assert.equal(oversized.initialCreditLimit.toFixed(), "100");
 });
 
 test("invalid, zero and negative recharge amounts are rejected", () => {
@@ -67,7 +70,7 @@ test("deposit capacity becomes unavailable when the minimum net recharge exceeds
   assert.equal(capacity.projectedBalanceXtu.gt("300"), true);
 });
 
-test("system-funded minimum recharge capacity uses a conservative post-recharge price", () => {
+test("system-funded minimum recharge capacity includes retained tfees in the post-recharge price", () => {
   const capacity = calculateMinimumRechargeCapacity({
     currentBalanceInitialAsset: "280.6",
     totalUnitsPrice: "18000000",
@@ -80,7 +83,7 @@ test("system-funded minimum recharge capacity uses a conservative post-recharge 
     maximumUserXtu: "300",
   });
 
-  assert.equal(capacity.projectionMethod, "conservative_post_recharge_price");
+  assert.equal(capacity.projectionMethod, "retained_tfees_post_recharge_price");
   assert.equal(capacity.projectedUnitPrice.gt("1"), true);
   assert.equal(capacity.allowed, false);
 });

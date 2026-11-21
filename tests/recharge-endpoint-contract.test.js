@@ -30,6 +30,8 @@ test("user-last-stock is the only app endpoint that returns the shared treasury 
   assert.match(stockRoute, /paymentConfig\.treasuryAddress/);
   assert.doesNotMatch(stockRoute, /getOrCreateUserDepositAddress/);
   assert.match(stockRoute, /deposit_addr:\s*depositAddress/);
+  assert.match(stockRoute, /has_pending_recharge:\s*hasPendingRecharge/);
+  assert.match(stockRoute, /SELECT 1 AS pending[\s\S]*remaining_amount>0/);
   assert.match(stockRoute, /getVisibleDepositAddress/);
   assert.doesNotMatch(rechargeRoute, /getOrCreateUserDepositAddress/);
   assert.doesNotMatch(rechargeRoute, /deposit_addr/);
@@ -71,7 +73,7 @@ test("public reserve availability endpoint is authenticated, cached and separate
 
 test("minimum automatic recharge is 20 BSC-USD across validation and API metadata", () => {
   assert.match(rechargePolicySource, /const MIN_RECHARGE_AMOUNT = new BigNumber\("20"\)/);
-  assert.match(routesSource, /below_minimum: "The total received during the 60-minute session is below 20 BSC-USD\."/);
+  assert.match(routesSource, /minimum_not_reached: "The 60-minute session total has not reached the 20 BSC-USD minimum\."/);
   assert.match(routesSource, /minimum_recharge_amount_bsc_usd: MIN_RECHARGE_AMOUNT\.toFixed\(0\)/);
   assert.match(envExample, /^BSC_MAX_TX_FEE_BSC_USD=0\.4$/m);
 });

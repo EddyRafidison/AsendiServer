@@ -492,17 +492,42 @@ const TABLES = [
     expires_at_ms BIGINT UNSIGNED NOT NULL,
     total_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
     total_amount_raw DECIMAL(65,0) NOT NULL DEFAULT 0,
+    credited_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    remaining_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    refunded_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    tfees_rate_percent DECIMAL(20,10) NOT NULL,
     transfer_count INT UNSIGNED NOT NULL DEFAULT 0,
+    credit_sequence INT UNSIGNED NOT NULL DEFAULT 0,
+    minimum_met_at_ms BIGINT UNSIGNED NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'collecting',
     pending_since_ms BIGINT UNSIGNED NULL,
     release_at_ms BIGINT UNSIGNED NULL,
     next_attempt_at_ms BIGINT UNSIGNED NULL,
     reason_codes TEXT NULL,
+    last_credit_at_ms BIGINT UNSIGNED NULL,
     credited_at_ms BIGINT UNSIGNED NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
     KEY idx_deposit_batches_user_status(username,status,id),
-    KEY idx_deposit_batches_due(status,expires_at_ms,release_at_ms,next_attempt_at_ms)
+    KEY idx_deposit_batches_due(status,expires_at_ms,release_at_ms,next_attempt_at_ms),
+    KEY idx_deposit_batches_pending_user(username,status,remaining_amount,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS users_usdt_recharge_credits(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    batch_id BIGINT UNSIGNED NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    credit_sequence INT UNSIGNED NOT NULL,
+    gross_amount DECIMAL(36,18) NOT NULL,
+    tfees_rate_percent DECIMAL(20,10) NOT NULL,
+    fee_amount DECIMAL(36,18) NOT NULL,
+    net_amount DECIMAL(36,18) NOT NULL,
+    credited_initial_asset DECIMAL(50,30) NOT NULL,
+    unit_price DECIMAL(50,30) NOT NULL,
+    financial_reference VARCHAR(64) NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_recharge_credit_sequence(batch_id,credit_sequence),
+    UNIQUE KEY uq_recharge_credit_reference(financial_reference),
+    KEY idx_recharge_credit_user(username,created_at_ms,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_transfer_events(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -672,6 +697,22 @@ const TABLES = [
     KEY idx_usdt_refund_batch(batch_id,status,id),
     KEY idx_usdt_refund_status(status,id)
   ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS user_usdt_refund_requests(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    request_reference VARCHAR(64) NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    batch_id BIGINT UNSIGNED NOT NULL,
+    request_type ENUM('threshold','emergency') NOT NULL,
+    user_reason TEXT NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'pending_admin',
+    admin_username VARCHAR(64) NULL,
+    admin_reason TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    resolved_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_user_usdt_refund_request_reference(request_reference),
+    KEY idx_user_usdt_refund_request_user(username,status,id),
+    KEY idx_user_usdt_refund_request_batch(batch_id,status,id)
+  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS admin_payment_resolutions(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     admin_username VARCHAR(64) NOT NULL,
@@ -766,9 +807,14 @@ async function assertLatestSchema() {
     bsc_unknown_incoming_transfers: ["token_contract", "from_address", "to_address", "amount", "amount_raw", "tx_hash", "log_index", "block_number", "block_hash", "block_timestamp_ms", "previous_username", "status", "decision_action", "decision_username", "decision_reason", "decided_by", "decided_at_ms", "refund_id", "created_at_ms", "updated_at_ms"],
     users_usdt_deposit_batches: [
       "username", "treasury_address", "opened_at_ms", "expires_at_ms",
-      "total_amount", "total_amount_raw", "transfer_count", "status", "pending_since_ms",
-      "release_at_ms", "next_attempt_at_ms", "reason_codes", "credited_at_ms", "created_at_ms",
-      "updated_at_ms",
+      "total_amount", "total_amount_raw", "credited_amount", "remaining_amount", "refunded_amount",
+      "tfees_rate_percent", "transfer_count", "credit_sequence", "minimum_met_at_ms", "status",
+      "pending_since_ms", "release_at_ms", "next_attempt_at_ms", "reason_codes",
+      "last_credit_at_ms", "credited_at_ms", "created_at_ms", "updated_at_ms",
+    ],
+    users_usdt_recharge_credits: [
+      "batch_id", "username", "credit_sequence", "gross_amount", "tfees_rate_percent",
+      "fee_amount", "net_amount", "credited_initial_asset", "unit_price", "financial_reference", "created_at_ms",
     ],
     users_usdt_transfer_events: [
       "username", "batch_id", "treasury_address", "from_address", "amount",
@@ -792,6 +838,10 @@ async function assertLatestSchema() {
       "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd", "bnb_usd_price",
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number", "last_error",
       "created_at_ms", "updated_at_ms", "confirmed_at_ms",
+    ],
+    user_usdt_refund_requests: [
+      "request_reference", "username", "batch_id", "request_type", "user_reason", "status",
+      "admin_username", "admin_reason", "created_at_ms", "resolved_at_ms",
     ],
     admin_payment_resolutions: [
       "admin_username", "username", "batch_id", "unknown_transfer_id", "action", "initial_asset_amount", "gross_amount", "fee_amount",
@@ -825,6 +875,8 @@ async function assertLatestSchema() {
     recharge_service_control_events: ["idx_recharge_control_events_created"],
     users_seller_reserve_lots: ["idx_seller_lot_availability"],
     users_usdt_disbursements: ["idx_usdt_disbursement_reserve_availability"],
+    users_usdt_recharge_credits: ["uq_recharge_credit_sequence", "uq_recharge_credit_reference"],
+    user_usdt_refund_requests: ["uq_user_usdt_refund_request_reference"],
   };
   for (const [table, expected] of Object.entries(requiredIndexes)) {
     const indexes = await db.queryAsync(

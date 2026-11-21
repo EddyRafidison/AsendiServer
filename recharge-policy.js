@@ -4,7 +4,8 @@ const BigNumber = require("bignumber.js");
 const { calculateGlobalUnitPrice, calculateRechargeFundingAllocation } = require("./stock-accounting");
 
 const MAX_DEFAULT_STOCK = "300";
-// Automatic deposit sessions are fixed to the published 20–100 BSC-USD range.
+// The minimum applies to the initial 60-minute deposit session. The 100 BSC-USD
+// maximum limits only its first credit tranche; any remaining balance stays pending.
 const MIN_RECHARGE_AMOUNT = new BigNumber("20");
 const MAX_RECHARGE_AMOUNT = new BigNumber("100");
 const SYSTEM_ADMIN_RESERVE_RATIO = new BigNumber(
@@ -35,10 +36,13 @@ function validateRechargeAmount(amountValue) {
   if (amount.isLessThan(MIN_RECHARGE_AMOUNT)) {
     return { allowed: false, reason: "below_minimum" };
   }
-  if (amount.isGreaterThan(MAX_RECHARGE_AMOUNT)) {
-    return { allowed: false, reason: "above_maximum" };
-  }
-  return { allowed: true, reason: null, amount };
+  return {
+    allowed: true,
+    reason: null,
+    amount,
+    initialCreditLimit: MAX_RECHARGE_AMOUNT,
+    exceedsInitialCreditLimit: amount.isGreaterThan(MAX_RECHARGE_AMOUNT),
+  };
 }
 
 
@@ -46,12 +50,9 @@ function validateRechargeAmount(amountValue) {
  * Determine whether the account can accept one minimum automatic recharge
  * without exceeding its public XTU stock limit.
  *
- * The projected price uses a conservative assumption that the complete gross
- * tfees may be consumed by eligible BSC gas. This is the highest post-recharge
- * price produced by the current recharge accounting formula; actual retained
- * tfees can only lower that projected price. Reserve availability is evaluated
- * without pending payout reservations because this check is about the account
- * stock ceiling, while payout reservations are still enforced by applyUserTopUp.
+ * Incoming recharges have no OneX-paid consolidation gas. All tfees are retained
+ * in the common accounting model. This projection mirrors applyUserTopUp and
+ * includes the resulting tfees in both total valuation and backed initial assets.
  */
 function calculateMinimumRechargeCapacity({
   currentBalanceInitialAsset,
@@ -112,15 +113,18 @@ function calculateMinimumRechargeCapacity({
   let projectedPrice = price;
   let projectionMethod = "current_price_fallback";
   if (allocation.available) {
-    // This models the highest price possible under the current fee policy:
-    // all tfees are consumed by BSC gas, so no fee value is added to reserves.
-    const projectedTotal = total.plus(allocation.systemInitialAsset.multipliedBy(price));
-    const projectedBacked = backed.minus(allocation.consumedBacked);
+    // Incoming recharge tfees are retained by OneX and added to the common valuation.
+    // No BSC gas is deducted from the incoming amount or from the retained tfees.
+    const projectedTotal = total
+      .plus(allocation.systemInitialAsset.multipliedBy(price))
+      .plus(feeAmount);
+    const feeInitialAsset = feeAmount.dividedBy(price);
+    const projectedBacked = backed.minus(allocation.consumedBacked).plus(feeInitialAsset);
     if (!projectedBacked.isGreaterThan(0)) {
       throw new RangeError("The minimum recharge would exhaust common.backed_units");
     }
     projectedPrice = calculateGlobalUnitPrice(projectedTotal, projectedBacked);
-    projectionMethod = "conservative_post_recharge_price";
+    projectionMethod = "retained_tfees_post_recharge_price";
   }
 
   const projectedBalanceXtu = currentBalance.plus(requiredInitialAsset).multipliedBy(projectedPrice);

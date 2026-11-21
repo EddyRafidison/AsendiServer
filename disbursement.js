@@ -34,6 +34,7 @@ const {
   calculateRequiredAdminBonusReserve,
 } = require("./global-disbursement-policy");
 const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
+const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
 
 const INITIAL_STOCK_LIMIT = process.env.STOCK_LIMIT || "18000000";
 
@@ -597,6 +598,7 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
       "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
       [currentBalanceInitial.plus(job.gross_initial_asset).toFixed(30), date, time, username],
     );
+    await markPendingRechargeBatchesDueTx(tx, username);
     const failedAt = String(Date.now());
     await tx.query(
       `UPDATE users_usdt_disbursements

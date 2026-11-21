@@ -4,6 +4,7 @@ const BigNumber = require("bignumber.js");
 
 BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP });
 const { queueTelegramMessageTx } = require("./telegram");
+const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
 
 // The public minimum is expressed in XTU. Stored campaign and reserve amounts
 // are initial assets and are converted using the global price at campaign entry.
@@ -168,6 +169,7 @@ async function consumeSellerReserveTx(tx, requestedInitialAssetValue, reference,
       "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
       [newBalance.toFixed(DB_ASSET_DECIMALS), date, time, item.username],
     );
+    await markPendingRechargeBatchesDueTx(tx, item.username);
     await tx.query(
       "UPDATE users_seller_campaigns SET sold_initial_asset=sold_initial_asset+? WHERE id=? AND status IN ('active','cancel_requested')",
       [item.initialAsset.toFixed(DB_ASSET_DECIMALS), lot.campaign_id],
