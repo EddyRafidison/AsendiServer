@@ -495,6 +495,7 @@ const TABLES = [
     credited_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
     remaining_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
     refunded_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    reserved_refund_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
     tfees_rate_percent DECIMAL(20,10) NOT NULL,
     transfer_count INT UNSIGNED NOT NULL DEFAULT 0,
     credit_sequence INT UNSIGNED NOT NULL DEFAULT 0,
@@ -671,6 +672,7 @@ const TABLES = [
     username VARCHAR(30) NOT NULL,
     batch_id BIGINT UNSIGNED NULL,
     unknown_transfer_id BIGINT UNSIGNED NULL,
+    user_request_id BIGINT UNSIGNED NULL,
     payout_address CHAR(42) NOT NULL,
     amount DECIMAL(36,18) NOT NULL,
     gross_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
@@ -694,6 +696,7 @@ const TABLES = [
     UNIQUE KEY uq_usdt_refund_reference(reference),
     UNIQUE KEY uq_usdt_refund_tx_hash(tx_hash),
     UNIQUE KEY uq_usdt_refund_unknown_transfer(unknown_transfer_id),
+    UNIQUE KEY uq_usdt_refund_user_request(user_request_id),
     KEY idx_usdt_refund_batch(batch_id,status,id),
     KEY idx_usdt_refund_status(status,id)
   ) ENGINE=InnoDB`,
@@ -705,13 +708,40 @@ const TABLES = [
     request_type ENUM('threshold','emergency') NOT NULL,
     user_reason TEXT NOT NULL,
     status VARCHAR(24) NOT NULL DEFAULT 'pending_admin',
+    refund_id BIGINT UNSIGNED NULL,
     admin_username VARCHAR(64) NULL,
     admin_reason TEXT NULL,
+    last_error TEXT NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    approved_at_ms BIGINT UNSIGNED NULL,
     resolved_at_ms BIGINT UNSIGNED NULL,
+    completed_at_ms BIGINT UNSIGNED NULL,
+    failed_at_ms BIGINT UNSIGNED NULL,
     UNIQUE KEY uq_user_usdt_refund_request_reference(request_reference),
+    UNIQUE KEY uq_user_usdt_refund_request_refund(refund_id),
     KEY idx_user_usdt_refund_request_user(username,status,id),
     KEY idx_user_usdt_refund_request_batch(batch_id,status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS user_usdt_refund_request_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    request_id BIGINT UNSIGNED NOT NULL,
+    refund_id BIGINT UNSIGNED NULL,
+    event_key VARCHAR(191) NOT NULL,
+    event_type VARCHAR(32) NOT NULL,
+    actor_type VARCHAR(16) NOT NULL DEFAULT 'system',
+    actor_username VARCHAR(64) NULL,
+    old_status VARCHAR(24) NULL,
+    new_status VARCHAR(24) NULL,
+    reason TEXT NULL,
+    tx_hash CHAR(66) NULL,
+    gross_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    fee_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    net_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_user_refund_request_event_key(event_key),
+    KEY idx_user_refund_request_event_request(request_id,id),
+    KEY idx_user_refund_request_event_refund(refund_id,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS admin_payment_resolutions(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -719,6 +749,8 @@ const TABLES = [
     username VARCHAR(30) NOT NULL,
     batch_id BIGINT UNSIGNED NULL,
     unknown_transfer_id BIGINT UNSIGNED NULL,
+    user_refund_request_id BIGINT UNSIGNED NULL,
+    refund_id BIGINT UNSIGNED NULL,
     action VARCHAR(32) NOT NULL,
     initial_asset_amount DECIMAL(50,30) NOT NULL DEFAULT 0,
     gross_amount DECIMAL(36,18) NOT NULL,
@@ -730,7 +762,8 @@ const TABLES = [
     created_at_ms BIGINT UNSIGNED NOT NULL,
     UNIQUE KEY uq_admin_resolution_tx_hash(tx_hash),
     KEY idx_admin_resolution_batch(batch_id,id),
-    KEY idx_admin_resolution_user(username,id)
+    KEY idx_admin_resolution_user(username,id),
+    KEY idx_admin_resolution_refund(refund_id,id)
   ) ENGINE=InnoDB`,
 ];
 
@@ -807,7 +840,7 @@ async function assertLatestSchema() {
     bsc_unknown_incoming_transfers: ["token_contract", "from_address", "to_address", "amount", "amount_raw", "tx_hash", "log_index", "block_number", "block_hash", "block_timestamp_ms", "previous_username", "status", "decision_action", "decision_username", "decision_reason", "decided_by", "decided_at_ms", "refund_id", "created_at_ms", "updated_at_ms"],
     users_usdt_deposit_batches: [
       "username", "treasury_address", "opened_at_ms", "expires_at_ms",
-      "total_amount", "total_amount_raw", "credited_amount", "remaining_amount", "refunded_amount",
+      "total_amount", "total_amount_raw", "credited_amount", "remaining_amount", "refunded_amount", "reserved_refund_amount",
       "tfees_rate_percent", "transfer_count", "credit_sequence", "minimum_met_at_ms", "status",
       "pending_since_ms", "release_at_ms", "next_attempt_at_ms", "reason_codes",
       "last_credit_at_ms", "credited_at_ms", "created_at_ms", "updated_at_ms",
@@ -834,17 +867,21 @@ async function assertLatestSchema() {
     global_disbursement_participants: ["run_id", "username", "snapshot_balance_initial", "requested_initial_asset", "paid_initial_asset", "remaining_initial_asset", "request_count", "last_disbursement_id", "status", "resolution_action", "resolution_reference", "resolution_reason", "resolved_at_ms", "created_at_ms", "updated_at_ms"],
     global_disbursement_email_outbox: ["run_id", "username", "recipient", "subject", "message_text", "status", "attempts", "next_attempt_at_ms", "claimed_at_ms", "last_error", "created_at_ms", "sent_at_ms"],
     users_usdt_refunds: [
-      "username", "batch_id", "unknown_transfer_id", "payout_address", "amount", "gross_amount", "fee_amount", "amount_raw",
+      "username", "batch_id", "unknown_transfer_id", "user_request_id", "payout_address", "amount", "gross_amount", "fee_amount", "amount_raw",
       "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd", "bnb_usd_price",
       "reference", "status", "raw_tx", "tx_hash", "nonce", "block_number", "last_error",
       "created_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
     user_usdt_refund_requests: [
-      "request_reference", "username", "batch_id", "request_type", "user_reason", "status",
-      "admin_username", "admin_reason", "created_at_ms", "resolved_at_ms",
+      "request_reference", "username", "batch_id", "request_type", "user_reason", "status", "refund_id",
+      "admin_username", "admin_reason", "last_error", "created_at_ms", "updated_at_ms", "approved_at_ms", "resolved_at_ms", "completed_at_ms", "failed_at_ms",
+    ],
+    user_usdt_refund_request_events: [
+      "request_id", "refund_id", "event_key", "event_type", "actor_type", "actor_username", "old_status", "new_status",
+      "reason", "tx_hash", "gross_amount", "fee_amount", "net_amount", "created_at_ms",
     ],
     admin_payment_resolutions: [
-      "admin_username", "username", "batch_id", "unknown_transfer_id", "action", "initial_asset_amount", "gross_amount", "fee_amount",
+      "admin_username", "username", "batch_id", "unknown_transfer_id", "user_refund_request_id", "refund_id", "action", "initial_asset_amount", "gross_amount", "fee_amount",
       "net_amount", "payout_address", "tx_hash", "reason", "created_at_ms",
     ],
   };
@@ -876,7 +913,10 @@ async function assertLatestSchema() {
     users_seller_reserve_lots: ["idx_seller_lot_availability"],
     users_usdt_disbursements: ["idx_usdt_disbursement_reserve_availability"],
     users_usdt_recharge_credits: ["uq_recharge_credit_sequence", "uq_recharge_credit_reference"],
-    user_usdt_refund_requests: ["uq_user_usdt_refund_request_reference"],
+    users_usdt_refunds: ["uq_usdt_refund_user_request"],
+    user_usdt_refund_requests: ["uq_user_usdt_refund_request_reference", "uq_user_usdt_refund_request_refund"],
+    user_usdt_refund_request_events: ["uq_user_refund_request_event_key", "idx_user_refund_request_event_request"],
+    admin_payment_resolutions: ["idx_admin_resolution_refund"],
   };
   for (const [table, expected] of Object.entries(requiredIndexes)) {
     const indexes = await db.queryAsync(

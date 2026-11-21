@@ -116,6 +116,7 @@ const { getPublicRechargeAvailability } = require("./recharge-availability");
 const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
 const { findMaximumRechargeCredit } = require("./recharge-credit-policy");
 const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
+const { recordRefundRequestEventTx } = require("./refund-request-audit");
 const {
   GLOBAL_DISBURSEMENT_NOTICE_MS,
   resolveGlobalDisbursementRequestWindowDays,
@@ -1655,27 +1656,47 @@ async function closeStaleRechargeRefundRequestsTx(tx, batchId, username, remaini
       "The amount already credited to your XTU balance is not refundable under the pending-recharge refund procedure.",
     ].join("\n");
   } else {
-    const threshold = MAX_RECHARGE_AMOUNT.multipliedBy(2);
+    const threshold = MAX_RECHARGE_AMOUNT.multipliedBy(3);
     if (remaining.isLessThan(threshold)) {
       status = "remainder_changed";
-      adminReason = "Automatic recharge credits reduced the uncredited remainder below the 200 BSC-USD threshold before administrative approval. A new emergency request may be submitted if the circumstances qualify.";
+      adminReason = "Automatic recharge credits reduced the uncredited remainder below the 300 BSC-USD threshold before administrative approval. A new emergency request may be submitted if the circumstances qualify.";
       message = [
         "OneX Exceptional Refund Request Update",
         `Automatic crediting changed the uncredited remainder to below ${threshold.toFixed(8)} BSC-USD.`,
-        "The previous threshold-based refund request has been closed because its 200 BSC-USD eligibility condition is no longer met.",
+        "The previous threshold-based refund request has been closed because its 300 BSC-USD eligibility condition is no longer met.",
         "If a genuine emergency applies, you may submit a new exceptional request with its reason; an emergency refund still requires explicit administrative approval.",
         "The pending recharge itself has not been cancelled and automatic credit processing continues.",
       ].join("\n");
     }
   }
   if (!status) return 0;
+  const [requestRows] = await tx.query(
+    `SELECT id,status FROM user_usdt_refund_requests
+     WHERE batch_id=? AND status='pending_admin'
+       AND (?='auto_closed' OR request_type='threshold') FOR UPDATE`,
+    [String(batchId), status],
+  );
+  if (!requestRows.length) return 0;
   const [result] = await tx.query(
     `UPDATE user_usdt_refund_requests
-     SET status=?,admin_reason=?,resolved_at_ms=?
+     SET status=?,admin_reason=?,resolved_at_ms=?,updated_at_ms=?
      WHERE batch_id=? AND status='pending_admin'
        AND (?='auto_closed' OR request_type='threshold')`,
-    [status, adminReason, now, String(batchId), status],
+    [status, adminReason, now, now, String(batchId), status],
   );
+  for (const request of requestRows) {
+    await recordRefundRequestEventTx(tx, {
+      requestId: request.id,
+      eventKey: `refund-request:${request.id}:${status}`,
+      eventType: status,
+      actorType: "system",
+      oldStatus: request.status,
+      newStatus: status,
+      reason: adminReason,
+      grossAmount: remaining.toFixed(18),
+      createdAtMs: now,
+    });
+  }
   if (Number(result.affectedRows || 0) > 0) {
     await queueTelegramMessageTx(tx, username,
       `recharge-refund-request:batch:${batchId}:${status}:${now}`, message);
@@ -1727,7 +1748,9 @@ async function processOneRechargeBatch(batchId) {
     const totalAmount = new BigNumber(batch.total_amount || "0");
     const creditedBefore = new BigNumber(batch.credited_amount || "0");
     const refundedBefore = new BigNumber(batch.refunded_amount || "0");
-    let remainingAmount = new BigNumber(batch.remaining_amount || totalAmount.minus(creditedBefore).minus(refundedBefore));
+    let remainingAmount = new BigNumber(batch.remaining_amount == null
+      ? totalAmount.minus(creditedBefore).minus(refundedBefore).minus(batch.reserved_refund_amount || "0")
+      : batch.remaining_amount);
     if (![totalAmount, creditedBefore, refundedBefore, remainingAmount].every((value) => value.isFinite() && !value.isNegative())) {
       throw new Error(`Recharge batch ${batchId} contains invalid cumulative amounts`);
     }
@@ -2908,7 +2931,7 @@ router.post("/app/recharge/refund-request", async (req, res) => {
 
     const result = await withTransaction(async (tx) => {
       const [batchRows] = await tx.query(
-        `SELECT id,username,status,remaining_amount,credited_amount,refunded_amount,total_amount
+        `SELECT id,username,status,remaining_amount,credited_amount,refunded_amount,reserved_refund_amount,total_amount
          FROM users_usdt_deposit_batches
          WHERE id=? AND username=? LIMIT 1 FOR UPDATE`,
         [batchId, U],
@@ -2921,14 +2944,14 @@ router.post("/app/recharge/refund-request", async (req, res) => {
       if (!eligibleStatuses.has(String(batch.status))) {
         return { transf: "recharge is not eligible for an exceptional refund request" };
       }
-      const remaining = new BigNumber(batch.remaining_amount || new BigNumber(batch.total_amount)
-        .minus(batch.credited_amount || 0).minus(batch.refunded_amount || 0));
+      const remaining = new BigNumber(batch.remaining_amount == null ? new BigNumber(batch.total_amount)
+        .minus(batch.credited_amount || 0).minus(batch.refunded_amount || 0).minus(batch.reserved_refund_amount || 0) : batch.remaining_amount);
       if (!remaining.isFinite() || !remaining.isGreaterThan(0)) {
         return { transf: "no uncredited recharge remainder" };
       }
       const [existingRows] = await tx.query(
         `SELECT id,request_reference,status FROM user_usdt_refund_requests
-         WHERE batch_id=? AND status IN ('pending_admin','approved_queued')
+         WHERE batch_id=? AND status IN ('pending_admin','approved_queued','signed','submitted','manual_review')
          ORDER BY id DESC LIMIT 1 FOR UPDATE`,
         [batchId],
       );
@@ -2940,16 +2963,27 @@ router.post("/app/recharge/refund-request", async (req, res) => {
           status: existingRows[0].status,
         };
       }
-      const threshold = MAX_RECHARGE_AMOUNT.multipliedBy(2);
+      const threshold = MAX_RECHARGE_AMOUNT.multipliedBy(3);
       const requestType = remaining.gte(threshold) ? "threshold" : "emergency";
       const requestReference = createFinancialReference(`URF${U}`);
       const now = String(Date.now());
       const [insertResult] = await tx.query(
         `INSERT INTO user_usdt_refund_requests
-         (request_reference,username,batch_id,request_type,user_reason,status,created_at_ms)
-         VALUES(?,?,?,?,?,'pending_admin',?)`,
-        [requestReference, U, batchId, requestType, userReason, now],
+         (request_reference,username,batch_id,request_type,user_reason,status,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,?,'pending_admin',?,?)`,
+        [requestReference, U, batchId, requestType, userReason, now, now],
       );
+      await recordRefundRequestEventTx(tx, {
+        requestId: insertResult.insertId,
+        eventKey: `refund-request:${insertResult.insertId}:submitted`,
+        eventType: "user_submitted",
+        actorType: "user",
+        actorUsername: U,
+        newStatus: "pending_admin",
+        reason: userReason,
+        grossAmount: remaining.toFixed(18),
+        createdAtMs: now,
+      });
       await queueTelegramMessageTx(tx, U, `recharge-refund-request:${insertResult.insertId}:submitted`, [
         "OneX Exceptional Recharge Refund Request",
         "Your request has been recorded for administrative review. It is not yet approved and no refund transaction has been created.",
@@ -3748,7 +3782,7 @@ router.post("/admin/recharge/credit", async (req, res) => {
   try {
     const result = await withTransaction(async (tx) => {
       const [batchRows] = await tx.query(
-        `SELECT id,username,total_amount,credited_amount,remaining_amount,refunded_amount,
+        `SELECT id,username,total_amount,credited_amount,remaining_amount,refunded_amount,reserved_refund_amount,
                 tfees_rate_percent,credit_sequence,status
          FROM users_usdt_deposit_batches
          WHERE id=? AND username=? LIMIT 1 FOR UPDATE`,
@@ -3775,7 +3809,7 @@ router.post("/admin/recharge/credit", async (req, res) => {
       if (refundRows.length) return { transf: "refund operation is unresolved" };
 
       const creditedBefore = new BigNumber(batch.credited_amount || "0");
-      const remainingBefore = new BigNumber(batch.remaining_amount || new BigNumber(batch.total_amount).minus(creditedBefore).minus(batch.refunded_amount || 0));
+      const remainingBefore = new BigNumber(batch.remaining_amount || new BigNumber(batch.total_amount).minus(creditedBefore).minus(batch.refunded_amount || 0).minus(batch.reserved_refund_amount || 0));
       if (!remainingBefore.isFinite() || !remainingBefore.isGreaterThan(0) ||
           !creditedBefore.isFinite() || creditedBefore.isNegative()) {
         return { transf: "no remaining recharge amount to credit" };
@@ -4092,8 +4126,9 @@ router.post("/admin/recharge/refund", async (req, res) => {
     }
     const snapshotRows = await db.queryAsync(
       `SELECT r.id AS request_id,r.request_reference,r.request_type,r.status AS request_status,
-              b.id AS batch_id,b.username,b.total_amount,b.credited_amount,b.remaining_amount,b.refunded_amount,
-              b.status AS batch_status,a.wallet_address AS payout_address
+              b.id AS batch_id,b.username,b.total_amount,b.credited_amount,b.remaining_amount,
+              b.refunded_amount,b.reserved_refund_amount,b.status AS batch_status,
+              a.wallet_address AS payout_address,a.account_active
        FROM user_usdt_refund_requests r
        JOIN users_usdt_deposit_batches b ON b.id=r.batch_id AND b.username=r.username
        JOIN auths a ON a.username=b.username
@@ -4107,21 +4142,24 @@ router.post("/admin/recharge/refund", async (req, res) => {
       "pending_minimum", "pending_credit", "pending_weekly", "pending_reserve", "pending_support", "pending_global",
     ]);
     if (!eligibleStatuses.has(String(snapshot.batch_status))) return res.send({ transf: "batch not refundable in its current state" });
+    if (Number(snapshot.account_active) !== 1) return res.send({ transf: "account unavailable" });
     if (!isEvmAddress(snapshot.payout_address) || /^0x0{40}$/i.test(snapshot.payout_address) ||
         String(snapshot.payout_address).toLowerCase() === String(process.env.USDT_BEP20_TREASURY_ADDRESS || "").toLowerCase()) {
       return res.send({ transf: "payout wallet not registered" });
     }
 
-    const remaining = new BigNumber(snapshot.remaining_amount || new BigNumber(snapshot.total_amount)
-      .minus(snapshot.credited_amount || 0).minus(snapshot.refunded_amount || 0));
+    const remaining = new BigNumber(snapshot.remaining_amount == null
+      ? new BigNumber(snapshot.total_amount).minus(snapshot.credited_amount || 0)
+        .minus(snapshot.refunded_amount || 0).minus(snapshot.reserved_refund_amount || 0)
+      : snapshot.remaining_amount);
     if (!remaining.isFinite() || !remaining.isGreaterThan(0)) return res.send({ transf: "no uncredited pending amount to refund" });
-    const exceptionalThreshold = MAX_RECHARGE_AMOUNT.multipliedBy(2);
+    const exceptionalThreshold = MAX_RECHARGE_AMOUNT.multipliedBy(3);
     const thresholdEligible = remaining.gte(exceptionalThreshold);
     const emergencyEligible = snapshot.request_type === "emergency" && emergency_approved === true;
     if (!thresholdEligible && !emergencyEligible) {
       return res.send({
         transf: "refund not eligible",
-        reason: "A user-requested remainder of at least twice the initial credit limit, or a separately approved emergency request, is required.",
+        reason: "A user-requested remainder of at least three times the initial credit limit, or a separately approved emergency request, is required.",
         required_remainder: exceptionalThreshold.toFixed(18),
       });
     }
@@ -4144,25 +4182,42 @@ router.post("/admin/recharge/refund", async (req, res) => {
       const [requestRows] = await tx.query(
         "SELECT * FROM user_usdt_refund_requests WHERE id=? LIMIT 1 FOR UPDATE", [requestId],
       );
-      const [walletRows] = await tx.query(
-        "SELECT wallet_address,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [snapshot.username],
-      );
+      if (!requestRows.length || requestRows[0].status !== "pending_admin") {
+        return { transf: "refund request already resolved" };
+      }
+      const request = requestRows[0];
       const [batchRows] = await tx.query(
-        `SELECT id,username,total_amount,credited_amount,remaining_amount,refunded_amount,status
+        `SELECT id,username,total_amount,credited_amount,remaining_amount,refunded_amount,
+                reserved_refund_amount,status
          FROM users_usdt_deposit_batches WHERE id=? AND username=? LIMIT 1 FOR UPDATE`,
         [snapshot.batch_id, snapshot.username],
       );
-      if (!requestRows.length || requestRows[0].status !== "pending_admin") return { transf: "refund request already resolved" };
-      if (!batchRows.length || !eligibleStatuses.has(String(batchRows[0].status))) return { transf: "batch not refundable in its current state" };
+      const [walletRows] = await tx.query(
+        "SELECT wallet_address,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
+        [snapshot.username],
+      );
+      if (!batchRows.length || !eligibleStatuses.has(String(batchRows[0].status))) {
+        return { transf: "batch not refundable in its current state" };
+      }
       const lockedBatch = batchRows[0];
-      const lockedRemaining = new BigNumber(lockedBatch.remaining_amount || new BigNumber(lockedBatch.total_amount)
-        .minus(lockedBatch.credited_amount || 0).minus(lockedBatch.refunded_amount || 0));
+      const lockedRemaining = new BigNumber(lockedBatch.remaining_amount == null
+        ? new BigNumber(lockedBatch.total_amount).minus(lockedBatch.credited_amount || 0)
+          .minus(lockedBatch.refunded_amount || 0).minus(lockedBatch.reserved_refund_amount || 0)
+        : lockedBatch.remaining_amount);
+      const lockedReserved = new BigNumber(lockedBatch.reserved_refund_amount || "0");
       if (!lockedRemaining.isFinite() || !lockedRemaining.eq(remaining) || !lockedRemaining.isGreaterThan(0)) {
         return { transf: "pending amount changed; refresh and review again" };
       }
       if (!walletRows.length || Number(walletRows[0].account_active) !== 1 ||
           String(walletRows[0].wallet_address || "").toLowerCase() !== String(snapshot.payout_address).toLowerCase()) {
         return { transf: "payout wallet changed or account unavailable" };
+      }
+      const [existingRequestRefundRows] = await tx.query(
+        "SELECT id,status FROM users_usdt_refunds WHERE user_request_id=? LIMIT 1 FOR UPDATE",
+        [requestId],
+      );
+      if (existingRequestRefundRows.length) {
+        return { transf: "this user request already has a refund record", refund_id: String(existingRequestRefundRows[0].id) };
       }
       const [existingRows] = await tx.query(
         "SELECT id FROM users_usdt_refunds WHERE batch_id=? AND status IN ('queued','signed','submitted','confirmed','manual_review') LIMIT 1 FOR UPDATE",
@@ -4174,51 +4229,75 @@ router.post("/admin/recharge/refund", async (req, res) => {
       const now = String(Date.now());
       const [refundInsert] = await tx.query(
         `INSERT INTO users_usdt_refunds
-         (username,batch_id,payout_address,amount,gross_amount,fee_amount,amount_raw,estimated_fee_bnb,estimated_fee_usd,bnb_usd_price,reference,status,created_at_ms,updated_at_ms)
-         VALUES(?,?,?,?,?,0,?,0,0,0,?,'queued',?,?)`,
-        [snapshot.username, snapshot.batch_id, snapshot.payout_address, remaining.toFixed(18), remaining.toFixed(18), grossRaw.toFixed(0), reference, now, now],
+         (username,batch_id,user_request_id,payout_address,amount,gross_amount,fee_amount,amount_raw,
+          estimated_fee_bnb,estimated_fee_usd,bnb_usd_price,reference,status,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,?,?,0,?,0,0,0,?,'queued',?,?)`,
+        [snapshot.username, snapshot.batch_id, requestId, snapshot.payout_address,
+          remaining.toFixed(18), remaining.toFixed(18), grossRaw.toFixed(0), reference, now, now],
       );
+      const refundId = String(refundInsert.insertId);
       const [batchUpdate] = await tx.query(
         `UPDATE users_usdt_deposit_batches
-         SET refunded_amount=refunded_amount+?,remaining_amount=0,status='refund_queued',
-             reason_codes=NULL,next_attempt_at_ms=NULL,updated_at_ms=?
-         WHERE id=? AND remaining_amount=? AND status=?`,
-        [remaining.toFixed(18), now, snapshot.batch_id, remaining.toFixed(18), lockedBatch.status],
+         SET reserved_refund_amount=reserved_refund_amount+?,remaining_amount=remaining_amount-?,
+             status='refund_queued',reason_codes=NULL,next_attempt_at_ms=NULL,updated_at_ms=?
+         WHERE id=? AND remaining_amount=? AND reserved_refund_amount=? AND status=?`,
+        [remaining.toFixed(18), remaining.toFixed(18), now, snapshot.batch_id,
+          lockedRemaining.toFixed(18), lockedReserved.toFixed(18), lockedBatch.status],
       );
-      if (Number(batchUpdate.affectedRows || 0) !== 1) throw new Error("Recharge batch changed while queuing its refund");
+      if (Number(batchUpdate.affectedRows || 0) !== 1) throw new Error("Recharge batch changed while reserving its refund");
       const [requestUpdate] = await tx.query(
         `UPDATE user_usdt_refund_requests
-         SET status='approved_queued',admin_username='configured_admin',admin_reason=?,resolved_at_ms=?
-         WHERE id=? AND status='pending_admin'`,
-        [resolutionReason, now, requestId],
+         SET status='approved_queued',refund_id=?,admin_username='configured_admin',admin_reason=?,
+             approved_at_ms=?,updated_at_ms=?,resolved_at_ms=NULL,last_error=NULL
+         WHERE id=? AND status='pending_admin' AND refund_id IS NULL`,
+        [refundId, resolutionReason, now, now, requestId],
       );
       if (Number(requestUpdate.affectedRows || 0) !== 1) throw new Error("Refund request changed while approving it");
       await tx.query(
-        "UPDATE users_usdt_transfer_events SET status='refund_queued' WHERE batch_id=? AND status NOT IN ('refunded','refund_confirmed')",
+        "UPDATE users_usdt_transfer_events SET status='refund_queued' WHERE batch_id=? AND status NOT IN ('refunded','refund_confirmed','ignored')",
         [snapshot.batch_id],
       );
-      const adminReason = `${resolutionReason} | user_request=${snapshot.request_reference} | request_type=${snapshot.request_type} | threshold=${thresholdEligible} | emergency_approved=${emergencyEligible}`;
+      const adminReason = `${resolutionReason} | user_request=${snapshot.request_reference} | request_type=${snapshot.request_type} | threshold_eligible=${thresholdEligible} | emergency_approved=${emergencyEligible}`;
       await tx.query(
         `INSERT INTO admin_payment_resolutions
-         (admin_username,username,batch_id,action,gross_amount,fee_amount,net_amount,payout_address,tx_hash,reason,created_at_ms)
-         VALUES('configured_admin',?,?,'refund_queued',?,0,?, ?,NULL,?,?)`,
-        [snapshot.username, snapshot.batch_id, remaining.toFixed(18), remaining.toFixed(18), snapshot.payout_address, adminReason, now],
+         (admin_username,username,batch_id,user_refund_request_id,refund_id,action,gross_amount,fee_amount,
+          net_amount,payout_address,tx_hash,reason,created_at_ms)
+         VALUES('configured_admin',?,?,?,?,'refund_queued',?,0,?, ?,NULL,?,?)`,
+        [snapshot.username, snapshot.batch_id, requestId, refundId, remaining.toFixed(18),
+          remaining.toFixed(18), snapshot.payout_address, adminReason, now],
       );
-      await queueTelegramMessageTx(tx, snapshot.username, `refund:${refundInsert.insertId}:queued`, [
+      await recordRefundRequestEventTx(tx, {
+        requestId,
+        refundId,
+        eventKey: `refund-request:${requestId}:approved:${refundId}`,
+        eventType: "admin_approved",
+        actorType: "admin",
+        actorUsername: "configured_admin",
+        oldStatus: "pending_admin",
+        newStatus: "approved_queued",
+        reason: adminReason,
+        grossAmount: remaining.toFixed(18),
+        netAmount: remaining.toFixed(18),
+        createdAtMs: now,
+      });
+      await queueTelegramMessageTx(tx, snapshot.username, `refund:${refundId}:queued`, [
         "OneX Refund Update",
-        "An exceptional refund of the uncredited pending recharge remainder has been approved and queued.",
-        `Uncredited gross amount: ${remaining.toFixed(8)} BSC-USD`,
+        "An exceptional refund of the uncredited pending recharge remainder has been approved and reserved.",
+        `Uncredited gross amount reserved: ${remaining.toFixed(8)} BSC-USD`,
         `Maximum permitted estimated gas recovery: ${maximumGasRecovery.toFixed(8)} BSC-USD`,
-        "The outgoing BSC gas estimate will be deducted from this refund by the payout worker. The amount already credited to your XTU balance is not included.",
-        `Refund ID: ${refundInsert.insertId}`,
+        "The reserved amount is not counted as refunded until the BSC-USD transfer is confirmed on BNB Smart Chain.",
+        "The outgoing BSC gas estimate will be deducted from the refund by the payout worker. The amount already credited to your XTU balance is not included.",
+        `Refund ID: ${refundId}`,
         `Destination: ${snapshot.payout_address}`,
         `User request reference: ${snapshot.request_reference}`,
         "Status: QUEUED",
       ].join("\n"));
       return {
         transf: "refund_processing",
-        refund_id: String(refundInsert.insertId),
+        refund_id: refundId,
         gross_amount: remaining.toFixed(18),
+        reserved_amount: remaining.toFixed(18),
+        refunded_amount: "0",
         maximum_gas_recovery: maximumGasRecovery.toFixed(18),
         payout_address: snapshot.payout_address,
         credited_amount_preserved: String(lockedBatch.credited_amount || "0"),
@@ -5638,6 +5717,171 @@ router.post("/admin/unlock-system-seller", async (req, res) => {
   } catch (error) {
     console.error("Admin seller unlock failed:", error.message);
     return res.send({ auth: "error" });
+  }
+});
+
+// Administrative account and financial overview. Sensitive authentication secrets are never returned.
+router.post("/admin/user-info", async (req, res) => {
+  const { pswd, pin, username, user } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ auth: "incorrect" });
+
+  const U = normalizeUsername(username ?? user);
+  if (!U || U === OneX) return res.status(400).send({ error: "invalid user" });
+
+  try {
+    const [accountRows, stockRows, commonRows, rechargeRows, disbursementRows, refundRequestRows, refundRows, sellerPayoutRows] = await Promise.all([
+      db.queryAsync(
+        `SELECT username,name,email,birthdate,wallet_address,account_active,account_deactivation_reason,
+                account_deactivated_at_ms,account_deactivated_by,created_at_ms,last_login_at_ms
+         FROM auths WHERE username=? LIMIT 1`, [U],
+      ),
+      db.queryAsync(
+        "SELECT balance,run_balance,seller_status,seller_activated_at_ms,seller_expires_at_ms FROM users_stock WHERE username=? LIMIT 1", [U],
+      ),
+      db.queryAsync("SELECT unit_price FROM common ORDER BY id DESC LIMIT 1"),
+      db.queryAsync(
+        `SELECT id,total_amount,credited_amount,remaining_amount,refunded_amount,reserved_refund_amount,
+                tfees_rate_percent,transfer_count,status,reason_codes,opened_at_ms,expires_at_ms,
+                release_at_ms,next_attempt_at_ms,created_at_ms,updated_at_ms
+         FROM users_usdt_deposit_batches
+         WHERE username=? AND (remaining_amount>0 OR reserved_refund_amount>0)
+         ORDER BY id ASC`, [U],
+      ),
+      db.queryAsync(
+        `SELECT id,requested_amount,payout_amount,fee_amount,disbursement_mode,status,tx_hash,
+                last_error,created_at_ms,updated_at_ms,confirmed_at_ms,payout_address
+         FROM users_usdt_disbursements
+         WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
+         ORDER BY id ASC`, [U],
+      ),
+      db.queryAsync(
+        `SELECT r.id,r.request_reference,r.batch_id,r.request_type,r.user_reason,r.status,
+                r.refund_id,r.admin_username,r.admin_reason,r.last_error,r.created_at_ms,
+                r.updated_at_ms,r.approved_at_ms,r.resolved_at_ms,r.completed_at_ms,r.failed_at_ms,
+                f.status AS refund_status,f.tx_hash,f.gross_amount,f.fee_amount,f.amount AS net_amount
+         FROM user_usdt_refund_requests r
+         LEFT JOIN users_usdt_refunds f ON f.id=r.refund_id
+         WHERE r.username=? ORDER BY r.id DESC LIMIT 100`, [U],
+      ),
+      db.queryAsync(
+        `SELECT id,reference,batch_id,user_request_id,amount,gross_amount,fee_amount,status,
+                tx_hash,payout_address,last_error,created_at_ms,updated_at_ms,confirmed_at_ms,
+                estimated_fee_usd,actual_fee_usd
+         FROM users_usdt_refunds WHERE username=? ORDER BY id DESC LIMIT 100`, [U],
+      ),
+      db.queryAsync(
+        `SELECT id,batch_id,gross_amount,payout_amount,status,tx_hash,last_error,created_at_ms,
+                updated_at_ms,confirmed_at_ms,payout_address
+         FROM users_usdt_seller_payouts
+         WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
+         ORDER BY id ASC`, [U],
+      ),
+    ]);
+
+    if (!accountRows.length) return res.send({ auth: "user not found" });
+    const account = accountRows[0];
+    const stock = stockRows[0] || { balance: "0", run_balance: "0", seller_status: 0 };
+    const unitPrice = new BigNumber(commonRows[0]?.unit_price || "0");
+    const balanceInitial = new BigNumber(stock.balance || "0");
+    const runBalanceInitial = new BigNumber(stock.run_balance || "0");
+    const pendingRechargeAmount = rechargeRows.reduce(
+      (sum, row) => sum.plus(row.remaining_amount || "0"), new BigNumber(0),
+    );
+    const refundReservedAmount = rechargeRows.reduce(
+      (sum, row) => sum.plus(row.reserved_refund_amount || "0"), new BigNumber(0),
+    );
+
+    return res.send({
+      auth: "ok",
+      user: {
+        username: account.username,
+        name: account.name,
+        email: account.email,
+        birthdate: account.birthdate,
+        wallet_address: account.wallet_address,
+        account_status: Number(account.account_active) === 1 ? "active" : "deactivated",
+        deactivation_reason: account.account_deactivation_reason,
+        deactivated_at_ms: account.account_deactivated_at_ms == null ? null : Number(account.account_deactivated_at_ms),
+        deactivated_by: account.account_deactivated_by,
+        created_at_ms: Number(account.created_at_ms),
+        last_login_at_ms: account.last_login_at_ms == null ? null : Number(account.last_login_at_ms),
+      },
+      balance: {
+        principal_initial_asset: balanceInitial.toFixed(30),
+        principal_xtu: balanceInitial.multipliedBy(unitPrice).toFixed(18),
+        run_balance_initial_asset: runBalanceInitial.toFixed(30),
+        run_balance_xtu: runBalanceInitial.multipliedBy(unitPrice).toFixed(18),
+        seller_status: Number(stock.seller_status || 0),
+        global_unit_price: unitPrice.toFixed(30),
+      },
+      recharges: {
+        has_pending: rechargeRows.length > 0,
+        pending_amount_bsc_usd: pendingRechargeAmount.toFixed(18),
+        refund_reserved_amount_bsc_usd: refundReservedAmount.toFixed(18),
+        batches: rechargeRows.map((row) => ({
+          id: String(row.id),
+          total_amount_bsc_usd: String(row.total_amount),
+          credited_amount_bsc_usd: String(row.credited_amount),
+          remaining_amount_bsc_usd: String(row.remaining_amount),
+          refund_reserved_amount_bsc_usd: String(row.reserved_refund_amount),
+          refunded_amount_bsc_usd: String(row.refunded_amount),
+          tfees_rate_percent: String(row.tfees_rate_percent),
+          transfer_count: Number(row.transfer_count),
+          status: row.status,
+          reason_codes: parseRechargeBatchReasons(row.reason_codes),
+          opened_at_ms: Number(row.opened_at_ms),
+          expires_at_ms: Number(row.expires_at_ms),
+          release_at_ms: row.release_at_ms == null ? null : Number(row.release_at_ms),
+          next_attempt_at_ms: row.next_attempt_at_ms == null ? null : Number(row.next_attempt_at_ms),
+          created_at_ms: Number(row.created_at_ms),
+          updated_at_ms: Number(row.updated_at_ms),
+        })),
+      },
+      disbursements: disbursementRows.map((row) => ({
+        id: String(row.id), status: row.status, mode: row.disbursement_mode,
+        requested_amount_xtu: String(row.requested_amount), payout_amount_bsc_usd: String(row.payout_amount),
+        fee_amount_bsc_usd: String(row.fee_amount), tx_hash: row.tx_hash, last_error: row.last_error,
+        payout_address: row.payout_address, created_at_ms: Number(row.created_at_ms),
+        updated_at_ms: Number(row.updated_at_ms), confirmed_at_ms: row.confirmed_at_ms == null ? null : Number(row.confirmed_at_ms),
+      })),
+      refund_requests: refundRequestRows.map((row) => ({
+        id: String(row.id), request_reference: row.request_reference, batch_id: String(row.batch_id),
+        request_type: row.request_type, user_reason: row.user_reason, status: row.status,
+        refund_id: row.refund_id == null ? null : String(row.refund_id), refund_status: row.refund_status,
+        admin_username: row.admin_username, admin_reason: row.admin_reason, last_error: row.last_error,
+        tx_hash: row.tx_hash, gross_amount_bsc_usd: row.gross_amount == null ? null : String(row.gross_amount),
+        fee_amount_bsc_usd: row.fee_amount == null ? null : String(row.fee_amount),
+        net_amount_bsc_usd: row.net_amount == null ? null : String(row.net_amount),
+        created_at_ms: Number(row.created_at_ms), updated_at_ms: Number(row.updated_at_ms),
+        approved_at_ms: row.approved_at_ms == null ? null : Number(row.approved_at_ms),
+        resolved_at_ms: row.resolved_at_ms == null ? null : Number(row.resolved_at_ms),
+        completed_at_ms: row.completed_at_ms == null ? null : Number(row.completed_at_ms),
+        failed_at_ms: row.failed_at_ms == null ? null : Number(row.failed_at_ms),
+      })),
+      refunds: refundRows.map((row) => ({
+        id: String(row.id), reference: row.reference, batch_id: row.batch_id == null ? null : String(row.batch_id),
+        user_request_id: row.user_request_id == null ? null : String(row.user_request_id),
+        gross_amount_bsc_usd: String(row.gross_amount), amount_net_bsc_usd: String(row.amount),
+        fee_amount_bsc_usd: String(row.fee_amount), status: row.status, tx_hash: row.tx_hash,
+        payout_address: row.payout_address, last_error: row.last_error,
+        estimated_fee_usd: String(row.estimated_fee_usd), actual_fee_usd: row.actual_fee_usd == null ? null : String(row.actual_fee_usd),
+        created_at_ms: Number(row.created_at_ms), updated_at_ms: Number(row.updated_at_ms),
+        confirmed_at_ms: row.confirmed_at_ms == null ? null : Number(row.confirmed_at_ms),
+      })),
+      seller_payouts: sellerPayoutRows.map((row) => ({
+        id: String(row.id), batch_id: String(row.batch_id), gross_amount_bsc_usd: String(row.gross_amount),
+        payout_amount_bsc_usd: String(row.payout_amount), status: row.status, tx_hash: row.tx_hash,
+        payout_address: row.payout_address, last_error: row.last_error,
+        created_at_ms: Number(row.created_at_ms), updated_at_ms: Number(row.updated_at_ms),
+        confirmed_at_ms: row.confirmed_at_ms == null ? null : Number(row.confirmed_at_ms),
+      })),
+    });
+  } catch (error) {
+    console.error("Administrative user-info lookup failed:", error.message);
+    return res.status(500).send({ auth: "error" });
   }
 });
 

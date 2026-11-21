@@ -34,6 +34,7 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /admin/bsc/unknown-transfers/resolve": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/recharge/credit": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/recharge/refund": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
+  "POST /admin/user-info": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/unlock-disbursement": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/deactivate-account": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/activate-account": { limit: 10, windowMs: 5 * 60_000, authResponse: true },

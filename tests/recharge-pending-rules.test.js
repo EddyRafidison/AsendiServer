@@ -86,7 +86,9 @@ test("exceptional refund requests are persisted and require administrative appro
   assert.match(adminRoute, /FROM user_usdt_refund_requests/);
   assert.match(adminRoute, /requestRows\[0\]\.status !== "pending_admin"/);
   assert.match(adminRoute, /request_type === "emergency" && emergency_approved === true/);
-  assert.match(adminRoute, /remaining_amount=0,status='refund_queued'/);
+  assert.match(adminRoute, /reserved_refund_amount=reserved_refund_amount\+\?,remaining_amount=remaining_amount-\?,[\s\S]*status='refund_queued'/);
+  assert.match(adminRoute, /status='approved_queued',refund_id=\?,admin_username/);
+  assert.match(adminRoute, /MAX_RECHARGE_AMOUNT\.multipliedBy\(3\)/);
   assert.match(routes, /async function closeStaleRechargeRefundRequestsTx/);
   assert.match(routes, /status = "auto_closed"/);
   assert.match(routes, /status = "remainder_changed"/);
@@ -96,7 +98,7 @@ test("exceptional refund requests are persisted and require administrative appro
 for (const file of ["terms_fr.html", "terms_en.html"]) {
   test(`${file} explains partial credits, indefinite pending, and exceptional refunds`, () => {
     const html = read(file);
-    assert.match(html, /200 BSC-USD/);
+    assert.match(html, /300 BSC-USD/);
     assert.match(html, /60-minute|60 minutes|60 minutes|60 minutes/);
     assert.match(html, /100 BSC-USD/);
     assert.match(html, /no maximum|without a guaranteed maximum|sans délai maximal/);

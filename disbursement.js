@@ -16,6 +16,7 @@ const {
 } = require("./disbursement-policy");
 const { getDate } = require("./utils");
 const { queueTelegramMessageTx } = require("./telegram");
+const { recordRefundRequestEventTx } = require("./refund-request-audit");
 const {
   getLatestCommonTx,
   insertCommonSnapshotTx,
@@ -971,6 +972,23 @@ async function processOneJob(db, job, activeRuntime) {
   }
 
   let receipt = await activeRuntime.provider.getTransactionReceipt(job.tx_hash);
+  if (receipt && job.status === "signed") {
+    const submittedAt = String(Date.now());
+    await db.queryAsync(
+      "UPDATE users_usdt_refunds SET status='submitted',last_error=NULL,updated_at_ms=? WHERE id=? AND status='signed'",
+      [submittedAt, job.id],
+    );
+    if (job.user_request_id != null) {
+      await withTransaction(db, async (tx) => {
+        const [refundRows] = await tx.query(
+          "SELECT * FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE", [job.id],
+        );
+        if (!refundRows.length) return;
+        await synchronizeUserRefundRequestTx(tx, refundRows[0], submittedAt);
+      });
+    }
+    job = { ...job, status: "submitted" };
+  }
   if (!receipt) {
     const knownTransaction = await activeRuntime.provider.getTransaction(job.tx_hash);
     if (!knownTransaction) {
@@ -1289,24 +1307,145 @@ async function processOneSellerPayout(db, job, activeRuntime) {
 }
 
 async function markRefundError(db, refundId, error) {
+  const message = String(error?.message || error || "Unknown refund error").slice(0, 2000);
+  const now = String(Date.now());
   await db.queryAsync(
     `UPDATE users_usdt_refunds
      SET last_error=?,updated_at_ms=?
      WHERE id=? AND status IN ('queued','signed','submitted')`,
-    [String(error?.message || error || "Unknown refund error").slice(0, 2000), String(Date.now()), refundId],
+    [message, now, refundId],
   );
+  await db.queryAsync(
+    `UPDATE user_usdt_refund_requests r
+     JOIN users_usdt_refunds f ON f.user_request_id=r.id
+     SET r.last_error=?,r.updated_at_ms=?
+     WHERE f.id=? AND r.status IN ('approved_queued','signed','submitted')`,
+    [message, now, refundId],
+  );
+}
+
+async function transitionUserRefundRequestTx(tx, refund, {
+  newStatus,
+  eventType,
+  reason = null,
+  txHash = null,
+  feeAmount = "0",
+  netAmount = "0",
+  createdAtMs = String(Date.now()),
+}) {
+  if (refund.user_request_id == null) return false;
+  const [requestRows] = await tx.query(
+    "SELECT id,status FROM user_usdt_refund_requests WHERE id=? LIMIT 1 FOR UPDATE",
+    [refund.user_request_id],
+  );
+  if (!requestRows.length) throw new Error(`Refund request ${refund.user_request_id} is missing.`);
+  const request = requestRows[0];
+  const transitions = {
+    signed: ["approved_queued", "signed"],
+    submitted: ["approved_queued", "signed", "submitted"],
+    completed: ["approved_queued", "signed", "submitted", "manual_review"],
+    failed: ["approved_queued", "signed", "submitted", "manual_review"],
+    manual_review: ["approved_queued", "signed", "submitted", "manual_review"],
+  };
+  if (String(request.status) === String(newStatus)) return false;
+  if (!(transitions[newStatus] || []).includes(String(request.status))) return false;
+  const terminal = ["completed", "failed"].includes(newStatus);
+  await tx.query(
+    `UPDATE user_usdt_refund_requests
+     SET status=?,last_error=?,updated_at_ms=?,
+         completed_at_ms=CASE WHEN ?='completed' THEN ? ELSE completed_at_ms END,
+         failed_at_ms=CASE WHEN ?='failed' THEN ? ELSE failed_at_ms END,
+         resolved_at_ms=CASE WHEN ? IN ('completed','failed') THEN ? ELSE resolved_at_ms END
+     WHERE id=?`,
+    [newStatus, newStatus === "failed" || newStatus === "manual_review" ? reason : null,
+      createdAtMs, newStatus, createdAtMs, newStatus, createdAtMs, newStatus, createdAtMs, refund.user_request_id],
+  );
+  await recordRefundRequestEventTx(tx, {
+    requestId: refund.user_request_id,
+    refundId: refund.id,
+    eventKey: `refund:${refund.id}:${newStatus}`,
+    eventType: eventType || newStatus,
+    actorType: "system",
+    oldStatus: request.status,
+    newStatus,
+    reason,
+    txHash,
+    grossAmount: String(refund.gross_amount || refund.amount || "0"),
+    feeAmount,
+    netAmount,
+    createdAtMs,
+  });
+  return true;
+}
+
+async function synchronizeUserRefundRequestTx(tx, refund, createdAtMs = String(Date.now())) {
+  if (refund.user_request_id == null) return false;
+
+  if (refund.status === "signed") {
+    await transitionUserRefundRequestTx(tx, refund, {
+      newStatus: "signed",
+      eventType: "transaction_signed_recovered",
+      reason: "The worker recovered the persisted signed refund transaction after an interruption.",
+      txHash: refund.tx_hash,
+      feeAmount: String(refund.fee_amount || "0"),
+      netAmount: String(refund.amount || "0"),
+      createdAtMs,
+    });
+    await tx.query(
+      `UPDATE admin_payment_resolutions SET action='refund_signed',tx_hash=?,fee_amount=?,net_amount=?
+       WHERE refund_id=? AND action IN ('refund_queued','refund_signed')`,
+      [refund.tx_hash, String(refund.fee_amount || "0"), String(refund.amount || "0"), refund.id],
+    );
+    return true;
+  }
+
+  if (refund.status === "submitted") {
+    // Recover a missing intermediate audit event if the process stopped
+    // between persisting the signed transaction and persisting its submission.
+    await transitionUserRefundRequestTx(tx, refund, {
+      newStatus: "signed",
+      eventType: "transaction_signed_recovered",
+      reason: "The worker recovered the signed transaction record after an interruption.",
+      txHash: refund.tx_hash,
+      feeAmount: String(refund.fee_amount || "0"),
+      netAmount: String(refund.amount || "0"),
+      createdAtMs,
+    });
+    await transitionUserRefundRequestTx(tx, refund, {
+      newStatus: "submitted",
+      eventType: "transaction_submitted_recovered",
+      reason: "The worker recovered the submitted refund transaction after an interruption.",
+      txHash: refund.tx_hash,
+      feeAmount: String(refund.fee_amount || "0"),
+      netAmount: String(refund.amount || "0"),
+      createdAtMs,
+    });
+    await tx.query(
+      `UPDATE admin_payment_resolutions SET action='refund_submitted',tx_hash=?,fee_amount=?,net_amount=?
+       WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')`,
+      [refund.tx_hash, String(refund.fee_amount || "0"), String(refund.amount || "0"), refund.id],
+    );
+    return true;
+  }
+
+  return false;
 }
 
 async function finalizeRefund(db, refundId, receipt) {
   return withTransaction(db, async (tx) => {
     const [preRows] = await tx.query(
-      "SELECT batch_id,unknown_transfer_id FROM users_usdt_refunds WHERE id=? LIMIT 1", [refundId],
+      "SELECT id,batch_id,unknown_transfer_id,user_request_id FROM users_usdt_refunds WHERE id=? LIMIT 1",
+      [refundId],
     );
     if (!preRows.length) throw new Error(`Refund ${refundId} does not exist.`);
     const batchId = preRows[0].batch_id;
     const unknownTransferId = preRows[0].unknown_transfer_id;
+    const userRequestId = preRows[0].user_request_id;
+    const [requestRows] = userRequestId == null ? [[]] : await tx.query(
+      "SELECT id,status FROM user_usdt_refund_requests WHERE id=? LIMIT 1 FOR UPDATE", [userRequestId],
+    );
     const [batchRows] = batchId == null ? [[]] : await tx.query(
-      "SELECT id,status FROM users_usdt_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [batchId],
+      "SELECT id,status,reserved_refund_amount,remaining_amount,refunded_amount FROM users_usdt_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [batchId],
     );
     const [unknownRows] = unknownTransferId == null ? [[]] : await tx.query(
       "SELECT id,status FROM bsc_unknown_incoming_transfers WHERE id=? LIMIT 1 FOR UPDATE", [unknownTransferId],
@@ -1317,6 +1456,9 @@ async function finalizeRefund(db, refundId, receipt) {
     if (!refundRows.length) throw new Error(`Refund ${refundId} disappeared.`);
     const refund = refundRows[0];
     if (refund.status === "confirmed") return { confirmed: true };
+    if (refund.status !== "submitted" && refund.status !== "signed") {
+      return { skipped: true, status: refund.status };
+    }
     const actualFee = await recordActualBscFeeTx(tx, {
       txHash: refund.tx_hash,
       operation: "refund",
@@ -1329,33 +1471,54 @@ async function finalizeRefund(db, refundId, receipt) {
     const sourceIsQueued = batchId != null
       ? batchRows.length > 0 && batchRows[0].status === "refund_queued"
       : unknownRows.length > 0 && unknownRows[0].status === "refund_queued";
-    if (!sourceIsQueued) {
-      const reviewReason = "The refund was confirmed on-chain but its source payment is not in refund_queued state.";
+    const grossAmount = new BigNumber(refund.gross_amount || refund.amount || "0");
+    const reservedAmount = batchId == null ? null : new BigNumber(batchRows[0]?.reserved_refund_amount || "0");
+    const reservationIsValid = batchId == null || (
+      reservedAmount.isFinite() && grossAmount.isFinite() && reservedAmount.gte(grossAmount)
+    );
+    if (!sourceIsQueued || !reservationIsValid || (userRequestId != null && !requestRows.length)) {
+      const reviewReason = "The refund was confirmed on-chain, but its linked recharge/request reservation is inconsistent and requires manual reconciliation.";
       await tx.query(
         "UPDATE users_usdt_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
         [reviewReason, String(Date.now()), refundId],
       );
+      await tx.query(
+        "UPDATE admin_payment_resolutions SET action='refund_manual_review',tx_hash=?,reason=? WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')",
+        [refund.tx_hash, reviewReason, refundId],
+      );
+      await transitionUserRefundRequestTx(tx, refund, {
+        newStatus: "manual_review", eventType: "source_reconciliation_required", reason: reviewReason,
+        txHash: refund.tx_hash, feeAmount: String(refund.fee_amount || "0"), netAmount: String(refund.amount || "0"),
+      });
       await queueTelegramMessageTx(tx, refund.username, `refund:${refundId}:manual_review`, [
         "OneX Refund Update",
-        "Your refund transaction was confirmed on-chain, but the refund requires manual review.",
+        "Your refund transaction was confirmed on-chain, but the linked recharge/request reservation requires manual reconciliation.",
         `Refund ID: ${refundId}`,
+        `Transaction: ${refund.tx_hash}`,
         `Reason: ${reviewReason}`,
         "Status: MANUAL REVIEW",
       ].join("\n"));
       return { manualReview: true };
     }
+
     const now = String(Date.now());
     await tx.query(
       `UPDATE users_usdt_refunds
        SET status='confirmed',block_number=?,last_error=NULL,confirmed_at_ms=?,updated_at_ms=?
-       WHERE id=?`,
+       WHERE id=? AND status IN ('signed','submitted')`,
       [String(receipt.blockNumber), now, now, refundId],
     );
     if (batchId != null) {
-      await tx.query(
-        "UPDATE users_usdt_deposit_batches SET status='refunded',updated_at_ms=? WHERE id=? AND status='refund_queued'",
-        [now, batchId],
+      const [batchUpdate] = await tx.query(
+        `UPDATE users_usdt_deposit_batches
+         SET reserved_refund_amount=reserved_refund_amount-?,
+             refunded_amount=refunded_amount+?,status='refunded',updated_at_ms=?
+         WHERE id=? AND status='refund_queued' AND reserved_refund_amount>=?`,
+        [grossAmount.toFixed(18), grossAmount.toFixed(18), now, batchId, grossAmount.toFixed(18)],
       );
+      if (Number(batchUpdate.affectedRows || 0) !== 1) {
+        throw new Error("Unable to settle the reserved recharge refund amount after confirmation.");
+      }
       await tx.query(
         "UPDATE users_usdt_transfer_events SET status='refunded' WHERE batch_id=?",
         [batchId],
@@ -1363,8 +1526,8 @@ async function finalizeRefund(db, refundId, receipt) {
       await tx.query(
         `UPDATE admin_payment_resolutions
          SET action='refund_confirmed',tx_hash=?
-         WHERE batch_id=? AND action='refund_queued' AND tx_hash IS NULL`,
-        [refund.tx_hash, batchId],
+         WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')`,
+        [refund.tx_hash, refundId],
       );
     } else {
       await tx.query(
@@ -1373,14 +1536,19 @@ async function finalizeRefund(db, refundId, receipt) {
       );
       await tx.query(
         `UPDATE admin_payment_resolutions SET action='refund_confirmed',tx_hash=?
-         WHERE unknown_transfer_id=? AND action='unknown_refund_queued' AND tx_hash IS NULL`,
-        [refund.tx_hash, unknownTransferId],
+         WHERE unknown_transfer_id=? AND (refund_id=? OR refund_id IS NULL) AND action IN ('unknown_refund_queued','refund_queued')`,
+        [refund.tx_hash, unknownTransferId, refundId],
       );
     }
+    await transitionUserRefundRequestTx(tx, refund, {
+      newStatus: "completed", eventType: "blockchain_confirmed", reason: "The BSC-USD refund transfer was confirmed on BNB Smart Chain.",
+      txHash: refund.tx_hash, feeAmount: String(refund.fee_amount || "0"),
+      netAmount: String(refund.amount || "0"), createdAtMs: now,
+    });
     await queueTelegramMessageTx(tx, refund.username, `refund:${refundId}:confirmed`, [
       "OneX Refund Update",
       "Your BSC-USD refund has been transferred successfully.",
-      `Gross amount: ${new BigNumber(refund.gross_amount || refund.amount).toFixed(8)} BSC-USD`,
+      `Gross amount: ${grossAmount.toFixed(8)} BSC-USD`,
       `BSC gas recovery: ${new BigNumber(refund.fee_amount || 0).toFixed(8)} BSC-USD`,
       `Net amount: ${new BigNumber(refund.amount).toFixed(8)} BSC-USD`,
       `Actual gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD)`,
@@ -1396,7 +1564,7 @@ async function finalizeRefund(db, refundId, receipt) {
 async function markRefundManualReview(db, job, reason) {
   return withTransaction(db, async (tx) => {
     const [refundRows] = await tx.query(
-      "SELECT id,username,batch_id,unknown_transfer_id,status FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE",
+      "SELECT id,username,batch_id,unknown_transfer_id,user_request_id,gross_amount,amount,fee_amount,status FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE",
       [job.id],
     );
     if (!refundRows.length || refundRows[0].status !== "queued") return;
@@ -1408,12 +1576,12 @@ async function markRefundManualReview(db, job, reason) {
     );
     if (refund.batch_id != null) {
       await tx.query(
-        "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=?",
+        "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=? AND status='refund_queued'",
         [now, refund.batch_id],
       );
       await tx.query(
-        "UPDATE admin_payment_resolutions SET action='refund_manual_review',reason=? WHERE batch_id=? AND action='refund_queued'",
-        [String(reason).slice(0, 1000), refund.batch_id],
+        "UPDATE admin_payment_resolutions SET action='refund_manual_review',reason=? WHERE refund_id=? AND action='refund_queued'",
+        [String(reason).slice(0, 1000), job.id],
       );
     } else if (refund.unknown_transfer_id != null) {
       await tx.query(
@@ -1426,17 +1594,31 @@ async function markRefundManualReview(db, job, reason) {
         [String(reason).slice(0, 1000), refund.unknown_transfer_id],
       );
     }
+    await transitionUserRefundRequestTx(tx, refund, {
+      newStatus: "manual_review", eventType: "manual_review", reason: String(reason).slice(0, 2000), createdAtMs: now,
+    });
     await queueTelegramMessageTx(tx, refund.username, `refund:${job.id}:manual_review`, [
       "OneX Refund Update",
-      "The refund requires manual review because its net amount would be below the permitted minimum.",
+      "The refund requires manual review because its net amount would be below the permitted minimum or the payment needs reconciliation.",
       `Refund ID: ${job.id}`,
       `Reason: ${String(reason).slice(0, 500)}`,
+      "The reserved recharge remainder remains blocked and has not been counted as refunded.",
       "Status: MANUAL REVIEW",
     ].join("\n"));
   });
 }
 
 async function processOneRefundJob(db, job, activeRuntime) {
+  if (job.user_request_id != null && ["signed", "submitted"].includes(String(job.status))) {
+    await withTransaction(db, async (tx) => {
+      const [refundRows] = await tx.query(
+        "SELECT * FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE", [job.id],
+      );
+      if (!refundRows.length) return;
+      await synchronizeUserRefundRequestTx(tx, refundRows[0]);
+    });
+  }
+
   if (job.status === "queued") {
     const payoutAddress = requiredAddress(job.payout_address, "Refund payout address");
     if (payoutAddress.toLowerCase() === activeRuntime.treasuryAddress.toLowerCase()) {
@@ -1513,17 +1695,32 @@ async function processOneRefundJob(db, job, activeRuntime) {
         gasPriceWei: finalEstimate.gasPrice.toString(),
         bnbUsdPrice: finalEstimate.bnbUsdPrice,
       });
-      if (job.batch_id != null) {
+      if (job.user_request_id != null) {
         await tx.query(
-          `UPDATE admin_payment_resolutions SET fee_amount=?,net_amount=?
-           WHERE batch_id=? AND action='refund_queued'`,
-          [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), job.batch_id],
+          `UPDATE admin_payment_resolutions SET action='refund_signed',fee_amount=?,net_amount=?,tx_hash=?
+           WHERE refund_id=? AND action IN ('refund_queued','refund_signed')`,
+          [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), transactionHash, job.id],
+        );
+        await transitionUserRefundRequestTx(tx, {
+          id: job.id, user_request_id: job.user_request_id,
+          gross_amount: grossAmount.toFixed(18), amount: finalPayoutAmount.toFixed(18),
+        }, {
+          newStatus: "signed", eventType: "transaction_signed",
+          reason: "The refund transaction has been signed and persisted for broadcast.",
+          txHash: transactionHash, feeAmount: finalEstimate.feeUsd.toFixed(18),
+          netAmount: finalPayoutAmount.toFixed(18),
+        });
+      } else if (job.batch_id != null) {
+        await tx.query(
+          `UPDATE admin_payment_resolutions SET fee_amount=?,net_amount=?,tx_hash=?
+           WHERE refund_id=? AND action='refund_queued'`,
+          [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), transactionHash, job.id],
         );
       } else {
         await tx.query(
-          `UPDATE admin_payment_resolutions SET fee_amount=?,net_amount=?
+          `UPDATE admin_payment_resolutions SET fee_amount=?,net_amount=?,tx_hash=?
            WHERE unknown_transfer_id=? AND action='unknown_refund_queued'`,
-          [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), job.unknown_transfer_id],
+          [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), transactionHash, job.unknown_transfer_id],
         );
       }
       await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:gas_accepted`, [
@@ -1561,10 +1758,25 @@ async function processOneRefundJob(db, job, activeRuntime) {
         }
       }
     }
-    await db.queryAsync(
+    const submittedAt = String(Date.now());
+    const [submittedUpdate] = await db.queryAsync(
       "UPDATE users_usdt_refunds SET status='submitted',last_error=NULL,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')",
-      [String(Date.now()), job.id],
+      [submittedAt, job.id],
     );
+    if (Number(submittedUpdate.affectedRows || 0) > 0 && job.user_request_id != null) {
+      await withTransaction(db, async (tx) => {
+        await tx.query(
+          `UPDATE admin_payment_resolutions SET action='refund_submitted'
+           WHERE refund_id=? AND action IN ('refund_signed','refund_submitted')`,
+          [job.id],
+        );
+        await transitionUserRefundRequestTx(tx, job, {
+          newStatus: "submitted", eventType: "transaction_submitted",
+          reason: "The signed refund transaction has been broadcast to BNB Smart Chain.",
+          txHash: job.tx_hash, createdAtMs: submittedAt,
+        });
+      });
+    }
     receipt = await activeRuntime.provider.getTransactionReceipt(job.tx_hash);
     if (!receipt) return;
   }
@@ -1584,39 +1796,66 @@ async function processOneRefundJob(db, job, activeRuntime) {
         operation: "refund",
         receipt,
       });
-      await tx.query(
-        "UPDATE users_usdt_refunds SET status='failed',actual_fee_bnb=?,actual_fee_usd=?,last_error=?,updated_at_ms=? WHERE id=?",
-        [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), "The refund transaction was finalized but reverted on BNB Smart Chain.", now, job.id],
+      const [refundRows] = await tx.query(
+        "SELECT * FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE", [job.id],
       );
-      if (job.batch_id != null) {
+      if (!refundRows.length) throw new Error(`Refund ${job.id} disappeared while restoring its reservation.`);
+      const refund = refundRows[0];
+      const grossAmount = new BigNumber(refund.gross_amount || refund.amount || "0");
+      const [failedRefundUpdate] = await tx.query(
+        "UPDATE users_usdt_refunds SET status='failed',actual_fee_bnb=?,actual_fee_usd=?,last_error=?,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')",
+        [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), "The refund transaction was finalized but reverted on BNB Smart Chain. No BSC-USD refund transfer was completed.", now, job.id],
+      );
+      if (Number(failedRefundUpdate.affectedRows || 0) !== 1) {
+        throw new Error("Refund state changed before failed-transfer reconciliation; reservation was not modified.");
+      }
+      if (refund.batch_id != null) {
+        const [batchUpdate] = await tx.query(
+          `UPDATE users_usdt_deposit_batches
+           SET reserved_refund_amount=reserved_refund_amount-?,
+               remaining_amount=remaining_amount+?,status='pending_support',
+               reason_codes=?,next_attempt_at_ms=?,updated_at_ms=?
+           WHERE id=? AND status='refund_queued' AND reserved_refund_amount>=?`,
+          [grossAmount.toFixed(18), grossAmount.toFixed(18), JSON.stringify(["refund_failed"]), now, now,
+            refund.batch_id, grossAmount.toFixed(18)],
+        );
+        if (Number(batchUpdate.affectedRows || 0) !== 1) {
+          throw new Error("The failed refund reservation could not be restored to its recharge remainder.");
+        }
         await tx.query(
-          "UPDATE users_usdt_deposit_batches SET status='pending_support',updated_at_ms=? WHERE id=? AND status='refund_queued'",
-          [now, job.batch_id],
+          "UPDATE users_usdt_transfer_events SET status='pending_support',reason_codes=? WHERE batch_id=?",
+          [JSON.stringify(["refund_failed"]), refund.batch_id],
         );
         await tx.query(
-          "UPDATE users_usdt_transfer_events SET status='pending_support' WHERE batch_id=?",
-          [job.batch_id],
+          "UPDATE admin_payment_resolutions SET action='refund_failed',tx_hash=?,reason=CONCAT(reason,' | Refund reverted on-chain; reserved amount restored to pending recharge.') WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')",
+          [job.tx_hash, job.id],
         );
-        await tx.query(
-          "UPDATE admin_payment_resolutions SET action='refund_failed' WHERE batch_id=? AND action='refund_queued'",
-          [job.batch_id],
-        );
-      } else if (job.unknown_transfer_id != null) {
+      } else if (refund.unknown_transfer_id != null) {
         await tx.query(
           `UPDATE bsc_unknown_incoming_transfers SET status='refund_failed',updated_at_ms=? WHERE id=?`,
-          [now, job.unknown_transfer_id],
+          [now, refund.unknown_transfer_id],
         );
         await tx.query(
-          `UPDATE admin_payment_resolutions SET action='refund_failed'
-           WHERE unknown_transfer_id=? AND action='unknown_refund_queued'`,
-          [job.unknown_transfer_id],
+          `UPDATE admin_payment_resolutions SET action='refund_failed',tx_hash=?
+           WHERE unknown_transfer_id=? AND (refund_id=? OR refund_id IS NULL) AND action IN ('unknown_refund_queued','refund_queued')`,
+          [job.tx_hash, refund.unknown_transfer_id, job.id],
         );
       }
-      await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:failed`, [
+      await transitionUserRefundRequestTx(tx, refund, {
+        newStatus: "failed", eventType: "blockchain_reverted",
+        reason: "The refund transaction was finalized with a revert. The BSC-USD amount reserved for the refund has been restored to the recharge remainder; no token refund was completed.",
+        txHash: job.tx_hash, feeAmount: String(refund.fee_amount || "0"),
+        netAmount: String(refund.amount || "0"), createdAtMs: now,
+      });
+      await queueTelegramMessageTx(tx, refund.username, `refund:${job.id}:failed`, [
         "OneX Refund Update",
-        "Your refund transaction failed after blockchain finality. The support case has been reopened.",
+        "The refund transaction was finalized but reverted on BNB Smart Chain. No BSC-USD refund transfer was completed.",
         `Refund ID: ${job.id}`,
-        "Status: FAILED - SUPPORT REQUIRED",
+        `Transaction: ${job.tx_hash}`,
+        `Reserved gross amount restored to pending recharge: ${grossAmount.toFixed(8)} BSC-USD`,
+        `Actual gas paid by OneX: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD)`,
+        "The pending recharge will be evaluated again under the normal credit rules. A new exceptional refund request may be submitted if the applicable conditions are still met.",
+        "Status: FAILED - AMOUNT RESTORED",
       ].join("\n"));
     });
     return;
@@ -1630,6 +1869,10 @@ async function processOneRefundJob(db, job, activeRuntime) {
         operation: "refund",
         receipt,
       });
+      const [refundRows] = await tx.query(
+        "SELECT * FROM users_usdt_refunds WHERE id=? LIMIT 1 FOR UPDATE", [job.id],
+      );
+      const refund = refundRows[0];
       await tx.query(
         "UPDATE users_usdt_refunds SET status='manual_review',actual_fee_bnb=?,actual_fee_usd=?,last_error=?,updated_at_ms=? WHERE id=?",
         [actualFee.feeBnb.toFixed(30), actualFee.feeUsd.toFixed(18), "The refund transaction succeeded but did not contain the expected BSC-USD Transfer event.", now, job.id],
@@ -1640,8 +1883,8 @@ async function processOneRefundJob(db, job, activeRuntime) {
           [now, job.batch_id],
         );
         await tx.query(
-          "UPDATE admin_payment_resolutions SET action='refund_manual_review' WHERE batch_id=? AND action='refund_queued'",
-          [job.batch_id],
+          "UPDATE admin_payment_resolutions SET action='refund_manual_review',tx_hash=? WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')",
+          [job.tx_hash, job.id],
         );
       } else if (job.unknown_transfer_id != null) {
         await tx.query(
@@ -1654,9 +1897,14 @@ async function processOneRefundJob(db, job, activeRuntime) {
           [job.unknown_transfer_id],
         );
       }
+      await transitionUserRefundRequestTx(tx, refund || job, {
+        newStatus: "manual_review", eventType: "unexpected_transfer_event",
+        reason: "The refund transaction succeeded but its BSC-USD Transfer event did not match the expected payout. The reserved amount remains blocked pending reconciliation.",
+        txHash: job.tx_hash, createdAtMs: now,
+      });
       await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:manual_review`, [
         "OneX Refund Update",
-        "The refund transaction requires manual review because its receipt does not match the expected transfer.",
+        "The refund transaction requires manual review because its receipt does not match the expected transfer. The reserved amount remains blocked pending reconciliation.",
         `Refund ID: ${job.id}`,
         "Status: MANUAL REVIEW",
       ].join("\n"));
