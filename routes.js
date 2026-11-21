@@ -724,7 +724,8 @@ async function applyUserTopUp(
   const [authRows] = await tx.query(
     "SELECT last_login_at_ms,account_active FROM auths WHERE username=? FOR UPDATE", [username],
   );
-  if (!authRows.length || authRows[0].last_login_at_ms == null || Number(authRows[0].account_active) !== 1) return { error: "user not found" };
+  if (!authRows.length || authRows[0].last_login_at_ms == null) return { error: "user not found" };
+  if (Number(authRows[0].account_active) !== 1) return { error: "account deactivated" };
   const [userRows] = await tx.query(
     "SELECT balance FROM users_stock WHERE username=? FOR UPDATE", [username],
   );
@@ -1279,7 +1280,8 @@ const RECHARGE_HOLD_REASON_TEXT = {
   weekly_limit: "The seven-day system-reserve recharge cooldown has not elapsed. Seller-reserve funding may still become available earlier; otherwise OneX retries when the cooldown expires.",
   manual_recharge_suspended: "Automatic recharge crediting is temporarily suspended by OneX administration.",
   payment_service_unavailable: "The recharge processing service is temporarily unavailable. The received funds remain recorded and will be retried when service resumes.",
-  account_unavailable: "The account is disabled or unavailable. Contact OneX support to resolve the account status; the received amount remains pending.",
+  account_deactivated: "The account has been administratively deactivated. Existing uncredited recharge amounts and any new incoming transfers are held; automatic crediting remains paused until an administrator reactivates the account.",
+  account_unavailable: "The account is unavailable or has not completed its first successful sign-in. Contact OneX support to resolve the account status; the received amount remains pending.",
   system_reserve: "Available distributable reserves are not currently sufficient. OneX retries automatically when reserves become available.",
   previous_batch_unresolved: "An older recharge remains in the FIFO queue and must be processed first.",
   received_after_global_disbursement_cutoff: "The transfer arrived after the global disbursement cutoff and requires administrative handling.",
@@ -1348,8 +1350,14 @@ async function queueRechargeBatchStatusTx(
   if (reasons.includes("manual_recharge_suspended")) {
     lines.push("Suggested action: do not send another payment while recharges are suspended. The recorded amount will be reconsidered when the administration resumes the service.");
   }
+  if (reasons.includes("account_deactivated")) {
+    lines.push("Suggested action: your account has been administratively deactivated. Do not send another payment. Contact OneX support and wait for an administrator to reactivate the account; automatic recharge processing will resume after reactivation when all other credit conditions are met.");
+  }
   if (reasons.includes("account_unavailable")) {
     lines.push("Suggested action: contact OneX support to resolve the account status. Do not send another payment until the account is available.");
+  }
+  if (details.accountReactivated) {
+    lines.push("Account access has been restored. OneX has immediately requeued this pending recharge for automatic eligibility checks; credit remains subject to the session window, FIFO order, account balance capacity and available reserves.");
   }
   if (reasons.includes("initial_credit_limit")) {
     lines.push("Suggested action: no additional payment is required for the retained remainder. The first credit tranche is capped at 100 BSC-USD; the remainder will be retried automatically without reapplying the 100 BSC-USD cap or the initial 20 BSC-USD minimum when account and reserve capacity permit.");
@@ -1496,13 +1504,19 @@ async function processConfirmedUsdtPayment(event) {
       batch.reason_codes = null;
     }
 
+    const accountDeactivated = Number(account.account_active) !== 1;
+    const accountUnavailable = account.last_login_at_ms == null || !stockRows.length;
     let initialStatus = transferAfterCutoff
       ? "pending_global"
       : (manualRechargeSuspended ? "pending_support" : "collecting");
     let initialReasons = transferAfterCutoff
       ? ["received_after_global_disbursement_cutoff"]
       : (manualRechargeSuspended ? ["manual_recharge_suspended"] : []);
-    if (!transferAfterCutoff && (account.last_login_at_ms == null || Number(account.account_active) !== 1 || !stockRows.length)) {
+    if (accountDeactivated) {
+      initialStatus = "pending_support";
+      initialReasons.push("account_deactivated");
+    }
+    if (accountUnavailable) {
       initialStatus = "pending_support";
       initialReasons.push("account_unavailable");
     }
@@ -1515,8 +1529,8 @@ async function processConfirmedUsdtPayment(event) {
         `INSERT INTO users_usdt_deposit_batches
          (username,treasury_address,opened_at_ms,expires_at_ms,total_amount,total_amount_raw,
           credited_amount,remaining_amount,refunded_amount,tfees_rate_percent,transfer_count,
-          credit_sequence,minimum_met_at_ms,status,reason_codes,created_at_ms,updated_at_ms)
-         VALUES(?,?,?,?,0,0,0,0,0,?,0,0,NULL,?,?,?,?)`,
+          credit_sequence,minimum_met_at_ms,status,pending_since_ms,reason_codes,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,0,0,0,0,0,?,0,0,NULL,?,?,?,?,?)`,
         [
           username,
           event.treasuryAddress,
@@ -1524,6 +1538,7 @@ async function processConfirmedUsdtPayment(event) {
           String(expiresAt),
           String(tfees),
           initialStatus,
+          initialStatus === "pending_support" ? String(now) : null,
           initialReasons.length ? safeJson(initialReasons) : null,
           String(now),
           String(now),
@@ -1536,11 +1551,9 @@ async function processConfirmedUsdtPayment(event) {
       batch = createdRows[0];
     }
 
-    const nextStatus = transferAfterCutoff
-      ? "pending_global"
-      : (manualRechargeSuspended
-        ? "pending_support"
-        : (batch.status === "collecting" ? "batched" : batch.status));
+    const nextStatus = (accountDeactivated || accountUnavailable || manualRechargeSuspended)
+      ? "pending_support"
+      : (transferAfterCutoff ? "pending_global" : (batch.status === "collecting" ? "batched" : batch.status));
     let reasonCodes = initialReasons;
     if (batch.reason_codes) {
       try {
@@ -1699,6 +1712,14 @@ async function processOneRechargeBatch(batchId) {
       "ready", "finalizing", "pending_credit", "pending_weekly", "pending_reserve", "pending_support",
     ];
     if (!retryableStatuses.includes(batch.status)) return { skipped: true };
+    const sessionExpiresAt = Number(batch.expires_at_ms || 0);
+    if (batch.status !== "collecting" && Number.isSafeInteger(sessionExpiresAt) && sessionExpiresAt > now) {
+      await tx.query(
+        "UPDATE users_usdt_deposit_batches SET next_attempt_at_ms=?,updated_at_ms=? WHERE id=?",
+        [String(sessionExpiresAt), String(now), String(batchId)],
+      );
+      return { waiting: true, reason: "recharge_session_window_open", nextAttemptAtMs: sessionExpiresAt };
+    }
     if (batch.next_attempt_at_ms != null && Number(batch.next_attempt_at_ms) > now) {
       return { waiting: true, nextAttemptAtMs: Number(batch.next_attempt_at_ms) };
     }
@@ -1821,7 +1842,10 @@ async function processOneRechargeBatch(batchId) {
       let reasons = ["account_unavailable"];
       let releaseAt = null;
 
-      if (creditResult?.error === "payment service disabled") {
+      if (creditResult?.error === "account deactivated") {
+        reasons = ["account_deactivated"];
+        retryAt = null;
+      } else if (creditResult?.error === "payment service disabled") {
         reasons = ["payment_service_unavailable"];
       } else if (creditResult?.error === "recharge manually suspended") {
         reasons = ["manual_recharge_suspended"];
@@ -1858,7 +1882,7 @@ async function processOneRechargeBatch(batchId) {
         `UPDATE users_usdt_deposit_batches
          SET status=?,pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,
              next_attempt_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
-        [status, String(now), releaseAt == null ? null : String(releaseAt), String(retryAt), safeJson(reasons), String(now), batchId],
+        [status, String(now), releaseAt == null ? null : String(releaseAt), retryAt == null ? null : String(retryAt), safeJson(reasons), String(now), batchId],
       );
       await updateBatchEventStatus(tx, batchId, status, reasons);
       await queueRechargeBatchStatusTx(tx, batch.username, batchId, status, reasons, releaseAt, {
@@ -1962,7 +1986,12 @@ async function processRechargeBatchQueue() {
      WHERE (status='collecting' AND expires_at_ms<=?)
         OR status='ready'
         OR (status IN ('finalizing','pending_credit','pending_support','pending_reserve')
-            AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms<=?))
+            AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms<=?)
+            AND CASE
+              WHEN status='pending_support' AND JSON_VALID(reason_codes)=1
+                THEN JSON_CONTAINS(reason_codes, JSON_QUOTE('account_deactivated'))=0
+              ELSE 1
+            END)
         OR (status='pending_weekly' AND (next_attempt_at_ms<=? OR release_at_ms<=?))
      ORDER BY id ASC LIMIT 50`,
     [String(now), String(now), String(now), String(now)],
@@ -5305,6 +5334,125 @@ router.post("/admin/send-temp-pswd", async (req, res) => {
 });
 
 // Account access changes are always recorded with the administrator-provided reason.
+function parseRechargeBatchReasons(raw) {
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed) ? [...new Set(parsed.filter((item) => typeof item === "string"))] : [];
+  } catch {
+    return ["invalid_stored_reason_data"];
+  }
+}
+
+async function holdOutstandingRechargeBatchesForDeactivatedAccount(username) {
+  return withTransaction(async (tx) => {
+    const [batchRows] = await tx.query(
+      `SELECT * FROM users_usdt_deposit_batches
+       WHERE username=? AND remaining_amount>0
+         AND status IN ('collecting','batched','ready','finalizing','pending_minimum',
+                        'pending_credit','pending_weekly','pending_reserve','pending_support','pending_global')
+       ORDER BY id ASC FOR UPDATE`,
+      [username],
+    );
+    const now = Date.now();
+    const batchIds = [];
+    for (const batch of batchRows) {
+      const reasons = parseRechargeBatchReasons(batch.reason_codes)
+        .filter((reason) => reason !== "account_unavailable");
+      if (!reasons.includes("account_deactivated")) reasons.push("account_deactivated");
+      const reasonJson = safeJson(reasons);
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches
+         SET status='pending_support',pending_since_ms=COALESCE(pending_since_ms,?),
+             next_attempt_at_ms=NULL,reason_codes=?,updated_at_ms=?
+         WHERE id=? AND remaining_amount>0`,
+        [String(now), reasonJson, String(now), String(batch.id)],
+      );
+      await updateBatchEventStatus(tx, batch.id, "pending_support", reasons);
+      await queueRechargeBatchStatusTx(
+        tx,
+        username,
+        batch.id,
+        "pending_support",
+        reasons,
+        null,
+        {
+          sessionTotal: String(batch.total_amount || "0"),
+          creditedAmount: String(batch.credited_amount || "0"),
+          remainingAmount: String(batch.remaining_amount || "0"),
+        },
+      );
+      batchIds.push(String(batch.id));
+    }
+    return { count: batchIds.length, batchIds };
+  });
+}
+
+async function releaseDeactivatedRechargeBatches(username) {
+  return withTransaction(async (tx) => {
+    const [batchRows] = await tx.query(
+      `SELECT * FROM users_usdt_deposit_batches
+       WHERE username=? AND remaining_amount>0 AND status='pending_support'
+         AND JSON_VALID(reason_codes)=1
+         AND JSON_CONTAINS(reason_codes, JSON_QUOTE('account_deactivated'))=1
+       ORDER BY id ASC FOR UPDATE`,
+      [username],
+    );
+    const now = Date.now();
+    const batchIds = [];
+    for (const batch of batchRows) {
+      const reasons = parseRechargeBatchReasons(batch.reason_codes)
+        .filter((reason) => reason !== "account_deactivated");
+      const reasonJson = reasons.length ? safeJson(reasons) : null;
+      const expiresAt = Number(batch.expires_at_ms || now);
+      const nextAttemptAt = Math.max(now, Number.isSafeInteger(expiresAt) && expiresAt > 0 ? expiresAt : now);
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches
+         SET status='pending_support',next_attempt_at_ms=?,reason_codes=?,updated_at_ms=?
+         WHERE id=? AND remaining_amount>0 AND status='pending_support'`,
+        [String(nextAttemptAt), reasonJson, String(now), String(batch.id)],
+      );
+      await updateBatchEventStatus(tx, batch.id, "pending_support", reasons);
+      await queueRechargeBatchStatusTx(
+        tx,
+        username,
+        batch.id,
+        "pending_support",
+        reasons,
+        nextAttemptAt > now ? nextAttemptAt : null,
+        {
+          sessionTotal: String(batch.total_amount || "0"),
+          creditedAmount: String(batch.credited_amount || "0"),
+          remainingAmount: String(batch.remaining_amount || "0"),
+          accountReactivated: true,
+        },
+      );
+      batchIds.push(String(batch.id));
+    }
+    return { count: batchIds.length, batchIds };
+  });
+}
+
+function wakeRechargeBatchesImmediately(batchIds) {
+  const ids = [...new Set((batchIds || []).map((id) => String(id)).filter((id) => /^\d+$/.test(id)))];
+  if (!ids.length) return;
+  setImmediate(() => {
+    void (async () => {
+      for (const batchId of ids) {
+        try {
+          await processOneRechargeBatch(batchId);
+        } catch (error) {
+          console.error(`Immediate recharge wake-up failed for batch ${batchId}:`, error.message);
+        }
+      }
+      try {
+        await processRechargeBatchQueue();
+      } catch (error) {
+        console.error("Recharge queue wake-up failed after account reactivation:", error.message);
+      }
+    })();
+  });
+}
+
 async function changeAccountAccess(req, res, action) {
   const { pswd, pin, user, username, reason } = req.body || {};
   if (
@@ -5325,7 +5473,7 @@ async function changeAccountAccess(req, res, action) {
   }
 
   try {
-    const result = await withTransaction(async (tx) => {
+    let result = await withTransaction(async (tx) => {
       const [authRows] = await tx.query(
         "SELECT username,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE",
         [U],
@@ -5371,6 +5519,18 @@ async function changeAccountAccess(req, res, action) {
         changed_at_ms: Number(now),
       };
     });
+
+    if (action === "deactivated" && ["deactivated", "already deactivated"].includes(result.account)) {
+      const holdResult = await holdOutstandingRechargeBatchesForDeactivatedAccount(U);
+      result = { ...result, recharge_batches_held: holdResult.count };
+    }
+
+    if (action === "activated" && ["activated", "already active"].includes(result.account)) {
+      const wakeResult = await releaseDeactivatedRechargeBatches(U);
+      wakeRechargeBatchesImmediately(wakeResult.batchIds);
+      result = { ...result, recharge_batches_woken: wakeResult.count };
+    }
+
     return res.send(result);
   } catch (error) {
     console.error(`Account ${action} operation failed:`, error.message);

@@ -87,3 +87,11 @@ Pour `tfees=3%`, le seuil est `A * 1.09`, soit 9 % au-dessus de A. Au démarrage
 4. Vérifier que l'adresse de trésorerie affichée par `/app/user-last-stock` est exactement celle surveillée par le scanner et que l'application cliente envoie les dépôts depuis `wallet_address` inscrit.
 5. Tester les scénarios de transfert normal, expéditeur inconnu, RPC indisponible, redémarrage, doublon, changement de hash de curseur et compte désactivé avant d'activer `USDT_PAYMENTS_ENABLED`.
 6. Utiliser exclusivement une base vide créée par le schéma actuel. Aucune migration n'est attendue ni fournie.
+
+
+## Account deactivation and pending recharge synchronization (2026-11-21)
+
+- After `auths.account_active` is committed as inactive, all outstanding recharge batches with `remaining_amount > 0` are moved to `pending_support` with the `account_deactivated` reason. Linked transfer events are updated and a Telegram state notification is queued. New finalized deposits from a deactivated account are also stored as `pending_support` with the same explicit reason.
+- The normal retry query and balance-change wake-up helper exclude batches whose reason list contains `account_deactivated`, so they do not churn while the account is disabled. The financial credit path independently checks `account_active` under row lock and returns a distinct deactivation result.
+- On reactivation, only `account_deactivated` is removed from each held batch's reason list. Batches are made due no earlier than the end of their 60-minute collection window, a reactivation notification is queued, and the processor is invoked immediately after commit. FIFO, global-cutoff, minimum, weekly cooldown, account ceiling and reserve checks are all re-evaluated; reactivation does not force a credit.
+- No schema migration is required; existing initial-schema columns are reused.
