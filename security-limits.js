@@ -6,6 +6,7 @@ const ACCOUNT_SECURITY_POLICIES = Object.freeze({
   password_change: Object.freeze({ maxFailed: 3, maxSuccessful: 1 }),
   seed_change: Object.freeze({ maxFailed: 3, maxSuccessful: 1 }),
   account_recovery: Object.freeze({ maxRequests: 2 }),
+  device_registration: Object.freeze({ maxFailed: 5, maxSuccessful: 5 }),
 });
 
 function countRecentEvents(events, nowMs = Date.now(), windowMs = DAY_MS) {

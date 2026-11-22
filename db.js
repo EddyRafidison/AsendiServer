@@ -118,10 +118,76 @@ const TABLES = [
     UNIQUE KEY uq_auths_tg_chat_id(tg_chat_id),
     KEY idx_auths_failed_auth(consec_failed_auth)
   ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS auth_devices(
+    username VARCHAR(30) PRIMARY KEY,
+    device_id VARCHAR(80) NOT NULL,
+    public_key_der TEXT NOT NULL,
+    public_key_fingerprint CHAR(64) NOT NULL,
+    session_token_hash CHAR(64) NOT NULL,
+    session_expires_at_ms BIGINT UNSIGNED NOT NULL,
+    registered_at_ms BIGINT UNSIGNED NOT NULL,
+    last_seen_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_auth_devices_fingerprint(public_key_fingerprint),
+    KEY idx_auth_devices_session_expiry(session_expires_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS auth_device_challenges(
+    challenge_id CHAR(43) PRIMARY KEY,
+    username VARCHAR(30) NOT NULL,
+    device_id VARCHAR(80) NOT NULL,
+    public_key_der TEXT NOT NULL,
+    public_key_fingerprint CHAR(64) NOT NULL,
+    challenge_value CHAR(43) NOT NULL,
+    expires_at_ms BIGINT UNSIGNED NOT NULL,
+    used_at_ms BIGINT UNSIGNED NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_auth_device_challenge_user(username,expires_at_ms,used_at_ms),
+    KEY idx_auth_device_challenge_expiry(expires_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS auth_device_request_nonces(
+    username VARCHAR(30) NOT NULL,
+    device_id VARCHAR(80) NOT NULL,
+    nonce VARCHAR(80) NOT NULL,
+    expires_at_ms BIGINT UNSIGNED NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY(username,device_id,nonce),
+    KEY idx_auth_device_nonce_expiry(expires_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS auth_device_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(30) NOT NULL,
+    event_type VARCHAR(32) NOT NULL,
+    old_device_id VARCHAR(80) NULL,
+    new_device_id VARCHAR(80) NULL,
+    old_key_fingerprint CHAR(64) NULL,
+    new_key_fingerprint CHAR(64) NULL,
+    ip_hash CHAR(64) NULL,
+    user_agent VARCHAR(512) NULL,
+    reason VARCHAR(1000) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_auth_device_events_user(username,id),
+    KEY idx_auth_device_events_created(created_at_ms)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS account_security_email_outbox(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    event_key VARCHAR(191) NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    recipient VARCHAR(254) NOT NULL,
+    subject VARCHAR(255) NOT NULL,
+    message_text TEXT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    next_attempt_at_ms BIGINT UNSIGNED NOT NULL,
+    claimed_at_ms BIGINT UNSIGNED NULL,
+    last_error TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    sent_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_account_security_email_event(event_key),
+    KEY idx_account_security_email_due(status,next_attempt_at_ms,id)
+  ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_stock(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
-    balance DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Initial-asset balance; public XTU is calculated using common.unit_price',
+    balance DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Initial-asset principal; user XTU value uses the individual effective price',
     seller_status TINYINT UNSIGNED NOT NULL DEFAULT 0,
     run_balance DECIMAL(50,30) NOT NULL DEFAULT 0,
     seller_activated_at_ms BIGINT UNSIGNED NULL,
@@ -139,6 +205,7 @@ const TABLES = [
     amount DECIMAL(50,30) NOT NULL,
     unit_price DECIMAL(50,30) NOT NULL DEFAULT 0,
     fees DECIMAL(50,30) NOT NULL DEFAULT 0,
+    fee_unit_price DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Global price used to value system tfees in common reserves',
     bsc_fee_cost_usd DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Actual BSC network cost allocated to this activity',
     reference VARCHAR(64) NULL,
     record_date INT NOT NULL,
@@ -186,14 +253,19 @@ const TABLES = [
     cycle_number INT UNSIGNED NOT NULL,
     base_price DECIMAL(50,30) NOT NULL,
     tfees_rate DECIMAL(20,10) NOT NULL,
+    remuneration_rate DECIMAL(20,10) NOT NULL,
     target_price DECIMAL(50,30) NOT NULL,
     status VARCHAR(16) NOT NULL DEFAULT 'watching',
     start_price_event_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
     triggered_price DECIMAL(50,30) NULL,
     triggered_at_ms BIGINT UNSIGNED NULL,
-    trigger_balance_initial_asset DECIMAL(50,30) NULL,
-    required_sale_initial_asset DECIMAL(50,30) NULL,
-    sold_since_trigger_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    frozen_price DECIMAL(50,30) NULL,
+    sale_group_base_initial_asset DECIMAL(50,30) NULL,
+    sale_group_volume_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    sale_group_fee_weighted DECIMAL(50,30) NOT NULL DEFAULT 0,
+    purchase_group_base_initial_asset DECIMAL(50,30) NULL,
+    purchase_group_volume_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    purchase_group_fee_weighted DECIMAL(50,30) NOT NULL DEFAULT 0,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     KEY idx_user_price_state_threshold(status,target_price,start_price_event_id,username)
@@ -204,14 +276,16 @@ const TABLES = [
     cycle_number INT UNSIGNED NOT NULL,
     base_price DECIMAL(50,30) NOT NULL,
     tfees_rate DECIMAL(20,10) NOT NULL,
+    remuneration_rate DECIMAL(20,10) NOT NULL,
     target_price DECIMAL(50,30) NOT NULL,
     start_price_event_id BIGINT UNSIGNED NOT NULL,
     triggered_price DECIMAL(50,30) NULL,
     triggered_at_ms BIGINT UNSIGNED NULL,
-    trigger_balance_initial_asset DECIMAL(50,30) NULL,
-    required_sale_initial_asset DECIMAL(50,30) NULL,
-    sold_since_trigger_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    principal_before_operation DECIMAL(50,30) NULL,
+    operation_direction VARCHAR(16) NULL,
+    operation_volume_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     resumed_at_ms BIGINT UNSIGNED NULL,
+    resume_reason VARCHAR(48) NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
     UNIQUE KEY uq_user_price_cycle(username,cycle_number),
@@ -220,9 +294,9 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS users_seller_campaigns(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
-    run_balance DECIMAL(50,30) NOT NULL COMMENT 'Initial assets; unit_price stores the frozen public valuation',
+    run_balance DECIMAL(50,30) NOT NULL COMMENT 'Initial assets; unit_price stores the frozen individual valuation',
     reserved_initial_asset DECIMAL(50,30) NOT NULL,
-    unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable global price captured when the seller submitted this campaign; not a live account price',
+    unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable individual price captured when the seller submitted this campaign',
     price_cycle_number INT UNSIGNED NOT NULL,
     sold_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     status VARCHAR(24) NOT NULL DEFAULT 'active',
@@ -241,7 +315,7 @@ const TABLES = [
     username VARCHAR(30) NOT NULL,
     original_initial_asset DECIMAL(50,30) NOT NULL,
     remaining_initial_asset DECIMAL(50,30) NOT NULL,
-    unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable campaign-submission price used for seller payout valuation',
+    unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable individual campaign price used for seller payout valuation',
     payout_pending_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     payout_reserved_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     paid_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -560,9 +634,10 @@ const TABLES = [
     amount_raw DECIMAL(65,0) NOT NULL,
     gross_initial_asset DECIMAL(50,30) NOT NULL,
     sold_initial_asset DECIMAL(50,30) NOT NULL,
-    fee_amount DECIMAL(36,18) NOT NULL COMMENT 'BSC-USD fee value locked at submission',
+    fee_amount DECIMAL(36,18) NOT NULL COMMENT 'tfees XTU value locked at the participant individual price at submission',
     fee_initial_asset DECIMAL(50,30) NOT NULL,
-    price_value DECIMAL(50,30) NOT NULL COMMENT 'Immutable common.unit_price captured at user request submission',
+    tfees_rate_percent DECIMAL(20,10) NOT NULL DEFAULT 0,
+    price_value DECIMAL(50,30) NOT NULL COMMENT 'Immutable individual price captured at user request submission',
     disbursement_mode VARCHAR(16) NOT NULL DEFAULT 'individual',
     global_run_id BIGINT UNSIGNED NULL,
     balance_after_reservation DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -635,6 +710,11 @@ const TABLES = [
     run_id BIGINT UNSIGNED NOT NULL,
     username VARCHAR(30) NOT NULL,
     snapshot_balance_initial DECIMAL(50,30) NOT NULL,
+    snapshot_base_price DECIMAL(50,30) NOT NULL,
+    snapshot_remuneration_rate DECIMAL(20,10) NOT NULL,
+    snapshot_target_price DECIMAL(50,30) NOT NULL,
+    snapshot_unit_price DECIMAL(50,30) NOT NULL,
+    snapshot_price_status VARCHAR(16) NOT NULL,
     requested_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     paid_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     remaining_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -780,12 +860,17 @@ async function assertLatestSchema() {
       "created_at_ms", "last_login_at_ms", "consec_failed_auth", "password_temp_expires_at_ms",
       "tg_userId", "tg_chat_id", "record_date", "record_time",
     ],
+    auth_devices: ["username", "device_id", "public_key_der", "public_key_fingerprint", "session_token_hash", "session_expires_at_ms", "registered_at_ms", "last_seen_at_ms"],
+    auth_device_challenges: ["challenge_id", "username", "device_id", "public_key_der", "public_key_fingerprint", "challenge_value", "expires_at_ms", "used_at_ms", "created_at_ms"],
+    auth_device_request_nonces: ["username", "device_id", "nonce", "expires_at_ms", "created_at_ms"],
+    auth_device_events: ["username", "event_type", "old_device_id", "new_device_id", "old_key_fingerprint", "new_key_fingerprint", "ip_hash", "user_agent", "reason", "created_at_ms"],
+    account_security_email_outbox: ["event_key", "username", "recipient", "subject", "message_text", "status", "attempts", "next_attempt_at_ms", "claimed_at_ms", "last_error", "created_at_ms", "sent_at_ms"],
     users_stock: [
       "username", "balance", "seller_status", "run_balance",
       "seller_activated_at_ms", "seller_expires_at_ms", "seller_last_p2p_at_ms", "record_date", "record_time",
     ],
     activities: [
-      "sender", "receiver", "type", "amount", "unit_price", "fees", "bsc_fee_cost_usd", "reference",
+      "sender", "receiver", "type", "amount", "unit_price", "fees", "fee_unit_price", "bsc_fee_cost_usd", "reference",
       "record_date", "record_time",
     ],
     telegram_link_challenges: [
@@ -802,8 +887,8 @@ async function assertLatestSchema() {
       "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "record_date", "record_time",
     ],
     common_price_events: ["old_price", "new_price", "status", "last_username", "processed_at_ms", "created_at_ms", "updated_at_ms"],
-    user_price_state: ["username", "cycle_number", "base_price", "tfees_rate", "target_price", "status", "start_price_event_id", "triggered_price", "triggered_at_ms", "trigger_balance_initial_asset", "required_sale_initial_asset", "sold_since_trigger_initial_asset", "updated_at_ms", "created_at_ms"],
-    user_price_cycle_history: ["username", "cycle_number", "base_price", "tfees_rate", "target_price", "start_price_event_id", "triggered_price", "triggered_at_ms", "trigger_balance_initial_asset", "required_sale_initial_asset", "sold_since_trigger_initial_asset", "resumed_at_ms", "created_at_ms", "updated_at_ms"],
+    user_price_state: ["username", "cycle_number", "base_price", "tfees_rate", "remuneration_rate", "target_price", "status", "start_price_event_id", "triggered_price", "triggered_at_ms", "frozen_price", "sale_group_base_initial_asset", "sale_group_volume_initial_asset", "sale_group_fee_weighted", "purchase_group_base_initial_asset", "purchase_group_volume_initial_asset", "purchase_group_fee_weighted", "updated_at_ms", "created_at_ms"],
+    user_price_cycle_history: ["username", "cycle_number", "base_price", "tfees_rate", "remuneration_rate", "target_price", "start_price_event_id", "triggered_price", "triggered_at_ms", "principal_before_operation", "operation_direction", "operation_volume_initial_asset", "resumed_at_ms", "resume_reason", "created_at_ms", "updated_at_ms"],
     users_seller_campaigns: [
       "username", "run_balance", "reserved_initial_asset", "unit_price", "price_cycle_number",
       "sold_initial_asset", "status", "activated_at_ms", "expires_at_ms", "last_p2p_at_ms", "closed_at_ms", "close_reason",
@@ -856,7 +941,7 @@ async function assertLatestSchema() {
     ],
     users_usdt_disbursements: [
       "username", "payout_address", "requested_amount", "payout_amount", "amount_raw",
-      "gross_initial_asset", "sold_initial_asset", "fee_amount", "fee_initial_asset",
+      "gross_initial_asset", "sold_initial_asset", "fee_amount", "fee_initial_asset", "tfees_rate_percent",
       "price_value", "disbursement_mode", "global_run_id", "balance_after_reservation", "bsc_fee_recovered_usd",
       "bonus_amount", "bonus_initial_asset",
       "estimated_fee_bnb", "estimated_fee_usd", "actual_fee_bnb", "actual_fee_usd",
@@ -864,7 +949,7 @@ async function assertLatestSchema() {
       "last_error", "created_at_ms", "reservation_expires_at_ms", "updated_at_ms", "confirmed_at_ms",
     ],
     global_disbursement_runs: ["status", "trigger_reason", "decision_reference", "notice_method", "notice_reference", "request_window_days", "extension_days", "planned_activation_at_ms", "request_deadline_at_ms", "extension_deadline_at_ms", "activated_at_ms", "closed_at_ms", "snapshot_unit_price", "snapshot_total_units_price", "planned_total_initial_asset", "last_user_stock_id", "max_user_stock_id", "total_users", "processed_users", "total_gross_initial_asset", "total_requested_initial_asset", "total_paid_bsc_usd", "bonus_rate_percent", "admin_bonus_reserved_initial_asset", "admin_bonus_committed_initial_asset", "total_bonus_paid_bsc_usd", "total_bonus_paid_initial_asset", "total_bsc_gas_actual_usd", "announced_at_ms", "effective_at_ms", "last_error", "created_at_ms", "updated_at_ms", "completed_at_ms"],
-    global_disbursement_participants: ["run_id", "username", "snapshot_balance_initial", "requested_initial_asset", "paid_initial_asset", "remaining_initial_asset", "request_count", "last_disbursement_id", "status", "resolution_action", "resolution_reference", "resolution_reason", "resolved_at_ms", "created_at_ms", "updated_at_ms"],
+    global_disbursement_participants: ["run_id", "username", "snapshot_balance_initial", "snapshot_base_price", "snapshot_remuneration_rate", "snapshot_target_price", "snapshot_unit_price", "snapshot_price_status", "requested_initial_asset", "paid_initial_asset", "remaining_initial_asset", "request_count", "last_disbursement_id", "status", "resolution_action", "resolution_reference", "resolution_reason", "resolved_at_ms", "created_at_ms", "updated_at_ms"],
     global_disbursement_email_outbox: ["run_id", "username", "recipient", "subject", "message_text", "status", "attempts", "next_attempt_at_ms", "claimed_at_ms", "last_error", "created_at_ms", "sent_at_ms"],
     users_usdt_refunds: [
       "username", "batch_id", "unknown_transfer_id", "user_request_id", "payout_address", "amount", "gross_amount", "fee_amount", "amount_raw",
@@ -902,6 +987,11 @@ async function assertLatestSchema() {
 
   const requiredIndexes = {
     auths: ["uq_auths_email", "uq_auths_wallet_address", "uq_auths_registration_sequence", "idx_auths_first_login_cleanup"],
+    auth_devices: ["idx_auth_devices_fingerprint", "idx_auth_devices_session_expiry"],
+    auth_device_challenges: ["idx_auth_device_challenge_user", "idx_auth_device_challenge_expiry"],
+    auth_device_request_nonces: ["idx_auth_device_nonce_expiry"],
+    auth_device_events: ["idx_auth_device_events_user", "idx_auth_device_events_created"],
+    account_security_email_outbox: ["uq_account_security_email_event", "idx_account_security_email_due"],
     bsc_unknown_incoming_transfers: ["uq_bsc_unknown_transfer", "idx_bsc_unknown_status"],
     activities: [
       "idx_activities_sender_id",
@@ -1110,6 +1200,10 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
       await tx.query("DELETE FROM account_security_events WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM account_api_rate_limits WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM telegram_link_challenges WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM auth_device_challenges WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM auth_device_request_nonces WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM auth_devices WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM account_security_email_outbox WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM telegram_outbox WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM global_disbursement_email_outbox WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM users_stock WHERE username=?", [candidate.username]);
@@ -1141,6 +1235,18 @@ async function cleanup() {
     await db.queryAsync(
       "DELETE FROM telegram_link_challenges WHERE expires_at_ms<? OR used_at_ms IS NOT NULL",
       [String(now - 24 * 60 * 60 * 1000)],
+    );
+    await db.queryAsync(
+      "DELETE FROM auth_device_challenges WHERE expires_at_ms<? OR used_at_ms IS NOT NULL",
+      [String(now - 24 * 60 * 60 * 1000)],
+    );
+    await db.queryAsync(
+      "DELETE FROM auth_device_request_nonces WHERE expires_at_ms<?",
+      [String(now)],
+    );
+    await db.queryAsync(
+      "DELETE FROM account_security_email_outbox WHERE status IN ('sent','failed') AND created_at_ms<?",
+      [String(now - 365 * 24 * 60 * 60 * 1000)],
     );
     await db.queryAsync(
       "DELETE FROM account_security_events WHERE created_at_ms<?",

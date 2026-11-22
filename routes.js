@@ -7,6 +7,20 @@ const fs = require("fs");
 const geoip = require("geoip-country");
 const nodemailer = require("nodemailer");
 const { createEmailQueue } = require("./email-queue");
+const {
+  DEVICE_CHALLENGE_TTL_MS,
+  DEVICE_REQUEST_CLOCK_SKEW_MS,
+  DEVICE_REQUEST_NONCE_TTL_MS,
+  normalizeDeviceId,
+  createDeviceChallenge,
+  buildDeviceChallengeMessage,
+  verifyDeviceSignature,
+  createSessionToken,
+  hashSessionToken,
+  timingSafeHexEqual,
+  hashRequestBody,
+  buildDeviceRequestMessage,
+} = require("./device-auth");
 const BigNumber = require("bignumber.js");
 const {
   xtuToInitialAsset,
@@ -41,6 +55,8 @@ const {
   calculateGlobalDisbursement,
   validateGlobalDisbursementCapacity,
   isRequestedPayoutWithinTolerance,
+  isPositivePayoutAmount,
+  isIndividualDisbursementBalanceEligible,
 } = require("./disbursement-policy");
 
 const {
@@ -80,9 +96,18 @@ const {
 } = require("./pay");
 const { checkTreasuryLiquidity } = require("./disbursement");
 const { getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
+const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
 getConfiguredMaxBscTxFeeUsd();
 const { createTelegramBotLinkTx, queueTelegramMessageTx } = require("./telegram");
-const { resetUserPriceBasisTx, triggerUserPriceThresholdTx, recordUserP2PSaleTx } = require("./user-price-accounting");
+const {
+  resetUserPriceBasisTx,
+  triggerUserPriceThresholdTx,
+  recordUserOperationTx,
+  initializeUserPriceStateTx,
+  getUserPriceStateTx,
+  previewUserOperationCapacity,
+  calculateEffectiveIndividualPrice,
+} = require("./user-price-accounting");
 const {
   getLatestCommonTx,
   insertCommonSnapshotTx,
@@ -113,7 +138,6 @@ const {
 const { validateSignupIdentity } = require("./identity-policy");
 const { resolveRechargeAvailability, getVisibleDepositAddress } = require("./recharge-service-control");
 const { getPublicRechargeAvailability } = require("./recharge-availability");
-const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
 const { findMaximumRechargeCredit } = require("./recharge-credit-policy");
 const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
 const { recordRefundRequestEventTx } = require("./refund-request-audit");
@@ -155,6 +179,11 @@ const WELCOME_BONUS_AMOUNT_XTU = resolveWelcomeBonusAmount(
 const WELCOME_BONUS_CLAIM_SECRET = String(
   process.env.WELCOME_BONUS_CLAIM_SECRET || DB_CONFIG.password || "",
 );
+const configuredDeviceSessionTtlDays = Number(process.env.DEVICE_SESSION_TTL_DAYS || 30);
+if (!Number.isInteger(configuredDeviceSessionTtlDays) || configuredDeviceSessionTtlDays < 1 || configuredDeviceSessionTtlDays > 90) {
+  throw new Error("DEVICE_SESSION_TTL_DAYS must be an integer between 1 and 90");
+}
+const DEVICE_SESSION_TTL_MS = configuredDeviceSessionTtlDays * 24 * 60 * 60 * 1000;
 
 const router = express.Router();
 
@@ -200,20 +229,76 @@ function createFinancialReference(prefix = "ONEX") {
   return `${String(prefix).replace(/[^A-Za-z0-9]/g, "").slice(0, 12)}${crypto.randomBytes(16).toString("hex")}`;
 }
 
-function requestTokenIsValid(req, token, password, username) {
-  const ua = req.headers["user-agent"];
+async function requestTokenIsValid(req, token, _password, username) {
   if (
-    typeof token !== "string" || Buffer.byteLength(token, "utf8") > 32_768 ||
-    typeof password !== "string" || Buffer.byteLength(password, "utf8") > 4096 ||
-    typeof username !== "string" || username.length > 30 ||
-    typeof ua !== "string" || Buffer.byteLength(ua, "utf8") > 16_384
-  ) {
+    typeof token !== "string" || token.length > 128 ||
+    typeof username !== "string" || username.length === 0 || username.length > 30
+  ) return false;
+
+  const deviceId = normalizeDeviceId(req.get("x-onex-device-id"));
+  const timestampText = String(req.get("x-onex-device-timestamp") || "");
+  const nonce = String(req.get("x-onex-device-nonce") || "");
+  const signature = String(req.get("x-onex-device-signature") || "");
+  if (!deviceId || !/^\d{13}$/.test(timestampText) ||
+      !/^[A-Za-z0-9_-]{22,80}$/.test(nonce) || signature.length > 512) return false;
+
+  const timestamp = Number(timestampText);
+  const now = Date.now();
+  if (!Number.isSafeInteger(timestamp) || Math.abs(now - timestamp) > DEVICE_REQUEST_CLOCK_SKEW_MS) return false;
+
+  let tokenHash;
+  try {
+    tokenHash = hashSessionToken(token);
+  } catch {
+    return false;
+  }
+
+  let message;
+  try {
+    const bodyHash = hashRequestBody(req.rawBody);
+    message = buildDeviceRequestMessage({
+      method: req.method,
+      originalUrl: req.originalUrl,
+      timestamp: timestampText,
+      nonce,
+      token,
+      bodyHash,
+    });
+  } catch {
     return false;
   }
 
   try {
-    return ua === decrypt(token, password + username);
-  } catch {
+    return await withTransaction(async (tx) => {
+      const [deviceRows] = await tx.execute(
+        `SELECT device_id,public_key_der,session_token_hash,session_expires_at_ms
+         FROM auth_devices WHERE username=? LIMIT 1 FOR UPDATE`,
+        [username],
+      );
+      if (!deviceRows.length) return false;
+      const device = deviceRows[0];
+      if (
+        device.device_id !== deviceId ||
+        Number(device.session_expires_at_ms) <= now ||
+        !timingSafeHexEqual(String(device.session_token_hash || ""), tokenHash) ||
+        !verifyDeviceSignature(device.public_key_der, message, signature)
+      ) return false;
+
+      await tx.execute(
+        `INSERT INTO auth_device_request_nonces(username,device_id,nonce,expires_at_ms,created_at_ms)
+         VALUES(?,?,?,?,?)`,
+        [username, deviceId, nonce, String(now + DEVICE_REQUEST_NONCE_TTL_MS), String(now)],
+      );
+      await tx.execute(
+        `UPDATE auth_devices SET last_seen_at_ms=? WHERE username=? AND device_id=? AND session_token_hash=?`,
+        [String(now), username, deviceId, tokenHash],
+      );
+      return true;
+    });
+  } catch (error) {
+    if (error.code !== "ER_DUP_ENTRY") {
+      console.error("Device-bound request validation failed:", error.message);
+    }
     return false;
   }
 }
@@ -378,7 +463,7 @@ async function applyWelcomeBonusAtFirstLoginTx(tx, authRow, nowMs) {
     allocation.newTotalUnitsPrice,
     allocation.newBacked,
   );
-  await resetUserPriceBasisTx(tx, authRow.username, resultingPrice, tfees);
+  await resetUserPriceBasisTx(tx, authRow.username, resultingPrice, tfees, { source: "welcome_bonus" });
   await tx.query(
     `INSERT INTO welcome_bonus_claims(subject_type,subject_hash,username,amount_xtu,credited_at_ms)
      VALUES('email',?,?,?,?),('identity',?,?,?,?)`,
@@ -579,6 +664,11 @@ async function assessUserRechargeAvailability(username) {
        FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE`, [username],
     );
     if (!stockRows.length) return { allowed: false, reason: "account_not_found", common, globalRun, rechargeControl };
+    const [priceStateRows] = await tx.query(
+      "SELECT * FROM user_price_state WHERE username=? LIMIT 1 FOR UPDATE", [username],
+    );
+    if (!priceStateRows.length) throw new Error(`Individual remuneration state is missing for ${username}`);
+    const priceState = priceStateRows[0];
 
     const globalEffective = Boolean(
       globalRun && isGlobalDisbursementEffective(globalRun.status, globalRun.effective_at_ms, Date.now()),
@@ -624,6 +714,10 @@ async function assessUserRechargeAvailability(username) {
       currentUnitPrice: common.unit_price,
       tfeesRate: tfees,
       maximumUserXtu: maxStockDefault,
+      stockLimitEvaluator: (_balance, creditInitial, projectedGlobalPrice) => previewUserOperationCapacity(
+        priceState, "purchase", creditInitial, new BigNumber(stockRows[0].balance),
+        new BigNumber(stockRows[0].balance).plus(creditInitial), projectedGlobalPrice,
+      ),
     });
     const availability = resolveRechargeAvailability({
       globalDisbursementActive: false,
@@ -731,6 +825,11 @@ async function applyUserTopUp(
     "SELECT balance FROM users_stock WHERE username=? FOR UPDATE", [username],
   );
   if (!userRows.length) return { error: "user not found" };
+  const [userPriceRows] = await tx.query(
+    "SELECT * FROM user_price_state WHERE username=? LIMIT 1 FOR UPDATE", [username],
+  );
+  if (!userPriceRows.length) throw new Error(`Individual remuneration state is missing for ${username}`);
+  const userPriceState = userPriceRows[0];
   const [pendingDisbursementRows] = await tx.query(
     `SELECT id FROM users_usdt_disbursements
      WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
@@ -797,6 +896,13 @@ async function applyUserTopUp(
     globalBonusRatePercent: bonusRate,
     remainingAdminReserveInitialAsset: adminQuotaRemaining,
     alreadyReservedAdminBonusInitialAsset: currentlyReserved,
+    stockLimitEvaluator: (_balance, creditInitial, projectedGlobalPrice) => {
+      const projectedBalance = userBalanceInitial.plus(creditInitial);
+      return previewUserOperationCapacity(
+        userPriceState, "purchase", creditInitial, userBalanceInitial,
+        projectedBalance, projectedGlobalPrice,
+      );
+    },
   });
   if (!creditPlan.allowed) {
     if (creditPlan.reason === "system_reserve") {
@@ -829,7 +935,6 @@ async function applyUserTopUp(
   amountValue = creditPlan.grossAmount;
   const feeAmountXtu = creditPlan.feeAmount;
   const netAmountXtu = creditPlan.netAmount;
-  const feeAllocation = allocateBscCostFromTfees(feeAmountXtu, actualBscFeeUsd);
   const bscFeeCoveredUsd = new BigNumber(0);
   const bscFeeUncoveredUsd = new BigNumber(0);
   const netFeeAmountXtu = feeAmountXtu;
@@ -841,7 +946,6 @@ async function applyUserTopUp(
   const systemBasis = systemAmountInitial;
   const creditedBasis = sellerBasis.plus(systemBasis);
   const grossFeeBasis = feeAmountXtu.dividedBy(price);
-  const bscFeeCoveredBasis = new BigNumber(0);
   const feeBasis = grossFeeBasis;
   if (!feeBasis.isFinite() || feeBasis.isNegative()) throw new Error("Net tfees reserve basis is invalid");
   const newTotal = creditPlan.newTotal;
@@ -855,8 +959,9 @@ async function applyUserTopUp(
 
   const newPrice = creditPlan.newPrice;
   const newBalanceInitial = userBalanceInitial.plus(creditedBasis);
-  const stockLimit = isUserBalanceWithinMaxStock(
-    userBalanceInitial, creditedBasis, newPrice, maxStockDefault,
+  const stockLimit = previewUserOperationCapacity(
+    userPriceState, "purchase", creditedBasis, userBalanceInitial,
+    newBalanceInitial, newPrice,
   );
   if (!stockLimit.allowed) {
     return { error: "maximum user balance exceeded", projected_balance: stockLimit.projectedXtu.toFixed(18) };
@@ -880,26 +985,26 @@ async function applyUserTopUp(
   if (!sellerAllocation.consumedInitialAsset.eq(sellerAmountInitial)) {
     throw new Error("The seller reserve changed during recharge allocation");
   }
-  const sellerFeeBasis = requestedInitialAsset.isGreaterThan(0)
-    ? grossFeeBasis.multipliedBy(sellerBasis).dividedBy(requestedInitialAsset)
+  const sellerFeeBasis = creditedBasis.isGreaterThan(0)
+    ? grossFeeBasis.multipliedBy(sellerBasis).dividedBy(creditedBasis)
     : new BigNumber(0);
   const systemFeeBasis = grossFeeBasis.minus(sellerFeeBasis);
-  const sellerBscFeeCost = requestedInitialAsset.isGreaterThan(0)
-    ? actualBscFeeUsd.multipliedBy(sellerBasis).dividedBy(requestedInitialAsset)
+  const sellerBscFeeCost = creditedBasis.isGreaterThan(0)
+    ? actualBscFeeUsd.multipliedBy(sellerBasis).dividedBy(creditedBasis)
     : new BigNumber(0);
   const systemBscFeeCost = actualBscFeeUsd.minus(sellerBscFeeCost);
   if (sellerBasis.isGreaterThan(0)) {
     await tx.query(
-      `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,bsc_fee_cost_usd,reference,record_date,record_time)
-       VALUES('XUSER',?,?,?, ?,?,?,?,?,?)`,
-      [username, 2, sellerBasis.toFixed(30), price.toFixed(30), sellerFeeBasis.toFixed(30), sellerBscFeeCost.toFixed(30), `${reference}S`.slice(0, 64), date, time],
+      `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,fee_unit_price,bsc_fee_cost_usd,reference,record_date,record_time)
+       VALUES('XUSER',?,?,?, ?,?,?,?,?,?,?)`,
+      [username, 2, sellerBasis.toFixed(30), price.toFixed(30), sellerFeeBasis.toFixed(30), price.toFixed(30), sellerBscFeeCost.toFixed(30), `${reference}S`.slice(0, 64), date, time],
     );
   }
   if (systemBasis.isGreaterThan(0)) {
     await tx.query(
-      `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,bsc_fee_cost_usd,reference,record_date,record_time)
-       VALUES(?,?,2,?,?,?,?,?,?,?)`,
-      [OneX, username, systemBasis.toFixed(30), price.toFixed(30), systemFeeBasis.toFixed(30), systemBscFeeCost.toFixed(30), `${reference}O`.slice(0, 64), date, time],
+      `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,fee_unit_price,bsc_fee_cost_usd,reference,record_date,record_time)
+       VALUES(?,?,2,?,?,?,?,?,?,?,?)`,
+      [OneX, username, systemBasis.toFixed(30), price.toFixed(30), systemFeeBasis.toFixed(30), price.toFixed(30), systemBscFeeCost.toFixed(30), `${reference}O`.slice(0, 64), date, time],
     );
   }
   await tx.query(
@@ -918,9 +1023,19 @@ async function applyUserTopUp(
   }, date, time);
 
   const resultingPrice = calculateGlobalUnitPrice(newTotal, newBacked);
-  await resetUserPriceBasisTx(tx, username, resultingPrice, appliedTfeesRate);
-
-  const creditedXtuAtTransactionPrice = creditedBasis.multipliedBy(price);
+  await recordUserOperationTx(
+    tx, username, "purchase", creditedBasis, userBalanceInitial, newBalanceInitial,
+    resultingPrice, appliedTfeesRate, reference,
+  );
+  // Only evaluate the post-credit global price after a qualifying group has
+  // had a chance to create its next cycle; this avoids a false pause notice.
+  await triggerUserPriceThresholdTx(tx, username, resultingPrice, null, newBalanceInitial);
+  const updatedPriceState = await getUserPriceStateTx(tx, username, true);
+  if (!updatedPriceState) throw new Error(`Individual remuneration state is missing after recharge for ${username}`);
+  const updatedIndividualPrice = calculateEffectiveIndividualPrice(
+    updatedPriceState, newBalanceInitial, resultingPrice, maxStockDefault,
+  ).price;
+  const creditedXtuAtIndividualPrice = creditedBasis.multipliedBy(updatedIndividualPrice);
   await queueTelegramMessageTx(
     tx,
     username,
@@ -932,7 +1047,9 @@ async function applyUserTopUp(
       `Applied tfees rate: ${appliedTfeesRate.toFixed(4)}%`,
       `Gross tfees retained by OneX: ${feeAmountXtu.toFixed(8)} BSC-USD`,
       "No OneX BSC network fee is deducted from incoming recharges.",
-      `Amount credited: ${creditedXtuAtTransactionPrice.toFixed(8)} XTU at transaction price ${price.toFixed(12)}`,
+      `Initial assets credited to your principal: ${creditedBasis.toFixed(8)}`,
+      `Individual valuation of the credited assets: ${creditedXtuAtIndividualPrice.toFixed(8)} XTU at ${updatedIndividualPrice.toFixed(12)} XTU per initial asset`,
+      `Public/global price after this credit: ${resultingPrice.toFixed(12)} XTU per initial asset`,
       `Funding source: ${[
         fundingAllocation.consumedInactive.isGreaterThan(0) ? "inactive reserve" : null,
         sellerBasis.isGreaterThan(0) ? "seller reserve" : null,
@@ -1010,12 +1127,8 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   }
 
   const mode = globalRequestOpen ? "global" : "individual";
-  const requestPrice = mode === "global"
-    ? new BigNumber(globalRun.snapshot_unit_price)
-    : commonPrice;
-  if (!requestPrice.isFinite() || !requestPrice.isGreaterThan(0)) {
-    throw new Error("Invalid price for disbursement request");
-  }
+  let requestPrice;
+  let globalParticipant = null;
 
   const [authRows] = await tx.query(
     `SELECT last_login_at_ms,account_active,password,consec_failed_auth,password_temp_expires_at_ms
@@ -1067,6 +1180,25 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   if (!userBalanceInitial.isFinite() || !userBalanceInitial.isGreaterThan(0)) {
     return { transf: "not eligible" };
   }
+  if (mode === "global") {
+    const [participantRows] = await tx.query(
+      `SELECT * FROM global_disbursement_participants
+       WHERE run_id=? AND username=? LIMIT 1 FOR UPDATE`, [globalRun.id, username],
+    );
+    if (!participantRows.length) return { transf: "global participant not found; administrative review required" };
+    globalParticipant = participantRows[0];
+    requestPrice = new BigNumber(globalParticipant.snapshot_unit_price);
+  } else {
+    await triggerUserPriceThresholdTx(tx, username, commonPrice);
+    const userPriceState = await getUserPriceStateTx(tx, username, true);
+    if (!userPriceState) throw new Error(`Individual remuneration state is missing for ${username}`);
+    requestPrice = calculateEffectiveIndividualPrice(
+      userPriceState, userBalanceInitial, commonPrice, maxStockDefault,
+    ).price;
+  }
+  if (!requestPrice.isFinite() || !requestPrice.isGreaterThan(0)) {
+    throw new Error("Invalid individual price for disbursement request");
+  }
   const currentBalanceXtu = userBalanceInitial.multipliedBy(requestPrice);
   const minimumCheck = evaluateDisbursementMinimumXtu(
     requestedGrossAmountXtu,
@@ -1082,12 +1214,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   }
 
   if (mode === "global") {
-    const [participantRows] = await tx.query(
-      `SELECT * FROM global_disbursement_participants
-       WHERE run_id=? AND username=? LIMIT 1 FOR UPDATE`, [globalRun.id, username],
-    );
-    if (!participantRows.length) return { transf: "global participant not found; administrative review required" };
-    const participant = participantRows[0];
+    const participant = globalParticipant;
     if (!["awaiting_request", "paid"].includes(String(participant.status))) {
       return { transf: "global participant requires administrative review" };
     }
@@ -1100,7 +1227,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
       globalPhase === "primary" ? (globalRun.bonus_rate_percent || "0") : "0",
     );
     const calculation = calculateGlobalDisbursement(
-      requestedInitialAsset, requestPrice, 0, bonusRate,
+      requestedInitialAsset, requestPrice, 0, bonusRate, tfees,
     );
     const reservedBonus = new BigNumber(globalRun.admin_bonus_reserved_initial_asset || "0");
     const committedBonus = new BigNumber(globalRun.admin_bonus_committed_initial_asset || "0");
@@ -1115,27 +1242,19 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     const [insertResult] = await tx.query(
       `INSERT INTO users_usdt_disbursements
        (username,payout_address,requested_amount,payout_amount,amount_raw,gross_initial_asset,
-        sold_initial_asset,fee_amount,fee_initial_asset,price_value,disbursement_mode,global_run_id,
+        sold_initial_asset,fee_amount,fee_initial_asset,tfees_rate_percent,price_value,disbursement_mode,global_run_id,
         balance_after_reservation,bsc_fee_recovered_usd,bonus_amount,bonus_initial_asset,
         estimated_fee_bnb,estimated_fee_usd,reference,status,created_at_ms,reservation_expires_at_ms,updated_at_ms)
-       VALUES(?,?,?,?,?,?,?,0,0,?,'global',?,?,0,?,?,0,0,?,'queued',?,?,?)`,
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,'global',?,?,0,?,?,0,0,?,'queued',?,?,?)`,
       [
-        username,
-        payoutAddress,
-        calculation.grossBalance.toFixed(18),
-        calculation.payoutBeforeGas.toFixed(18),
-        calculation.amountRaw,
-        requestedInitialAsset.toFixed(30),
-        requestedInitialAsset.toFixed(30),
-        requestPrice.toFixed(30),
-        String(globalRun.id),
-        newBalanceInitial.toFixed(30),
-        calculation.bonusAmount.toFixed(18),
-        calculation.bonusInitialAsset.toFixed(30),
-        reference,
-        String(now),
-        String(now + 365 * 24 * 60 * 60 * 1000),
-        String(now),
+        username, payoutAddress, calculation.grossBalance.toFixed(18),
+        calculation.payoutBeforeGas.toFixed(18), calculation.amountRaw,
+        requestedInitialAsset.toFixed(30), calculation.soldInitialAsset.toFixed(30),
+        calculation.feeAmount.toFixed(18), calculation.feeInitialAsset.toFixed(30),
+        new BigNumber(tfees).toFixed(10), requestPrice.toFixed(30), String(globalRun.id),
+        newBalanceInitial.toFixed(30), calculation.bonusAmount.toFixed(18),
+        calculation.bonusInitialAsset.toFixed(30), reference, String(now),
+        String(now + 365 * 24 * 60 * 60 * 1000), String(now),
       ],
     );
     const newRequested = new BigNumber(participant.requested_initial_asset || "0").plus(requestedInitialAsset);
@@ -1164,11 +1283,13 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     await queueTelegramMessageTx(tx, username, `global-disbursement:${globalRun.id}:${insertResult.insertId}:queued`, [
       "OneX Global Disbursement Update",
       "Your global disbursement request to ONEX has been accepted.",
-      `Net amount requested: ${calculation.grossBalance.toFixed(8)} XTU`,
+      `Gross amount requested: ${calculation.grossBalance.toFixed(8)} XTU`,
+      `Net amount after tfees: ${calculation.netRequestedAmount.toFixed(8)} XTU`,
       `Global bonus: ${calculation.bonusAmount.toFixed(8)} BSC-USD`,
       ...(globalPhase === "extension" ? ["The 30-day extension is active; no bonus applies to new requests."] : []),
-      "No tfees are charged in global disbursement mode. BSC network gas is deducted separately.",
-      `Locked global valuation: ${requestPrice.toFixed(12)} XTU per initial asset`,
+      `System tfees deducted from the gross sale: ${calculation.feeAmount.toFixed(8)} BSC-USD.`,
+      "The estimated BSC network fee is deducted separately from your BSC-USD payout.",
+      `Locked individual valuation: ${requestPrice.toFixed(12)} XTU per initial asset`,
       `Reference: ${reference}`,
       "Status: PROCESSING",
     ].join("\n"));
@@ -1177,7 +1298,7 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
       disbursement_mode: "global",
       disbursement_id: String(insertResult.insertId),
       gross_amount: calculation.grossBalance.toFixed(18),
-      fee_amount: "0",
+      fee_amount: calculation.feeAmount.toFixed(18),
       bonus_amount: calculation.bonusAmount.toFixed(18),
       payout_amount_before_bsc_gas: calculation.payoutBeforeGas.toFixed(18),
       remaining_balance: newRemaining.multipliedBy(requestPrice).toFixed(18),
@@ -1187,8 +1308,9 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     };
   }
 
-  const minimumEligibleBalanceXtu = new BigNumber(maxStockDefault).minus(10);
-  if (!currentBalanceXtu.isFinite() || currentBalanceXtu.lt(minimumEligibleBalanceXtu)) {
+  // Account eligibility follows the same configurable minimum as the individual request itself.
+  const minimumEligibleBalanceXtu = minimumCheck.minimumAmount;
+  if (!isIndividualDisbursementBalanceEligible(currentBalanceXtu, minimumEligibleBalanceXtu)) {
     return { transf: "not eligible", minimum_balance: minimumEligibleBalanceXtu.toFixed() };
   }
   const minimumRemainingXtu = new BigNumber(process.env.DISBURSEMENT_INDIVIDUAL_MINIMUM_REMAINING_XTU || "0");
@@ -1198,7 +1320,6 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   const calculation = calculateIndividualDisbursement(
     requestedGrossAmountXtu, userBalanceInitial, requestPrice, tfees,
   );
-  await triggerUserPriceThresholdTx(tx, username, requestPrice);
   const newBalanceInitial = userBalanceInitial.minus(calculation.grossInitialAsset);
   const remainingBalanceXtu = newBalanceInitial.multipliedBy(requestPrice);
   if (remainingBalanceXtu.lt(minimumRemainingXtu)) {
@@ -1227,17 +1348,17 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   await tx.query(
     `INSERT INTO users_usdt_disbursements
      (username,payout_address,requested_amount,payout_amount,amount_raw,gross_initial_asset,
-      sold_initial_asset,fee_amount,fee_initial_asset,price_value,disbursement_mode,global_run_id,
+      sold_initial_asset,fee_amount,fee_initial_asset,tfees_rate_percent,price_value,disbursement_mode,global_run_id,
       balance_after_reservation,bsc_fee_recovered_usd,reference,status,created_at_ms,
       reservation_expires_at_ms,updated_at_ms)
-     VALUES(?,?,?,?,?,?,?,?,?,?,'individual',NULL,?,0,?,'queued',?,?,?)`,
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,'individual',NULL,?,0,?,'queued',?,?,?)`,
     [
       username, payoutAddress,
       calculation.grossAmountXtu.toFixed(18), calculation.payoutAmount.toFixed(18),
       calculation.amountRaw, calculation.grossInitialAsset.toFixed(30),
       calculation.soldInitialAsset.toFixed(30), calculation.feeAmount.toFixed(18),
-      calculation.feeInitialAsset.toFixed(30), calculation.priceValue.toFixed(30),
-      newBalanceInitial.toFixed(30), reference, String(now),
+      calculation.feeInitialAsset.toFixed(30), new BigNumber(tfees).toFixed(10),
+      calculation.priceValue.toFixed(30), newBalanceInitial.toFixed(30), reference, String(now),
       String(now + DISBURSEMENT_RESERVATION_MS), String(now),
     ],
   );
@@ -1254,7 +1375,8 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     `Gross amount requested: ${calculation.grossAmountXtu.toFixed(8)} XTU`,
     `System fee: ${calculation.feeAmount.toFixed(8)} XTU`,
     `Locked valuation price: ${calculation.priceValue.toFixed(12)} XTU per initial asset`,
-    `Expected payment: ${calculation.payoutAmount.toFixed(8)} BSC-USD`,
+    `Expected payment before BSC network fee: ${calculation.payoutAmount.toFixed(8)} BSC-USD`,
+    "The estimated BSC network fee will be deducted from the BSC-USD payout before it is sent.",
     `Remaining balance: ${remainingBalanceXtu.toFixed(8)} XTU`,
     `Reference: ${reference}`,
     "Status: PROCESSING",
@@ -1856,6 +1978,7 @@ async function processOneRechargeBatch(batchId) {
         enforceRechargeRange: false,
         allowPartial: true,
         tfeesRatePercent: batch.tfees_rate_percent,
+        priceCycleSource: "recharge",
       },
     );
 
@@ -2107,6 +2230,83 @@ function startGlobalDisbursementEmailOutbox() {
   if (typeof timer.unref === "function") timer.unref();
 }
 
+let accountSecurityEmailWorkerStarted = false;
+let accountSecurityEmailWorkerBusy = false;
+
+async function processAccountSecurityEmailOutbox() {
+  if (accountSecurityEmailWorkerBusy || !SERVER_MAIL || !SERVER_MAIL_PSWD) return;
+  accountSecurityEmailWorkerBusy = true;
+  try {
+    const now = Date.now();
+    await db.queryAsync(
+      `UPDATE account_security_email_outbox
+       SET status='pending',claimed_at_ms=NULL,next_attempt_at_ms=?,
+           last_error='Recovered an expired account-security email claim.'
+       WHERE status='sending' AND claimed_at_ms IS NOT NULL AND CAST(claimed_at_ms AS UNSIGNED)<=?`,
+      [String(now), String(now - 10 * 60 * 1000)],
+    );
+    const rows = await db.queryAsync(
+      `SELECT id,recipient,subject,message_text,attempts FROM account_security_email_outbox
+       WHERE status='pending' AND CAST(next_attempt_at_ms AS UNSIGNED)<=?
+       ORDER BY id ASC LIMIT 1`,
+      [String(now)],
+    );
+    if (!rows.length) return;
+    const row = rows[0];
+    const claim = await db.executeAsync(
+      `UPDATE account_security_email_outbox
+       SET status='sending',attempts=attempts+1,claimed_at_ms=?,last_error=NULL
+       WHERE id=? AND status='pending'`,
+      [String(now), row.id],
+    );
+    if (claim.affectedRows !== 1) return;
+
+    try {
+      await mailQueue.sendMail({
+        from: SERVER_MAIL,
+        to: row.recipient,
+        subject: row.subject,
+        text: row.message_text,
+      });
+      await db.executeAsync(
+        `UPDATE account_security_email_outbox
+         SET status='sent',sent_at_ms=?,claimed_at_ms=NULL,last_error=NULL
+         WHERE id=? AND status='sending'`,
+        [String(Date.now()), row.id],
+      );
+    } catch (error) {
+      const nextAttempt = Number(row.attempts || 0) + 1;
+      const permanentlyFailed = nextAttempt >= 8;
+      const delayMs = error.code === "EMAIL_RATE_LIMIT"
+        ? 60 * 60 * 1000
+        : Math.min(60 * 60 * 1000, 15_000 * (2 ** Math.min(nextAttempt - 1, 7)));
+      await db.executeAsync(
+        `UPDATE account_security_email_outbox
+         SET status=?,next_attempt_at_ms=?,claimed_at_ms=NULL,last_error=?
+         WHERE id=? AND status='sending'`,
+        [
+          permanentlyFailed ? "failed" : "pending",
+          String(Date.now() + delayMs),
+          String(error.message || error).slice(0, 1000),
+          row.id,
+        ],
+      );
+    }
+  } catch (error) {
+    console.error("Account-security email worker failed:", error.message);
+  } finally {
+    accountSecurityEmailWorkerBusy = false;
+  }
+}
+
+function startAccountSecurityEmailOutbox() {
+  if (accountSecurityEmailWorkerStarted) return;
+  accountSecurityEmailWorkerStarted = true;
+  void processAccountSecurityEmailOutbox();
+  const timer = setInterval(() => void processAccountSecurityEmailOutbox(), 5_000);
+  if (typeof timer.unref === "function") timer.unref();
+}
+
 if (!SERVER_MAIL || !SERVER_MAIL_PSWD) {
   console.warn("Email delivery is not configured: set SERV_MAIL and SERV_MAIL_PSWD.");
 }
@@ -2143,7 +2343,7 @@ router.post("/app/contact-onex", async (req, res) => {
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
 
-  if (!requestTokenIsValid(req, tkn, P, U)) {
+  if (!await requestTokenIsValid(req, tkn, P, U)) {
     return res.send({ status: "forbidden request" });
   }
 
@@ -2416,6 +2616,8 @@ router.post("/app/signup", async (req, res) => {
           "INSERT INTO users_stock(username,balance,record_date,record_time) VALUES(?,?,?,?)",
           [U, "0", date, time],
         );
+        const signupCommon = await getLatestCommonTx(connection, true);
+        await initializeUserPriceStateTx(connection, U, signupCommon.unit_price, tfees);
         await connection.commit();
       } catch (insertError) {
         if (conn) {
@@ -2495,37 +2697,117 @@ router.post("/app/signup", async (req, res) => {
   }
 });
 
-// signin
-router.post("/app/signin", async (req, res) => {
-  const { user, pswd, tkn, recon, seed } = req.body || {};
-  const U = normalizeUsername(user);
-  const P = normalizeFormValue(pswd);
-  const submittedSeed = normalizeFormValue(seed);
-  const needsSeed = String(recon) === "0";
-
-  if (!U || !P || Buffer.byteLength(P, "utf8") > 4096) {
-    return res.status(400).send({ msg: "invalid request", ua: "", tg_botLink: null });
-  }
-  if (needsSeed && (!submittedSeed || Buffer.byteLength(submittedSeed, "utf8") > 4096)) {
-    return res.status(400).send({ msg: "invalid seed", ua: "", tg_botLink: null });
-  }
-  if (needsSeed && !requestTokenIsValid(req, tkn, P, U)) {
-    return res.send({ msg: "forbidden request", ua: "", tg_botLink: null });
-  }
-
-  const ua = req.headers["user-agent"];
-  if (typeof ua !== "string") {
-    return res.send({ msg: "error", ua: "", tg_botLink: null });
+// Device challenge. The Android client signs the returned challenge using its Android Keystore P-256 key.
+router.post("/app/device/challenge", async (req, res) => {
+  const U = normalizeUsername(req.body?.user);
+  const deviceId = normalizeDeviceId(req.body?.device_id);
+  const publicKeyDer = normalizeFormValue(req.body?.device_public_key);
+  if (!U || !deviceId || !publicKeyDer) {
+    return res.status(400).send({ auth: "invalid device request" });
   }
 
   try {
+    if (await accountApiLimitReached(res, U, "device_challenge", 10, 15 * 60_000)) return;
+    const accountRows = await db.queryAsync(
+      "SELECT account_active FROM auths WHERE username=? LIMIT 1",
+      [U],
+    );
+    if (!accountRows.length) return res.send({ auth: "incorrect" });
+    if (Number(accountRows[0].account_active) !== 1) return res.send({ auths: "deactivated" });
+
+    const challenge = createDeviceChallenge({
+      username: U,
+      deviceId,
+      publicKeyBase64: publicKeyDer,
+      nowMs: Date.now(),
+      ttlMs: DEVICE_CHALLENGE_TTL_MS,
+    });
+    const currentDeviceRows = await db.queryAsync(
+      `SELECT device_id,public_key_fingerprint FROM auth_devices
+       WHERE username=? LIMIT 1`,
+      [U],
+    );
+    const registeredDevice = currentDeviceRows.length > 0 &&
+      currentDeviceRows[0].device_id === challenge.deviceId &&
+      currentDeviceRows[0].public_key_fingerprint === challenge.publicKeyFingerprint;
+
+    await db.executeAsync(
+      `INSERT INTO auth_device_challenges(
+         challenge_id,username,device_id,public_key_der,public_key_fingerprint,
+         challenge_value,expires_at_ms,used_at_ms,created_at_ms
+       ) VALUES(?,?,?,?,?,?,?,NULL,?)`,
+      [
+        challenge.challengeId, U, challenge.deviceId, challenge.publicKeyDerBase64,
+        challenge.publicKeyFingerprint, challenge.challenge, String(challenge.expiresAtMs),
+        String(Date.now()),
+      ],
+    );
+
+    return res.send({
+      auth: "device challenge created",
+      challenge_id: challenge.challengeId,
+      challenge_message: challenge.message,
+      expires_at_ms: challenge.expiresAtMs,
+      device_registered: registeredDevice,
+      seed_required: !registeredDevice,
+    });
+  } catch (error) {
+    console.error("Device challenge creation failed:", error.message);
+    return res.status(400).send({ auth: "invalid device key or request" });
+  }
+});
+
+// Sign-in binds the account to exactly one Android Keystore device key.
+router.post("/app/signin", async (req, res) => {
+  const { user, pswd, seed, device_id, device_challenge_id, device_signature } = req.body || {};
+  const U = normalizeUsername(user);
+  const P = normalizeFormValue(pswd);
+  const submittedSeed = normalizeFormValue(seed);
+  const deviceId = normalizeDeviceId(device_id);
+  const challengeId = typeof device_challenge_id === "string" ? device_challenge_id.trim() : "";
+  const signature = typeof device_signature === "string" ? device_signature.trim() : "";
+
+  if (
+    !U || !P || Buffer.byteLength(P, "utf8") > 4096 || !deviceId ||
+    !/^[A-Za-z0-9_-]{43}$/.test(challengeId) || !signature || signature.length > 512
+  ) {
+    return res.status(400).send({ msg: "invalid device sign-in request", ua: "", tg_botLink: null });
+  }
+
+  try {
+    const challengeRows = await db.queryAsync(
+      `SELECT challenge_id,username,device_id,public_key_der,public_key_fingerprint,
+              challenge_value,expires_at_ms,used_at_ms
+       FROM auth_device_challenges WHERE challenge_id=? AND username=? LIMIT 1`,
+      [challengeId, U],
+    );
+    if (!challengeRows.length) return res.send({ msg: "device challenge expired", ua: "", tg_botLink: null });
+    const challenge = challengeRows[0];
+    const challengeExpiresAt = Number(challenge.expires_at_ms);
+    if (
+      challenge.used_at_ms != null || challenge.device_id !== deviceId ||
+      !Number.isFinite(challengeExpiresAt) || challengeExpiresAt <= Date.now()
+    ) return res.send({ msg: "device challenge expired", ua: "", tg_botLink: null });
+
+    const challengeMessage = buildDeviceChallengeMessage({
+      username: U,
+      deviceId,
+      publicKeyFingerprint: challenge.public_key_fingerprint,
+      challengeId,
+      challenge: challenge.challenge_value,
+      expiresAtMs: challengeExpiresAt,
+    });
+    if (!verifyDeviceSignature(challenge.public_key_der, challengeMessage, signature)) {
+      return res.send({ msg: "invalid device proof", ua: "", tg_botLink: null });
+    }
+
     const bonusSnapshotRows = await db.queryAsync(
       "SELECT id,registration_sequence,welcome_bonus_status FROM auths WHERE username=? LIMIT 1",
       [U],
     );
     const bonusSnapshot = bonusSnapshotRows[0] || null;
+    if (!bonusSnapshot) return res.send({ msg: "incorrect password", ua: "", tg_botLink: null });
     const mustLockCommonForBonus = Boolean(
-      bonusSnapshot &&
       bonusSnapshot.welcome_bonus_status === "pending" &&
       Number(bonusSnapshot.registration_sequence) <= WELCOME_BONUS_BENEFICIARIES &&
       WELCOME_BONUS_AMOUNT_XTU.isGreaterThan(0)
@@ -2540,17 +2822,15 @@ router.post("/app/signin", async (req, res) => {
       }
 
       const [rows] = await tx.query(
-        `SELECT id,registration_sequence,username,password,seed,account_active,welcome_bonus_status,welcome_bonus_amount_xtu,
+        `SELECT id,registration_sequence,username,password,seed,email,account_active,welcome_bonus_status,welcome_bonus_amount_xtu,
                 welcome_bonus_email_hash,welcome_bonus_identity_hash,
                 consec_failed_auth,password_temp_expires_at_ms,tg_userId,tg_chat_id
          FROM auths WHERE username=? LIMIT 1 FOR UPDATE`,
         [U],
       );
-      if (!rows.length) {
-        return { response: { msg: "incorrect password", ua: "", tg_botLink: null } };
-      }
-
+      if (!rows.length) return { response: { msg: "incorrect password", ua: "", tg_botLink: null } };
       const row = rows[0];
+      const now = Date.now();
       const passwordMatches = await verifySecret(row.password, P);
       if (passwordMatches && Number(row.account_active) !== 1) {
         return { response: { auths: "deactivated" } };
@@ -2560,54 +2840,157 @@ router.post("/app/signin", async (req, res) => {
         failedCount: Number(row.consec_failed_auth || 0),
         temporaryPasswordExpiresAtMs: row.password_temp_expires_at_ms,
         passwordMatches,
-        nowMs: Date.now(),
+        nowMs: now,
       });
-
       if (!authDecision.allowed) {
-        let currentFailureCount = Number(row.consec_failed_auth || 0);
+        let failureCount = Number(row.consec_failed_auth || 0);
         if (authDecision.incrementFailureCount) {
-          currentFailureCount = nextFailedAuthCount(currentFailureCount);
-          await tx.query(
-            "UPDATE auths SET consec_failed_auth=? WHERE username=?",
-            [currentFailureCount, U],
-          );
+          failureCount = nextFailedAuthCount(failureCount);
+          await tx.query("UPDATE auths SET consec_failed_auth=? WHERE username=?", [failureCount, U]);
         }
-        const locked = authDecision.recoveryRequired || currentFailureCount >= 3;
-        return {
-          response: {
-            msg: locked ? "account recovery required" : "incorrect password",
-            ua: "",
-            tg_botLink: null,
-            recovery_required: locked,
-          },
-        };
+        const locked = authDecision.recoveryRequired || failureCount >= 3;
+        return { response: { msg: locked ? "account recovery required" : "incorrect password", ua: "", tg_botLink: null, recovery_required: locked } };
       }
 
-      if (needsSeed && !(await verifySecret(row.seed, submittedSeed))) {
-        return { response: { msg: "incorrect seed", ua: "", tg_botLink: null } };
+      const [challengeLockRows] = await tx.query(
+        `SELECT challenge_id,username,device_id,public_key_der,public_key_fingerprint,challenge_value,expires_at_ms,used_at_ms
+         FROM auth_device_challenges WHERE challenge_id=? AND username=? LIMIT 1 FOR UPDATE`,
+        [challengeId, U],
+      );
+      if (!challengeLockRows.length) return { response: { msg: "device challenge expired", ua: "", tg_botLink: null } };
+      const lockedChallenge = challengeLockRows[0];
+      const lockedExpiresAt = Number(lockedChallenge.expires_at_ms);
+      if (
+        lockedChallenge.used_at_ms != null || lockedChallenge.device_id !== deviceId ||
+        !Number.isFinite(lockedExpiresAt) || lockedExpiresAt <= now
+      ) return { response: { msg: "device challenge expired", ua: "", tg_botLink: null } };
+      const lockedMessage = buildDeviceChallengeMessage({
+        username: U,
+        deviceId,
+        publicKeyFingerprint: lockedChallenge.public_key_fingerprint,
+        challengeId,
+        challenge: lockedChallenge.challenge_value,
+        expiresAtMs: lockedExpiresAt,
+      });
+      if (!verifyDeviceSignature(lockedChallenge.public_key_der, lockedMessage, signature)) {
+        return { response: { msg: "invalid device proof", ua: "", tg_botLink: null } };
       }
+
+      const [deviceRows] = await tx.query(
+        `SELECT device_id,public_key_fingerprint FROM auth_devices
+         WHERE username=? LIMIT 1 FOR UPDATE`,
+        [U],
+      );
+      const previousDevice = deviceRows[0] || null;
+      const sameDevice = Boolean(
+        previousDevice && previousDevice.device_id === deviceId &&
+        previousDevice.public_key_fingerprint === lockedChallenge.public_key_fingerprint
+      );
+      const requiresSeed = !sameDevice;
+      if (requiresSeed) {
+        if (!submittedSeed || Buffer.byteLength(submittedSeed, "utf8") > 4096) {
+          return { response: { msg: "device registration requires seed", device_registration_required: true, ua: "", tg_botLink: null } };
+        }
+        await lockAccountSecurityActionTx(tx, U, "device_registration");
+        const deviceCounts = await getRecentAccountSecurityEventsTx(tx, U, "device_registration", now);
+        const deviceDecision = evaluateAccountActionLimit("device_registration", deviceCounts);
+        if (!deviceDecision.allowed || !deviceDecision.canRecordFailure) {
+          return { response: { msg: "device registration limit reached", recovery_required: false, ua: "", tg_botLink: null } };
+        }
+        const seedMatches = await verifySecret(row.seed, submittedSeed);
+        if (!seedMatches) {
+          await recordAccountSecurityEventTx(tx, U, "device_registration", "failed", now);
+          await tx.query("UPDATE auth_device_challenges SET used_at_ms=? WHERE challenge_id=? AND used_at_ms IS NULL", [String(now), challengeId]);
+          return { response: { msg: "incorrect seed", ua: "", tg_botLink: null } };
+        }
+        await recordAccountSecurityEventTx(tx, U, "device_registration", "successful", now);
+      }
+
+      await tx.query(
+        "UPDATE auth_device_challenges SET used_at_ms=? WHERE challenge_id=? AND used_at_ms IS NULL",
+        [String(now), challengeId],
+      );
 
       const isTemporaryPassword = authDecision.passwordChangeRequired;
-      const welcomeBonus = await applyWelcomeBonusAtFirstLoginTx(tx, row, Date.now());
+      const welcomeBonus = await applyWelcomeBonusAtFirstLoginTx(tx, row, now);
       if (authDecision.resetFailedAuthCount) {
-        await tx.query(
-          "UPDATE auths SET consec_failed_auth=0 WHERE username=?",
-          [U],
-        );
+        await tx.query("UPDATE auths SET consec_failed_auth=0 WHERE username=?", [U]);
       }
 
-      const loginAtMs = String(Date.now());
+      const sessionToken = createSessionToken();
+      const sessionTokenHash = hashSessionToken(sessionToken);
+      const sessionExpiresAt = now + DEVICE_SESSION_TTL_MS;
+      await tx.query(
+        `INSERT INTO auth_devices(
+           username,device_id,public_key_der,public_key_fingerprint,session_token_hash,
+           session_expires_at_ms,registered_at_ms,last_seen_at_ms
+         ) VALUES(?,?,?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE
+           device_id=VALUES(device_id),public_key_der=VALUES(public_key_der),
+           public_key_fingerprint=VALUES(public_key_fingerprint),session_token_hash=VALUES(session_token_hash),
+           session_expires_at_ms=VALUES(session_expires_at_ms),registered_at_ms=VALUES(registered_at_ms),
+           last_seen_at_ms=VALUES(last_seen_at_ms)`,
+        [
+          U, deviceId, lockedChallenge.public_key_der, lockedChallenge.public_key_fingerprint,
+          sessionTokenHash, String(sessionExpiresAt), String(now), String(now),
+        ],
+      );
+
+      const eventType = !previousDevice ? "device_registered" : (sameDevice ? "session_renewed" : "device_replaced");
+      const userAgent = String(req.headers["user-agent"] || "").slice(0, 512);
+      const ipHash = crypto.createHash("sha256").update(String(req.ip || req.socket?.remoteAddress || "unknown")).digest("hex");
+      await tx.query(
+        `INSERT INTO auth_device_events(
+           username,event_type,old_device_id,new_device_id,old_key_fingerprint,new_key_fingerprint,
+           ip_hash,user_agent,reason,created_at_ms
+         ) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+        [
+          U, eventType, previousDevice?.device_id || null, deviceId,
+          previousDevice?.public_key_fingerprint || null, lockedChallenge.public_key_fingerprint,
+          ipHash, userAgent, requiresSeed ? "New Android device authorized with password and account seed." : "Registered Android device signed in.",
+          String(now),
+        ],
+      );
+
+      if (requiresSeed) {
+        const replaced = Boolean(previousDevice);
+        const eventKey = `device-security:${U}:${challengeId}`;
+        const subject = replaced ? "OneX security alert: registered device replaced" : "OneX security alert: Android device registered";
+        const notificationText = [
+          "OneX Account Security",
+          replaced ? "A new Android device has replaced the previously registered device." : "An Android device has been registered for your OneX account.",
+          `Username: ${U}`,
+          `New device reference: ${deviceId.slice(-8)}`,
+          `Date (UTC): ${new Date(now).toISOString()}`,
+          replaced
+            ? "The previous device session has been revoked."
+            : "This is the first Android device registered for this account.",
+          "If you did not authorize this change, contact OneX support immediately and secure your account.",
+        ].join("\n");
+        await tx.query(
+          `INSERT IGNORE INTO account_security_email_outbox(
+             event_key,username,recipient,subject,message_text,status,attempts,
+             next_attempt_at_ms,claimed_at_ms,last_error,created_at_ms,sent_at_ms
+           ) VALUES(?,?,?,?,?,'pending',0,?,NULL,NULL,?,NULL)`,
+          [eventKey, U, row.email, subject, notificationText, String(now), String(now)],
+        );
+        await queueTelegramMessageTx(tx, U, eventKey, notificationText);
+      }
+
+      const loginAtMs = String(now);
       await tx.query(
         "UPDATE auths SET last_login_at_ms=? WHERE username=? AND account_active=1",
         [loginAtMs, U],
       );
-
-      const encUA = encrypt(ua, P + U);
       const tgBotLink = await createTelegramBotLinkTx(tx, U, row);
       return {
         response: {
           msg: 1,
-          ua: encUA,
+          tkn: sessionToken,
+          device_id: deviceId,
+          device_session_expires_at_ms: sessionExpiresAt,
+          device_auth_version: 1,
+          device_replaced: Boolean(previousDevice && !sameDevice),
           tg_botLink: tgBotLink,
           password_change_required: isTemporaryPassword,
           welcome_bonus: welcomeBonus,
@@ -2617,7 +3000,7 @@ router.post("/app/signin", async (req, res) => {
 
     return res.send(result.response);
   } catch (error) {
-    console.error("Sign-in failed:", error);
+    console.error("Device-bound sign-in failed:", error);
     return res.send({ msg: "error", ua: "", tg_botLink: null });
   }
 });
@@ -2627,7 +3010,7 @@ router.post("/app/user-last-stock", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U))
+  if (!await requestTokenIsValid(req, tkn, P, U))
     return res.send({ msg: "forbidden request" });
 
   try {
@@ -2664,7 +3047,7 @@ router.post("/app/user-last-stock", async (req, res) => {
     const stockRow = rechargeAvailability.stock;
     const commonRow = rechargeAvailability.common;
     if (!stockRow || !commonRow) return res.send({ msg: "error" });
-    const [pendingRechargeRows] = await db.queryAsync(
+    const pendingRechargeRows = await db.queryAsync(
       `SELECT 1 AS pending
        FROM users_usdt_deposit_batches
        WHERE username=? AND remaining_amount>0
@@ -2675,28 +3058,89 @@ router.post("/app/user-last-stock", async (req, res) => {
     );
     const hasPendingRecharge = pendingRechargeRows.length > 0;
 
-    const commonTotal = new BigNumber(commonRow.total_units_price);
-    const commonBacked = new BigNumber(commonRow.backed_units);
-    const unitPrice = new BigNumber(commonRow.unit_price);
-    const verifiedPrice = calculateGlobalUnitPrice(commonTotal, commonBacked);
-    if (verifiedPrice.minus(unitPrice).abs().gt("0.000000000000000000000000000001")) {
-      throw new Error("The current XTU price snapshot is inconsistent");
-    }
-    const balanceInitial = new BigNumber(stockRow.balance);
-    const runBalanceInitial = new BigNumber(stockRow.run_balance || "0");
-    if (
-      !unitPrice.isFinite() || !unitPrice.isGreaterThan(0) ||
-      !balanceInitial.isFinite() || balanceInitial.isNegative() ||
-      !runBalanceInitial.isFinite() || runBalanceInitial.isNegative()
-    ) throw new Error("Invalid user stock or global unit price");
-
-    const balanceXtu = initialAssetToXtu(balanceInitial, unitPrice);
-    const runBalanceXtu = initialAssetToXtu(runBalanceInitial, unitPrice);
-    const numericBalance = balanceXtu.toNumber();
-    if (!Number.isFinite(numericBalance)) throw new Error("User XTU balance is outside the supported numeric range");
-
+    const individualSnapshot = await withTransaction(async (tx) => {
+      const [lockRows] = await tx.query(
+        "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
+      );
+      if (!lockRows.length) throw new Error("The common-state lock row has not been initialized");
+      const latestCommon = await getLatestCommonTx(tx, true);
+      const latestUnitPrice = new BigNumber(latestCommon.unit_price);
+      const verifiedPrice = calculateGlobalUnitPrice(
+        latestCommon.total_units_price, latestCommon.backed_units,
+      );
+      if (!latestUnitPrice.isFinite() || !latestUnitPrice.isGreaterThan(0) ||
+          verifiedPrice.minus(latestUnitPrice).abs().gt("0.000000000000000000000000000001")) {
+        throw new Error("The current XTU price snapshot is inconsistent");
+      }
+      const [latestStockRows] = await tx.query(
+        `SELECT balance,run_balance,seller_status,seller_expires_at_ms
+         FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE`, [U],
+      );
+      if (!latestStockRows.length) throw new Error(`User stock is missing for ${U}`);
+      const latestBalance = new BigNumber(latestStockRows[0].balance);
+      const latestRunBalance = new BigNumber(latestStockRows[0].run_balance || "0");
+      if (!latestBalance.isFinite() || latestBalance.isNegative() ||
+          !latestRunBalance.isFinite() || latestRunBalance.isNegative()) {
+        throw new Error("Invalid user initial-asset balance");
+      }
+      if (!rechargeAvailability.globalEffective) {
+        await triggerUserPriceThresholdTx(tx, U, latestUnitPrice, null, latestBalance);
+      }
+      const state = await getUserPriceStateTx(tx, U, true);
+      if (!state) throw new Error(`Individual remuneration state is missing for ${U}`);
+      return {
+        state,
+        common: latestCommon,
+        stock: latestStockRows[0],
+        unitPrice: latestUnitPrice,
+        balanceInitial: latestBalance,
+        runBalanceInitial: latestRunBalance,
+      };
+    });
+    const unitPrice = individualSnapshot.unitPrice;
+    const balanceInitial = individualSnapshot.balanceInitial;
+    const runBalanceInitial = individualSnapshot.runBalanceInitial;
+    const latestStock = individualSnapshot.stock;
+    const individualValuation = calculateEffectiveIndividualPrice(
+      individualSnapshot.state, balanceInitial, unitPrice, maxStockDefault,
+    );
     const globalRun = rechargeAvailability.globalRun || null;
     const globalEffective = Boolean(rechargeAvailability.globalEffective);
+    let individualPrice = individualValuation.price;
+    let individualPriceStatus = individualValuation.status;
+    let individualBasePrice = new BigNumber(individualSnapshot.state.base_price);
+    let individualRemunerationRate = new BigNumber(individualSnapshot.state.remuneration_rate);
+    let individualTargetPrice = new BigNumber(individualSnapshot.state.target_price);
+    let globalParticipantSnapshot = null;
+
+    if (globalEffective && globalRun) {
+      const participantRows = await db.queryAsync(
+        `SELECT snapshot_base_price,snapshot_remuneration_rate,snapshot_target_price,
+                snapshot_unit_price,snapshot_price_status
+         FROM global_disbursement_participants
+         WHERE run_id=? AND username=? LIMIT 1`,
+        [globalRun.id, U],
+      );
+      if (!participantRows.length) {
+        throw new Error(`Global disbursement price snapshot is missing for ${U}`);
+      }
+      globalParticipantSnapshot = participantRows[0];
+      individualPrice = new BigNumber(globalParticipantSnapshot.snapshot_unit_price);
+      individualPriceStatus = String(globalParticipantSnapshot.snapshot_price_status);
+      individualBasePrice = new BigNumber(globalParticipantSnapshot.snapshot_base_price);
+      individualRemunerationRate = new BigNumber(globalParticipantSnapshot.snapshot_remuneration_rate);
+      individualTargetPrice = new BigNumber(globalParticipantSnapshot.snapshot_target_price);
+      if (!individualPrice.isFinite() || !individualPrice.isGreaterThan(0) ||
+          !individualBasePrice.isFinite() || !individualRemunerationRate.isFinite() ||
+          !individualTargetPrice.isFinite()) {
+        throw new Error(`Invalid global disbursement price snapshot for ${U}`);
+      }
+    }
+
+    const balanceXtu = initialAssetToXtu(balanceInitial, individualPrice);
+    const runBalanceXtu = initialAssetToXtu(runBalanceInitial, individualPrice);
+    const numericBalance = balanceXtu.toNumber();
+    if (!Number.isFinite(numericBalance)) throw new Error("User XTU balance is outside the supported numeric range");
     const globalPhase = globalRun
       ? resolveGlobalDisbursementPhase(
         globalRun.status,
@@ -2752,12 +3196,25 @@ router.post("/app/user-last-stock", async (req, res) => {
           ? String(globalRun.bonus_rate_percent || "0")
           : "0",
       } : null,
-      unit_price: unitPrice.toFixed(30),
+      unit_price: individualPrice.toFixed(30),
+      global_unit_price: unitPrice.toFixed(30),
+      base_price: individualBasePrice.toFixed(30),
+      remuneration_rate: individualRemunerationRate.toFixed(10),
+      target_price: individualTargetPrice.toFixed(30),
+      remuneration_status: individualPriceStatus,
+      price_snapshot_mode: globalParticipantSnapshot ? "global_disbursement" : "live_individual",
+      maximum_user_stock: maxStockDefault,
+      stock_limit_reached: balanceXtu.gte(maxStockDefault),
+      stock_purchases_allowed: !globalEffective && individualPriceStatus !== "capped" && balanceXtu.lt(maxStockDefault),
+      stock_capacity_remaining: BigNumber.maximum(
+        0, new BigNumber(maxStockDefault).minus(balanceXtu),
+      ).toFixed(18),
       balance_initial_asset: balanceInitial.toFixed(30),
-      seller_status: Number(stockRow.seller_status || 0),
+      seller_status: Number(latestStock.seller_status || 0),
       run_balance: runBalanceXtu.toFixed(18),
+      run_balance_unit_price: individualPrice.toFixed(30),
       run_balance_initial_asset: runBalanceInitial.toFixed(30),
-      seller_expires_at_ms: stockRow.seller_expires_at_ms == null ? null : Number(stockRow.seller_expires_at_ms),
+      seller_expires_at_ms: latestStock.seller_expires_at_ms == null ? null : Number(latestStock.seller_expires_at_ms),
     });
   } catch {
     res.send({ msg: "error" });
@@ -2769,7 +3226,7 @@ router.post("/app/recharge", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
+  if (!await requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
@@ -2835,7 +3292,7 @@ router.post("/app/recharge/availability", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) {
+  if (!await requestTokenIsValid(req, tkn, P, U)) {
     return res.status(401).send({ msg: "not allowed" });
   }
 
@@ -2872,7 +3329,7 @@ router.post("/app/recharge/status", async (req, res) => {
   const { user, pswd, batch_id, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ transf: "forbidden request" });
+  if (!await requestTokenIsValid(req, tkn, P, U)) return res.send({ transf: "forbidden request" });
   const id = String(batch_id ?? "").trim();
   if (id && !/^\d{1,20}$/.test(id)) return res.status(400).send({ transf: "invalid request" });
   try {
@@ -2918,7 +3375,7 @@ router.post("/app/recharge/refund-request", async (req, res) => {
   const P = normalizeFormValue(pswd);
   const batchId = String(batch_id ?? "").trim();
   const userReason = typeof reason === "string" ? reason.trim() : "";
-  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ transf: "forbidden request" });
+  if (!await requestTokenIsValid(req, tkn, P, U)) return res.send({ transf: "forbidden request" });
   if (!/^\d{1,20}$/.test(batchId) || userReason.length < 10 || userReason.length > 2000) {
     return res.status(400).send({ transf: "invalid refund request" });
   }
@@ -3014,13 +3471,13 @@ router.post("/app/set-payout-address", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
+  if (!await requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
     if (passwordState === "not_allowed") return res.send({ auth: "not allowed" });
     if (passwordState !== "ok") return res.send({ auth: "incorrect" });
-    const [rows] = await db.queryAsync(
+    const rows = await db.queryAsync(
       "SELECT wallet_address FROM auths WHERE username=? AND account_active=1 LIMIT 1",
       [U],
     );
@@ -3037,7 +3494,7 @@ router.post("/app/join-system-sellers", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
+  if (!await requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
@@ -3084,15 +3541,17 @@ router.post("/app/join-system-sellers", async (req, res) => {
 
       // A threshold crossing must be applied synchronously before seller eligibility is checked.
       await triggerUserPriceThresholdTx(tx, U, unitPrice);
-      const [priceStateRows] = await tx.query(
-        `SELECT cycle_number,status FROM user_price_state WHERE username=? LIMIT 1 FOR UPDATE`, [U],
-      );
-      const thresholdReached = priceStateRows.length > 0 && priceStateRows[0].status === "paused";
-      const eligibility = validateSellerJoin(stockRows[0].balance, unitPrice, thresholdReached);
+      const priceState = await getUserPriceStateTx(tx, U, true);
+      if (!priceState) throw new Error(`Individual remuneration state is missing for ${U}`);
+      const thresholdReached = priceState.status === "paused";
+      const sellerIndividualPrice = calculateEffectiveIndividualPrice(
+        priceState, stockRows[0].balance, unitPrice, maxStockDefault,
+      ).price;
+      const eligibility = validateSellerJoin(stockRows[0].balance, sellerIndividualPrice, thresholdReached);
       if (!eligibility.eligible) {
         return { msg: "not allowed", reason: eligibility.reason };
       }
-      const priceCycleNumber = Number(priceStateRows[0].cycle_number);
+      const priceCycleNumber = Number(priceState.cycle_number);
       if (!Number.isSafeInteger(priceCycleNumber) || priceCycleNumber < 1) {
         throw new Error("Invalid individual price cycle number");
       }
@@ -3135,7 +3594,7 @@ router.post("/app/join-system-sellers", async (req, res) => {
           U,
           eligibility.runBalanceInitial.toFixed(30),
           eligibility.reservedInitialAsset.toFixed(30),
-          unitPrice.toFixed(30),
+          sellerIndividualPrice.toFixed(30),
           String(priceCycleNumber),
           String(now),
           String(expiresAt),
@@ -3152,7 +3611,7 @@ router.post("/app/join-system-sellers", async (req, res) => {
           U,
           eligibility.reservedInitialAsset.toFixed(30),
           eligibility.reservedInitialAsset.toFixed(30),
-          unitPrice.toFixed(30),
+          sellerIndividualPrice.toFixed(30),
           String(now),
           String(now),
         ],
@@ -3173,11 +3632,11 @@ router.post("/app/join-system-sellers", async (req, res) => {
         "Your priority seller status is now active.",
         `Campaign: ${campaignResult.insertId}`,
         `Principal balance: ${eligibility.runBalanceXtu.toFixed(8)} XTU`,
-        `Committed seller reserve (50%): ${eligibility.reservedInitialAsset.multipliedBy(unitPrice).toFixed(8)} XTU`,
-        `Valuation price locked: ${unitPrice.toFixed(12)} XTU per initial asset`,
+        `Committed seller reserve (50%): ${eligibility.reservedInitialAsset.multipliedBy(sellerIndividualPrice).toFixed(8)} XTU`,
+        `Individual valuation price locked: ${sellerIndividualPrice.toFixed(12)} XTU per initial asset`,
         `Price cycle: ${priceCycleNumber}`,
         `Expires (UTC): ${new Date(expiresAt).toISOString()}`,
-        "Activation is not counted as a P2P sale toward the 50% threshold requirement.",
+        "Campaign activation is not counted toward the 5% grouped purchase or sale requirement.",
         "Status: ACTIVE",
       ].join("\n"));
       return {
@@ -3186,9 +3645,9 @@ router.post("/app/join-system-sellers", async (req, res) => {
         seller_status: 1,
         run_balance: eligibility.runBalanceXtu.toFixed(18),
         run_balance_initial_asset: eligibility.runBalanceInitial.toFixed(30),
-        reserved_units: eligibility.reservedInitialAsset.multipliedBy(unitPrice).toFixed(18),
+        reserved_units: eligibility.reservedInitialAsset.multipliedBy(sellerIndividualPrice).toFixed(18),
         reserved_initial_asset: eligibility.reservedInitialAsset.toFixed(30),
-        unit_price: unitPrice.toFixed(30),
+        unit_price: sellerIndividualPrice.toFixed(30),
         price_cycle_number: priceCycleNumber,
         expires_at_ms: expiresAt,
       };
@@ -3205,7 +3664,7 @@ router.post("/app/cancel-system-sellers", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
+  if (!await requestTokenIsValid(req, tkn, P, U)) return res.send({ msg: "not allowed" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
@@ -3255,7 +3714,7 @@ router.post("/app/transactions-history", async (req, res) => {
   const { user, pswd, days, limit: limitInput, before_id: beforeIdInput, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) {
+  if (!await requestTokenIsValid(req, tkn, P, U)) {
     return res.send({ trans: "forbidden request" });
   }
 
@@ -3342,7 +3801,7 @@ router.post("/app/xtu-transfer", async (req, res) => {
       ? String(amount).trim()
       : "";
 
-  if (!requestTokenIsValid(req, tkn, P, senderInput)) {
+  if (!await requestTokenIsValid(req, tkn, P, senderInput)) {
     return res.send({ transf: "forbidden request" });
   }
 
@@ -3485,6 +3944,16 @@ router.post("/app/xtu-transfer", async (req, res) => {
       const senderBalanceInitial = new BigNumber(senderStock.balance);
       const destinationBalanceInitial = new BigNumber(destinationStock.balance);
       const unitPrice = new BigNumber(common.unit_price);
+      // Persist any threshold crossing at the pre-operation price before
+      // converting the sender's public XTU amount or evaluating the recipient.
+      await triggerUserPriceThresholdTx(tx, S, unitPrice, null, senderBalanceInitial);
+      await triggerUserPriceThresholdTx(tx, D, unitPrice, null, destinationBalanceInitial);
+      const senderPriceState = await getUserPriceStateTx(tx, S, true);
+      const destinationPriceState = await getUserPriceStateTx(tx, D, true);
+      if (!senderPriceState || !destinationPriceState) throw new Error("An individual remuneration state is missing during P2P transfer");
+      const senderIndividualPrice = calculateEffectiveIndividualPrice(
+        senderPriceState, senderBalanceInitial, unitPrice, maxStockDefault,
+      ).price;
       const lastTotal = new BigNumber(common.total_units_price);
       const backedUnits = new BigNumber(common.backed_units);
       const inactiveInitialAssets = new BigNumber(common.inactive_init_asset);
@@ -3497,9 +3966,9 @@ router.post("/app/xtu-transfer", async (req, res) => {
         !destinationBalanceInitial.isFinite() || destinationBalanceInitial.isNegative()
       ) throw new Error("Invalid initial-asset balances or common reserve values in P2P transfer");
 
-      // P2P requests are public XTU amounts; every stored balance and activity
-      // amount is in initial assets and uses the same frozen global price.
-      const requestedInitialAsset = xtuToInitialAsset(requestedAmount, unitPrice);
+      // XTU remains the public transfer unit. Only the sender's XTU-to-initial-asset
+      // conversion uses the sender's individual remuneration price.
+      const requestedInitialAsset = xtuToInitialAsset(requestedAmount, senderIndividualPrice);
       const feesInitialAsset = requestedInitialAsset.multipliedBy(tfees).dividedBy(100);
       const recipientCreditInitial = requestedInitialAsset.minus(feesInitialAsset);
       const sellerStatus = Number(senderStock.seller_status || 0);
@@ -3532,34 +4001,35 @@ router.post("/app/xtu-transfer", async (req, res) => {
         !futureDestinationBalanceInitial.isFinite() || futureDestinationBalanceInitial.isNegative()
       ) throw new Error("Invalid calculated P2P initial-asset amounts");
       if (futureSenderBalanceInitial.isNegative()) return { transf: "insufficient balance" };
-      const destinationLimit = isUserBalanceWithinMaxStock(
-        destinationBalanceInitial, recipientCreditInitial, unitPrice, maxStockDefault,
+      const feesXtu = feesInitialAsset.multipliedBy(unitPrice);
+      const newTotalUnitsPrice = lastTotal.plus(feesXtu);
+      const newBackedUnits = backedUnits.plus(feesInitialAsset);
+      const resultingPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits);
+      const destinationLimit = previewUserOperationCapacity(
+        destinationPriceState, "purchase", recipientCreditInitial,
+        destinationBalanceInitial, futureDestinationBalanceInitial, resultingPrice,
       );
       if (!destinationLimit.allowed) {
         return { transf: "unsupported", projected_balance: destinationLimit.projectedXtu.toFixed(18) };
       }
 
-      // Price-threshold state changes are applied only after all transfer limits pass.
-      await triggerUserPriceThresholdTx(tx, S, unitPrice);
-      await triggerUserPriceThresholdTx(tx, D, unitPrice);
-
-      const feesXtu = feesInitialAsset.multipliedBy(unitPrice);
-      const newTotalUnitsPrice = lastTotal.plus(feesXtu);
-      const newBackedUnits = backedUnits.plus(feesInitialAsset);
+      // The pre-operation individual price states are now locked and stable.
+      // Record the sender's gross sale and recipient's net acquisition against them.
       const newTotalTfees = new BigNumber(common.total_tfees || "0").plus(feesInitialAsset);
       const [date, time] = getDate();
       const reference = createFinancialReference(`P2P${S}`);
 
       await tx.query(
-        `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,reference,record_date,record_time)
-         VALUES(?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,fee_unit_price,reference,record_date,record_time)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`,
         [
           S,
           D,
           1,
           recipientCreditInitial.toFixed(30),
-          unitPrice.toFixed(30),
+          senderIndividualPrice.toFixed(30),
           feesInitialAsset.toFixed(30),
+          unitPrice.toFixed(30),
           reference,
           date,
           time,
@@ -3581,11 +4051,23 @@ router.post("/app/xtu-transfer", async (req, res) => {
         inactive_init_asset: inactiveInitialAssets.toFixed(30),
         total_tfees: newTotalTfees.toFixed(30),
       }, date, time);
-      const resultingPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits);
-      // Only completed outgoing P2P transfers count toward the 50% sale requirement.
-      await recordUserP2PSaleTx(tx, S, requestedInitialAsset, resultingPrice, tfees);
-      // Incoming P2P value also resets the recipient's A/B reference basis.
-      await resetUserPriceBasisTx(tx, D, resultingPrice, tfees);
+      await recordUserOperationTx(
+        tx, S, "sale", requestedInitialAsset, senderBalanceInitial,
+        futureSenderBalanceInitial, resultingPrice, tfees, reference,
+      );
+      await recordUserOperationTx(
+        tx, D, "purchase", recipientCreditInitial, destinationBalanceInitial,
+        futureDestinationBalanceInitial, resultingPrice, tfees, reference,
+      );
+      // Evaluate the post-operation global price only after eligible groups have
+      // had a chance to create their new cycle, avoiding a transient pause notice.
+      await triggerUserPriceThresholdTx(tx, S, resultingPrice);
+      await triggerUserPriceThresholdTx(tx, D, resultingPrice);
+      const recipientPriceState = await getUserPriceStateTx(tx, D, true);
+      const recipientIndividualPrice = calculateEffectiveIndividualPrice(
+        recipientPriceState, futureDestinationBalanceInitial, resultingPrice, maxStockDefault,
+      ).price;
+      const recipientAmountXtu = recipientCreditInitial.multipliedBy(recipientIndividualPrice);
       const p2pTimestamp = Date.now();
       if (sellerStatus > 0) {
         await tx.query(
@@ -3607,8 +4089,9 @@ router.post("/app/xtu-transfer", async (req, res) => {
           "OneX Transaction Update",
           "Your P2P transfer was completed successfully.",
           `Recipient: ${D}`,
-          `Amount debited: ${requestedAmount.toFixed(8)} XTU`,
-          "The recipient pays the transfer fee.",
+          `Gross amount sent: ${requestedAmount.toFixed(8)} public XTU`,
+          `Initial assets debited at your individual price: ${requestedInitialAsset.toFixed(8)}`,
+          `Recipient-paid tfees deducted from the gross transfer: ${tfees.toFixed(4)}%`,
           `Reference: ${reference}`,
           "Status: SUCCESS",
         ].join("\n"),
@@ -3621,8 +4104,10 @@ router.post("/app/xtu-transfer", async (req, res) => {
           "OneX Transaction Update",
           "You have received a P2P transfer.",
           `Sender: ${S}`,
-          `Amount received after fee: ${recipientCreditInitial.multipliedBy(unitPrice).toFixed(8)} XTU`,
-          `Transfer fee: ${feesXtu.toFixed(8)} XTU`,
+          `Initial assets credited after tfees: ${recipientCreditInitial.toFixed(8)}`,
+          `Individual valuation of the credited assets: ${recipientAmountXtu.toFixed(8)} XTU`,
+          `Recipient-paid tfees deducted: ${feesInitialAsset.toFixed(8)} initial assets (${tfees.toFixed(4)}%)`,
+          `Common-reserve valuation of tfees at the pre-transfer global price: ${feesXtu.toFixed(8)} XTU`,
           `Reference: ${reference}`,
           "Status: SUCCESS",
         ].join("\n"),
@@ -3652,7 +4137,7 @@ router.post("/app/disbursement/status", async (req, res) => {
   const P = normalizeFormValue(pswd);
   const id = String(disbursement_id ?? "");
 
-  if (!requestTokenIsValid(req, tkn, P, userInput)) {
+  if (!await requestTokenIsValid(req, tkn, P, userInput)) {
     return res.send({ transf: "forbidden request" });
   }
   if (!/^\d{1,20}$/.test(id)) {
@@ -3835,6 +4320,7 @@ router.post("/admin/recharge/credit", async (req, res) => {
           allowPartial: true,
           tfeesRatePercent: batch.tfees_rate_percent,
           rechargeBatchId: batchId,
+          priceCycleSource: "recharge",
         },
       );
       if (creditResult?.transf !== "sent") {
@@ -3986,7 +4472,7 @@ router.post("/admin/bsc/unknown-transfers/resolve", async (req, res) => {
   }
 
   try {
-    const [transferRows] = await db.queryAsync(
+    const transferRows = await db.queryAsync(
       `SELECT * FROM bsc_unknown_incoming_transfers WHERE id=? AND status='pending_admin' LIMIT 1`,
       [transferId],
     );
@@ -3996,7 +4482,7 @@ router.post("/admin/bsc/unknown-transfers/resolve", async (req, res) => {
 
     if (requestedAction === "assign") {
       if (!targetUsername) return res.status(400).send({ transf: "username required" });
-      const [accountRows] = await db.queryAsync(
+      const accountRows = await db.queryAsync(
         `SELECT username,wallet_address FROM auths WHERE username=? LIMIT 1`, [targetUsername],
       );
       if (!accountRows.length ||
@@ -4056,8 +4542,8 @@ router.post("/admin/bsc/unknown-transfers/resolve", async (req, res) => {
     const maximumGasRecovery = getConfiguredMaxBscTxFeeUsd();
     if (!grossAmount.isFinite() || !grossAmount.isGreaterThan(0) ||
         !grossRaw.isFinite() || !grossRaw.isInteger() ||
-        grossAmount.minus(maximumGasRecovery).isLessThan(10)) {
-      return res.send({ transf: "unknown transfer is below the minimum refundable net amount" });
+        grossAmount.minus(maximumGasRecovery).isLessThan(MINIMUM_REFUND_NET_BSC_USD)) {
+      return res.send({ transf: `unknown transfer is below the minimum refundable net amount of ${MINIMUM_REFUND_NET_BSC_USD.toString()} BSC-USD` });
     }
     const liquidity = await checkTreasuryLiquidity(grossRaw.toFixed(0), transfer.from_address);
     if (!liquidity.tokenAvailable) {
@@ -4166,9 +4652,9 @@ router.post("/admin/recharge/refund", async (req, res) => {
     const grossRaw = remaining.shiftedBy(18);
     if (!grossRaw.isInteger() || !grossRaw.isGreaterThan(0)) return res.send({ transf: "invalid refund amount" });
     const maximumGasRecovery = getConfiguredMaxBscTxFeeUsd();
-    if (remaining.minus(maximumGasRecovery).isLessThan(10)) {
+    if (remaining.minus(maximumGasRecovery).isLessThan(MINIMUM_REFUND_NET_BSC_USD)) {
       return res.send({
-        transf: "gross refund is too small to guarantee a 10 BSC-USD net refund within the configured gas-fee cap",
+        transf: `gross refund is too small to guarantee the minimum net refund of ${MINIMUM_REFUND_NET_BSC_USD.toFixed(8)} BSC-USD within the configured gas-fee cap`,
         gross_amount: remaining.toFixed(18),
         maximum_gas_recovery: maximumGasRecovery.toFixed(18),
       });
@@ -4341,8 +4827,8 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
       snapshot.status !== "manual_review" || snapshot.raw_tx || snapshot.tx_hash ||
       Number(snapshot.reservation_expires_at_ms) > Date.now()
     ) return res.send({ transf: "not eligible for unlock" });
-    if (!new BigNumber(snapshot.payout_amount).isFinite() || new BigNumber(snapshot.payout_amount).isLessThan(10)) {
-      return res.send({ transf: "minimum payout is 10 BSC-USD" });
+    if (!isPositivePayoutAmount(snapshot.payout_amount)) {
+      return res.send({ transf: "invalid payout amount" });
     }
     if (!isEvmAddress(snapshot.payout_address)) return res.send({ transf: "invalid payout address" });
 
@@ -4371,7 +4857,7 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
       if (
         job.status !== "manual_review" || job.raw_tx || job.tx_hash ||
         Number(job.reservation_expires_at_ms) > Date.now() ||
-        new BigNumber(job.payout_amount).isLessThan(10)
+        !isPositivePayoutAmount(job.payout_amount)
       ) return { transf: "not eligible for unlock" };
       const balanceInitial = new BigNumber(stockRows[0].balance);
       if (!balanceInitial.isZero()) return { transf: "reserved balance changed" };
@@ -4413,7 +4899,7 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
   if (!U || U.length > 30 || !P1 || Buffer.byteLength(P1, "utf8") > 4096) {
     return res.status(400).send({ auth: "invalid request" });
   }
-  if (!requestTokenIsValid(req, tkn, P1, U)) {
+  if (!await requestTokenIsValid(req, tkn, P1, U)) {
     return res.send({ auth: "forbidden request" });
   }
   if (!P2 || Buffer.byteLength(P2, "utf8") > 4096) {
@@ -4506,7 +4992,22 @@ router.post("/app/modify-pin-or-password", async (req, res) => {
         );
       }
       await recordAccountSecurityEventTx(tx, U, "password_change", "successful", now);
-      return { auth: "updated", recovery_completed: isRecoveryPassword };
+      await tx.query(
+        `UPDATE auth_devices SET session_token_hash=REPEAT('0',64),session_expires_at_ms=0
+         WHERE username=?`,
+        [U],
+      );
+      await tx.query(
+        `INSERT INTO auth_device_events(
+           username,event_type,old_device_id,new_device_id,old_key_fingerprint,new_key_fingerprint,
+           ip_hash,user_agent,reason,created_at_ms
+         ) SELECT username,'password_changed_session_revoked',device_id,device_id,
+                  public_key_fingerprint,public_key_fingerprint,NULL,NULL,
+                  'All existing device sessions were revoked after a password change.',?
+           FROM auth_devices WHERE username=?`,
+        [String(now), U],
+      );
+      return { auth: "updated", recovery_completed: isRecoveryPassword, device_session_revoked: true };
     });
     return res.send(result);
   } catch (error) {
@@ -4523,7 +5024,7 @@ router.post("/app/delete-user", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
   const P = normalizeFormValue(pswd);
-  if (!requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
+  if (!await requestTokenIsValid(req, tkn, P, U)) return res.send({ auth: "forbidden request" });
   try {
     const passwordState = await getUserActivityPasswordState(U, P);
     if (passwordState === "deactivated") return res.send({ auths: "deactivated" });
@@ -4609,6 +5110,21 @@ router.post("/app/delete-user", async (req, res) => {
         Number(stockRows[0].seller_status || 0) !== 0 || sellerCampaignRows.length ||
         sellerLotRows.length || sellerPayoutRows.length
       ) return { auth: "failed, seller reserve pending" };
+
+      // Record device removal before deleting live credentials; keep historical device events.
+      await tx.query(
+        `INSERT INTO auth_device_events(
+           username,event_type,old_device_id,new_device_id,old_key_fingerprint,new_key_fingerprint,
+           ip_hash,user_agent,reason,created_at_ms
+         ) SELECT username,'device_removed_account_deleted',device_id,NULL,
+                  public_key_fingerprint,NULL,NULL,NULL,
+                  'The account owner deleted the account; the active device credential was removed.',?
+           FROM auth_devices WHERE username=?`,
+        [String(Date.now()), U],
+      );
+      await tx.query("DELETE FROM auth_device_challenges WHERE username=?", [U]);
+      await tx.query("DELETE FROM auth_device_request_nonces WHERE username=?", [U]);
+      await tx.query("DELETE FROM auth_devices WHERE username=?", [U]);
 
       // Keep the public wallet address permanently reserved in bsc_wallet_address_registry.
       // The account row is removed only after all financial operations have been settled.
@@ -4701,7 +5217,7 @@ router.post("/app/modify-seed", async (req, res) => {
   if (!U || U.length > 30 || !P || Buffer.byteLength(P, "utf8") > 4096) {
     return res.status(400).send({ auth: "invalid request" });
   }
-  if (!requestTokenIsValid(req, tkn, P, U)) {
+  if (!await requestTokenIsValid(req, tkn, P, U)) {
     return res.send({ auth: "forbidden request" });
   }
   if (!S || Buffer.byteLength(S, "utf8") > 4096) {
@@ -4768,7 +5284,22 @@ router.post("/app/modify-seed", async (req, res) => {
       if (!seedHash) throw new Error("Seed hash was not prepared");
       await tx.query("UPDATE auths SET seed=? WHERE username=?", [seedHash, U]);
       await recordAccountSecurityEventTx(tx, U, "seed_change", "successful", now);
-      return { auth: "updated" };
+      await tx.query(
+        `UPDATE auth_devices SET session_token_hash=REPEAT('0',64),session_expires_at_ms=0
+         WHERE username=?`,
+        [U],
+      );
+      await tx.query(
+        `INSERT INTO auth_device_events(
+           username,event_type,old_device_id,new_device_id,old_key_fingerprint,new_key_fingerprint,
+           ip_hash,user_agent,reason,created_at_ms
+         ) SELECT username,'seed_changed_session_revoked',device_id,device_id,
+                  public_key_fingerprint,public_key_fingerprint,NULL,NULL,
+                  'All existing device sessions were revoked after a seed change.',?
+           FROM auth_devices WHERE username=?`,
+        [String(now), U],
+      );
+      return { auth: "updated", device_session_revoked: true };
     });
     return res.send(result);
   } catch (error) {
@@ -4866,7 +5397,9 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
       }
 
       const bonusRate = CONFIGURED_GLOBAL_DISBURSEMENT_BONUS;
-      const provisionalBonusReserve = calculateRequiredAdminBonusReserve(plannedTotal, bonusRate);
+      const provisionalBonusReserve = calculateRequiredAdminBonusReserve(
+        plannedTotal.multipliedBy(new BigNumber(1).minus(new BigNumber(tfees).dividedBy(100))), bonusRate,
+      );
       const availableAdminReserve = calculateRemainingSystemAdminReserve(
         stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
       ).remainingInitialAsset;
@@ -4885,7 +5418,7 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
         "Each user must submit a disbursement request addressed to ONEX before the final extension deadline. The minimum request during both global periods is 1 XTU.",
         "Requests accepted during the primary period retain their bonus even if paid during the extension. Requests accepted during the extension receive no bonus. Accepted but unpaid requests remain protected.",
         "After the extension, no new requests are accepted. Unclaimed balances may then be subject to a separately recorded administrative reallocation.",
-        "BSC network fees are deducted separately. No tfees apply to global disbursement requests.",
+        "System tfees are deducted from each gross sale. Estimated BSC network fees are also deducted from each BSC-USD payout.",
       ].join("\n");
       let emailCount = 0;
       let telegramCount = 0;
@@ -5033,30 +5566,74 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
       const [snapshotRows] = await tx.query(
         `SELECT COALESCE(MAX(id),0) AS max_id,
                 SUM(CASE WHEN username<>? THEN 1 ELSE 0 END) AS total_users,
-                COALESCE(SUM(CASE WHEN username<>? THEN balance ELSE 0 END),0) AS total_initial_asset,
                 COALESCE(SUM(CASE WHEN username<>? AND balance<0 THEN 1 ELSE 0 END),0) AS negative_balance_count
-         FROM users_stock`, [OneX, OneX, OneX],
+         FROM users_stock`, [OneX, OneX],
       );
       const totalUsers = Number(snapshotRows[0]?.total_users || 0);
-      const totalInitial = new BigNumber(snapshotRows[0]?.total_initial_asset || "0");
       const snapshotPrice = new BigNumber(common.unit_price);
       const snapshotTotal = new BigNumber(common.total_units_price);
-      if (!Number.isSafeInteger(totalUsers) || totalUsers < 1 || Number(snapshotRows[0]?.negative_balance_count || 0) !== 0 ||
-          !totalInitial.isFinite() || !totalInitial.isGreaterThan(0) ||
+      if (!Number.isSafeInteger(totalUsers) || totalUsers < 1 ||
+          Number(snapshotRows[0]?.negative_balance_count || 0) !== 0 ||
           !snapshotPrice.isFinite() || !snapshotPrice.isGreaterThan(0) ||
           !snapshotTotal.isFinite() || !snapshotTotal.isGreaterThan(0)) {
         return { auth: "invalid_global_activation_snapshot" };
       }
+
+      const [participantStockRows] = await tx.query(
+        `SELECT username,balance FROM users_stock WHERE username<>? ORDER BY username ASC FOR UPDATE`,
+        [OneX],
+      );
+      if (participantStockRows.length !== totalUsers) {
+        throw new Error("Global disbursement participant count changed during activation");
+      }
       const bonusRate = new BigNumber(run.bonus_rate_percent || "0");
-      const requiredBonusReserve = calculateRequiredAdminBonusReserve(totalInitial, bonusRate);
+      const tfeesRate = new BigNumber(tfees);
+      const participantSnapshots = [];
+      let totalInitial = new BigNumber(0);
+      let totalXtuLiability = new BigNumber(0);
+      let requiredBonusReserve = new BigNumber(0);
+      for (const participantStock of participantStockRows) {
+        const participantBalance = new BigNumber(participantStock.balance);
+        if (!participantBalance.isFinite() || participantBalance.isNegative()) {
+          throw new Error(`Invalid global participant balance for ${participantStock.username}`);
+        }
+        await triggerUserPriceThresholdTx(tx, participantStock.username, snapshotPrice);
+        const participantPriceState = await getUserPriceStateTx(tx, participantStock.username, true);
+        if (!participantPriceState) {
+          throw new Error(`Individual remuneration state is missing for ${participantStock.username}`);
+        }
+        const participantPrice = calculateEffectiveIndividualPrice(
+          participantPriceState, participantBalance, snapshotPrice, maxStockDefault,
+        ).price;
+        const grossXtu = participantBalance.multipliedBy(participantPrice);
+        const feeInitial = participantBalance.multipliedBy(tfeesRate).dividedBy(100);
+        const netInitial = participantBalance.minus(feeInitial);
+        const netXtu = netInitial.multipliedBy(participantPrice);
+        const bonusXtu = netXtu.multipliedBy(bonusRate).dividedBy(100);
+        const bonusInitial = bonusXtu.dividedBy(participantPrice);
+        totalInitial = totalInitial.plus(participantBalance);
+        totalXtuLiability = totalXtuLiability.plus(netXtu).plus(bonusXtu);
+        requiredBonusReserve = requiredBonusReserve.plus(bonusInitial);
+        participantSnapshots.push({
+          username: participantStock.username,
+          balance: participantBalance,
+          basePrice: new BigNumber(participantPriceState.base_price),
+          remunerationRate: new BigNumber(participantPriceState.remuneration_rate),
+          targetPrice: new BigNumber(participantPriceState.target_price),
+          unitPrice: participantPrice,
+          status: participantPriceState.status,
+        });
+      }
+      if (!totalInitial.isFinite() || !totalInitial.isGreaterThan(0)) {
+        return { auth: "invalid_global_activation_snapshot" };
+      }
       const adminReserveAvailable = calculateRemainingSystemAdminReserve(
         stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
       ).remainingInitialAsset;
       if (requiredBonusReserve.gt(adminReserveAvailable) || requiredBonusReserve.gt(common.backed_units)) {
         return { auth: "insufficient_administrative_bonus_reserve", required: requiredBonusReserve.toFixed(30), available: adminReserveAvailable.toFixed(30) };
       }
-      const totalLiability = totalInitial.plus(requiredBonusReserve);
-      const capacity = validateGlobalDisbursementCapacity(snapshotTotal, snapshotPrice, totalLiability);
+      const capacity = validateGlobalDisbursementCapacity(snapshotTotal, snapshotPrice, totalInitial, totalXtuLiability);
       if (!capacity.available) return { auth: "global_liability_exceeds_stock_value" };
 
       let requestWindowDays;
@@ -5069,15 +5646,19 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
       }
       const deadline = getGlobalRequestDeadline(now, requestWindowDays);
       const extensionDeadline = getGlobalRequestDeadline(deadline, extensionDays);
-      await tx.query(
-        `INSERT INTO global_disbursement_participants
-         (run_id,username,snapshot_balance_initial,requested_initial_asset,paid_initial_asset,
-          remaining_initial_asset,request_count,last_disbursement_id,status,created_at_ms,updated_at_ms)
-         SELECT ?,s.username,s.balance,0,0,s.balance,0,NULL,
-                CASE WHEN s.balance>0 THEN 'awaiting_request' ELSE 'no_balance' END,?,?
-         FROM users_stock s WHERE s.username<>?`,
-        [runId, String(now), String(now), OneX],
-      );
+      for (const participant of participantSnapshots) {
+        await tx.query(
+          `INSERT INTO global_disbursement_participants
+           (run_id,username,snapshot_balance_initial,snapshot_base_price,snapshot_remuneration_rate,
+            snapshot_target_price,snapshot_unit_price,snapshot_price_status,requested_initial_asset,
+            paid_initial_asset,remaining_initial_asset,request_count,last_disbursement_id,status,created_at_ms,updated_at_ms)
+           VALUES(?,?,?,?,?,?,?, ?,0,0,?,0,NULL,?,?,?)`,
+          [runId, participant.username, participant.balance.toFixed(30), participant.basePrice.toFixed(30),
+            participant.remunerationRate.toFixed(10), participant.targetPrice.toFixed(30), participant.unitPrice.toFixed(30),
+            participant.status, participant.balance.toFixed(30), participant.balance.isGreaterThan(0) ? "awaiting_request" : "no_balance",
+            String(now), String(now)],
+        );
+      }
       await tx.query(
         `UPDATE global_disbursement_runs
          SET status='active',snapshot_unit_price=?,snapshot_total_units_price=?,
@@ -5130,7 +5711,8 @@ router.post("/admin/global-disbursement-participants", async (req, res) => {
     if (cursor !== null) { conditions.push("id<?"); parameters.push(cursor); }
     if (requestedStatus !== null) { conditions.push("status=?"); parameters.push(requestedStatus); }
     const rows = await db.queryAsync(
-      `SELECT id,run_id,username,snapshot_balance_initial,requested_initial_asset,
+      `SELECT id,run_id,username,snapshot_balance_initial,snapshot_base_price,snapshot_remuneration_rate,
+              snapshot_target_price,snapshot_unit_price,snapshot_price_status,requested_initial_asset,
               paid_initial_asset,remaining_initial_asset,request_count,last_disbursement_id,
               status,resolution_action,resolution_reference,resolution_reason,resolved_at_ms,
               created_at_ms,updated_at_ms
@@ -6014,10 +6596,11 @@ router.post("/admin/update-common-stock", async (req, res) => {
 
 async function initializeRechargePayments() {
   startGlobalDisbursementEmailOutbox();
+  startAccountSecurityEmailOutbox();
   const providerInfo = await initializePaymentProvider();
   if (providerInfo.enabled) {
     const treasuryLower = String(providerInfo.treasuryAddress || "").toLowerCase();
-    const [walletCollisionRows] = await db.queryAsync(
+    const walletCollisionRows = await db.queryAsync(
       `SELECT username FROM bsc_wallet_address_registry
        WHERE wallet_address_lower=? LIMIT 1`,
       [treasuryLower],

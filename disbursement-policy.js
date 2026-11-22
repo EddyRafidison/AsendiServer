@@ -15,50 +15,6 @@ function finitePositive(value, fieldName) {
   return result;
 }
 
-/**
- * Calculate a full system sale using the global price frozen when the user
- * submits the request. `balanceInitialValue` is the user's entire internal
- * balance in initial assets; the resulting payout is BSC-USD.
- */
-function calculateSystemDisbursement(balanceInitialValue, priceValue, feePercent) {
-  const grossInitialAsset = finitePositive(balanceInitialValue, "users_stock.balance");
-  const price = finitePositive(priceValue, "common.unit_price");
-  const fee = new BigNumber(feePercent);
-  if (!fee.isFinite() || fee.isNegative() || !fee.isLessThan(100)) {
-    throw new RangeError("FEES must be greater than or equal to 0 and less than 100");
-  }
-
-  const grossBalance = grossInitialAsset.multipliedBy(price);
-  const feeAmount = grossBalance.multipliedBy(fee).dividedBy(100);
-  const feeInitialAsset = grossInitialAsset.multipliedBy(fee).dividedBy(100);
-  const soldInitialAsset = grossInitialAsset.minus(feeInitialAsset);
-  const payoutAmount = soldInitialAsset.multipliedBy(price)
-    .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
-  const amountRawDecimal = payoutAmount.shiftedBy(TOKEN_DECIMALS);
-
-  if (
-    !grossBalance.isFinite() || !grossBalance.isGreaterThan(0) ||
-    !feeAmount.isFinite() || feeAmount.isNegative() ||
-    !feeInitialAsset.isFinite() || feeInitialAsset.isNegative() ||
-    !soldInitialAsset.isFinite() || !soldInitialAsset.isGreaterThan(0) ||
-    !payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0) ||
-    !amountRawDecimal.isInteger()
-  ) {
-    throw new RangeError("The calculated disbursement amount is invalid");
-  }
-
-  return {
-    grossInitialAsset,
-    grossBalance,
-    priceValue: price,
-    payoutAmount,
-    soldInitialAsset,
-    feeAmount,
-    feeInitialAsset,
-    amountRaw: amountRawDecimal.toFixed(0),
-  };
-}
-
 /** Calculate a user-requested individual disbursement from a gross XTU amount. */
 function calculateIndividualDisbursement(grossAmountXtuValue, availableInitialAssetValue, priceValue, feePercent) {
   const grossXtu = finitePositive(grossAmountXtuValue, "requested gross XTU amount");
@@ -100,64 +56,67 @@ function calculateIndividualDisbursement(grossAmountXtuValue, availableInitialAs
   };
 }
 
-/** Ensure the frozen global liquidation liability leaves a positive XTU backing value. */
-function validateGlobalDisbursementCapacity(totalUnitsPriceValue, snapshotPriceValue, totalInitialAssetValue) {
+/** Ensure the frozen, participant-specific global liquidation liability is covered. */
+function validateGlobalDisbursementCapacity(totalUnitsPriceValue, snapshotPriceValue, totalInitialAssetValue, individualLiabilityXtuValue = null) {
   const totalUnitsPrice = finitePositive(totalUnitsPriceValue, "common.total_units_price");
   const snapshotPrice = finitePositive(snapshotPriceValue, "global snapshot unit price");
   const totalInitialAsset = new BigNumber(totalInitialAssetValue);
   if (!totalInitialAsset.isFinite() || totalInitialAsset.isNegative()) {
     throw new RangeError("Global liquidation initial-asset total must be finite and non-negative");
   }
-  const grossLiability = totalInitialAsset.multipliedBy(snapshotPrice);
+  const grossLiability = individualLiabilityXtuValue == null
+    ? totalInitialAsset.multipliedBy(snapshotPrice)
+    : new BigNumber(individualLiabilityXtuValue);
+  if (!grossLiability.isFinite() || grossLiability.isNegative()) {
+    throw new RangeError("Global participant liability must be finite and non-negative");
+  }
   const remainingValue = totalUnitsPrice.minus(grossLiability);
-  return {
-    available: remainingValue.isGreaterThan(0),
-    grossLiability,
-    remainingValue,
-  };
+  return { available: remainingValue.isGreaterThan(0), grossLiability, remainingValue };
 }
 
-/** Global liquidation is fee-free; the announced bonus is calculated on the net XTU amount. */
-function calculateGlobalDisbursement(balanceInitialAssetValue, priceValue, gasRecoveryValue = 0, bonusRateValue = 0) {
+/** Global liquidation applies recipient-paid tfees and separately recovers BSC gas from the payout. */
+function calculateGlobalDisbursement(balanceInitialAssetValue, priceValue, gasRecoveryValue = 0, bonusRateValue = 0, feePercentValue = 0) {
   const grossInitialAsset = finitePositive(balanceInitialAssetValue, "users_stock.balance");
-  const price = finitePositive(priceValue, "common.unit_price");
+  const price = finitePositive(priceValue, "participant individual snapshot price");
   const gasRecovery = new BigNumber(gasRecoveryValue);
   const bonusRate = new BigNumber(bonusRateValue);
-  if (!gasRecovery.isFinite() || gasRecovery.isNegative()) {
-    throw new RangeError("BSC fee recovery must be finite and non-negative");
-  }
-  if (
-    !bonusRate.isFinite() || bonusRate.isNegative() ||
-    bonusRate.isGreaterThan(10)
-  ) {
+  const feeRate = new BigNumber(feePercentValue);
+  if (!gasRecovery.isFinite() || gasRecovery.isNegative()) throw new RangeError("BSC fee recovery must be finite and non-negative");
+  if (!bonusRate.isFinite() || bonusRate.isNegative() || bonusRate.isGreaterThan(10)) {
     throw new RangeError("GLOBAL_DISBURSEMENT_BONUS must be between 0 and 10 percent");
   }
+  if (!feeRate.isFinite() || feeRate.isNegative() || !feeRate.isLessThan(100)) {
+    throw new RangeError("tfees rate must be between 0 and 100 percent");
+  }
 
-  const grossAmount = grossInitialAsset.multipliedBy(price);
-  const bonusAmount = grossAmount.multipliedBy(bonusRate).dividedBy(100)
+  const grossBalance = grossInitialAsset.multipliedBy(price);
+  const feeInitialAsset = grossInitialAsset.multipliedBy(feeRate).dividedBy(100);
+  const feeAmount = feeInitialAsset.multipliedBy(price);
+  const soldInitialAsset = grossInitialAsset.minus(feeInitialAsset);
+  const netBalance = soldInitialAsset.multipliedBy(price);
+  const bonusAmount = netBalance.multipliedBy(bonusRate).dividedBy(100)
     .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
   const bonusInitialAsset = bonusAmount.dividedBy(price);
-  const payoutBeforeGas = grossAmount.plus(bonusAmount);
-  const payoutAmount = payoutBeforeGas.minus(gasRecovery)
-    .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
+  const payoutBeforeGas = netBalance.plus(bonusAmount);
+  const payoutAmount = payoutBeforeGas.minus(gasRecovery).decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
   if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
-    throw new RangeError("Global disbursement is not sufficient to cover its BSC gas fee");
+    throw new RangeError("Global disbursement is not sufficient to cover its BSC gas fee and tfees");
   }
   const amountRawDecimal = payoutAmount.shiftedBy(TOKEN_DECIMALS);
   if (!amountRawDecimal.isInteger()) throw new RangeError("Global disbursement raw amount is invalid");
   return {
     grossInitialAsset,
-    grossBalance: grossAmount,
-    netRequestedAmount: grossAmount,
+    grossBalance,
+    netRequestedAmount: netBalance,
     bonusRatePercent: bonusRate,
     bonusAmount,
     bonusInitialAsset,
     payoutBeforeGas,
     priceValue: price,
     payoutAmount,
-    soldInitialAsset: grossInitialAsset,
-    feeAmount: new BigNumber(0),
-    feeInitialAsset: new BigNumber(0),
+    soldInitialAsset,
+    feeAmount,
+    feeInitialAsset,
     bscFeeRecoveredUsd: gasRecovery,
     amountRaw: amountRawDecimal.toFixed(0),
   };
@@ -190,9 +149,13 @@ function calculateDisbursementReserveSettlement(
   );
   const soldInitialAsset = finitePositive(disbursement.soldInitialAsset, "soldInitialAsset");
   const feeInitialAsset = new BigNumber(disbursement.feeInitialAsset);
+  const feeValueXtu = new BigNumber(disbursement.feeValueXtu || "0");
   const bonusInitialAsset = new BigNumber(disbursement.bonusInitialAsset || "0");
   if (!feeInitialAsset.isFinite() || feeInitialAsset.isNegative()) {
     throw new RangeError("Disbursement fee initial-asset basis is invalid");
+  }
+  if (!feeValueXtu.isFinite() || feeValueXtu.isNegative()) {
+    throw new RangeError("Disbursement fee XTU reserve value is invalid");
   }
   if (!bonusInitialAsset.isFinite() || bonusInitialAsset.isNegative()) {
     throw new RangeError("Disbursement bonus initial-asset basis is invalid");
@@ -204,9 +167,9 @@ function calculateDisbursementReserveSettlement(
   // Principal is moved to the inactive reserve. The bonus is paid from the
   // protected administrative backing and is therefore removed from backed_units.
   // The treasury pays both the token amount sent to the user and the actual
-  // BNB gas expense. For global reimbursement, gas is deducted from the user's
-  // payout estimate, but the actual receipt cost must still be debited here.
-  const newTotalUnitsPrice = totalUnitsPrice.minus(reserveExpenseAmount);
+  // BNB gas expense. Tfees return to common backing and are valued at the public
+  // global price captured immediately before settlement.
+  const newTotalUnitsPrice = totalUnitsPrice.minus(reserveExpenseAmount).plus(feeValueXtu);
   const newInactiveInitAsset = inactiveInitAsset.plus(soldInitialAsset);
   const newBackedUnits = backedUnits.minus(bonusInitialAsset).plus(feeInitialAsset);
   const newSysInactiveInitAsset = sysInactiveInitAsset.plus(bonusInitialAsset);
@@ -217,11 +180,25 @@ function calculateDisbursementReserveSettlement(
   return {
     newTotalUnitsPrice,
     reserveExpenseAmount,
+    feeValueXtu,
     newInactiveInitAsset,
     newBackedUnits,
     newSysInactiveInitAsset,
     newUnitPrice,
   };
+}
+
+function isPositivePayoutAmount(value) {
+  const amount = new BigNumber(value);
+  return amount.isFinite() && amount.isGreaterThan(0);
+}
+
+function isIndividualDisbursementBalanceEligible(balanceXtuValue, minimumRequestXtuValue) {
+  const balance = new BigNumber(balanceXtuValue);
+  const minimumRequest = new BigNumber(minimumRequestXtuValue);
+  return balance.isFinite() && balance.isGreaterThanOrEqualTo(0) &&
+    minimumRequest.isFinite() && minimumRequest.isGreaterThan(0) &&
+    balance.isGreaterThanOrEqualTo(minimumRequest);
 }
 
 function isRequestedPayoutWithinTolerance(requestedValue, expectedValue) {
@@ -235,10 +212,11 @@ module.exports = {
   TOKEN_DECIMALS,
   DISBURSEMENT_TOLERANCE,
   DISBURSEMENT_COOLDOWN_MS,
-  calculateSystemDisbursement,
   calculateIndividualDisbursement,
   validateGlobalDisbursementCapacity,
   calculateGlobalDisbursement,
   calculateDisbursementReserveSettlement,
   isRequestedPayoutWithinTolerance,
+  isPositivePayoutAmount,
+  isIndividualDisbursementBalanceEligible,
 };

@@ -5,10 +5,11 @@ const BigNumber = require("bignumber.js");
 BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP });
 const { queueTelegramMessageTx } = require("./telegram");
 const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
+const { getMinimumOutgoingNetBscUsd, getMinimumOutgoingGrossBscUsd } = require("./outgoing-payout-policy");
 
 // The public minimum is expressed in XTU. Stored campaign and reserve amounts
-// are initial assets and are converted using the global price at campaign entry.
-const SELLER_MIN_RUN_BALANCE = new BigNumber("10");
+// are initial assets and are valued at the user's individual price captured at campaign entry.
+const SELLER_MIN_RUN_BALANCE = new BigNumber("20");
 const SELLER_LOCK_RATIO = new BigNumber("0.5");
 const SELLER_STATUS_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 const SELLER_PAYOUT_BATCH_LIMIT = new BigNumber("300"); // BSC-USD gross payout value.
@@ -103,12 +104,107 @@ function calculateSellerPayoutGrossAtLockedPrice(initialAssetValue, lockedUnitPr
     .decimalPlaces(TOKEN_DECIMALS, BigNumber.ROUND_DOWN);
 }
 
-function calculateSellerPayoutNet(grossValue, gasFeeValue) {
+function calculateSellerPayoutNet(grossValue, gasFeeValue, maximumFeeValue) {
   const gross = finiteNonNegative(grossValue, "seller payout gross amount");
   const gasFee = finiteNonNegative(gasFeeValue, "seller payout gas recovery");
   const net = gross.minus(gasFee);
   if (!net.isGreaterThan(0)) throw new RangeError("Estimated BSC gas fee must be lower than the seller payout");
-  return { grossAmount: gross, gasFee, payoutAmount: net };
+  const minimumNet = getMinimumOutgoingNetBscUsd(maximumFeeValue);
+  if (net.isLessThan(minimumNet)) {
+    throw new RangeError(`Seller net payout must be at least ${minimumNet.toFixed(18)} BSC-USD.`);
+  }
+  return { grossAmount: gross, gasFee, payoutAmount: net, minimumNetAmount: minimumNet };
+}
+
+function buildSellerPayoutBatchGroups(rows, batchLimitValue, minimumGrossValue) {
+  const batchLimit = finitePositive(batchLimitValue, "seller payout batch limit");
+  const minimumGross = finiteNonNegative(minimumGrossValue, "minimum seller payout gross amount");
+  const bySeller = new Map();
+
+  for (const row of rows) {
+    const username = String(row.username || "");
+    if (!username) throw new Error("Seller payout row is missing its username.");
+    const grossAvailable = finiteNonNegative(row.grossAvailable, "seller payout available gross amount");
+    if (!bySeller.has(username)) {
+      bySeller.set(username, {
+        username,
+        payoutAddress: row.payout_address,
+        rows: [],
+        availableGross: new BigNumber(0),
+      });
+    }
+    const seller = bySeller.get(username);
+    if (String(seller.payoutAddress || "").toLowerCase() !== String(row.payout_address || "").toLowerCase()) {
+      throw new Error(`Seller ${username} has inconsistent payout addresses across reserve lots`);
+    }
+    seller.rows.push(row);
+    seller.availableGross = seller.availableGross.plus(grossAvailable);
+  }
+
+  const qualifiedSellers = [...bySeller.values()]
+    .filter((seller) => seller.availableGross.isGreaterThan(0) && seller.availableGross.isGreaterThanOrEqualTo(minimumGross));
+  const qualifiedAvailableGross = qualifiedSellers.reduce(
+    (sum, seller) => sum.plus(seller.availableGross), new BigNumber(0),
+  );
+  if (qualifiedSellers.length === 0) {
+    return { ready: false, qualifiedAvailableGross, groups: [], remainingBatchGross: batchLimit };
+  }
+
+  let remainingBatchGross = batchLimit;
+  const groups = [];
+  for (const seller of qualifiedSellers) {
+    if (remainingBatchGross.isLessThan(minimumGross)) break;
+    const targetGross = BigNumber.minimum(seller.availableGross, remainingBatchGross);
+    if (targetGross.isLessThan(minimumGross)) continue;
+
+    let remainingTarget = targetGross;
+    const allocations = [];
+    for (const row of seller.rows) {
+      if (!remainingTarget.isGreaterThan(0)) break;
+      const price = finitePositive(row.price, "seller payout locked unit price");
+      const availableInitial = finiteNonNegative(row.availableInitialAsset, "seller payout available initial assets");
+      let initialAssetAmount = row.grossAvailable.isLessThanOrEqualTo(remainingTarget)
+        ? availableInitial
+        : BigNumber.minimum(
+          availableInitial,
+          remainingTarget.dividedBy(price),
+        ).decimalPlaces(DB_ASSET_DECIMALS, BigNumber.ROUND_DOWN);
+      if (!initialAssetAmount.isGreaterThan(0)) continue;
+      let grossAmount = calculateSellerPayoutGrossAtLockedPrice(initialAssetAmount, price);
+      if (grossAmount.isGreaterThan(remainingTarget)) {
+        initialAssetAmount = initialAssetAmount.minus(new BigNumber(1).shiftedBy(-DB_ASSET_DECIMALS));
+        if (!initialAssetAmount.isGreaterThan(0)) continue;
+        grossAmount = calculateSellerPayoutGrossAtLockedPrice(initialAssetAmount, price);
+      }
+      if (!grossAmount.isGreaterThan(0) || grossAmount.isGreaterThan(remainingTarget)) continue;
+      allocations.push({
+        lotId: String(row.id),
+        initialAssetAmount,
+        grossAmount,
+        unitPrice: price,
+      });
+      remainingTarget = remainingTarget.minus(grossAmount);
+    }
+
+    const grossAmount = allocations.reduce((sum, item) => sum.plus(item.grossAmount), new BigNumber(0));
+    if (grossAmount.isLessThan(minimumGross)) continue;
+    const initialAssetAmount = allocations.reduce((sum, item) => sum.plus(item.initialAssetAmount), new BigNumber(0));
+    groups.push({
+      username: seller.username,
+      payoutAddress: seller.payoutAddress,
+      grossAmount,
+      initialAssetAmount,
+      allocations,
+    });
+    remainingBatchGross = remainingBatchGross.minus(grossAmount);
+  }
+
+  return {
+    ready: groups.length > 0,
+    qualifiedAvailableGross,
+    groups,
+    remainingBatchGross,
+  };
 }
 
 async function consumeSellerReserveTx(tx, requestedInitialAssetValue, reference, date, time, excludedUsername = null) {
@@ -188,6 +284,9 @@ async function consumeSellerReserveTx(tx, requestedInitialAssetValue, reference,
 
 async function queueSellerPayoutBatchesTx(tx) {
   const now = String(Date.now());
+  const minimumSellerNet = getMinimumOutgoingNetBscUsd();
+  const minimumSellerGross = getMinimumOutgoingGrossBscUsd();
+
   for (let batchIndex = 0; batchIndex < 10; batchIndex += 1) {
     const [rows] = await tx.query(
       `SELECT l.id,l.username,l.payout_pending_initial_asset,l.payout_reserved_initial_asset,
@@ -200,64 +299,47 @@ async function queueSellerPayoutBatchesTx(tx) {
        FOR UPDATE`,
     );
     const eligible = rows.map((row) => {
-      const rawInitial = new BigNumber(row.payout_pending_initial_asset).minus(row.payout_reserved_initial_asset);
+      const rawInitial = finiteNonNegative(
+        new BigNumber(row.payout_pending_initial_asset).minus(row.payout_reserved_initial_asset),
+        "seller payout unreserved initial assets",
+      );
       const price = finitePositive(row.unit_price, "seller payout locked unit price");
       const availableInitialAsset = rawInitial.shiftedBy(DB_ASSET_DECIMALS)
         .integerValue(BigNumber.ROUND_DOWN).shiftedBy(-DB_ASSET_DECIMALS);
-      // The lot price was frozen when the seller submitted the campaign request.
-      // Never revalue this seller liability using the price at payout time.
       const grossAvailable = calculateSellerPayoutGrossAtLockedPrice(availableInitialAsset, price);
       return { ...row, price, availableInitialAsset, grossAvailable };
     }).filter((row) => row.availableInitialAsset.isGreaterThan(0) && row.grossAvailable.isGreaterThan(0));
-    const availableGrossTotal = eligible.reduce((sum, row) => sum.plus(row.grossAvailable), new BigNumber(0));
-    if (availableGrossTotal.isLessThan(SELLER_PAYOUT_BATCH_LIMIT)) break;
 
-    const grouped = new Map();
-    let batchRemainingUsd = new BigNumber(SELLER_PAYOUT_BATCH_LIMIT);
-    for (const row of eligible) {
-      if (batchRemainingUsd.isZero()) break;
-      const maxInitialByBatch = batchRemainingUsd.dividedBy(row.price);
-      let initialAssetAmount = BigNumber.minimum(row.availableInitialAsset, maxInitialByBatch)
-        .decimalPlaces(DB_ASSET_DECIMALS, BigNumber.ROUND_DOWN);
-      let grossAmount = calculateSellerPayoutGrossAtLockedPrice(initialAssetAmount, row.price);
-      if (!initialAssetAmount.isGreaterThan(0) || !grossAmount.isGreaterThan(0)) continue;
-      if (grossAmount.isGreaterThan(batchRemainingUsd)) {
-        initialAssetAmount = initialAssetAmount.minus(new BigNumber(1).shiftedBy(-DB_ASSET_DECIMALS));
-        grossAmount = calculateSellerPayoutGrossAtLockedPrice(initialAssetAmount, row.price);
-      }
-      if (!initialAssetAmount.isGreaterThan(0) || !grossAmount.isGreaterThan(0)) continue;
-
-      if (!grouped.has(row.username)) {
-        grouped.set(row.username, {
-          username: row.username,
-          payoutAddress: row.payout_address,
-          grossAmount: new BigNumber(0),
-          initialAssetAmount: new BigNumber(0),
-          allocations: [],
-        });
-      }
-      const seller = grouped.get(row.username);
-      if (String(seller.payoutAddress).toLowerCase() !== String(row.payout_address).toLowerCase()) {
-        throw new Error(`Seller ${row.username} has inconsistent payout addresses across reserve lots`);
-      }
-      seller.grossAmount = seller.grossAmount.plus(grossAmount);
-      seller.initialAssetAmount = seller.initialAssetAmount.plus(initialAssetAmount);
-      seller.allocations.push({ lotId: String(row.id), initialAssetAmount, grossAmount, unitPrice: row.price });
-      await tx.query(
-        `UPDATE users_seller_reserve_lots
-         SET payout_reserved_initial_asset=payout_reserved_initial_asset+?,updated_at_ms=?
-         WHERE id=?`,
-        [initialAssetAmount.toFixed(DB_ASSET_DECIMALS), now, row.id],
-      );
-      batchRemainingUsd = batchRemainingUsd.minus(grossAmount);
+    const plan = buildSellerPayoutBatchGroups(eligible, SELLER_PAYOUT_BATCH_LIMIT, minimumSellerGross);
+    if (!plan.ready) break;
+    if (plan.groups.some((seller) => seller.grossAmount.minus(minimumSellerGross).isNegative())) {
+      throw new Error("A seller payout batch would violate the configured minimum gross payout.");
     }
-    if (grouped.size === 0) break;
-    const batchGross = [...grouped.values()].reduce((sum, seller) => sum.plus(seller.grossAmount), new BigNumber(0));
+
+    const batchGross = plan.groups.reduce((sum, seller) => sum.plus(seller.grossAmount), new BigNumber(0));
     const [batchResult] = await tx.query(
       "INSERT INTO users_usdt_seller_payout_batches(gross_amount,status,created_at_ms,updated_at_ms) VALUES(?,'queued',?,?)",
       [batchGross.toFixed(TOKEN_DECIMALS), now, now],
     );
-    for (const seller of grouped.values()) {
+
+    for (const seller of plan.groups) {
+      for (const allocation of seller.allocations) {
+        const [reserveUpdate] = await tx.query(
+          `UPDATE users_seller_reserve_lots
+           SET payout_reserved_initial_asset=payout_reserved_initial_asset+?,updated_at_ms=?
+           WHERE id=? AND payout_reserved_initial_asset<=payout_pending_initial_asset-?`,
+          [
+            allocation.initialAssetAmount.toFixed(DB_ASSET_DECIMALS),
+            now,
+            allocation.lotId,
+            allocation.initialAssetAmount.toFixed(DB_ASSET_DECIMALS),
+          ],
+        );
+        if (Number(reserveUpdate.affectedRows || 0) !== 1) {
+          throw new Error(`Seller payout reservation changed for reserve lot ${allocation.lotId}`);
+        }
+      }
+
       const effectiveUnitPrice = seller.grossAmount.dividedBy(seller.initialAssetAmount);
       const [payoutResult] = await tx.query(
         `INSERT INTO users_usdt_seller_payouts
@@ -299,6 +381,7 @@ async function queueSellerPayoutBatchesTx(tx) {
           "Your sold seller-reserve assets have reached a payout batch and are queued for BSC-USD settlement.",
           `Payout ID: ${payoutResult.insertId}`,
           `Gross amount: ${seller.grossAmount.toFixed(8)} BSC-USD`,
+          `Minimum net payout: ${minimumSellerNet.toFixed(8)} BSC-USD`,
           `Valuation price locked at campaign submission: ${effectiveUnitPrice.toFixed(12)} XTU per initial asset`,
           "The outgoing BSC gas fee will be deducted from your payout. No transaction fee is charged to priority sellers.",
           "Status: PROCESSING",
@@ -396,6 +479,7 @@ module.exports = {
   getActiveSellerReserveAvailableTx,
   calculateSellerPayoutGrossAtLockedPrice,
   calculateSellerPayoutNet,
+  buildSellerPayoutBatchGroups,
   consumeSellerReserveTx,
   queueSellerPayoutBatchesTx,
   closeExpiredSellerCampaignsTx,

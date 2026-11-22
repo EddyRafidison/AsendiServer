@@ -64,6 +64,7 @@ function calculateMinimumRechargeCapacity({
   currentUnitPrice,
   tfeesRate,
   maximumUserXtu = MAX_DEFAULT_STOCK,
+  stockLimitEvaluator = null,
 }) {
   const currentBalance = new BigNumber(currentBalanceInitialAsset);
   const total = new BigNumber(totalUnitsPrice);
@@ -127,9 +128,13 @@ function calculateMinimumRechargeCapacity({
     projectionMethod = "retained_tfees_post_recharge_price";
   }
 
-  const projectedBalanceXtu = currentBalance.plus(requiredInitialAsset).multipliedBy(projectedPrice);
+  const stockLimit = typeof stockLimitEvaluator === "function"
+    ? stockLimitEvaluator(currentBalance, requiredInitialAsset, projectedPrice)
+    : { allowed: currentBalance.plus(requiredInitialAsset).multipliedBy(projectedPrice).isLessThanOrEqualTo(maximumXtu),
+      projectedXtu: currentBalance.plus(requiredInitialAsset).multipliedBy(projectedPrice) };
+  const projectedBalanceXtu = stockLimit.projectedXtu;
   return {
-    allowed: projectedBalanceXtu.isLessThanOrEqualTo(maximumXtu),
+    allowed: stockLimit.allowed,
     minimumGrossAmount: new BigNumber(MIN_RECHARGE_AMOUNT),
     minimumTfeesAmount: feeAmount,
     minimumNetAmount,

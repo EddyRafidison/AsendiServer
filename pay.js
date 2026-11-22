@@ -363,8 +363,8 @@ async function initializeScanState(db, safeBlock) {
       "Set USDT_INCOMING_START_BLOCK explicitly when historical treasury deposits must also be indexed.",
     );
   }
-  const [created] = await db.queryAsync("SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1");
-  return created;
+  const createdRows = await db.queryAsync("SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1");
+  return createdRows[0] || null;
 }
 
 async function verifyFinalizedTransfer(log) {
@@ -428,7 +428,7 @@ async function verifyFinalizedTransfer(log) {
 }
 
 async function persistUnknownTransfer(db, event) {
-  const [registryRows] = await db.queryAsync(
+  const registryRows = await db.queryAsync(
     "SELECT username FROM bsc_wallet_address_registry WHERE wallet_address_lower=? LIMIT 1",
     [event.fromAddress.toLowerCase()],
   );
@@ -499,7 +499,7 @@ async function scanTreasury(db, safeBlock) {
     if (event?.pending) throw new Error("A BSC transfer receipt or canonical block is not yet consistent; the scan cursor was not advanced.");
     if (!event || event.ignored) continue;
 
-    const [accountRows] = await db.queryAsync(
+    const accountRows = await db.queryAsync(
       `SELECT username FROM auths WHERE LOWER(wallet_address)=? LIMIT 1`,
       [event.fromAddress.toLowerCase()],
     );

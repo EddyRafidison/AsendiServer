@@ -10,7 +10,7 @@ const {
   calculateTopUpReserveAllocation,
 } = require("../stock-accounting");
 const {
-  calculateSystemDisbursement,
+  calculateIndividualDisbursement,
   calculateDisbursementReserveSettlement,
   DISBURSEMENT_COOLDOWN_MS,
 } = require("../disbursement-policy");
@@ -74,31 +74,33 @@ test("reserve allocation refuses a top-up above the combined distributable reser
   assert.equal(fixed(result.newBacked), "100");
 });
 
-test("P2P stores both user balances in initial assets and retains recipient-paid fees", () => {
-  const price = new BigNumber("2");
+test("P2P uses the sender individual price while tfees are valued at the pre-operation global price", () => {
+  const globalPriceBefore = new BigNumber("2");
+  const senderIndividualPrice = new BigNumber("2.5");
   const senderBalanceInitial = new BigNumber("150");
   const recipientBalanceInitial = new BigNumber("80");
   const requestedXtu = new BigNumber("50");
-  const requestedInitial = requestedXtu.dividedBy(price);
+  const requestedInitial = requestedXtu.dividedBy(senderIndividualPrice);
   const feesInitial = requestedInitial.multipliedBy(3).dividedBy(100);
   const recipientCreditInitial = requestedInitial.minus(feesInitial);
   const newSenderBalance = senderBalanceInitial.minus(requestedInitial);
   const newRecipientBalance = recipientBalanceInitial.plus(recipientCreditInitial);
-  const feesXtu = feesInitial.multipliedBy(price);
-  const newTotal = new BigNumber("200").plus(feesXtu);
+  const commonFeeValueXtu = feesInitial.multipliedBy(globalPriceBefore);
+  const newTotal = new BigNumber("200").plus(commonFeeValueXtu);
   const newBacked = new BigNumber("100").plus(feesInitial);
 
-  assert.equal(fixed(requestedInitial), "25");
-  assert.equal(fixed(feesInitial), "0.75");
-  assert.equal(fixed(newSenderBalance), "125");
-  assert.equal(fixed(newRecipientBalance), "104.25");
-  assert.equal(fixed(newTotal), "201.5");
-  assert.equal(fixed(newBacked), "100.75");
+  assert.equal(fixed(requestedInitial), "20");
+  assert.equal(fixed(feesInitial), "0.6");
+  assert.equal(fixed(newSenderBalance), "130");
+  assert.equal(fixed(newRecipientBalance), "99.4");
+  assert.equal(fixed(commonFeeValueXtu), "1.2");
+  assert.equal(fixed(newTotal), "201.2");
+  assert.equal(fixed(newBacked), "100.6");
   assert.equal(fixed(calculateGlobalUnitPrice(newTotal, newBacked)), "2");
 });
 
-test("disbursement freezes the public price and BSC-USD payment at request submission", () => {
-  const result = calculateSystemDisbursement("300", "1.25", 3);
+test("individual disbursement uses the participant's snapshot price and deducts tfees", () => {
+  const result = calculateIndividualDisbursement("375", "300", "1.25", 3);
   assert.equal(fixed(result.grossInitialAsset), "300");
   assert.equal(fixed(result.grossBalance), "375");
   assert.equal(fixed(result.priceValue), "1.25");
@@ -107,32 +109,27 @@ test("disbursement freezes the public price and BSC-USD payment at request submi
   assert.equal(fixed(result.soldInitialAsset), "291");
   assert.equal(fixed(result.payoutAmount), "363.75");
   assert.equal(result.amountRaw, "363750000000000000000");
-  // A later global price is deliberately not an input to the persisted payout.
   const laterGlobalPrice = new BigNumber("1.8");
-  assert.equal(fixed(result.soldInitialAsset.multipliedBy(result.priceValue)), "363.75");
   assert.notEqual(fixed(result.soldInitialAsset.multipliedBy(laterGlobalPrice)), fixed(result.payoutAmount));
 });
 
-test("disbursement settlement applies the frozen payout while recalculating the current common price", () => {
-  const disbursement = calculateSystemDisbursement("300", "1.25", 3);
-  const settlement = calculateDisbursementReserveSettlement("10000000", "10000000", "0", disbursement);
-  assert.equal(fixed(settlement.newTotalUnitsPrice), "9999636.25");
+test("individual disbursement settlement returns tfees at the pre-settlement global price", () => {
+  const disbursement = calculateIndividualDisbursement("375", "300", "1.25", 3);
+  const settlement = calculateDisbursementReserveSettlement("10000000", "10000000", "0", {
+    ...disbursement,
+    feeValueXtu: disbursement.feeInitialAsset.multipliedBy("1.40"),
+  });
+  assert.equal(fixed(settlement.newTotalUnitsPrice), "9999648.85");
   assert.equal(fixed(settlement.newInactiveInitAsset), "291");
   assert.equal(fixed(settlement.newBackedUnits), "10000009");
   assert.equal(fixed(settlement.newUnitPrice), fixed(settlement.newTotalUnitsPrice.dividedBy(settlement.newBackedUnits)));
 });
 
-test("checks the requested payout with a bounded tolerance", () => {
-  const result = calculateSystemDisbursement("300", "1.25", 3);
-  assert.equal(require("../disbursement-policy").isRequestedPayoutWithinTolerance("363.750000000", result.payoutAmount), true);
-  assert.equal(require("../disbursement-policy").isRequestedPayoutWithinTolerance("363.75000002", result.payoutAmount), false);
-  assert.equal(require("../disbursement-policy").isRequestedPayoutWithinTolerance("invalid", result.payoutAmount), false);
-});
-
-test("rejects invalid fee percentages and invalid balances", () => {
-  assert.throws(() => calculateSystemDisbursement("300", "1.25", 100), /FEES/);
-  assert.throws(() => calculateSystemDisbursement("0", "1.25", 3), /balance/);
-  assert.throws(() => calculateSystemDisbursement("300", "0", 3), /unit_price/);
+test("rejects invalid individual payout fees, amounts and participant prices", () => {
+  assert.throws(() => calculateIndividualDisbursement("375", "300", "1.25", 100), /FEES/);
+  assert.throws(() => calculateIndividualDisbursement("0", "300", "1.25", 3), /gross XTU/);
+  assert.throws(() => calculateIndividualDisbursement("375", "0", "1.25", 3), /balance/);
+  assert.throws(() => calculateIndividualDisbursement("375", "300", "0", 3), /unit_price/);
 });
 
 test("weekly pending release is at least seven days after first pending and last successful recharge", () => {

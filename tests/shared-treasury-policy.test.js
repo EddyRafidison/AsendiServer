@@ -74,11 +74,13 @@ test("individual price threshold uses three times the applied fee rate", () => {
   const index = read("index.js");
   const testSource = read("tests/individual-price.test.js");
   assert.match(price, /USER_PRICE_TRIGGER_RATIO = new BigNumber\(3\)/);
-  assert.match(price, /feeRate\.multipliedBy\(USER_PRICE_TRIGGER_RATIO\)/);
+  assert.match(price, /USER_PRICE_TRIGGER_RATIO\.multipliedBy\(feeRate\)/);
   assert.match(price, /recalculateWatchingPriceTargets/);
   assert.match(index, /recalculateWatchingPriceTargets\(database\)/);
-  assert.match(testSource, /equals A plus three times/);
-  assert.ok(testSource.includes('assert.equal(fixed(calculateIndividualTargetPrice("1.25", "3")), "1.3625")'));
+  assert.match(price, /MINIMUM_OPERATION_RATIO = new BigNumber\("0\.05"\)/);
+  assert.match(price, /calculateIndividualRemunerationRate/);
+  assert.match(testSource, /calculateIndividualRemunerationRate\("50", "100", "3"\)/);
+  assert.ok(testSource.includes('assert.equal(fixed(calculateIndividualRemunerationRate("25", "100", "3")), "4.5")'));
 });
 
 test("Terms and Privacy describe the shared-treasury and fixed-wallet model in both languages", () => {
@@ -90,6 +92,6 @@ test("Terms and Privacy describe the shared-treasury and fixed-wallet model in b
     assert.match(text, /from|expédit/i, `${name} must explain sender-address matching`);
     assert.match(text, /block cursor|curseur de blocs/i, `${name} must describe durable scanner state`);
   }
-  assert.match(read("terms_fr.html"), /3 × tfees \/ 100/);
-  assert.match(read("terms_en.html"), /3 × tfees \/ 100/);
+  assert.match(read("terms_fr.html"), /C = 3 × tfees × min\(1, 2 × V \/ P\)/);
+  assert.match(read("terms_en.html"), /C = 3 × tfees × min\(1, 2 × V \/ P\)/);
 });

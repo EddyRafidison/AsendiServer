@@ -101,7 +101,7 @@ test("welcome promotion defaults and public global-disbursement deadlines are do
   assert.match(envExample, /^WELCOME_BONUS_AMOUNT_XTU=0$/m);
   assert.match(termsFr, /au minimum 90 jours/);
   assert.match(termsFr, /extension d'au moins 30 jours/);
-  assert.match(termsFr, /ne bénéficient d'aucun bonus global/);
+  assert.match(termsFr, /aucune nouvelle demande.*ne bénéficie du bonus global/);
   assert.match(termsEn, /at least 90 days/);
   assert.match(termsEn, /extension of at least 30 days/);
   assert.match(termsEn, /do not qualify for the global bonus/);

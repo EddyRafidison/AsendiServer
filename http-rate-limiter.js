@@ -9,6 +9,7 @@ const ROUTE_LIMITS = Object.freeze({
   "GET /app/privacy-terms-info": { limit: 60, windowMs: 60_000 },
   "POST /app/check-app-version": { limit: 30, windowMs: 60_000 },
   "POST /app/signin": { limit: 10, windowMs: 15 * 60_000, authResponse: true },
+  "POST /app/device/challenge": { limit: 10, windowMs: 15 * 60_000, authResponse: true },
   "POST /app/signup": { limit: 5, windowMs: 60 * 60_000 },
   "POST /app/contact-onex": { limit: 5, windowMs: 60 * 60_000, authResponse: true },
   "POST /app/user-last-stock": { limit: 30, windowMs: 60_000, authResponse: true },

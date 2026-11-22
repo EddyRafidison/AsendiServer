@@ -35,6 +35,7 @@ function evaluateRechargeCredit({
   globalBonusRatePercent = 0,
   remainingAdminReserveInitialAsset = 0,
   alreadyReservedAdminBonusInitialAsset = 0,
+  stockLimitEvaluator = null,
 }) {
   const gross = asAmount(grossAmount, "Recharge gross amount");
   const balance = asAmount(currentBalanceInitialAsset, "User balance");
@@ -99,12 +100,9 @@ function evaluateRechargeCredit({
     return { allowed: false, reason: "system_reserve", allocation };
   }
   const newPrice = calculateGlobalUnitPrice(newTotal, newBacked);
-  const stockLimit = isUserBalanceWithinMaxStock(
-    balance,
-    requestedInitialAsset,
-    newPrice,
-    maximumXtu,
-  );
+  const stockLimit = typeof stockLimitEvaluator === "function"
+    ? stockLimitEvaluator(balance, requestedInitialAsset, newPrice)
+    : isUserBalanceWithinMaxStock(balance, requestedInitialAsset, newPrice, maximumXtu);
   if (!stockLimit.allowed) {
     return {
       allowed: false,

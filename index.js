@@ -74,8 +74,17 @@ app.use((req, res, next) => {
   });
 });
 
-app.use(express.json({ limit: "256kb", strict: true }));
-app.use(express.urlencoded({ limit: "256kb", extended: false, parameterLimit: 100 }));
+function captureRawRequestBody(req, _res, buffer) {
+  req.rawBody = Buffer.from(buffer);
+}
+
+app.use(express.json({ limit: "256kb", strict: true, verify: captureRawRequestBody }));
+app.use(express.urlencoded({
+  limit: "256kb",
+  extended: false,
+  parameterLimit: 100,
+  verify: captureRawRequestBody,
+}));
 app.use("/", routes);
 
 // Handle body-parser errors and unexpected route errors without exposing stack traces.

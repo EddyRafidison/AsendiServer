@@ -16,6 +16,7 @@ const {
 } = require("./disbursement-policy");
 const { getDate } = require("./utils");
 const { queueTelegramMessageTx } = require("./telegram");
+const { recordUserOperationTx, triggerUserPriceThresholdTx } = require("./user-price-accounting");
 const { recordRefundRequestEventTx } = require("./refund-request-audit");
 const {
   getLatestCommonTx,
@@ -34,8 +35,9 @@ const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
 const {
   calculateRequiredAdminBonusReserve,
 } = require("./global-disbursement-policy");
-const { allocateBscCostFromTfees } = require("./tfees-bsc-allocation");
 const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
+const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
+const { getMinimumOutgoingNetBscUsd } = require("./outgoing-payout-policy");
 
 const INITIAL_STOCK_LIMIT = process.env.STOCK_LIMIT || "18000000";
 
@@ -363,54 +365,31 @@ async function signQueuedJob(db, job, activeRuntime) {
   let estimate;
   let data;
   const tokenBalanceRaw = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
-  const grossBase = job.disbursement_mode === "global"
-    ? new BigNumber(job.gross_initial_asset).multipliedBy(new BigNumber(job.price_value)).plus(new BigNumber(job.bonus_amount || "0"))
-    : null;
-
-  if (job.disbursement_mode === "global") {
-    if (!grossBase.isFinite() || !grossBase.isGreaterThan(0)) {
-      throw new Error("The global disbursement gross amount must be positive.");
-    }
-    const payout = await estimateNetBscTokenTransfer({
-      provider: activeRuntime.provider,
-      fromAddress: activeRuntime.treasuryAddress,
-      tokenAddress: activeRuntime.tokenAddress,
-      payoutAddress,
-      grossAmount: grossBase,
-      tokenBalanceRaw,
-      maximumGasLimit: activeRuntime.gasLimit,
-      bnbUsdPrice: getConfiguredBnbUsdPrice(),
-    });
-    if (!payout.payoutAmount.isGreaterThan(0) || payout.amountRaw <= 0n || !payout.data) {
-      throw new Error("The global request is too small to cover the estimated BSC network fee.");
-    }
-    payoutAmount = payout.payoutAmount;
-    amountRaw = payout.amountRaw;
-    data = payout.data;
-    estimate = payout.estimate;
-    bscFeeRecovered = estimate.feeUsd;
-  } else {
-    if (!payoutAmount.isFinite() || !payoutAmount.isGreaterThan(0)) {
-      throw new Error("The individual disbursement amount must be positive.");
-    }
-    amountRaw = BigInt(job.amount_raw);
-    if (amountRaw <= 0n) throw new Error("The disbursement token amount must be positive.");
-    if (tokenBalanceRaw < amountRaw) {
-      throw new Error("The OneX treasury does not have enough BSC-USD for this disbursement.");
-    }
-    data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [payoutAddress, amountRaw]);
-    estimate = await estimateBscTokenTransfer({
-      provider: activeRuntime.provider,
-      fromAddress: activeRuntime.treasuryAddress,
-      tokenAddress: activeRuntime.tokenAddress,
-      data,
-      maximumGasLimit: activeRuntime.gasLimit,
-      bnbUsdPrice: getConfiguredBnbUsdPrice(),
-    });
-    if (!estimate.allowed) {
-      throw createBscFeeLimitError(estimate.feeUsd, estimate.maximumFeeUsd);
-    }
+  const grossBase = new BigNumber(job.sold_initial_asset)
+    .multipliedBy(new BigNumber(job.price_value))
+    .plus(new BigNumber(job.bonus_amount || "0"));
+  const payoutBase = job.disbursement_mode === "global" ? grossBase : payoutAmount;
+  if (!payoutBase.isFinite() || !payoutBase.isGreaterThan(0)) {
+    throw new Error("The disbursement net amount after tfees must be positive.");
   }
+  const payout = await estimateNetBscTokenTransfer({
+    provider: activeRuntime.provider,
+    fromAddress: activeRuntime.treasuryAddress,
+    tokenAddress: activeRuntime.tokenAddress,
+    payoutAddress,
+    grossAmount: payoutBase,
+    tokenBalanceRaw,
+    maximumGasLimit: activeRuntime.gasLimit,
+    bnbUsdPrice: getConfiguredBnbUsdPrice(),
+  });
+  if (!payout.payoutAmount.isGreaterThan(0) || payout.amountRaw <= 0n || !payout.data) {
+    throw new Error("The disbursement amount is too small to cover the estimated BSC network fee.");
+  }
+  payoutAmount = payout.payoutAmount;
+  amountRaw = payout.amountRaw;
+  data = payout.data;
+  estimate = payout.estimate;
+  bscFeeRecovered = estimate.feeUsd;
 
   if (tokenBalanceRaw < amountRaw) {
     throw new Error("The OneX treasury does not have enough BSC-USD for this disbursement.");
@@ -725,11 +704,10 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     const backed = new BigNumber(common.backed_units);
     const inactive = new BigNumber(common.inactive_init_asset);
     const payoutAmount = new BigNumber(job.payout_amount);
-    // Every treasury transfer consumes both the BSC-USD sent to the user and
-    // the actual BNB gas paid for the transaction. For individual sales the
-    // gas is covered from gross tfees; for global payouts it was estimated and
-    // deducted from the token amount before submission. In both cases, the
-    // confirmed receipt cost must be included in common stock-value accounting.
+    // Every treasury transfer consumes both the BSC-USD sent to the recipient
+    // and the actual BNB gas paid for the transaction. For individual and global
+    // disbursements, the estimated BSC-USD gas cost is deducted from the payout
+    // before signing; the confirmed receipt cost is reconciled in common reserves.
     const reserveExpenseAmount = payoutAmount.plus(actualFee.feeUsd);
     const soldInitialAssets = new BigNumber(job.sold_initial_asset);
     const grossInitialAsset = new BigNumber(job.gross_initial_asset);
@@ -740,22 +718,14 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     const bscFeeRecovered = new BigNumber(job.bsc_fee_recovered_usd || "0");
     const bonusAmount = new BigNumber(job.bonus_amount || "0");
     const bonusInitialAssets = new BigNumber(job.bonus_initial_asset || "0");
-    const expectedPayoutAmount = (isGlobalDisbursement
-      ? grossBalance.plus(bonusAmount).minus(bscFeeRecovered)
-      : soldInitialAssets.multipliedBy(priceValue))
+    const expectedPayoutAmount = soldInitialAssets.multipliedBy(priceValue)
+      .plus(bonusAmount).minus(bscFeeRecovered)
       .decimalPlaces(18, BigNumber.ROUND_DOWN);
-    const expectedFeeAmount = isGlobalDisbursement
-      ? new BigNumber(0)
-      : feeInitialAssets.multipliedBy(priceValue).decimalPlaces(18, BigNumber.ROUND_DOWN);
+    const expectedFeeAmount = feeInitialAssets.multipliedBy(priceValue)
+      .decimalPlaces(18, BigNumber.ROUND_DOWN);
     const actualBscFeeUsd = new BigNumber(actualFee.feeUsd);
-    const feeAllocation = isGlobalDisbursement
-      ? { coveredBscCost: new BigNumber(0), uncoveredBscCost: new BigNumber(0), retainedTfees: new BigNumber(0) }
-      : allocateBscCostFromTfees(expectedFeeAmount, actualBscFeeUsd);
-    const tfeesCoveredBscUsd = feeAllocation.coveredBscCost;
-    const tfeesUncoveredBscUsd = feeAllocation.uncoveredBscCost;
-    const netFeeInitialAssets = isGlobalDisbursement
-      ? new BigNumber(0)
-      : feeAllocation.retainedTfees.dividedBy(priceValue);
+    const tfeesCoveredBscUsd = new BigNumber(0);
+    const tfeesUncoveredBscUsd = new BigNumber(0);
     const lockedAmountsTolerance = new BigNumber("0.000000000000000001");
     const grossInitialAssetMismatch = grossInitialAsset.minus(soldInitialAssets.plus(feeInitialAssets)).abs();
     const payoutAmountMismatch = payoutAmount.minus(expectedPayoutAmount).abs();
@@ -776,7 +746,6 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       !bonusAmount.isFinite() || bonusAmount.isNegative() ||
       !bonusInitialAssets.isFinite() || bonusInitialAssets.isNegative() ||
       !actualBscFeeUsd.isFinite() || actualBscFeeUsd.isNegative() ||
-      (isGlobalDisbursement && (!feeInitialAssets.isZero() || !new BigNumber(job.fee_amount).isZero())) ||
       (!isGlobalDisbursement && (!bonusAmount.isZero() || !bonusInitialAssets.isZero())) ||
       new BigNumber(job.bsc_fee_recovered_usd || "0").isNegative() ||
       !new BigNumber(job.fee_amount).isFinite() || new BigNumber(job.fee_amount).isNegative() ||
@@ -801,7 +770,8 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
         payoutAmount,
         reserveExpenseAmount,
         soldInitialAsset: soldInitialAssets,
-        feeInitialAsset: isGlobalDisbursement ? new BigNumber(0) : netFeeInitialAssets,
+        feeInitialAsset: feeInitialAssets,
+        feeValueXtu: feeInitialAssets.multipliedBy(unitPrice),
         bonusInitialAsset: isGlobalDisbursement ? bonusInitialAssets : new BigNumber(0),
       },
       common.sys_inactive_init_asset || "0",
@@ -834,9 +804,7 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username='ONEX'",
       [newSystemBalanceInitial.toFixed(30), date, time],
     );
-    const totalTfees = new BigNumber(common.total_tfees || "0").plus(
-      isGlobalDisbursement ? 0 : netFeeInitialAssets,
-    );
+    const totalTfees = new BigNumber(common.total_tfees || "0").plus(feeInitialAssets);
     const totalTfeesBscCost = new BigNumber(common.total_tfees_bsc_cost_usd || "0").plus(tfeesCoveredBscUsd);
     const totalTfeesBscUncovered = new BigNumber(common.total_tfees_bsc_uncovered_usd || "0").plus(tfeesUncoveredBscUsd);
     await insertCommonSnapshotTx(tx, common, {
@@ -855,9 +823,9 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
     );
     if (existingActivityRows.length === 0) {
       await tx.query(
-        `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,bsc_fee_cost_usd,reference,record_date,record_time)
-         VALUES(?,?,?,?,?,?,?,?,?,?)`,
-        [username, "ONEX", 3, soldInitialAssets.toFixed(), priceValue.toFixed(), feeInitialAssets.toFixed(), actualBscFeeUsd.toFixed(18), job.reference, date, time],
+        `INSERT INTO activities(sender,receiver,type,amount,unit_price,fees,fee_unit_price,bsc_fee_cost_usd,reference,record_date,record_time)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+        [username, "ONEX", 3, soldInitialAssets.toFixed(), priceValue.toFixed(), feeInitialAssets.toFixed(), unitPrice.toFixed(), actualBscFeeUsd.toFixed(18), job.reference, date, time],
       );
     }
 
@@ -868,6 +836,21 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
        WHERE id=?`,
       [String(receipt.blockNumber), confirmedAt, confirmedAt, jobId],
     );
+    if (job.disbursement_mode === "individual") {
+      const principalBefore = new BigNumber(job.balance_after_reservation || "0").plus(grossInitialAsset);
+      await recordUserOperationTx(
+        tx, username, "sale", grossInitialAsset, principalBefore,
+        new BigNumber(job.balance_after_reservation || "0"), reserveSettlement.newUnitPrice,
+        job.tfees_rate_percent || (grossInitialAsset.isGreaterThan(0)
+          ? feeInitialAssets.multipliedBy(100).dividedBy(grossInitialAsset)
+          : 0), job.reference,
+      );
+      await triggerUserPriceThresholdTx(
+        tx, username, reserveSettlement.newUnitPrice, null,
+        new BigNumber(job.balance_after_reservation || "0"),
+      );
+    }
+
     if (job.disbursement_mode === "global" && job.global_run_id != null) {
       const [globalRows] = await tx.query(
         "SELECT status,request_deadline_at_ms,extension_deadline_at_ms FROM global_disbursement_runs WHERE id=? LIMIT 1 FOR UPDATE",
@@ -884,7 +867,7 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
         `UPDATE global_disbursement_participants
          SET paid_initial_asset=paid_initial_asset+?,remaining_initial_asset=?,status=?,updated_at_ms=?
          WHERE run_id=? AND username=? AND status<>'resolved'`,
-        [String(job.sold_initial_asset), remainingInitial.toFixed(30), participantStatus,
+        [String(job.gross_initial_asset), remainingInitial.toFixed(30), participantStatus,
           confirmedAt, job.global_run_id, username],
       );
       await tx.query(
@@ -903,8 +886,9 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
       "Your sale to OneX has been completed and the BSC-USD payment is confirmed.",
       `Actual BSC gas cost: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD).`,
       `Gross amount: ${grossBalance.toFixed(8)} XTU`,
-      `Fees: ${isGlobalDisbursement ? "0" : feeInitialAssets.multipliedBy(priceValue).toFixed(8)} XTU`,
-      ...(isGlobalDisbursement ? [`Automatic global bonus: ${bonusAmount.toFixed(8)} BSC-USD`] : [`BSC fee allocated from tfees: ${tfeesCoveredBscUsd.toFixed(8)} BSC-USD`, `Net tfees retained: ${netFeeInitialAssets.multipliedBy(priceValue).toFixed(8)} XTU`]),
+      `System tfees deducted from the gross sale: ${feeInitialAssets.multipliedBy(priceValue).toFixed(8)} XTU`,
+      `BSC network fee recovered from your payout: ${bscFeeRecovered.toFixed(8)} BSC-USD`,
+      ...(isGlobalDisbursement ? [`Automatic global bonus: ${bonusAmount.toFixed(8)} BSC-USD`] : []),
       `Valuation price locked at request submission: ${priceValue.toFixed(12)} XTU per initial asset`,
       `Amount paid: ${payoutAmount.toFixed(8)} BSC-USD`,
       `Destination: ${job.payout_address}`,
@@ -1088,8 +1072,9 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
     bnbUsdPrice,
   });
   const { payoutAmount, amountRaw, data, estimate: finalEstimate } = payout;
-  if (!payoutAmount.isGreaterThan(0) || amountRaw <= 0n || !data) {
-    throw new Error("Seller payout is too small after BSC gas recovery.");
+  const minimumSellerNetPayout = getMinimumOutgoingNetBscUsd();
+  if (!payoutAmount.isGreaterThanOrEqualTo(minimumSellerNetPayout) || amountRaw <= 0n || !data) {
+    throw new Error(`Seller payout net amount must be at least ${minimumSellerNetPayout.toFixed(18)} BSC-USD after BSC gas recovery.`);
   }
   const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
   if (nativeBalance < finalEstimate.gasLimit * finalEstimate.gasPrice) {
@@ -1640,11 +1625,11 @@ async function processOneRefundJob(db, job, activeRuntime) {
       bnbUsdPrice: getConfiguredBnbUsdPrice(),
     });
     const { payoutAmount: finalPayoutAmount, amountRaw: finalAmountRaw, data: signedData, estimate: finalEstimate } = payout;
-    if (!finalPayoutAmount.isGreaterThanOrEqualTo(10) || finalAmountRaw <= 0n || !signedData) {
+    if (!finalPayoutAmount.isGreaterThanOrEqualTo(MINIMUM_REFUND_NET_BSC_USD) || finalAmountRaw <= 0n || !signedData) {
       await markRefundManualReview(
         db,
         job,
-        "The estimated network-fee deduction would reduce the net refund below 10 BSC-USD.",
+        `The estimated network-fee deduction would reduce the net refund below ${MINIMUM_REFUND_NET_BSC_USD.toFixed(8)} BSC-USD.`,
       );
       return;
     }
@@ -1759,7 +1744,7 @@ async function processOneRefundJob(db, job, activeRuntime) {
       }
     }
     const submittedAt = String(Date.now());
-    const [submittedUpdate] = await db.queryAsync(
+    const submittedUpdate = await db.queryAsync(
       "UPDATE users_usdt_refunds SET status='submitted',last_error=NULL,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')",
       [submittedAt, job.id],
     );
@@ -1934,7 +1919,7 @@ async function processRefundQueue(db, activeRuntime) {
 
 async function closeExpiredGlobalDisbursement(db) {
   const now = Date.now();
-  const [runs] = await db.queryAsync(
+  const runs = await db.queryAsync(
     `SELECT id FROM global_disbursement_runs
      WHERE status='active' AND CAST(CASE WHEN extension_deadline_at_ms>0 THEN extension_deadline_at_ms ELSE request_deadline_at_ms END AS UNSIGNED)<=?
      ORDER BY id ASC LIMIT 10`,
@@ -1972,7 +1957,7 @@ async function closeExpiredGlobalDisbursement(db) {
 }
 
 async function settleGlobalDisbursementRun(db) {
-  const [runs] = await db.queryAsync(
+  const runs = await db.queryAsync(
     `SELECT id,status FROM global_disbursement_runs
      WHERE status IN ('closed','manual_review') ORDER BY id ASC LIMIT 10`,
   );
