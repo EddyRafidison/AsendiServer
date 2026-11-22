@@ -76,6 +76,10 @@ test("sensitive routes have explicit IP-level limits", () => {
   assert.ok(ROUTE_LIMITS["POST /admin/activate-account"].limit > 0);
   assert.equal(ROUTE_LIMITS["POST /admin/set-user-status"], undefined);
   assert.ok(ROUTE_LIMITS["POST /admin/unlock-system-seller"].limit > 0);
+  assert.ok(ROUTE_LIMITS["POST /admin/bsc/incoming-scanner/status"].limit > 0);
+  assert.ok(ROUTE_LIMITS["POST /admin/bsc/incoming-scanner/reconcile/preview"].limit > 0);
+  assert.ok(ROUTE_LIMITS["POST /admin/bsc/incoming-scanner/reconcile/resolve-event"].limit > 0);
+  assert.ok(ROUTE_LIMITS["POST /admin/bsc/incoming-scanner/reconcile/commit"].limit > 0);
 });
 
 test("HTTP limiter returns 429 and Retry-After when a route bucket is exhausted", () => {

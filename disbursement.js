@@ -38,6 +38,11 @@ const {
 const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
 const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
 const { getMinimumOutgoingNetBscUsd } = require("./outgoing-payout-policy");
+const { db: sharedDb } = require("./db");
+const {
+  getHotWalletReserveAmounts,
+  getHotWalletFinalizedTokenBalance,
+} = require("./treasury-liquidity");
 
 const INITIAL_STOCK_LIMIT = process.env.STOCK_LIMIT || "18000000";
 
@@ -125,35 +130,27 @@ async function estimateNetBscTokenTransfer({
   throw new Error("The BSC-USD payout amount and gas estimate did not converge; the queued job will be re-evaluated.");
 }
 
-function makeRuntime(forcePendingWork = false) {
+function makeRuntime({ needDisbursement = true, needTreasury = true } = {}) {
   if (runtime) return runtime;
 
-  const masterEnabled = String(process.env.USDT_DISBURSEMENTS_ENABLED || "false").toLowerCase() === "true";
-  const individualEnabled = masterEnabled && String(process.env.USDT_INDIVIDUAL_DISBURSEMENT_ENABLED || "false").toLowerCase() === "true";
-  const globalEnabled = masterEnabled && String(process.env.USDT_GLOBAL_DISBURSEMENT_ENABLED || "false").toLowerCase() === "true";
-  const sellerPayoutsEnabled = String(process.env.USDT_SELLER_PAYOUTS_ENABLED || "false").toLowerCase() === "true";
-  if (!individualEnabled && !globalEnabled && !sellerPayoutsEnabled && !forcePendingWork) return null;
-  getConfiguredMaxBscTxFeeUsd();
-
-  const privateKey = String(process.env.BSC_DISBURSEMENT_PRIVATE_KEY || "").trim();
   const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
   const tokenAddress = requiredAddress(
     process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
     "BSC-USD token contract",
   );
-  const treasuryAddress = requiredAddress(
-    process.env.USDT_BEP20_TREASURY_ADDRESS || "",
-    "OneX treasury address",
-  );
+  const treasuryAddressRaw = String(process.env.USDT_BEP20_TREASURY_ADDRESS || "").trim();
+  const disbursementAddressRaw = String(process.env.USDT_BEP20_DISBURSEMENT_ADDRESS || "").trim();
+  const treasuryAddress = (needTreasury || treasuryAddressRaw)
+    ? requiredAddress(treasuryAddressRaw, "Hot Wallet address") : null;
+  const disbursementAddress = (needDisbursement || disbursementAddressRaw)
+    ? requiredAddress(disbursementAddressRaw, "Disbursement Wallet address") : null;
+  const coldAddressRaw = String(process.env.USDT_BEP20_COLD_WALLET_ADDRESS || "").trim();
+  const coldAddress = coldAddressRaw ? requiredAddress(coldAddressRaw, "Cold Wallet address") : null;
   const confirmations = Number(process.env.USDT_DISBURSEMENT_CONFIRMATIONS || 15);
   const pollIntervalMs = Number(process.env.USDT_DISBURSEMENT_POLL_MS || 3000);
   const gasLimit = BigInt(process.env.USDT_DISBURSEMENT_GAS_LIMIT || "100000");
 
-  if (!privateKey || !rpcUrl) {
-    throw new Error(
-      "Disbursements require BSC_DISBURSEMENT_PRIVATE_KEY and BSC_RPC_URL.",
-    );
-  }
+  if (!rpcUrl) throw new Error("BSC_RPC_URL is required for outgoing BSC-USD transactions.");
   if (tokenAddress.toLowerCase() !== CANONICAL_BSC_USD_CONTRACT.toLowerCase()) {
     throw new Error("Disbursement token contract is not the approved Binance-Peg BSC-USD contract.");
   }
@@ -167,25 +164,46 @@ function makeRuntime(forcePendingWork = false) {
     throw new Error("USDT_DISBURSEMENT_GAS_LIMIT must be between 60000 and 200000.");
   }
 
-  const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
-  const signer = new Wallet(privateKey, provider);
-  if (signer.address.toLowerCase() !== treasuryAddress.toLowerCase()) {
-    throw new Error(
-      `The disbursement signing wallet (${signer.address}) does not match USDT_BEP20_TREASURY_ADDRESS (${treasuryAddress}).`,
-    );
+  const distinctAddresses = [treasuryAddress, disbursementAddress, coldAddress]
+    .filter(Boolean).map((address) => address.toLowerCase());
+  if (new Set(distinctAddresses).size !== distinctAddresses.length) {
+    throw new Error("Hot, Cold and Disbursement Wallet addresses must be different.");
   }
+  if (distinctAddresses.includes(tokenAddress.toLowerCase())) {
+    throw new Error("A treasury wallet address cannot be the BSC-USD token contract.");
+  }
+
+  const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
+  const token = new Contract(tokenAddress, BALANCE_INTERFACE, provider);
+  const createWalletRuntime = (privateKeyName, address, role) => {
+    const privateKey = String(process.env[privateKeyName] || "").trim();
+    if (!privateKey) throw new Error(`${privateKeyName} is required for the ${role}.`);
+    const signer = new Wallet(privateKey, provider);
+    if (signer.address.toLowerCase() !== address.toLowerCase()) {
+      throw new Error(`${privateKeyName} does not match the configured ${role} address.`);
+    }
+    return { provider, signer, tokenAddress, treasuryAddress: address, confirmations, pollIntervalMs, gasLimit, token };
+  };
+
+  const disbursementRuntime = needDisbursement
+    ? createWalletRuntime("BSC_DISBURSEMENT_PRIVATE_KEY", disbursementAddress, "Disbursement Wallet")
+    : null;
+  const treasuryRuntime = needTreasury
+    ? createWalletRuntime("BSC_TREASURY_PRIVATE_KEY", treasuryAddress, "Hot Wallet")
+    : null;
 
   runtime = {
     provider,
-    signer,
     tokenAddress,
-    treasuryAddress,
+    token,
     confirmations,
     pollIntervalMs,
     gasLimit,
-    token: new Contract(tokenAddress, [
-      "function balanceOf(address account) view returns (uint256)",
-    ], provider),
+    treasuryAddress,
+    disbursementAddress,
+    coldAddress,
+    disbursementRuntime,
+    treasuryRuntime,
   };
   return runtime;
 }
@@ -210,7 +228,74 @@ async function validateRuntime(activeRuntime) {
   }
 }
 
-async function checkTreasuryLiquidity(amountRaw, payoutAddress) {
+function tokenAmountToRaw(value, label) {
+  const amount = new BigNumber(value == null || value === "" ? 0 : value);
+  if (!amount.isFinite() || amount.isNegative()) {
+    throw new TypeError(`${label} must be a finite non-negative BSC-USD amount.`);
+  }
+  return BigInt(amount.shiftedBy(18).integerValue(BigNumber.ROUND_CEIL).toFixed(0));
+}
+
+async function queryRows(queryable, sql, params = []) {
+  if (queryable && typeof queryable.queryAsync === "function") {
+    return queryable.queryAsync(sql, params);
+  }
+  if (queryable && typeof queryable.query === "function") {
+    const result = await queryable.query(sql, params);
+    return Array.isArray(result) && Array.isArray(result[0]) ? result[0] : result;
+  }
+  throw new TypeError("A MySQL queryable is required for disbursement reserve checks.");
+}
+
+async function getDisbursementReservedRaw(queryable = sharedDb) {
+  const rows = await queryRows(
+    queryable,
+    `SELECT COALESCE(SUM(payout_amount),0) AS reserved_amount
+     FROM users_usdt_disbursements
+     WHERE status IN ('queued','signed','submitted','manual_review')`,
+  );
+  return tokenAmountToRaw(rows[0]?.reserved_amount || "0", "Reserved disbursement amount");
+}
+
+async function getDisbursementSpendableTokenRaw(tokenBalanceRaw, reservationCreditRaw = 0n, queryable = sharedDb) {
+  const balance = BigInt(tokenBalanceRaw);
+  const reserved = await getDisbursementReservedRaw(queryable);
+  const credit = BigInt(reservationCreditRaw);
+  if (credit < 0n) throw new TypeError("Disbursement reservation credit cannot be negative.");
+  const protectedReservations = reserved > credit ? reserved - credit : 0n;
+  return balance > protectedReservations ? balance - protectedReservations : 0n;
+}
+
+async function getHotWalletSpendableTokenRaw(tokenBalanceRaw, reservationCredit = "0", queryable = sharedDb) {
+  const reserves = await getHotWalletReserveAmounts(queryable);
+  const reservedTotal = [
+    reserves.pendingRechargeAmount,
+    reserves.reservedRechargeRefundAmount,
+    reserves.unresolvedUnknownIncomingAmount,
+    reserves.pendingSellerPayoutAmount,
+    reserves.otherPendingRefundAmount,
+    reserves.pendingColdWalletSweepAmount,
+  ].reduce((sum, value) => sum.plus(value || "0"), new BigNumber(0));
+  const credit = new BigNumber(reservationCredit == null ? "0" : String(reservationCredit));
+  if (!credit.isFinite() || credit.isNegative()) {
+    throw new TypeError("Hot Wallet reservation credit must be a finite non-negative amount.");
+  }
+  const protectedReservations = BigNumber.maximum(0, reservedTotal.minus(credit));
+  const minimumOperating = new BigNumber(
+    String(process.env.USDT_TREASURY_MIN_OPERATING_BSC_USD || "0").trim() || "0",
+  );
+  if (!minimumOperating.isFinite() || minimumOperating.isNegative()) {
+    throw new TypeError("USDT_TREASURY_MIN_OPERATING_BSC_USD must be non-negative.");
+  }
+  const protectedRaw = tokenAmountToRaw(
+    protectedReservations.plus(minimumOperating),
+    "Hot Wallet protected balance",
+  );
+  const totalRaw = BigInt(tokenBalanceRaw);
+  return totalRaw > protectedRaw ? totalRaw - protectedRaw : 0n;
+}
+
+async function checkTreasuryLiquidity(amountRaw, payoutAddress, options = {}) {
   const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
   const tokenAddress = requiredAddress(
     process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
@@ -218,13 +303,14 @@ async function checkTreasuryLiquidity(amountRaw, payoutAddress) {
   );
   const treasuryAddress = requiredAddress(
     process.env.USDT_BEP20_TREASURY_ADDRESS || "",
-    "OneX treasury address",
+    "OneX Hot Wallet address",
   );
   const gasLimitCeiling = BigInt(process.env.USDT_DISBURSEMENT_GAS_LIMIT || "100000");
   const amount = BigInt(amountRaw);
   const destination = requiredAddress(payoutAddress, "BSC-USD payout address");
+  const reservationCredit = options.reservationCredit == null ? "0" : options.reservationCredit;
   if (!rpcUrl || amount <= 0n || tokenAddress.toLowerCase() !== CANONICAL_BSC_USD_CONTRACT.toLowerCase()) {
-    throw new Error("Treasury liquidity check is not correctly configured.");
+    throw new Error("Hot Wallet liquidity check is not correctly configured.");
   }
   if (gasLimitCeiling < 60000n || gasLimitCeiling > 200000n) {
     throw new Error("USDT_DISBURSEMENT_GAS_LIMIT is outside the permitted range.");
@@ -233,11 +319,21 @@ async function checkTreasuryLiquidity(amountRaw, payoutAddress) {
   const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
   try {
     const network = await provider.getNetwork();
-    if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("Treasury RPC is not BNB Smart Chain mainnet.");
+    if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("Hot Wallet RPC is not BNB Smart Chain mainnet.");
     const code = await provider.getCode(tokenAddress);
     if (!code || code === "0x") throw new Error("The approved BSC-USD contract is unavailable.");
     const token = new Contract(tokenAddress, ["function balanceOf(address account) view returns (uint256)"], provider);
-    const tokenBalance = await token.balanceOf(treasuryAddress);
+    const { tokenBalanceRaw } = await getHotWalletFinalizedTokenBalance({
+      queryable: options.queryable || sharedDb,
+      provider,
+      tokenContract: token,
+      walletAddress: treasuryAddress,
+    });
+    const spendableTokenBalance = await getHotWalletSpendableTokenRaw(
+      tokenBalanceRaw,
+      reservationCredit,
+      options.queryable || sharedDb,
+    );
     const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [destination, amount]);
     const bnbUsdPrice = await getBnbUsdPrice(provider);
     const estimate = await estimateBscTokenTransfer({
@@ -250,16 +346,16 @@ async function checkTreasuryLiquidity(amountRaw, payoutAddress) {
     });
     const bnbBalance = await provider.getBalance(treasuryAddress);
     const requiredGas = estimate.gasLimit * estimate.gasPrice;
-    const tokenAvailable = tokenBalance >= amount;
+    const tokenAvailable = spendableTokenBalance >= amount;
     const bnbAvailable = bnbBalance >= requiredGas;
     return {
-      available: tokenAvailable && bnbAvailable,
+      available: tokenAvailable && bnbAvailable && estimate.allowed,
       tokenAvailable,
       bnbAvailable,
       feeWithinLimit: estimate.allowed,
       maximumFeeUsd: estimate.maximumFeeUsd.toFixed(18),
       tokenBalanceRaw: tokenBalance.toString(),
-      spendableTokenBalanceRaw: tokenBalance.toString(),
+      spendableTokenBalanceRaw: spendableTokenBalance.toString(),
       requiredTokenRaw: amount.toString(),
       bnbBalanceWei: bnbBalance.toString(),
       requiredBnbWei: requiredGas.toString(),
@@ -268,6 +364,106 @@ async function checkTreasuryLiquidity(amountRaw, payoutAddress) {
       estimatedFeeBnb: estimate.feeBnb.toFixed(30),
       estimatedFeeUsd: estimate.feeUsd.toFixed(18),
       bnbUsdPrice: estimate.bnbUsdPrice.toFixed(12),
+    };
+  } finally {
+    await provider.destroy();
+  }
+}
+
+async function checkDisbursementLiquidity(amountRaw, payoutAddress, options = {}) {
+  const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
+  const tokenAddress = requiredAddress(
+    process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
+    "BSC-USD token contract",
+  );
+  const disbursementAddress = requiredAddress(
+    process.env.USDT_BEP20_DISBURSEMENT_ADDRESS || "",
+    "OneX Disbursement Wallet address",
+  );
+  const destination = requiredAddress(payoutAddress, "BSC-USD payout address");
+  const amount = BigInt(amountRaw);
+  if (!rpcUrl || amount <= 0n || tokenAddress.toLowerCase() !== CANONICAL_BSC_USD_CONTRACT.toLowerCase()) {
+    throw new Error("Disbursement Wallet liquidity check is not correctly configured.");
+  }
+  const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
+  try {
+    const network = await provider.getNetwork();
+    if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("Disbursement Wallet RPC is not BNB Smart Chain mainnet.");
+    const code = await provider.getCode(tokenAddress);
+    if (!code || code === "0x") throw new Error("The approved BSC-USD contract is unavailable.");
+    const token = new Contract(tokenAddress, ["function balanceOf(address account) view returns (uint256)"], provider);
+    const [tokenBalance, bnbBalance, reservedRaw] = await Promise.all([
+      token.balanceOf(disbursementAddress),
+      provider.getBalance(disbursementAddress),
+      getDisbursementReservedRaw(options.queryable || sharedDb),
+    ]);
+    const creditRaw = options.reservationCreditRaw == null ? 0n : BigInt(options.reservationCreditRaw);
+    const protectedRaw = reservedRaw > creditRaw ? reservedRaw - creditRaw : 0n;
+    const spendableRaw = tokenBalance > protectedRaw ? tokenBalance - protectedRaw : 0n;
+    const gasLimitCeiling = BigInt(process.env.USDT_DISBURSEMENT_GAS_LIMIT || "100000");
+    const data = TRANSFER_INTERFACE.encodeFunctionData("transfer", [destination, amount]);
+    const bnbUsdPrice = await getBnbUsdPrice(provider);
+    const estimate = await estimateBscTokenTransfer({
+      provider,
+      fromAddress: disbursementAddress,
+      tokenAddress,
+      data,
+      maximumGasLimit: gasLimitCeiling,
+      bnbUsdPrice,
+    });
+    const requiredGas = estimate.gasLimit * estimate.gasPrice;
+    return {
+      available: spendableRaw >= amount && bnbBalance >= requiredGas && estimate.allowed,
+      tokenAvailable: spendableRaw >= amount,
+      bnbAvailable: bnbBalance >= requiredGas,
+      feeWithinLimit: estimate.allowed,
+      tokenBalanceRaw: tokenBalance.toString(),
+      reservedTokenRaw: reservedRaw.toString(),
+      spendableTokenBalanceRaw: spendableRaw.toString(),
+      requiredTokenRaw: amount.toString(),
+      bnbBalanceWei: bnbBalance.toString(),
+      requiredBnbWei: requiredGas.toString(),
+      estimatedFeeUsd: estimate.feeUsd.toFixed(18),
+    };
+  } finally {
+    await provider.destroy();
+  }
+}
+
+async function checkDisbursementReserveCapacity(requiredAmountBscUsd, options = {}) {
+  const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
+  const tokenAddress = requiredAddress(
+    process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
+    "BSC-USD token contract",
+  );
+  const disbursementAddress = requiredAddress(
+    process.env.USDT_BEP20_DISBURSEMENT_ADDRESS || "",
+    "OneX Disbursement Wallet address",
+  );
+  const requiredRaw = tokenAmountToRaw(requiredAmountBscUsd, "Required global disbursement reserve");
+  if (!rpcUrl || tokenAddress.toLowerCase() !== CANONICAL_BSC_USD_CONTRACT.toLowerCase()) {
+    throw new Error("Disbursement Wallet reserve check is not correctly configured.");
+  }
+  const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
+  try {
+    const network = await provider.getNetwork();
+    if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("Disbursement Wallet RPC is not BNB Smart Chain mainnet.");
+    const token = new Contract(tokenAddress, ["function balanceOf(address account) view returns (uint256)"], provider);
+    const [balanceRaw, reservedRaw] = await Promise.all([
+      token.balanceOf(disbursementAddress),
+      getDisbursementReservedRaw(options.queryable || sharedDb),
+    ]);
+    const spendableRaw = balanceRaw > reservedRaw ? balanceRaw - reservedRaw : 0n;
+    return {
+      available: spendableRaw >= requiredRaw,
+      token_balance_raw: balanceRaw.toString(),
+      reserved_raw: reservedRaw.toString(),
+      spendable_raw: spendableRaw.toString(),
+      required_raw: requiredRaw.toString(),
+      token_balance_bsc_usd: new BigNumber(balanceRaw.toString()).shiftedBy(-18).toFixed(18),
+      reserved_bsc_usd: new BigNumber(reservedRaw.toString()).shiftedBy(-18).toFixed(18),
+      spendable_bsc_usd: new BigNumber(spendableRaw.toString()).shiftedBy(-18).toFixed(18),
+      required_bsc_usd: new BigNumber(requiredRaw.toString()).shiftedBy(-18).toFixed(18),
     };
   } finally {
     await provider.destroy();
@@ -365,6 +561,12 @@ async function signQueuedJob(db, job, activeRuntime) {
   let estimate;
   let data;
   const tokenBalanceRaw = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
+  const reservationCreditRaw = tokenAmountToRaw(job.payout_amount || "0", "Current disbursement reservation");
+  const spendableTokenBalanceRaw = await getDisbursementSpendableTokenRaw(
+    tokenBalanceRaw,
+    reservationCreditRaw,
+    db,
+  );
   const grossBase = new BigNumber(job.sold_initial_asset)
     .multipliedBy(new BigNumber(job.price_value))
     .plus(new BigNumber(job.bonus_amount || "0"));
@@ -378,7 +580,7 @@ async function signQueuedJob(db, job, activeRuntime) {
     tokenAddress: activeRuntime.tokenAddress,
     payoutAddress,
     grossAmount: payoutBase,
-    tokenBalanceRaw,
+    tokenBalanceRaw: spendableTokenBalanceRaw,
     maximumGasLimit: activeRuntime.gasLimit,
     bnbUsdPrice: getConfiguredBnbUsdPrice(),
   });
@@ -391,8 +593,8 @@ async function signQueuedJob(db, job, activeRuntime) {
   estimate = payout.estimate;
   bscFeeRecovered = estimate.feeUsd;
 
-  if (tokenBalanceRaw < amountRaw) {
-    throw new Error("The OneX treasury does not have enough BSC-USD for this disbursement.");
+  if (spendableTokenBalanceRaw < amountRaw) {
+    throw new Error("The Disbursement Wallet does not have enough unreserved BSC-USD for this payment.");
   }
   const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
   const requiredGasBalance = estimate.gasLimit * estimate.gasPrice;
@@ -1060,14 +1262,20 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
   if (!bnbUsdPrice.isGreaterThan(0)) {
     throw new Error("A fresh Chainlink BNB/USD price is required to recover the seller's BSC gas cost.");
   }
-  const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
+  const { tokenBalanceRaw } = await getHotWalletFinalizedTokenBalance({
+    queryable: db,
+    provider: activeRuntime.provider,
+    tokenContract: activeRuntime.token,
+    walletAddress: activeRuntime.treasuryAddress,
+  });
+  const spendableTokenBalance = await getHotWalletSpendableTokenRaw(tokenBalanceRaw, job.gross_amount, db);
   const payout = await estimateNetBscTokenTransfer({
     provider: activeRuntime.provider,
     fromAddress: activeRuntime.treasuryAddress,
     tokenAddress: activeRuntime.tokenAddress,
     payoutAddress,
     grossAmount: gross,
-    tokenBalanceRaw: tokenBalance,
+    tokenBalanceRaw: spendableTokenBalance,
     maximumGasLimit: activeRuntime.gasLimit,
     bnbUsdPrice,
   });
@@ -1078,7 +1286,7 @@ async function signQueuedSellerPayout(db, job, activeRuntime) {
   }
   const nativeBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
   if (nativeBalance < finalEstimate.gasLimit * finalEstimate.gasPrice) {
-    throw new Error("The OneX treasury has insufficient BNB for the seller payout gas.");
+    throw new Error("The Hot Wallet has insufficient BNB for the seller payout gas.");
   }
 
   const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
@@ -1613,14 +1821,20 @@ async function processOneRefundJob(db, job, activeRuntime) {
     if (!grossAmount.isFinite() || !grossAmount.isGreaterThan(0)) {
       throw new Error("The refund gross amount must be positive.");
     }
-    const tokenBalance = await activeRuntime.token.balanceOf(activeRuntime.treasuryAddress);
+    const { tokenBalanceRaw } = await getHotWalletFinalizedTokenBalance({
+      queryable: db,
+      provider: activeRuntime.provider,
+      tokenContract: activeRuntime.token,
+      walletAddress: activeRuntime.treasuryAddress,
+    });
+    const spendableTokenBalance = await getHotWalletSpendableTokenRaw(tokenBalanceRaw, grossAmount.toFixed(18), db);
     const payout = await estimateNetBscTokenTransfer({
       provider: activeRuntime.provider,
       fromAddress: activeRuntime.treasuryAddress,
       tokenAddress: activeRuntime.tokenAddress,
       payoutAddress,
       grossAmount,
-      tokenBalanceRaw: tokenBalance,
+      tokenBalanceRaw: spendableTokenBalance,
       maximumGasLimit: activeRuntime.gasLimit,
       bnbUsdPrice: getConfiguredBnbUsdPrice(),
     });
@@ -1633,12 +1847,12 @@ async function processOneRefundJob(db, job, activeRuntime) {
       );
       return;
     }
-    if (tokenBalance < finalAmountRaw) {
-      throw new Error("The OneX treasury has insufficient BSC-USD for this refund.");
+    if (spendableTokenBalance < finalAmountRaw) {
+      throw new Error("The Hot Wallet has insufficient unreserved BSC-USD for this refund.");
     }
     const bnbBalance = await activeRuntime.provider.getBalance(activeRuntime.treasuryAddress);
     if (bnbBalance < finalEstimate.gasLimit * finalEstimate.gasPrice) {
-      throw new Error("The OneX treasury has insufficient BNB for the refund transaction gas.");
+      throw new Error("The Hot Wallet has insufficient BNB for the refund transaction gas.");
     }
     const nonce = await activeRuntime.provider.getTransactionCount(activeRuntime.treasuryAddress, "pending");
     const rawTransaction = await activeRuntime.signer.signTransaction({
@@ -1998,10 +2212,30 @@ async function settleGlobalDisbursementRun(db) {
   return { settled };
 }
 
-async function runDisbursementCycle(db, activeRuntime) {
+async function acquireHotWalletSpendLock(db) {
+  const connection = await connectionFromPool(db);
+  const queryable = connection.promise();
+  try {
+    const [rows] = await queryable.query("SELECT GET_LOCK(?,0) AS acquired", ["onex_hot_wallet_spend"]);
+    if (Number(rows[0]?.acquired) !== 1) {
+      connection.release();
+      return null;
+    }
+    return async () => {
+      try { await queryable.query("SELECT RELEASE_LOCK(?)", ["onex_hot_wallet_spend"]); }
+      finally { connection.release(); }
+    };
+  } catch (error) {
+    connection.release();
+    throw error;
+  }
+}
+
+async function runDisbursementCycle(db, activeRuntimes) {
   if (workerRunning) return;
   workerRunning = true;
   let releaseLock = null;
+  let releaseHotWalletLock = null;
   try {
     releaseLock = await acquireWorkerLock(db);
     if (!releaseLock) return;
@@ -2022,31 +2256,39 @@ async function runDisbursementCycle(db, activeRuntime) {
         "Reservation expired before transaction submission; administrator review is required.",
       );
     }
-    const jobs = await db.queryAsync(
-      `SELECT * FROM users_usdt_disbursements
-       WHERE status IN ('queued','signed','submitted')
-       ORDER BY id ASC LIMIT 10`,
-    );
-    for (const job of jobs) {
-      try {
-        await processOneJob(db, job, activeRuntime);
-      } catch (error) {
-        console.error(`Disbursement ${job.id} processing failed:`, error.message);
-        await updateJobError(db, job.id, error).catch(() => {});
+
+    if (activeRuntimes.disbursementRuntime) {
+      const jobs = await db.queryAsync(
+        `SELECT * FROM users_usdt_disbursements
+         WHERE status IN ('queued','signed','submitted')
+         ORDER BY id ASC LIMIT 10`,
+      );
+      for (const job of jobs) {
+        try {
+          await processOneJob(db, job, activeRuntimes.disbursementRuntime);
+        } catch (error) {
+          console.error(`Disbursement ${job.id} processing failed:`, error.message);
+          await updateJobError(db, job.id, error).catch(() => {});
+        }
       }
     }
-    await processRefundQueue(db, activeRuntime);
 
-    const sellerPayouts = await db.queryAsync(
-      `SELECT * FROM users_usdt_seller_payouts
-       WHERE status IN ('queued','signed','submitted')
-       ORDER BY id ASC LIMIT 20`,
-    );
-    for (const payout of sellerPayouts) {
-      try {
-        await processOneSellerPayout(db, payout, activeRuntime);
-      } catch (error) {
-        console.error(`Seller payout ${payout.id} processing failed:`, error.message);
+    if (activeRuntimes.treasuryRuntime) {
+      releaseHotWalletLock = await acquireHotWalletSpendLock(db);
+      if (releaseHotWalletLock) {
+        await processRefundQueue(db, activeRuntimes.treasuryRuntime);
+        const sellerPayouts = await db.queryAsync(
+          `SELECT * FROM users_usdt_seller_payouts
+           WHERE status IN ('queued','signed','submitted')
+           ORDER BY id ASC LIMIT 20`,
+        );
+        for (const payout of sellerPayouts) {
+          try {
+            await processOneSellerPayout(db, payout, activeRuntimes.treasuryRuntime);
+          } catch (error) {
+            console.error(`Seller payout ${payout.id} processing failed:`, error.message);
+          }
+        }
       }
     }
     await closeExpiredGlobalDisbursement(db);
@@ -2055,6 +2297,10 @@ async function runDisbursementCycle(db, activeRuntime) {
   } catch (error) {
     console.error("OneX BSC disbursement worker failed:", error);
   } finally {
+    if (releaseHotWalletLock) {
+      try { await releaseHotWalletLock(); }
+      catch (error) { console.error("Unable to release Hot Wallet spend lock:", error.message); }
+    }
     if (releaseLock) {
       try {
         await releaseLock();
@@ -2076,31 +2322,39 @@ async function startDisbursementWorker(db) {
     `SELECT
        (SELECT COUNT(*) FROM users_usdt_disbursements WHERE status IN ('queued','signed','submitted')) AS disbursements,
        (SELECT COUNT(*) FROM users_usdt_seller_payouts WHERE status IN ('queued','signed','submitted')) AS seller_payouts,
+       (SELECT COUNT(*) FROM users_usdt_refunds WHERE status IN ('queued','signed','submitted')) AS refunds,
        (SELECT COUNT(*) FROM global_disbursement_runs WHERE status IN ('active','closed','manual_review')) AS global_runs`,
   );
-  const pendingWork = Number(pendingRows[0]?.disbursements || 0) > 0 ||
-    Number(pendingRows[0]?.seller_payouts || 0) > 0 || Number(pendingRows[0]?.global_runs || 0) > 0;
-  if (!individualEnabled && !globalEnabled && !sellerEnabled && !pendingWork) {
-    console.log("OneX BSC treasury payouts are disabled; no accepted payouts are pending.");
+  const pendingDisbursements = Number(pendingRows[0]?.disbursements || 0);
+  const pendingSellerPayouts = Number(pendingRows[0]?.seller_payouts || 0);
+  const pendingRefunds = Number(pendingRows[0]?.refunds || 0);
+  const pendingGlobalRuns = Number(pendingRows[0]?.global_runs || 0);
+  const needDisbursement = individualEnabled || globalEnabled || pendingDisbursements > 0;
+  const needTreasury = sellerEnabled || pendingSellerPayouts > 0 || pendingRefunds > 0;
+  if (!needDisbursement && !needTreasury && pendingGlobalRuns === 0) {
+    console.log("OneX BSC payouts are disabled; no accepted payout or refund work is pending.");
     return { enabled: false };
   }
 
-  const activeRuntime = makeRuntime(pendingWork);
-  if (!activeRuntime) return { enabled: false };
-  const priceSnapshot = await startBnbUsdPriceOracle(activeRuntime.provider);
-  await validateRuntime(activeRuntime);
+  const activeRuntimes = makeRuntime({ needDisbursement, needTreasury });
+  const priceSnapshot = await startBnbUsdPriceOracle(activeRuntimes.provider);
+  await validateRuntime(activeRuntimes);
+  const senderSummary = [
+    activeRuntimes.disbursementRuntime ? `Disbursement Wallet: ${activeRuntimes.disbursementAddress}` : null,
+    activeRuntimes.treasuryRuntime ? `Hot Wallet: ${activeRuntimes.treasuryAddress}` : null,
+  ].filter(Boolean).join("; ");
   if (priceSnapshot) {
     console.log(
-      `OneX BSC treasury worker ready. Treasury: ${activeRuntime.treasuryAddress}. ` +
+      `OneX BSC payout worker ready. ${senderSummary}. ` +
       `Chainlink BNB/USD: ${priceSnapshot.price} (updated ${new Date(priceSnapshot.updatedAt * 1000).toISOString()}).`,
     );
   } else {
-    console.warn("OneX BSC treasury worker is ready, but no fresh Chainlink BNB/USD quote is available. Outgoing jobs will remain queued.");
+    console.warn("OneX BSC payout worker is ready, but no fresh Chainlink BNB/USD quote is available. Outgoing jobs will remain queued.");
   }
 
   const run = async () => {
-    await runDisbursementCycle(db, activeRuntime);
-    timer = setTimeout(run, activeRuntime.pollIntervalMs);
+    await runDisbursementCycle(db, activeRuntimes);
+    timer = setTimeout(run, activeRuntimes.pollIntervalMs);
   };
   void run();
   return { enabled: true };
@@ -2109,6 +2363,8 @@ async function startDisbursementWorker(db) {
 module.exports = {
   startDisbursementWorker,
   checkTreasuryLiquidity,
+  checkDisbursementLiquidity,
+  checkDisbursementReserveCapacity,
   closeExpiredGlobalDisbursement,
   settleGlobalDisbursementRun,
 };

@@ -30,6 +30,9 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /admin/send-temp-pswd": { limit: 5, windowMs: 60 * 60_000, authResponse: true },
   "POST /admin/recharge/control": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/bsc/incoming-scanner/status": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
+  "POST /admin/bsc/incoming-scanner/reconcile/preview": { limit: 3, windowMs: 15 * 60_000, authResponse: true },
+  "POST /admin/bsc/incoming-scanner/reconcile/resolve-event": { limit: 10, windowMs: 15 * 60_000, authResponse: true },
+  "POST /admin/bsc/incoming-scanner/reconcile/commit": { limit: 3, windowMs: 15 * 60_000, authResponse: true },
   "POST /admin/bsc/incoming-scanner/reconcile": { limit: 3, windowMs: 15 * 60_000, authResponse: true },
   "POST /admin/bsc/unknown-transfers/list": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/bsc/unknown-transfers/resolve": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
@@ -42,6 +45,7 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /admin/unlock-system-seller": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/update-user-stock": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/update-common-stock": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
+  "POST /admin/individual-disbursement/control": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/common-history": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
 });
 

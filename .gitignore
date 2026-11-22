@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 !.env.disbursement.example
+!.env.treasury.example
 node_modules/
 npm-debug.log*
 .DS_Store

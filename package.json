@@ -20,7 +20,8 @@
     "start": "node index.js",
     "check": "node scripts/syntax-check.js",
     "disburse": "node disbursement-worker.js",
-    "telegram": "node telegram-worker.js"
+    "telegram": "node telegram-worker.js",
+    "treasury": "node treasury-worker.js"
   },
   "keywords": [],
   "author": "Eddy Rafidison",

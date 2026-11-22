@@ -54,3 +54,38 @@ test("administrative common history has a dedicated rate-limit entry", () => {
   assert.match(historyRoute, /columns\.join/);
   assert.doesNotMatch(historyRoute, /req\.body\.(table|column)/);
 });
+
+
+test("individual disbursement control is rate limited and common history exposes protected Hot Wallet liquidity", () => {
+  assert.ok(limiterSource.includes('"POST /admin/individual-disbursement/control": { limit: 10, windowMs: 5 * 60_000, authResponse: true }'));
+  const controlRoute = getRouteBlock(
+    routesSource,
+    "/admin/individual-disbursement/control",
+    'router.post("/admin/global-disbursement-participants"',
+  );
+  assert.match(controlRoute, /individual_disbursement_control/);
+  assert.match(controlRoute, /individual_disbursement_control_events/);
+
+  const historyRoute = getRouteBlock(
+    routesSource,
+    "/admin/common-history",
+    'router.post("/admin/resolve-global-disbursement-review"',
+  );
+  assert.match(historyRoute, /getHotWalletTreasurySnapshot\(db\)/);
+  assert.match(historyRoute, /hot_wallet:\s*hotWallet/);
+});
+
+test("Hot Wallet reserve allocation excludes duplicate liabilities and waits for scanner finality", () => {
+  const liquiditySource = fs.readFileSync(path.join(__dirname, "..", "treasury-liquidity.js"), "utf8");
+  assert.match(liquiditySource, /remaining_amount/);
+  assert.match(liquiditySource, /reserved_refund_amount/);
+  assert.match(liquiditySource, /'resolved_uncredited'/);
+  assert.match(liquiditySource, /bsc_treasury_sweeps/);
+  assert.match(liquiditySource, /pending_cold_wallet_sweeps/);
+  assert.match(liquiditySource, /payout_pending_initial_asset,unit_price/);
+  assert.match(liquiditySource, /batch_id IS NULL AND unknown_transfer_id IS NULL/);
+  assert.doesNotMatch(liquiditySource, /FROM users_usdt_seller_payouts/);
+  assert.match(liquiditySource, /contract\.balanceOf\(wallet, \{ blockTag: safeBlock\.number \}\)/);
+  assert.match(liquiditySource, /last_scanned_block/);
+  assert.match(liquiditySource, /provisional_available_before_scanner_reconciliation/);
+});

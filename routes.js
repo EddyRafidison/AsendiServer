@@ -91,10 +91,18 @@ const {
   startPaymentWatcher: startUsdtPaymentWatcher,
   getPaymentPublicConfig,
   getIncomingScannerStatus,
-  reconcileIncomingScanner,
+  previewIncomingScannerReconciliation,
+  resolveIncomingScannerCompensation,
+  commitIncomingScannerReconciliation,
   isAddress: isEvmAddress,
 } = require("./pay");
-const { checkTreasuryLiquidity } = require("./disbursement");
+const { createBscEventIdentity } = require("./bsc-reconciliation-policy");
+const {
+  checkTreasuryLiquidity,
+  checkDisbursementLiquidity,
+  checkDisbursementReserveCapacity,
+} = require("./disbursement");
+const { getHotWalletTreasurySnapshot } = require("./treasury-liquidity");
 const { getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
 const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
 getConfiguredMaxBscTxFeeUsd();
@@ -1084,7 +1092,7 @@ async function applyUserTopUp(
 
 async function queueSystemDisbursement(tx, username, verifiedPasswordHash, requestedGrossAmountXtu) {
   const enabled = (name) => String(process.env[name] || "false").toLowerCase() === "true";
-  if (!process.env.USDT_BEP20_TREASURY_ADDRESS) return { transf: "disbursement unavailable" };
+  if (!process.env.USDT_BEP20_DISBURSEMENT_ADDRESS) return { transf: "disbursement unavailable" };
   if (!requestedGrossAmountXtu.isFinite() || !requestedGrossAmountXtu.isGreaterThan(0)) {
     return { transf: "invalid disbursement amount" };
   }
@@ -1127,6 +1135,15 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   }
 
   const mode = globalRequestOpen ? "global" : "individual";
+  if (mode === "individual") {
+    const [controlRows] = await tx.query(
+      `SELECT is_open FROM individual_disbursement_control
+       WHERE control_id=1 LIMIT 1 FOR UPDATE`,
+    );
+    if (!controlRows.length || Number(controlRows[0].is_open) !== 1) {
+      return { transf: "disbursement unavailable" };
+    }
+  }
   let requestPrice;
   let globalParticipant = null;
 
@@ -1154,8 +1171,13 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     `SELECT wallet_address FROM auths WHERE username=? AND account_active=1 LIMIT 1 FOR UPDATE`, [username],
   );
   const payoutAddress = walletRows[0]?.wallet_address || "";
+  const internalWallets = [
+    process.env.USDT_BEP20_TREASURY_ADDRESS,
+    process.env.USDT_BEP20_COLD_WALLET_ADDRESS,
+    process.env.USDT_BEP20_DISBURSEMENT_ADDRESS,
+  ].map((address) => String(address || "").trim().toLowerCase()).filter(Boolean);
   if (!isEvmAddress(payoutAddress) || /^0x0{40}$/i.test(payoutAddress) ||
-      String(payoutAddress).toLowerCase() === String(process.env.USDT_BEP20_TREASURY_ADDRESS).toLowerCase()) {
+      internalWallets.includes(String(payoutAddress).toLowerCase())) {
     return { transf: "payout wallet not registered" };
   }
 
@@ -1320,6 +1342,19 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
   const calculation = calculateIndividualDisbursement(
     requestedGrossAmountXtu, userBalanceInitial, requestPrice, tfees,
   );
+  const requiredPayoutRaw = new BigNumber(calculation.payoutAmount)
+    .shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0);
+  const payoutLiquidity = await checkDisbursementLiquidity(
+    requiredPayoutRaw,
+    payoutAddress,
+    { queryable: tx },
+  );
+  if (!payoutLiquidity.tokenAvailable) {
+    return { transf: "insufficient res", liquidity: payoutLiquidity };
+  }
+  if (!payoutLiquidity.bnbAvailable || !payoutLiquidity.feeWithinLimit) {
+    return { transf: "disbursement unavailable", liquidity: payoutLiquidity };
+  }
   const newBalanceInitial = userBalanceInitial.minus(calculation.grossInitialAsset);
   const remainingBalanceXtu = newBalanceInitial.multipliedBy(requestPrice);
   if (remainingBalanceXtu.lt(minimumRemainingXtu)) {
@@ -1556,11 +1591,12 @@ async function processConfirmedUsdtPayment(event) {
         return { unknown: true, reason: "unknown_transfer_changed_or_already_resolved" };
       }
     }
+    const eventIdentity = createBscEventIdentity(event.txHash, event.logIndex, event.blockHash);
     const [eventInsert] = await tx.query(
       `INSERT IGNORE INTO users_usdt_transfer_events
        (username,batch_id,treasury_address,from_address,amount,amount_raw,tx_hash,log_index,
-        block_number,block_hash,block_timestamp_ms,status,reason_codes,created_at_ms)
-       VALUES(?,NULL,?,?,?,?,?,?,?,?,?,'detected',NULL,?)`,
+        block_number,block_hash,block_timestamp_ms,status,reason_codes,event_identity,created_at_ms)
+       VALUES(?,NULL,?,?,?,?,?,?,?,?,?,'detected',NULL,?,?)`,
       [
         username,
         event.treasuryAddress,
@@ -1572,6 +1608,7 @@ async function processConfirmedUsdtPayment(event) {
         event.blockNumber,
         event.blockHash,
         String(event.blockTimestampMs),
+        eventIdentity,
         String(Date.now()),
       ],
     );
@@ -1698,8 +1735,8 @@ async function processConfirmedUsdtPayment(event) {
       [amountValue.toFixed(18), event.amountRaw, amountValue.toFixed(18), minimumMetAt, String(now), batch.id],
     );
     await tx.query(
-      `UPDATE users_usdt_transfer_events SET batch_id=?,status=?,reason_codes=? WHERE tx_hash=? AND log_index=?`,
-      [batch.id, nextStatus, reasonCodes.length ? safeJson(reasonCodes) : null, event.txHash, event.logIndex],
+      `UPDATE users_usdt_transfer_events SET batch_id=?,status=?,reason_codes=? WHERE event_identity=?`,
+      [batch.id, nextStatus, reasonCodes.length ? safeJson(reasonCodes) : null, eventIdentity],
     );
 
     const batchTotal = new BigNumber(batch.total_amount || 0).plus(amountValue);
@@ -1826,7 +1863,30 @@ async function closeStaleRechargeRefundRequestsTx(tx, batchId, username, remaini
   return Number(result.affectedRows || 0);
 }
 
+async function isRechargeBatchSafeDuringScannerReview(batchId) {
+  const stateRows = await db.queryAsync(
+    "SELECT health_status FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1",
+  );
+  if (!stateRows.length || stateRows[0].health_status !== "manual_review") return true;
+  const previewRows = await db.queryAsync(
+    "SELECT id FROM bsc_scan_reconciliation_previews WHERE status='previewed' AND expires_at_ms>? ORDER BY id DESC LIMIT 1",
+    [String(Date.now())],
+  );
+  if (!previewRows.length) return false;
+  const unsafeRows = await db.queryAsync(
+    `SELECT id FROM bsc_scan_reconciliation_items
+     WHERE preview_id=? AND batch_id=?
+       AND (classification IN ('orphaned','unverifiable'))
+     LIMIT 1`,
+    [previewRows[0].id, batchId],
+  );
+  return unsafeRows.length === 0;
+}
+
 async function processOneRechargeBatch(batchId) {
+  if (!(await isRechargeBatchSafeDuringScannerReview(batchId))) {
+    return { held: true, reason: "scanner_reconciliation_review" };
+  }
   return withTransaction(async (tx) => {
     const [snapshotRows] = await tx.query(
       "SELECT username FROM users_usdt_deposit_batches WHERE id=? LIMIT 1",
@@ -2123,6 +2183,35 @@ async function processOneRechargeBatch(batchId) {
       status: nextStatus,
     };
   });
+}
+
+let rechargeBatchWorkerTimer = null;
+let rechargeBatchWorkerRunning = false;
+const RECHARGE_BATCH_WORKER_POLL_MS = Math.max(5000, Math.min(120000, Number(process.env.USDT_RECHARGE_QUEUE_POLL_MS || 30000)));
+
+function startRechargeBatchWorker() {
+  if (rechargeBatchWorkerTimer) return;
+  const schedule = (delay = RECHARGE_BATCH_WORKER_POLL_MS) => {
+    if (rechargeBatchWorkerTimer) clearTimeout(rechargeBatchWorkerTimer);
+    rechargeBatchWorkerTimer = setTimeout(() => {
+      rechargeBatchWorkerTimer = null;
+      void run();
+    }, delay);
+    if (typeof rechargeBatchWorkerTimer.unref === "function") rechargeBatchWorkerTimer.unref();
+  };
+  const run = async () => {
+    if (rechargeBatchWorkerRunning) return schedule();
+    rechargeBatchWorkerRunning = true;
+    try {
+      await processRechargeBatchQueue();
+    } catch (error) {
+      console.error("Independent recharge batch worker failed:", error.message);
+    } finally {
+      rechargeBatchWorkerRunning = false;
+      schedule();
+    }
+  };
+  schedule(0);
 }
 
 async function processRechargeBatchQueue() {
@@ -4174,6 +4263,84 @@ router.post("/app/disbursement/status", async (req, res) => {
   }
 });
 
+// Individual disbursement intake is opened and closed only by an explicit administrative decision.
+// The Telegram announcement is published manually outside the server; its reference is stored for audit.
+router.post("/admin/individual-disbursement/control", async (req, res) => {
+  const { pswd, pin, action, reason, notice_reference } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ auth: "incorrect" });
+
+  const requestedAction = String(action || "").trim().toLowerCase();
+  if (!["open", "close", "status"].includes(requestedAction)) {
+    return res.status(400).send({ error: "invalid action" });
+  }
+  const controlReason = typeof reason === "string" ? reason.trim() : "";
+  const noticeReference = typeof notice_reference === "string" ? notice_reference.trim() : "";
+  if (requestedAction !== "status" && (controlReason.length < 5 || controlReason.length > 1000)) {
+    return res.status(400).send({ error: "a reason between 5 and 1000 characters is required" });
+  }
+  if (requestedAction === "open" && (noticeReference.length < 5 || noticeReference.length > 512)) {
+    return res.status(400).send({ error: "a Telegram announcement reference between 5 and 512 characters is required before opening" });
+  }
+  if (noticeReference.length > 512) return res.status(400).send({ error: "notice reference is too long" });
+
+  try {
+    const result = await withTransaction(async (tx) => {
+      const [lockRows] = await tx.query(
+        "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
+      );
+      if (!lockRows.length) throw new Error("The common-state lock row has not been initialized");
+      const [controlRows] = await tx.query(
+        `SELECT is_open,opening_reason,notice_reference,changed_by,opened_at_ms,closed_at_ms,updated_at_ms
+         FROM individual_disbursement_control WHERE control_id=1 LIMIT 1 FOR UPDATE`,
+      );
+      if (!controlRows.length) throw new Error("The individual disbursement control row has not been initialized");
+      const current = controlRows[0];
+      if (requestedAction === "status") {
+        return {
+          status: Number(current.is_open) === 1 ? "open" : "closed",
+          reason: current.opening_reason,
+          notice_reference: current.notice_reference,
+          changed_by: current.changed_by,
+          opened_at_ms: current.opened_at_ms == null ? null : Number(current.opened_at_ms),
+          closed_at_ms: current.closed_at_ms == null ? null : Number(current.closed_at_ms),
+          updated_at_ms: Number(current.updated_at_ms),
+        };
+      }
+      const nextOpen = requestedAction === "open" ? 1 : 0;
+      const now = String(Date.now());
+      await tx.query(
+        `UPDATE individual_disbursement_control
+         SET is_open=?,opening_reason=?,notice_reference=?,changed_by='configured_admin',
+             opened_at_ms=CASE WHEN ?=1 THEN ? ELSE opened_at_ms END,
+             closed_at_ms=CASE WHEN ?=0 THEN ? ELSE closed_at_ms END,
+             updated_at_ms=? WHERE control_id=1`,
+        [nextOpen, nextOpen ? controlReason : null, nextOpen ? noticeReference : null,
+          nextOpen, now, nextOpen, now, now],
+      );
+      await tx.query(
+        `INSERT INTO individual_disbursement_control_events
+         (action,previous_open,current_open,reason,notice_reference,changed_by,created_at_ms)
+         VALUES(?,?,?,?,?,'configured_admin',?)`,
+        [requestedAction, Number(current.is_open), nextOpen, controlReason,
+          nextOpen ? noticeReference : null, now],
+      );
+      return {
+        status: nextOpen ? "open" : "closed",
+        reason: nextOpen ? controlReason : null,
+        notice_reference: nextOpen ? noticeReference : null,
+        changed_at_ms: Number(now),
+      };
+    });
+    return res.send({ individual_disbursement_control: result });
+  } catch (error) {
+    console.error("Administrative individual disbursement control failed:", error.message);
+    return res.status(500).send({ error: "individual disbursement control update failed" });
+  }
+});
+
 // Administrative control for temporarily hiding deposit addresses and holding automatic recharge credits.
 router.post("/admin/recharge/control", async (req, res) => {
   const { pswd, pin, action, reason } = req.body || {};
@@ -4409,25 +4576,85 @@ router.post("/admin/bsc/incoming-scanner/status", async (req, res) => {
   }
 });
 
-// Resume the scanner only after an administrator has reconciled a canonical finalized block.
-router.post("/admin/bsc/incoming-scanner/reconcile", async (req, res) => {
-  const { pswd, pin, resume_after_block, reason } = req.body || {};
+// Create a read-only forensic preview. No scanner cursor or financial balance is changed.
+router.post("/admin/bsc/incoming-scanner/reconcile/preview", async (req, res) => {
+  const { pswd, pin, reason } = req.body || {};
   if (
     pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
     pin !== decrypt(admin_pin, DB_CONFIG.password)
   ) return res.send({ scanner: "incorrect admin credentials" });
   try {
-    const result = await reconcileIncomingScanner(db, {
-      resumeAfterBlock: resume_after_block,
+    const result = await previewIncomingScannerReconciliation(db, {
+      reason,
+      adminUsername: "configured_admin",
+    });
+    return res.send({ scanner: "previewed", ...result });
+  } catch (error) {
+    if (error.code === "ONEX_BSC_SCANNER_BUSY") return res.status(409).send({ scanner: "busy" });
+    console.error("BSC incoming scanner reconciliation preview failed:", error.message);
+    return res.status(400).send({ scanner: "preview rejected", reason: error.message });
+  }
+});
+
+// Record a compensating ledger operation already applied by an administrator.
+router.post("/admin/bsc/incoming-scanner/reconcile/resolve-event", async (req, res) => {
+  const { pswd, pin, preview_id, item_id, compensation_reference, reason } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ scanner: "incorrect admin credentials" });
+  try {
+    const result = await resolveIncomingScannerCompensation(db, {
+      previewId: preview_id,
+      itemId: item_id,
+      compensationReference: compensation_reference,
+      reason,
+      adminUsername: "configured_admin",
+    });
+    return res.send({ scanner: "compensation recorded", ...result });
+  } catch (error) {
+    if (error.code === "ONEX_BSC_SCANNER_BUSY") return res.status(409).send({ scanner: "busy" });
+    console.error("BSC scanner compensation attestation failed:", error.message);
+    return res.status(400).send({ scanner: "compensation rejected", reason: error.message });
+  }
+});
+
+// Commit only a current preview with RPC agreement and no unresolved financial impact.
+router.post("/admin/bsc/incoming-scanner/reconcile/commit", async (req, res) => {
+  const { pswd, pin, preview_id, reason } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ scanner: "incorrect admin credentials" });
+  try {
+    const result = await commitIncomingScannerReconciliation(db, {
+      previewId: preview_id,
       reason,
       adminUsername: "configured_admin",
     });
     return res.send({ scanner: "resumed", ...result });
   } catch (error) {
     if (error.code === "ONEX_BSC_SCANNER_BUSY") return res.status(409).send({ scanner: "busy" });
-    console.error("BSC incoming scanner reconciliation failed:", error.message);
-    return res.status(400).send({ scanner: "reconciliation rejected", reason: error.message });
+    console.error("BSC incoming scanner reconciliation commit failed:", error.message);
+    return res.status(400).send({ scanner: "commit rejected", reason: error.message });
   }
+});
+
+// The previous direct cursor rewind is intentionally disabled; every resume must use preview and commit.
+router.post("/admin/bsc/incoming-scanner/reconcile", async (req, res) => {
+  const { pswd, pin } = req.body || {};
+  if (
+    pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+    pin !== decrypt(admin_pin, DB_CONFIG.password)
+  ) return res.send({ scanner: "incorrect admin credentials" });
+  return res.status(410).send({
+    scanner: "preview_required",
+    required_endpoints: [
+      "/admin/bsc/incoming-scanner/reconcile/preview",
+      "/admin/bsc/incoming-scanner/reconcile/resolve-event",
+      "/admin/bsc/incoming-scanner/reconcile/commit",
+    ],
+  });
 });
 
 router.post("/admin/bsc/unknown-transfers/list", async (req, res) => {
@@ -4545,7 +4772,7 @@ router.post("/admin/bsc/unknown-transfers/resolve", async (req, res) => {
         grossAmount.minus(maximumGasRecovery).isLessThan(MINIMUM_REFUND_NET_BSC_USD)) {
       return res.send({ transf: `unknown transfer is below the minimum refundable net amount of ${MINIMUM_REFUND_NET_BSC_USD.toString()} BSC-USD` });
     }
-    const liquidity = await checkTreasuryLiquidity(grossRaw.toFixed(0), transfer.from_address);
+    const liquidity = await checkTreasuryLiquidity(grossRaw.toFixed(0), transfer.from_address, { reservationCredit: grossAmount.toFixed(18) });
     if (!liquidity.tokenAvailable) {
       return res.send({ transf: "insufficient treasury BSC-USD balance", liquidity });
     }
@@ -4659,7 +4886,7 @@ router.post("/admin/recharge/refund", async (req, res) => {
         maximum_gas_recovery: maximumGasRecovery.toFixed(18),
       });
     }
-    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0), snapshot.payout_address);
+    const liquidityEstimate = await checkTreasuryLiquidity(grossRaw.toFixed(0), snapshot.payout_address, { reservationCredit: remaining.toFixed(18) });
     if (!liquidityEstimate.tokenAvailable) {
       return res.send({ transf: "insufficient treasury BSC-USD balance", liquidity: liquidityEstimate });
     }
@@ -4833,7 +5060,13 @@ router.post("/admin/unlock-disbursement", async (req, res) => {
     if (!isEvmAddress(snapshot.payout_address)) return res.send({ transf: "invalid payout address" });
 
     // The HTTP process checks balances only; the isolated worker owns the signing key.
-    const liquidity = await checkTreasuryLiquidity(snapshot.amount_raw, snapshot.payout_address);
+    const reservationCreditRaw = new BigNumber(snapshot.payout_amount || "0")
+      .shiftedBy(18).integerValue(BigNumber.ROUND_CEIL).toFixed(0);
+    const liquidity = await checkDisbursementLiquidity(
+      snapshot.amount_raw,
+      snapshot.payout_address,
+      { reservationCreditRaw },
+    );
     if (!liquidity.available) {
       return res.send({ transf: "insufficient treasury liquidity", liquidity });
     }
@@ -5635,6 +5868,17 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
       }
       const capacity = validateGlobalDisbursementCapacity(snapshotTotal, snapshotPrice, totalInitial, totalXtuLiability);
       if (!capacity.available) return { auth: "global_liability_exceeds_stock_value" };
+      const payoutReserve = await checkDisbursementReserveCapacity(
+        totalXtuLiability.toFixed(18),
+        { queryable: tx },
+      );
+      if (!payoutReserve.available) {
+        return {
+          auth: "insufficient_disbursement_wallet_reserve",
+          required_bsc_usd: payoutReserve.required_bsc_usd,
+          available_bsc_usd: payoutReserve.spendable_bsc_usd,
+        };
+      }
 
       let requestWindowDays;
       let extensionDays;
@@ -5830,11 +6074,15 @@ router.post("/admin/common-history", async (req, res) => {
       "record_date", "record_time",
     ];
     const sql = `SELECT ${columns.join(",")} FROM common ${cursor ? "WHERE id<?" : ""} ORDER BY id DESC LIMIT 50`;
-    const rows = await db.queryAsync(sql, cursor ? [cursor] : []);
+    const [rows, hotWallet] = await Promise.all([
+      db.queryAsync(sql, cursor ? [cursor] : []),
+      getHotWalletTreasurySnapshot(db),
+    ]);
     return res.send({
       history: rows,
       limit: 50,
       next_before_id: rows.length === 50 ? String(rows[rows.length - 1].id) : null,
+      hot_wallet: hotWallet,
     });
   } catch (error) {
     console.error("Administrative common history lookup failed:", error.message);
@@ -6610,7 +6858,8 @@ async function initializeRechargePayments() {
         `The configured OneX treasury address is permanently registered as a user wallet (${walletCollisionRows[0].username}). Choose a different treasury address.`,
       );
     }
-    startUsdtPaymentWatcher(db, processConfirmedUsdtPayment, processRechargeBatchQueue);
+    startRechargeBatchWorker();
+    startUsdtPaymentWatcher(db, processConfirmedUsdtPayment);
   }
   return providerInfo;
 }

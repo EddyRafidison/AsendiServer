@@ -37,15 +37,25 @@ test("incoming scanner has a durable, idempotent cursor and audited rollback rec
   const db = read("db.js");
   const routes = read("routes.js");
   assert.match(db, /CREATE TABLE IF NOT EXISTS bsc_incoming_scan_state/);
-  assert.match(db, /UNIQUE KEY uq_bsc_unknown_transfer\(tx_hash,log_index\)/);
+  assert.match(db, /KEY idx_bsc_unknown_tx_log\(tx_hash,log_index\)/);
   assert.match(db, /CREATE TABLE IF NOT EXISTS bsc_scan_admin_events/);
   assert.match(pay, /eth_getLogs/);
   assert.match(pay, /new WebSocketProvider\(paymentConfig\.websocketRpcUrl\)/);
   assert.match(pay, /HTTP log scanner remains the recovery source of truth/);
   assert.match(pay, /health_status='manual_review'/);
   assert.match(pay, /configured scanner identity is reviewed/);
-  assert.match(pay, /resumeAfterBlock >= BigInt\(previousBlock\)/);
+  assert.match(pay, /findLatestCommonCheckpoint/);
+  assert.match(pay, /Do not promote the persisted cursor to a canonical checkpoint/);
+  assert.match(pay, /scanner has no completed cursor/);
+  assert.match(pay, /getIndependentRpcConsensus/);
+  assert.match(pay, /latestPreview = \{/);
+  assert.match(pay, /can_commit:[\s\S]*?canCommitReconciliation\(itemRows\)/);
+  assert.match(pay, /previewIncomingScannerReconciliation/);
+  assert.match(pay, /commitIncomingScannerReconciliation/);
+  assert.match(pay, /resolveIncomingScannerCompensation/);
+  assert.match(pay, /INSERT(?: IGNORE)? INTO bsc_scan_checkpoints/);
   assert.match(pay, /INSERT INTO bsc_scan_admin_events/);
+  assert.doesNotMatch(pay, /function reconcileIncomingScanner\(/);
   assert.match(pay, /validatedRpcUrls = new Set\(\)/);
   assert.match(pay, /validateRpcEndpoint\(rpcUrl\)/);
   assert.match(pay, /The payment scanner will remain active and retry without advancing its database cursor/);
@@ -53,7 +63,13 @@ test("incoming scanner has a durable, idempotent cursor and audited rollback rec
   assert.match(read("routes.js"), /sharedTreasuryAddress = rechargeAvailability.allowed && paymentConfig.enabled && depositScannerReady/);
   assert.match(pay, /let watcherWsProvider = null/);
   assert.match(routes, /\/admin\/bsc\/incoming-scanner\/status/);
-  assert.match(routes, /\/admin\/bsc\/incoming-scanner\/reconcile/);
+  assert.match(routes, /\/admin\/bsc\/incoming-scanner\/reconcile\/preview/);
+  assert.match(routes, /\/admin\/bsc\/incoming-scanner\/reconcile\/resolve-event/);
+  assert.match(routes, /\/admin\/bsc\/incoming-scanner\/reconcile\/commit/);
+  assert.match(routes, /preview_required/);
+  assert.match(routes, /startRechargeBatchWorker\(\)/);
+  assert.match(routes, /isRechargeBatchSafeDuringScannerReview/);
+  assert.match(routes, /USDT_RECHARGE_QUEUE_POLL_MS/);
 });
 
 test("deposit batches persist the shared treasury, not a per-user deposit address", () => {
@@ -91,6 +107,7 @@ test("Terms and Privacy describe the shared-treasury and fixed-wallet model in b
     assert.match(text, /unknown|inconnu/i, `${name} must describe unmatched transfers`);
     assert.match(text, /from|expédit/i, `${name} must explain sender-address matching`);
     assert.match(text, /block cursor|curseur de blocs/i, `${name} must describe durable scanner state`);
+    assert.match(text, /manual_review/i, `${name} must describe scanner reconciliation holds`);
   }
   assert.match(read("terms_fr.html"), /C = 3 × tfees × min\(1, 2 × V \/ P\)/);
   assert.match(read("terms_en.html"), /C = 3 × tfees × min\(1, 2 × V \/ P\)/);
