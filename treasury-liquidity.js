@@ -1,6 +1,7 @@
 "use strict";
 
 const BigNumber = require("bignumber.js");
+const { attachEthersRpcMetrics } = require("./bsc-rpc-ethers-metrics");
 const {
   JsonRpcProvider,
   Contract,
@@ -173,6 +174,7 @@ async function getHotWalletOnchainBalances({ rpcUrl, tokenAddress, walletAddress
     throw new Error("Only the approved Binance-Peg BSC-USD contract can be used for treasury accounting.");
   }
   const provider = new JsonRpcProvider(rpc, Number(CHAIN_ID), { staticNetwork: true });
+  attachEthersRpcMetrics(provider, rpc, "hot-wallet-liquidity-check");
   try {
     const network = await provider.getNetwork();
     if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("The Hot Wallet RPC is not BNB Smart Chain mainnet.");

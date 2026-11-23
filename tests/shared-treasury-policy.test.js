@@ -41,7 +41,7 @@ test("incoming scanner has a durable, idempotent cursor and audited rollback rec
   assert.match(db, /CREATE TABLE IF NOT EXISTS bsc_scan_admin_events/);
   assert.match(pay, /eth_getLogs/);
   assert.match(pay, /new WebSocketProvider\(paymentConfig\.websocketRpcUrl\)/);
-  assert.match(pay, /HTTP log scanner remains the recovery source of truth/);
+  assert.match(pay, /finalized HTTP scanning remains the source of truth/);
   assert.match(pay, /health_status='manual_review'/);
   assert.match(pay, /configured scanner identity is reviewed/);
   assert.match(pay, /findLatestCommonCheckpoint/);

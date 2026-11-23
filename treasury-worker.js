@@ -22,6 +22,7 @@ const {
   CANONICAL_BSC_USD_CONTRACT,
 } = require("./treasury-liquidity");
 const { getBnbUsdPrice } = require("./bsc-price-oracle");
+const { attachEthersRpcMetrics } = require("./bsc-rpc-ethers-metrics");
 const { getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
 
 const CHAIN_ID = 56n;
@@ -363,7 +364,9 @@ async function runTreasuryCycle() {
     }
     const privateKey = String(process.env.BSC_TREASURY_PRIVATE_KEY || "").trim();
     if (!privateKey) throw new Error("BSC_TREASURY_PRIVATE_KEY is missing from the treasury secrets file.");
-    provider = new JsonRpcProvider(String(process.env.BSC_RPC_URL || "").trim(), Number(CHAIN_ID), { staticNetwork: true });
+    const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
+    provider = new JsonRpcProvider(rpcUrl, Number(CHAIN_ID), { staticNetwork: true });
+    attachEthersRpcMetrics(provider, rpcUrl, "cold-wallet-treasury-worker");
     const network = await provider.getNetwork();
     if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("The Treasury RPC must connect to BNB Smart Chain mainnet.");
     const signer = new Wallet(privateKey, provider);

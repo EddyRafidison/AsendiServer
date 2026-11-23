@@ -8,6 +8,23 @@ const {
   classifyReceiptPair,
   canCommitReconciliation,
 } = require("./bsc-reconciliation-policy");
+const {
+  shouldValidateCursorHash,
+  getWebsocketScanDelay,
+  getNextWebsocketReconnectDelay,
+} = require("./bsc-rpc-efficiency");
+const { getBscEthersRpcMetricsAdminSnapshot } = require("./bsc-rpc-ethers-metrics");
+const {
+  resolveIncomingRpcConfiguration,
+  validateHttpsRpcUrls,
+  validateWssRpcUrl,
+  createRpcFailoverState,
+  shouldTryRpcFallback,
+  getRpcCandidates,
+  recordRpcSuccess,
+  recordRpcFailure,
+  getRpcFailoverStatus,
+} = require("./bsc-rpc-routing");
 
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -21,6 +38,8 @@ const TREASURY_SCAN_LOCK = "onex_bsc_treasury_incoming_scanner";
 const SCAN_CHECKPOINT_INTERVAL_BLOCKS = 500n;
 const RECONCILIATION_PREVIEW_TTL_MS = 30 * 60 * 1000;
 const MAX_RECONCILIATION_CHECKPOINTS = 2000;
+const DEFAULT_CURSOR_HASH_CHECK_INTERVAL_MS = 60000;
+const RPC_METRICS_LOG_INTERVAL_MS = 60 * 60 * 1000;
 
 let paymentConfig = null;
 let rpcCounter = 0;
@@ -31,7 +50,169 @@ let watcherDatabase = null;
 let transferHandler = null;
 let maintenanceHandler = null;
 let watcherWsProvider = null;
+let watcherWsReconnectTimer = null;
+let watcherWsHealthTimer = null;
+let watcherWsReconnectDelayMs = 5000;
+let watcherWsConnecting = false;
 let validatedRpcUrls = new Set();
+let cursorHashValidation = null;
+let rpcMetricsWindow = createRpcMetricsWindow();
+let rpcMetricsLifetimeWindow = createRpcMetricsWindow();
+let previousRpcMetricsWindow = null;
+let rpcMetricsTimer = null;
+let lastWatcherScanStartedAtMs = 0;
+let lastFinalityFallbackWarningAtMs = 0;
+
+function createRpcMetricsWindow() {
+  return {
+    startedAtMs: Date.now(),
+    requests: 0,
+    errors: 0,
+    rateLimited: 0,
+    websocketNotifications: 0,
+    websocketErrors: 0,
+    failoverEvents: 0,
+    providers: new Map(),
+  };
+}
+
+function getRpcProviderLabel(rpcUrl) {
+  try {
+    return new URL(rpcUrl).host.toLowerCase();
+  } catch {
+    return 'unknown-provider';
+  }
+}
+
+function ensureRpcMetricsTimer() {
+  if (rpcMetricsTimer) return;
+  rpcMetricsTimer = setInterval(() => {
+    const snapshot = getRpcMetricsSnapshot();
+    if (snapshot.requests > 0 || snapshot.websocket_notifications > 0 || snapshot.websocket_errors > 0) {
+      previousRpcMetricsWindow = snapshot;
+      console.info(`ONEX_BSC_RPC_METRICS ${JSON.stringify(snapshot)}`);
+    }
+    rpcMetricsWindow = createRpcMetricsWindow();
+  }, RPC_METRICS_LOG_INTERVAL_MS);
+  if (typeof rpcMetricsTimer.unref === 'function') rpcMetricsTimer.unref();
+}
+
+function updateRpcMetricsWindow(window, { provider, method, durationMs, requestBytes, responseBytes, statusCode, error }) {
+  const providerLabel = provider || 'unknown-provider';
+  let providerMetrics = window.providers.get(providerLabel);
+  if (!providerMetrics) {
+    providerMetrics = new Map();
+    window.providers.set(providerLabel, providerMetrics);
+  }
+  let methodMetrics = providerMetrics.get(method);
+  if (!methodMetrics) {
+    methodMetrics = {
+      requests: 0,
+      errors: 0,
+      rateLimited: 0,
+      timeouts: 0,
+      totalDurationMs: 0,
+      maxDurationMs: 0,
+      requestBytes: 0,
+      responseBytes: 0,
+    };
+    providerMetrics.set(method, methodMetrics);
+  }
+
+  methodMetrics.requests += 1;
+  methodMetrics.totalDurationMs += durationMs;
+  methodMetrics.maxDurationMs = Math.max(methodMetrics.maxDurationMs, durationMs);
+  methodMetrics.requestBytes += requestBytes;
+  methodMetrics.responseBytes += responseBytes;
+  window.requests += 1;
+
+  if (error) {
+    methodMetrics.errors += 1;
+    window.errors += 1;
+    const message = String(error.message || error).toLowerCase();
+    if (statusCode === 429 || /rate.?limit|too many requests|http 429/.test(message)) {
+      methodMetrics.rateLimited += 1;
+      window.rateLimited += 1;
+    }
+    if (/timed out|timeout/.test(message)) methodMetrics.timeouts += 1;
+  }
+}
+
+function recordRpcMetric(metric) {
+  updateRpcMetricsWindow(rpcMetricsWindow, metric);
+  updateRpcMetricsWindow(rpcMetricsLifetimeWindow, metric);
+}
+
+function recordWebsocketMetric(type) {
+  const key = type === "error" ? "websocketErrors" : "websocketNotifications";
+  rpcMetricsWindow[key] += 1;
+  rpcMetricsLifetimeWindow[key] += 1;
+}
+
+function getRpcMetricsSnapshot() {
+  const now = Date.now();
+  const providers = {};
+  for (const [provider, methods] of rpcMetricsWindow.providers.entries()) {
+    providers[provider] = {};
+    for (const [method, metrics] of methods.entries()) {
+      providers[provider][method] = {
+        ...metrics,
+        averageDurationMs: metrics.requests
+          ? Number((metrics.totalDurationMs / metrics.requests).toFixed(2))
+          : 0,
+      };
+    }
+  }
+  return {
+    window_started_at_ms: String(rpcMetricsWindow.startedAtMs),
+    captured_at_ms: String(now),
+    window_duration_ms: now - rpcMetricsWindow.startedAtMs,
+    requests: rpcMetricsWindow.requests,
+    errors: rpcMetricsWindow.errors,
+    rate_limited: rpcMetricsWindow.rateLimited,
+    websocket_notifications: rpcMetricsWindow.websocketNotifications,
+    websocket_errors: rpcMetricsWindow.websocketErrors,
+    failover_events: rpcMetricsWindow.failoverEvents,
+    incoming_rpc_failover: paymentConfig?.enabled
+      ? getRpcFailoverStatus(paymentConfig.incomingRpcFailoverState)
+      : [],
+    providers,
+  };
+}
+
+function getRpcMetricsAdminSnapshot() {
+  const lifetime = rpcMetricsLifetimeWindow;
+  const providers = {};
+  for (const [provider, methods] of lifetime.providers.entries()) {
+    providers[provider] = {};
+    for (const [method, metrics] of methods.entries()) {
+      providers[provider][method] = {
+        ...metrics,
+        averageDurationMs: metrics.requests
+          ? Number((metrics.totalDurationMs / metrics.requests).toFixed(2))
+          : 0,
+      };
+    }
+  }
+  return {
+    process_started_at_ms: String(lifetime.startedAtMs),
+    ethers_provider_metrics: getBscEthersRpcMetricsAdminSnapshot(),
+    incoming_rpc_failover: paymentConfig?.enabled
+      ? getRpcFailoverStatus(paymentConfig.incomingRpcFailoverState)
+      : [],
+    since_process_start: {
+      requests: lifetime.requests,
+      errors: lifetime.errors,
+      rate_limited: lifetime.rateLimited,
+      websocket_notifications: lifetime.websocketNotifications,
+      websocket_errors: lifetime.websocketErrors,
+      failover_events: lifetime.failoverEvents,
+      providers,
+    },
+    current_window: getRpcMetricsSnapshot(),
+    previous_window: previousRpcMetricsWindow,
+  };
+}
 
 function isAddress(value) {
   return typeof value === "string" && /^0x[a-fA-F0-9]{40}$/.test(value);
@@ -50,6 +231,17 @@ function toQuantity(value) {
   return `0x${BigInt(value).toString(16)}`;
 }
 
+function withTimeout(promise, timeoutMs, operation) {
+  let timer = null;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${operation} timed out after ${timeoutMs} ms.`)), timeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 function minBigInt(left, right) {
   return left < right ? left : right;
 }
@@ -58,10 +250,9 @@ function getPaymentConfigFromEnvironment() {
   const enabled = String(process.env.USDT_PAYMENTS_ENABLED || "false").toLowerCase() === "true";
   if (!enabled) return { enabled: false };
 
-  const rpcUrls = [...new Set([process.env.BSC_RPC_URL, process.env.BSC_RPC_FALLBACK_URL]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean))];
-  const websocketRpcUrl = String(process.env.BSC_WS_RPC_URL || "").trim();
+  const incomingRpc = resolveIncomingRpcConfiguration(process.env);
+  const incomingRpcUrls = incomingRpc.urls;
+  const websocketRpcUrl = incomingRpc.websocketUrl;
   const tokenAddress = String(
     process.env.USDT_BEP20_CONTRACT || CANONICAL_BSC_USD_CONTRACT,
   ).trim();
@@ -69,35 +260,25 @@ function getPaymentConfigFromEnvironment() {
     process.env.USDT_BEP20_TREASURY_ADDRESS || process.env.USDT_BEP20_RECEIVER_ADDRESS || "",
   ).trim();
   const minConfirmations = Number(process.env.USDT_MIN_CONFIRMATIONS || 15);
-  const pollIntervalMs = Number(process.env.USDT_PAYMENT_POLL_MS || 5000);
-  const maxLogBlockRange = Number(process.env.USDT_MAX_LOG_BLOCK_RANGE || 250);
+  const pollIntervalMs = Number(process.env.USDT_PAYMENT_POLL_MS || 30000);
+  const maxLogBlockRange = Number(process.env.USDT_MAX_LOG_BLOCK_RANGE || 1500);
+  const cursorHashCheckIntervalMs = Number(
+    process.env.USDT_CURSOR_HASH_CHECK_INTERVAL_MS || DEFAULT_CURSOR_HASH_CHECK_INTERVAL_MS,
+  );
+  const configuredWebsocketMinScanIntervalMs = Number(
+    process.env.USDT_WS_MIN_SCAN_INTERVAL_MS || 10000,
+  );
+  const rpcCooldownMs = Number(process.env.BSC_INCOMING_RPC_COOLDOWN_MS || 30000);
   const configuredStartBlock = String(process.env.USDT_INCOMING_START_BLOCK || "").trim();
   const startBlock = configuredStartBlock === "" ? null : BigInt(configuredStartBlock);
 
-  if (!rpcUrls.length || !treasuryAddress) {
-    throw new Error("USDT payments require BSC_RPC_URL and USDT_BEP20_TREASURY_ADDRESS.");
+  validateHttpsRpcUrls(incomingRpcUrls);
+  validateWssRpcUrl(websocketRpcUrl);
+  if (!treasuryAddress) {
+    throw new Error("USDT payments require an incoming BSC RPC endpoint and USDT_BEP20_TREASURY_ADDRESS.");
   }
-  for (const [index, value] of rpcUrls.entries()) {
-    let parsed;
-    try {
-      parsed = new URL(value);
-    } catch {
-      throw new Error(`BSC RPC endpoint ${index + 1} is not a valid URL.`);
-    }
-    if (parsed.protocol !== "https:") {
-      throw new Error(`BSC RPC endpoint ${index + 1} must use HTTPS.`);
-    }
-  }
-  if (websocketRpcUrl) {
-    let parsed;
-    try {
-      parsed = new URL(websocketRpcUrl);
-    } catch {
-      throw new Error("BSC_WS_RPC_URL is not a valid URL.");
-    }
-    if (parsed.protocol !== "wss:") {
-      throw new Error("BSC_WS_RPC_URL must use secure WebSocket (wss).");
-    }
+  if (!Number.isInteger(rpcCooldownMs) || rpcCooldownMs < 5000 || rpcCooldownMs > 300000) {
+    throw new Error("BSC_INCOMING_RPC_COOLDOWN_MS must be between 5000 and 300000 milliseconds.");
   }
   if (!isAddress(tokenAddress) || !isAddress(treasuryAddress)) {
     throw new Error("The approved token contract or treasury address is invalid.");
@@ -117,15 +298,23 @@ function getPaymentConfigFromEnvironment() {
   if (!Number.isInteger(maxLogBlockRange) || maxLogBlockRange < 1 || maxLogBlockRange > 2000) {
     throw new Error("USDT_MAX_LOG_BLOCK_RANGE must be an integer between 1 and 2000.");
   }
+  if (!Number.isInteger(cursorHashCheckIntervalMs) || cursorHashCheckIntervalMs < 15000 || cursorHashCheckIntervalMs > 900000) {
+    throw new Error("USDT_CURSOR_HASH_CHECK_INTERVAL_MS must be an integer between 15000 and 900000 milliseconds.");
+  }
+  if (!Number.isInteger(configuredWebsocketMinScanIntervalMs) || configuredWebsocketMinScanIntervalMs < 1000 || configuredWebsocketMinScanIntervalMs > 60000) {
+    throw new Error("USDT_WS_MIN_SCAN_INTERVAL_MS must be an integer between 1000 and 60000 milliseconds.");
+  }
   if (startBlock !== null && (startBlock < 0n || startBlock > 0xffffffffffffffffn)) {
     throw new Error("USDT_INCOMING_START_BLOCK must be a valid non-negative block number.");
   }
 
   return {
     enabled: true,
-    rpcUrls,
+    incomingRpcUrls,
+    incomingRpcFailoverState: createRpcFailoverState(incomingRpcUrls, rpcCooldownMs),
+    primaryIncomingRpcUrl: incomingRpcUrls[0],
+    lastSuccessfulRpcUrl: null,
     websocketRpcUrl: websocketRpcUrl || null,
-    currentRpcIndex: 0,
     tokenAddress: checksumAddress(tokenAddress),
     tokenAddressLower: tokenAddress.toLowerCase(),
     treasuryAddress: checksumAddress(treasuryAddress),
@@ -133,6 +322,8 @@ function getPaymentConfigFromEnvironment() {
     minConfirmations: BigInt(minConfirmations),
     minConfirmationsNumber: minConfirmations,
     pollIntervalMs,
+    websocketMinScanIntervalMs: configuredWebsocketMinScanIntervalMs,
+    cursorHashCheckIntervalMs,
     maxLogBlockRange: BigInt(maxLogBlockRange),
     configuredStartBlock: startBlock,
     decimals: TOKEN_DECIMALS,
@@ -142,16 +333,40 @@ function getPaymentConfigFromEnvironment() {
 
 function rpcCallAt(rpcUrl, method, params = []) {
   const requestBody = JSON.stringify({ jsonrpc: "2.0", id: ++rpcCounter, method, params });
+  const requestBytes = Buffer.byteLength(requestBody);
+  const startedAtMs = Date.now();
+  const providerLabel = getRpcProviderLabel(rpcUrl);
+  ensureRpcMetricsTimer();
+
   return new Promise((resolve, reject) => {
+    let responseSize = 0;
+    let statusCode = null;
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      recordRpcMetric({
+        provider: providerLabel,
+        method,
+        durationMs: Math.max(0, Date.now() - startedAtMs),
+        requestBytes,
+        responseBytes: responseSize,
+        statusCode,
+        error,
+      });
+      if (error) reject(error);
+      else resolve(result);
+    };
+
     const request = https.request(rpcUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
-        "Content-Length": Buffer.byteLength(requestBody),
+        "Content-Length": requestBytes,
       },
     }, (response) => {
-      let responseSize = 0;
+      statusCode = Number(response.statusCode || 0);
       const chunks = [];
       response.on("data", (chunk) => {
         responseSize += chunk.length;
@@ -162,30 +377,35 @@ function rpcCallAt(rpcUrl, method, params = []) {
         chunks.push(chunk);
       });
       response.on("end", () => {
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          reject(new Error(`BSC RPC returned HTTP ${response.statusCode}.`));
+        if (statusCode < 200 || statusCode >= 300) {
+          const error = new Error(`BSC RPC returned HTTP ${statusCode}.`);
+          error.httpStatus = statusCode;
+          finish(error);
           return;
         }
         let payload;
         try {
           payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
         } catch {
-          reject(new Error("BSC RPC returned invalid JSON."));
+          finish(new Error("BSC RPC returned invalid JSON."));
           return;
         }
         if (payload.error) {
-          reject(new Error(`BSC RPC ${method} failed: ${String(payload.error.message || "unknown error")}`));
+          const error = new Error(`BSC RPC ${method} failed: ${String(payload.error.message || "unknown error")}`);
+          if (Number.isInteger(Number(payload.error.code))) error.rpcCode = Number(payload.error.code);
+          if (payload.error.data !== undefined) error.rpcData = payload.error.data;
+          finish(error);
           return;
         }
         if (!Object.prototype.hasOwnProperty.call(payload, "result")) {
-          reject(new Error(`BSC RPC ${method} returned no result.`));
+          finish(new Error(`BSC RPC ${method} returned no result.`));
           return;
         }
-        resolve(payload.result);
+        finish(null, payload.result);
       });
     });
     request.setTimeout(RPC_TIMEOUT_MS, () => request.destroy(new Error(`BSC RPC ${method} timed out.`)));
-    request.on("error", reject);
+    request.on("error", (error) => finish(error));
     request.end(requestBody);
   });
 }
@@ -212,23 +432,43 @@ async function rpcCall(method, params = []) {
   if (!paymentConfig || !paymentConfig.enabled) {
     throw new Error("BEP-20 payment provider is not initialized.");
   }
+  const candidates = getRpcCandidates(paymentConfig.incomingRpcFailoverState);
+  if (!candidates.length) {
+    throw new Error("All incoming BSC RPC endpoints are temporarily unavailable or disabled by the failover circuit.");
+  }
+
   let lastError = null;
-  const count = paymentConfig.rpcUrls.length;
-  const start = paymentConfig.currentRpcIndex || 0;
-  for (let offset = 0; offset < count; offset += 1) {
-    const index = (start + offset) % count;
-    const rpcUrl = paymentConfig.rpcUrls[index];
+  for (const rpcUrl of candidates) {
     try {
       if (!validatedRpcUrls.has(rpcUrl)) await validateRpcEndpoint(rpcUrl);
       const result = await rpcCallAt(rpcUrl, method, params);
-      paymentConfig.currentRpcIndex = index;
+      recordRpcSuccess(paymentConfig.incomingRpcFailoverState, rpcUrl);
+      paymentConfig.lastSuccessfulRpcUrl = rpcUrl;
       return result;
     } catch (error) {
       lastError = error;
-      console.error(`BSC RPC endpoint ${index + 1} failed for ${method}:`, error.message);
+      const failover = shouldTryRpcFallback(error);
+      if (failover) {
+        const circuit = recordRpcFailure(paymentConfig.incomingRpcFailoverState, rpcUrl, error);
+        if (circuit.disabled) {
+          validatedRpcUrls.delete(rpcUrl);
+          console.error(`Incoming BSC RPC endpoint ${getRpcProviderLabel(rpcUrl)} was disabled after a permanent configuration or network validation error:`, error.message);
+        } else {
+          if (circuit.opened) {
+            rpcMetricsWindow.failoverEvents += 1;
+            rpcMetricsLifetimeWindow.failoverEvents += 1;
+          }
+          console.warn(`Incoming BSC RPC endpoint ${getRpcProviderLabel(rpcUrl)} is unavailable for ${paymentConfig.incomingRpcFailoverState.cooldownMs} ms; trying the configured fallback when available:`, error.message);
+        }
+      } else {
+        // Deterministic JSON-RPC errors (for example, an unsupported optional
+        // block tag) must not open the circuit or move routine traffic to the
+        // paid fallback. The caller may use a compatible method on the primary.
+        throw error;
+      }
     }
   }
-  throw new Error(`All configured BSC RPC endpoints failed for ${method}: ${lastError?.message || "unknown error"}`);
+  throw new Error(`All available incoming BSC RPC endpoints failed for ${method}: ${lastError?.message || "unknown error"}`);
 }
 
 async function initializePaymentProvider() {
@@ -242,6 +482,7 @@ async function initializePaymentProvider() {
 
   paymentConfig = config;
   validatedRpcUrls = new Set();
+  cursorHashValidation = null;
   try {
     const latestBlock = BigInt(await rpcCall("eth_blockNumber", []));
     console.log(`BEP-20 treasury watcher ready. BSC block: ${latestBlock}; treasury: ${config.treasuryAddress}`);
@@ -300,7 +541,10 @@ async function getSafeBlock() {
       return { number: BigInt(finalized.number), hash: String(finalized.hash || "").toLowerCase(), method: "finalized" };
     }
   } catch (error) {
-    console.warn("BSC RPC does not provide the finalized block tag; using the confirmation fallback:", error.message);
+    if (Date.now() - lastFinalityFallbackWarningAtMs >= 5 * 60 * 1000) {
+      lastFinalityFallbackWarningAtMs = Date.now();
+      console.warn("BSC RPC does not provide the finalized block tag; using the confirmation fallback:", error.message);
+    }
   }
 
   const latest = BigInt(await rpcCall("eth_blockNumber", []));
@@ -357,6 +601,14 @@ async function initializeScanState(db, safeBlock) {
   if (!/^0x[0-9a-f]{64}$/i.test(initialCursorHash)) {
     throw new Error("Unable to obtain the initial BSC scan checkpoint hash.");
   }
+  if (initialCursor !== null) {
+    cursorHashValidation = {
+      blockNumber: initialCursor.toString(),
+      blockHash: initialCursorHash,
+      rpcUrl: (paymentConfig.lastSuccessfulRpcUrl || paymentConfig.primaryIncomingRpcUrl),
+      lastValidatedAtMs: Date.now(),
+    };
+  }
 
   await db.queryAsync(
     `INSERT INTO bsc_incoming_scan_state
@@ -390,7 +642,14 @@ async function initializeScanState(db, safeBlock) {
   return createdRows[0] || null;
 }
 
-async function verifyFinalizedTransfer(log) {
+async function getCachedScanRpcResult(cache, bucketName, key, method, params) {
+  const bucket = cache?.[bucketName];
+  if (!bucket) return rpcCall(method, params);
+  if (!bucket.has(key)) bucket.set(key, rpcCall(method, params));
+  return bucket.get(key);
+}
+
+async function verifyFinalizedTransfer(log, scanRpcCache = null) {
   if (!log || log.removed || !Array.isArray(log.topics) || log.topics.length < 3) return null;
   if (String(log.address || "").toLowerCase() !== paymentConfig.tokenAddressLower) return null;
   if (String(log.topics[0] || "").toLowerCase() !== TRANSFER_TOPIC) return null;
@@ -405,7 +664,7 @@ async function verifyFinalizedTransfer(log) {
   const logIndex = Number(BigInt(log.logIndex));
   if (!Number.isSafeInteger(logIndex) || logIndex < 0) return null;
 
-  const receipt = await rpcCall("eth_getTransactionReceipt", [txHash]);
+  const receipt = await getCachedScanRpcResult(scanRpcCache, "receipts", txHash, "eth_getTransactionReceipt", [txHash]);
   if (!receipt) return { pending: true };
   if (String(receipt.status || "").toLowerCase() !== "0x1") return { ignored: true };
   if (
@@ -424,7 +683,7 @@ async function verifyFinalizedTransfer(log) {
   );
   if (!receiptLog) return { ignored: true };
 
-  const canonicalBlock = await rpcCall("eth_getBlockByNumber", [toQuantity(blockNumber), false]);
+  const canonicalBlock = await getCachedScanRpcResult(scanRpcCache, "blocks", blockNumber.toString(), "eth_getBlockByNumber", [toQuantity(blockNumber), false]);
   if (!canonicalBlock || String(canonicalBlock.hash || "").toLowerCase() !== blockHash) {
     return { pending: true };
   }
@@ -486,17 +745,36 @@ async function scanTreasury(db, safeBlock) {
   }
 
   if (state.last_scanned_block !== null && state.last_scanned_block_hash) {
-    const cursorBlock = await rpcCall("eth_getBlockByNumber", [toQuantity(state.last_scanned_block), false]);
-    if (!cursorBlock || String(cursorBlock.hash || "").toLowerCase() !== String(state.last_scanned_block_hash).toLowerCase()) {
-      const message = "The stored BSC scan cursor no longer matches the canonical block. Automatic crediting has been halted for administrative reconciliation.";
-      await db.queryAsync(
-        `UPDATE bsc_incoming_scan_state
-         SET health_status='manual_review',manual_review_code='cursor_hash_mismatch',
-             manual_review_at_ms=COALESCE(manual_review_at_ms,?),last_error=?,updated_at_ms=?
-         WHERE singleton_id=1`,
-        [String(Date.now()), message, String(Date.now())],
-      );
-      throw new Error(message);
+    const activeRpcUrl = (paymentConfig.lastSuccessfulRpcUrl || paymentConfig.primaryIncomingRpcUrl);
+    const shouldCheckCursor = shouldValidateCursorHash({
+      safeBlockMethod: safeBlock.method,
+      cached: cursorHashValidation,
+      blockNumber: state.last_scanned_block,
+      blockHash: state.last_scanned_block_hash,
+      rpcUrl: activeRpcUrl,
+      intervalMs: paymentConfig.cursorHashCheckIntervalMs,
+    });
+    if (shouldCheckCursor) {
+      const cursorBlock = await rpcCall("eth_getBlockByNumber", [toQuantity(state.last_scanned_block), false]);
+      const checkedRpcUrl = (paymentConfig.lastSuccessfulRpcUrl || paymentConfig.primaryIncomingRpcUrl);
+      if (!cursorBlock || String(cursorBlock.hash || "").toLowerCase() !== String(state.last_scanned_block_hash).toLowerCase()) {
+        cursorHashValidation = null;
+        const message = "The stored BSC scan cursor no longer matches the canonical block. Automatic crediting has been halted for administrative reconciliation.";
+        await db.queryAsync(
+          `UPDATE bsc_incoming_scan_state
+           SET health_status='manual_review',manual_review_code='cursor_hash_mismatch',
+               manual_review_at_ms=COALESCE(manual_review_at_ms,?),last_error=?,updated_at_ms=?
+           WHERE singleton_id=1`,
+          [String(Date.now()), message, String(Date.now())],
+        );
+        throw new Error(message);
+      }
+      cursorHashValidation = {
+        blockNumber: String(state.last_scanned_block),
+        blockHash: String(state.last_scanned_block_hash).toLowerCase(),
+        rpcUrl: checkedRpcUrl,
+        lastValidatedAtMs: Date.now(),
+      };
     }
   }
 
@@ -521,8 +799,9 @@ async function scanTreasury(db, safeBlock) {
   });
 
   let processed = 0;
+  const scanRpcCache = { receipts: new Map(), blocks: new Map() };
   for (const log of logs) {
-    const event = await verifyFinalizedTransfer(log);
+    const event = await verifyFinalizedTransfer(log, scanRpcCache);
     if (event?.pending) throw new Error("A BSC transfer receipt or canonical block is not yet consistent; the scan cursor was not advanced.");
     if (!event || event.ignored) continue;
 
@@ -564,6 +843,16 @@ async function scanTreasury(db, safeBlock) {
     ],
   );
   await saveScanCheckpointIfDue(db, toBlock, String(cursorBlock.hash).toLowerCase(), safeBlock.method, now);
+  const cursorRpcUrl = (paymentConfig.lastSuccessfulRpcUrl || paymentConfig.primaryIncomingRpcUrl);
+  const previousValidationAtMs = cursorHashValidation?.rpcUrl === cursorRpcUrl
+    ? Number(cursorHashValidation.lastValidatedAtMs || cursorHashValidation.checkedAtMs || 0)
+    : 0;
+  cursorHashValidation = {
+    blockNumber: toBlock.toString(),
+    blockHash: String(cursorBlock.hash).toLowerCase(),
+    rpcUrl: cursorRpcUrl,
+    lastValidatedAtMs: previousValidationAtMs || Date.now(),
+  };
   return { scanned: true, fromBlock: fromBlock.toString(), toBlock: toBlock.toString(), events: processed };
 }
 
@@ -591,6 +880,7 @@ function startPaymentWatcher(db, onTransfer, onMaintenance) {
       return;
     }
     watcherRunning = true;
+    lastWatcherScanStartedAtMs = Date.now();
     let releaseLock = null;
     try {
       releaseLock = await acquireScannerLock(watcherDatabase);
@@ -606,7 +896,11 @@ function startPaymentWatcher(db, onTransfer, onMaintenance) {
     } finally {
       if (releaseLock) await releaseLock().catch((error) => console.error("BSC scanner lock release failed:", error.message));
       watcherRunning = false;
-      const nextDelay = watcherWakeRequested ? 0 : (paymentConfig?.pollIntervalMs || 5000);
+      const minimumIntervalMs = paymentConfig?.websocketMinScanIntervalMs || paymentConfig?.pollIntervalMs || 5000;
+      const websocketDelay = getWebsocketScanDelay(lastWatcherScanStartedAtMs, minimumIntervalMs);
+      const nextDelay = watcherWakeRequested
+        ? websocketDelay
+        : (paymentConfig?.pollIntervalMs || 5000);
       watcherWakeRequested = false;
       scheduleScan(nextDelay);
     }
@@ -614,27 +908,93 @@ function startPaymentWatcher(db, onTransfer, onMaintenance) {
 
   scheduleScan(0);
   if (paymentConfig.websocketRpcUrl) {
-    try {
+    const incomingLogFilter = {
+      address: paymentConfig.tokenAddress,
+      topics: [TRANSFER_TOPIC, null, addressTopic(paymentConfig.treasuryAddress)],
+    };
+
+    const scheduleWebsocketReconnect = (reason) => {
+      if (!paymentConfig?.websocketRpcUrl || watcherWsReconnectTimer || watcherWsConnecting) return;
+      const delayMs = watcherWsReconnectDelayMs;
+      watcherWsReconnectDelayMs = getNextWebsocketReconnectDelay(delayMs);
+      console.warn(`Incoming BSC WebSocket hint will reconnect in ${delayMs} ms; HTTP polling and cursor recovery remain active:`, reason);
+      watcherWsReconnectTimer = setTimeout(() => {
+        watcherWsReconnectTimer = null;
+        void connectWebsocketHint();
+      }, delayMs);
+      if (typeof watcherWsReconnectTimer.unref === "function") watcherWsReconnectTimer.unref();
+    };
+
+    const handleWebsocketFailure = (wsProvider, error) => {
+      if (watcherWsProvider !== wsProvider) return;
+      recordWebsocketMetric("error");
+      watcherWsProvider = null;
+      try { wsProvider.destroy(); } catch {}
+      scheduleWebsocketReconnect(error?.message || "WebSocket connection closed");
+    };
+
+    const connectWebsocketHint = async () => {
+      if (watcherWsConnecting || watcherWsProvider || !paymentConfig?.websocketRpcUrl) return;
+      watcherWsConnecting = true;
       const wsProvider = new WebSocketProvider(paymentConfig.websocketRpcUrl);
-      void wsProvider.getNetwork().then((network) => {
+      try {
+        const network = await withTimeout(
+          wsProvider.getNetwork(), 15000, "Incoming BSC WebSocket network detection",
+        );
         if (BigInt(network.chainId) !== CHAIN_ID) {
           throw new Error(`WebSocket RPC is on chain ${network.chainId}, not BNB Smart Chain mainnet 56.`);
         }
+        const wakeForIncomingLog = (log) => {
+          // WebSocket logs are notifications only. They are never credited
+          // directly; the finalized HTTP scanner validates the durable range.
+          recordWebsocketMetric("notification");
+          if (log?.removed) {
+            console.warn("Incoming BSC WebSocket reported a removed log; the finalized HTTP scanner will re-check its canonical range.");
+          }
+          if (watcherRunning) {
+            watcherWakeRequested = true;
+            return;
+          }
+          const minimumIntervalMs = paymentConfig?.websocketMinScanIntervalMs || paymentConfig?.pollIntervalMs || 10000;
+          scheduleScan(getWebsocketScanDelay(lastWatcherScanStartedAtMs, minimumIntervalMs));
+        };
         watcherWsProvider = wsProvider;
-        wsProvider.on("block", () => {
-          if (watcherRunning) watcherWakeRequested = true;
-          else scheduleScan(0);
-        });
-        wsProvider.on("error", (error) => {
-          console.warn("BSC WebSocket hint failed; the durable HTTP scanner remains active:", error?.message || "unknown error");
-        });
-        console.log("BSC WebSocket new-block hint connected; the HTTP log scanner remains the recovery source of truth.");
-      }).catch((error) => {
-        console.warn("Unable to start optional BSC WebSocket hint; the durable HTTP scanner remains active:", error.message);
-        wsProvider.destroy();
-      });
-    } catch (error) {
-      console.warn("Unable to create optional BSC WebSocket hint; the durable HTTP scanner remains active:", error.message);
+        attachEthersRpcMetrics(wsProvider, paymentConfig.websocketRpcUrl, "incoming-scanner-websocket");
+        await withTimeout(
+          wsProvider.on("error", (error) => handleWebsocketFailure(wsProvider, error)),
+          15000, "Incoming BSC WebSocket error-listener registration",
+        );
+        await withTimeout(
+          wsProvider.on(incomingLogFilter, wakeForIncomingLog),
+          15000, "Incoming BSC WebSocket log subscription",
+        );
+        watcherWsReconnectDelayMs = 5000;
+        console.log("Incoming BSC WebSocket Transfer subscription connected; finalized HTTP scanning remains the source of truth.");
+      } catch (error) {
+        if (watcherWsProvider === wsProvider) watcherWsProvider = null;
+        try { wsProvider.destroy(); } catch {}
+        scheduleWebsocketReconnect(error);
+      } finally {
+        watcherWsConnecting = false;
+        if (!watcherWsProvider) scheduleWebsocketReconnect("WebSocket setup did not complete");
+      }
+    };
+
+    void connectWebsocketHint();
+    if (!watcherWsHealthTimer) {
+      watcherWsHealthTimer = setInterval(() => {
+        if (!watcherWsProvider) {
+          scheduleWebsocketReconnect("no active WebSocket provider");
+          return;
+        }
+        const readyState = Number(watcherWsProvider.websocket?.readyState);
+        // WebSocket.OPEN is 1. A closed or closing socket is recreated with
+        // bounded exponential backoff; ordinary HTTP polling never pauses.
+        if (readyState === 2 || readyState === 3) {
+          handleWebsocketFailure(watcherWsProvider, new Error(`WebSocket readyState=${readyState}`));
+        }
+      }, 15000);
+      if (typeof watcherWsHealthTimer.unref === "function") watcherWsHealthTimer.unref();
     }
   }
   return { enabled: true, treasuryAddress: paymentConfig.treasuryAddress, websocketHint: Boolean(paymentConfig.websocketRpcUrl) };
@@ -681,11 +1041,11 @@ async function getRpcFinalizedSnapshot(rpcUrl) {
 
 async function getIndependentRpcConsensus() {
   if (!paymentConfig || !paymentConfig.enabled) throw new Error("BSC payment monitoring is not enabled.");
-  if (paymentConfig.rpcUrls.length < 2) {
+  if (paymentConfig.incomingRpcUrls.length < 2) {
     throw new Error("Scanner reconciliation requires two independently configured HTTPS RPC endpoints.");
   }
   const snapshots = [];
-  for (const rpcUrl of paymentConfig.rpcUrls) snapshots.push(await getRpcFinalizedSnapshot(rpcUrl));
+  for (const rpcUrl of paymentConfig.incomingRpcUrls) snapshots.push(await getRpcFinalizedSnapshot(rpcUrl));
   const safeNumber = snapshots.reduce((minimum, snapshot) => minBigInt(minimum, snapshot.number), snapshots[0].number);
   const blocks = await Promise.all(snapshots.map(async (snapshot) => {
     const block = await rpcCallAt(snapshot.rpcUrl, "eth_getBlockByNumber", [toQuantity(safeNumber), false]);
@@ -929,11 +1289,16 @@ function summarizeReconciliationItems(items) {
   };
 }
 
-async function getIncomingScannerStatus(db) {
+async function getIncomingScannerStatus(db, { includeRpcMetrics = false } = {}) {
   const rows = await db.queryAsync(
     "SELECT * FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1",
   );
-  if (!rows.length) return { initialized: false };
+  if (!rows.length) {
+    return {
+      initialized: false,
+      ...(includeRpcMetrics ? { rpc_metrics: getRpcMetricsAdminSnapshot() } : {}),
+    };
+  }
   const checkpointRows = await db.queryAsync(
     "SELECT COUNT(*) AS checkpoint_count,MAX(block_number) AS latest_checkpoint_block FROM bsc_scan_checkpoints WHERE checkpoint_status='canonical'",
   );
@@ -964,6 +1329,7 @@ async function getIncomingScannerStatus(db) {
   return {
     initialized: true,
     ...rows[0],
+    ...(includeRpcMetrics ? { rpc_metrics: getRpcMetricsAdminSnapshot() } : {}),
     checkpoint_history: checkpointRows[0] || { checkpoint_count: 0, latest_checkpoint_block: null },
     latest_reconciliation_preview: latestPreview,
   };
@@ -1548,6 +1914,7 @@ async function commitIncomingScannerReconciliation(db, options = {}) {
           consensus.number.toString(), reason, String(Date.now())],
       );
       await tx.commit();
+      cursorHashValidation = null;
       return {
         resumed: true,
         preview_id: previewId,
@@ -1591,4 +1958,5 @@ module.exports = {
   commitIncomingScannerReconciliation,
   isAddress,
   checksumAddress,
+  getRpcMetricsSnapshot,
 };

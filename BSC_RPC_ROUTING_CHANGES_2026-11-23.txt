@@ -1,0 +1,47 @@
+OneXServer — BSC RPC routing update
+Date: 2026-11-23
+Base: OneXServer_BSC_RPC_Budget_Optimized_2026-11-23.zip
+
+SUMMARY
+- Incoming BSC-USD monitoring now uses PublicNode as the preferred HTTP and WebSocket endpoint.
+- Chainstack remains configured through BSC_RPC_URL for outgoing disbursements and treasury operations.
+- Chainstack can also be used as an incoming HTTP fallback, but only after a transient provider failure or endpoint validation failure. The scanner does not query both providers in parallel during normal operation.
+- WebSocket logs are wake-up notifications only. They are not credited and do not move the durable scan cursor. The HTTP scanner catches up from MySQL, observes finality, checks receipts and canonical block hashes, and preserves the existing financial processing path.
+
+FILES UPDATED
+- .env.example: adds explicit incoming HTTP, WebSocket, fallback and cooldown settings; includes fictional Chainstack URL placeholders for reference.
+- pay.js: routes incoming scanner RPC separately; performs conditional fallback; subscribes to incoming Transfer logs over Ethers v6 WebSocketProvider; reconnects with bounded backoff; keeps HTTP cursor scanning as the source of truth.
+- bsc-rpc-routing.js: new routing configuration, URL validation, transient/permanent error classification and circuit-breaker state.
+- bsc-rpc-efficiency.js: adds bounded WebSocket reconnect backoff helper.
+- README.md: documents endpoint roles, fallback conditions and financial invariants.
+- tests/bsc-rpc-routing.test.js: tests routing, fallback and endpoint-state behavior.
+- tests/bsc-rpc-budget.test.js and tests/shared-treasury-policy.test.js: updated and extended regression tests.
+- BSC_RPC_ROUTING_IMPLEMENTATION_2026-11-23.md: implementation details and official documentation references.
+
+REFERENCE ENVIRONMENT VALUES
+BSC_RPC_URL=https://nd-000-000-000.p2pify.com/REPLACE_WITH_CHAINSTACK_NODE_TOKEN
+BSC_INCOMING_RPC_URL=https://bsc-rpc.publicnode.com
+BSC_INCOMING_WS_RPC_URL=wss://bsc-rpc.publicnode.com
+BSC_INCOMING_RPC_FALLBACK_URL=https://nd-000-000-000.p2pify.com/REPLACE_WITH_CHAINSTACK_NODE_TOKEN
+BSC_INCOMING_RPC_COOLDOWN_MS=30000
+USDT_PAYMENT_POLL_MS=30000
+USDT_CURSOR_HASH_CHECK_INTERVAL_MS=60000
+USDT_WS_MIN_SCAN_INTERVAL_MS=10000
+
+IMPORTANT CONFIGURATION NOTES
+- The Chainstack endpoint above is deliberately fictitious. Replace the host and token placeholder with the actual endpoint from the Chainstack project before deployment.
+- PublicNode publishes the BSC mainnet HTTPS endpoint and indicates HTTP RPC and WS RPC availability on its gateway page. Verify WebSocket availability and service behavior from the deployment environment before enabling production monitoring.
+- BSC_RPC_FALLBACK_URL remains as a legacy incoming-scanner alias only. Prefer BSC_INCOMING_RPC_FALLBACK_URL.
+- No automatic outgoing transaction fallback is added. A timeout after broadcast can be ambiguous; the transaction hash, signed raw transaction, nonce and receipt must be reconciled before any second-provider broadcast is attempted.
+- No database migration was added.
+
+FINANCIAL RULES PRESERVED
+- No positive incoming Transfer event is discarded due to a low amount.
+- Existing session aggregation, minimum amount, session timing, tranche/cap handling, wallet checks, user account capacity, fees, reserve handling, finality, manual review and pending-state rules remain in the existing financial modules.
+- Outgoing transaction construction, nonce handling, fee handling, payout eligibility and treasury rules are unchanged.
+
+VALIDATION
+- JavaScript syntax check: 78 files passed.
+- Targeted RPC routing, budget, reconciliation and recharge-policy tests: 40 passed, 0 failed.
+- Full suite: 142 total; 126 completed successfully. 16 tests could not start because the working test environment does not have the project runtime dependencies ethers and bignumber.js installed.
+- No live PublicNode or Chainstack RPC test was possible because no production credentials were supplied.

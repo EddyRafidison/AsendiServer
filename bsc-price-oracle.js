@@ -4,6 +4,7 @@ const { Contract, isAddress } = require("ethers");
 const BigNumber = require("bignumber.js");
 
 const CHAIN_ID = 56n;
+const FEED_METADATA_RECHECK_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_BNB_USD_FEED_ADDRESS = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE";
 const PRICE_FEED_ABI = [
   "function description() view returns (string)",
@@ -15,6 +16,7 @@ let cachedSnapshot = null;
 let refreshTimer = null;
 let refreshPromise = null;
 let oracleProvider = null;
+const validatedFeedCache = new WeakMap();
 
 function boundedIntegerEnv(name, fallback, minimum, maximum) {
   const raw = process.env[name];
@@ -131,28 +133,44 @@ async function refreshBnbUsdPrice(provider) {
 
   refreshPromise = (async () => {
     const config = getBnbUsdFeedConfig();
-    const network = await provider.getNetwork();
-    if (BigInt(network.chainId) !== CHAIN_ID) {
-      throw new Error("The Chainlink BNB/USD feed must be read from BNB Smart Chain mainnet (chain ID 56).");
+    let providerFeeds = validatedFeedCache.get(provider);
+    if (!providerFeeds) {
+      providerFeeds = new Map();
+      validatedFeedCache.set(provider, providerFeeds);
     }
 
-    const code = await provider.getCode(config.feedAddress);
-    if (!code || code === "0x") {
-      throw new Error("The configured Chainlink BNB/USD feed contract is unavailable on BNB Smart Chain.");
+    let feedState = providerFeeds.get(config.feedAddress.toLowerCase());
+    if (!feedState || Date.now() - feedState.validatedAtMs >= FEED_METADATA_RECHECK_MS) {
+      const network = await provider.getNetwork();
+      if (BigInt(network.chainId) !== CHAIN_ID) {
+        throw new Error("The Chainlink BNB/USD feed must be read from BNB Smart Chain mainnet (chain ID 56).");
+      }
+
+      const code = await provider.getCode(config.feedAddress);
+      if (!code || code === "0x") {
+        throw new Error("The configured Chainlink BNB/USD feed contract is unavailable on BNB Smart Chain.");
+      }
+
+      const feed = new Contract(config.feedAddress, PRICE_FEED_ABI, provider);
+      const [description, decimals] = await Promise.all([
+        feed.description(),
+        feed.decimals(),
+      ]);
+      if (!/^BNB\s*\/\s*USD$/i.test(String(description).trim())) {
+        throw new Error(`The configured Chainlink feed is not BNB/USD (reported description: ${String(description).slice(0, 80)}).`);
+      }
+      const precision = Number(decimals);
+      if (!Number.isSafeInteger(precision) || precision < 0 || precision > 36) {
+        throw new RangeError("Chainlink BNB/USD feed returned an invalid decimal precision.");
+      }
+      feedState = { feed, decimals: precision, validatedAtMs: Date.now() };
+      providerFeeds.set(config.feedAddress.toLowerCase(), feedState);
     }
 
-    const feed = new Contract(config.feedAddress, PRICE_FEED_ABI, provider);
-    const [description, decimals, round] = await Promise.all([
-      feed.description(),
-      feed.decimals(),
-      feed.latestRoundData(),
-    ]);
-    if (!/^BNB\s*\/\s*USD$/i.test(String(description).trim())) {
-      throw new Error(`The configured Chainlink feed is not BNB/USD (reported description: ${String(description).slice(0, 80)}).`);
-    }
+    const round = await feedState.feed.latestRoundData();
     const normalized = normalizeChainlinkPriceRound(
       round,
-      decimals,
+      feedState.decimals,
       Math.floor(Date.now() / 1000),
       config.maxAgeSeconds,
     );

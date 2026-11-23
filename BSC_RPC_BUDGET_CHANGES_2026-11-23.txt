@@ -1,0 +1,56 @@
+OneXServer — BSC RPC budget and reliability improvements
+Date: 2026-11-23
+
+Scope
+- Applied to the supplied OneXServer project archive.
+- No business rules, recharge eligibility rules, payout rules, wallet ownership rules, reserve priorities, or database schema were changed.
+- No production .env file or API credentials were included or modified.
+
+Changes
+1. Incoming BSC scanner cursor checks
+- Added USDT_CURSOR_HASH_CHECK_INTERVAL_MS (default 60000 ms; accepted range 15000–900000 ms).
+- For endpoints supporting the finalized block tag, retain the canonical cursor hash obtained at the end of a successful scan and revalidate it at startup/provider changes and at the configured interval.
+- For confirmation-count fallback mode, continue validating the cursor on every scan.
+- Preserve the validation timestamp as the scan cursor advances, so frequent scans cannot postpone periodic integrity checks indefinitely.
+- The scanner continues to stop for administrative reconciliation on a detected cursor hash mismatch.
+
+2. Bounded WebSocket wake-ups
+- Added USDT_WS_MIN_SCAN_INTERVAL_MS (default 10000 ms and always clamped to at least USDT_PAYMENT_POLL_MS).
+- WebSocket new-block notifications only wake the HTTP scanner; they cannot cause HTTP scans more frequently than the configured minimum interval.
+- The HTTP scanner remains the durable source of truth. The example configuration keeps BSC_WS_RPC_URL empty, avoiding a WebSocket subscription unless explicitly configured.
+
+3. Per-range RPC response reuse
+- Cache transaction receipts by transaction hash and canonical block responses by block number only for the lifetime of one scanned range.
+- Multiple Transfer logs from the same transaction or block no longer trigger repeated receipt/block reads in that range.
+- Cache is discarded after each range; no stale chain response is reused indefinitely.
+
+4. Chainlink BNB/USD oracle
+- Validate feed chain, contract code, description and decimals on initial use and revalidate metadata every 24 hours.
+- Normal refreshes continue to read latestRoundData at the configured refresh interval (default 60 seconds).
+- Price freshness, positivity and round checks remain in place.
+
+5. RPC usage and health metrics
+- Direct HTTPS scanner/reconciliation calls record provider hostname, method, request/error/rate-limit/timeout counts, latency and JSON body byte totals (excluding HTTP headers).
+- Ethers v6 providers used by disbursement, Cold Wallet, Hot Wallet liquidity and the optional incoming-scanner WebSocket hint now emit per-method metrics from debug events. WebSocket block notifications and errors are counted separately; notification counts are not equivalent to a vendor's billable-unit calculation.
+- Main-process metrics are included only in the admin scanner status response; public account endpoints request the lightweight scanner state without building diagnostic snapshots. Separately launched workers emit hourly ONEX_BSC_ETHERS_RPC_METRICS log entries.
+- Transport-level Ethers errors are counted separately when Ethers does not provide request IDs; they are not incorrectly attributed to every outstanding method.
+- Only provider hostnames are retained; full endpoint URLs, paths, API keys and JSON-RPC parameters are not stored in metrics.
+- Counters are process-local and reset on process restart. Ethers payload byte values are serialized-size estimates, not exact wire measurements.
+
+Configuration defaults added to .env.example
+- USDT_CURSOR_HASH_CHECK_INTERVAL_MS=60000
+- USDT_WS_MIN_SCAN_INTERVAL_MS=10000
+- BSC_WS_RPC_URL remains empty by default.
+
+Validation performed
+- JavaScript syntax check: passed for all 76 JavaScript files.
+- Focused test suites: 21 tests passed, 0 failed (RPC budget/efficiency, reconciliation policy, shared treasury policy).
+- Full test suite could not be completed in this extracted archive because node_modules are not present; dependency-based tests requiring packages such as ethers and bignumber.js cannot load until dependencies are installed.
+- No live Chainstack/RPC credentials, production .env, or production traffic counters were available. Therefore this change adds measurement and removes avoidable duplicate traffic, but does not claim measured production consumption.
+
+Operational notes
+- Keep BSC_WS_RPC_URL empty initially unless low-latency wake-up behavior is required.
+- Keep USDT_PAYMENT_POLL_MS at 10000 ms as in .env.example for the initial production measurement.
+- After deployment, observe at least 24 hours of ONEX_BSC_RPC_METRICS and ONEX_BSC_ETHERS_RPC_METRICS logs before purchasing larger RPC plans.
+- Admin status route: POST /admin/bsc/incoming-scanner/status (existing admin authentication applies).
+- Do not disable cursor validation, receipt verification, canonical block checks, or reconciliation safeguards to save RPC cost.

@@ -29,6 +29,7 @@ const {
   recordActualBscFeeTx,
 } = require("./bsc-fee-accounting");
 const { getBnbUsdPrice, startBnbUsdPriceOracle } = require("./bsc-price-oracle");
+const { attachEthersRpcMetrics } = require("./bsc-rpc-ethers-metrics");
 const { createBscFeeLimitError, getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
 const { SYSTEM_ADMIN_RESERVE_RATIO } = require("./recharge-policy");
 const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
@@ -174,6 +175,7 @@ function makeRuntime({ needDisbursement = true, needTreasury = true } = {}) {
   }
 
   const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
+  attachEthersRpcMetrics(provider, rpcUrl, "disbursement-worker");
   const token = new Contract(tokenAddress, BALANCE_INTERFACE, provider);
   const createWalletRuntime = (privateKeyName, address, role) => {
     const privateKey = String(process.env[privateKeyName] || "").trim();
@@ -317,6 +319,7 @@ async function checkTreasuryLiquidity(amountRaw, payoutAddress, options = {}) {
   }
 
   const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
+  attachEthersRpcMetrics(provider, rpcUrl, "disbursement-liquidity-check");
   try {
     const network = await provider.getNetwork();
     if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("Hot Wallet RPC is not BNB Smart Chain mainnet.");
@@ -386,6 +389,7 @@ async function checkDisbursementLiquidity(amountRaw, payoutAddress, options = {}
     throw new Error("Disbursement Wallet liquidity check is not correctly configured.");
   }
   const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
+  attachEthersRpcMetrics(provider, rpcUrl, "disbursement-liquidity-check");
   try {
     const network = await provider.getNetwork();
     if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("Disbursement Wallet RPC is not BNB Smart Chain mainnet.");
@@ -445,6 +449,7 @@ async function checkDisbursementReserveCapacity(requiredAmountBscUsd, options = 
     throw new Error("Disbursement Wallet reserve check is not correctly configured.");
   }
   const provider = new JsonRpcProvider(rpcUrl, 56, { staticNetwork: true });
+  attachEthersRpcMetrics(provider, rpcUrl, "disbursement-reserve-check");
   try {
     const network = await provider.getNetwork();
     if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("Disbursement Wallet RPC is not BNB Smart Chain mainnet.");

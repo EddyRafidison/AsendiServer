@@ -4568,7 +4568,7 @@ router.post("/admin/bsc/incoming-scanner/status", async (req, res) => {
     pin !== decrypt(admin_pin, DB_CONFIG.password)
   ) return res.send({ scanner: "incorrect admin credentials" });
   try {
-    const state = await getIncomingScannerStatus(db);
+    const state = await getIncomingScannerStatus(db, { includeRpcMetrics: true });
     return res.send({ scanner: "ok", state });
   } catch (error) {
     console.error("BSC incoming scanner status failed:", error.message);
