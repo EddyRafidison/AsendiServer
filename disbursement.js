@@ -982,6 +982,7 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
         bonusInitialAsset: isGlobalDisbursement ? bonusInitialAssets : new BigNumber(0),
       },
       common.sys_inactive_init_asset || "0",
+      unitPrice,
     );
     if (isGlobalDisbursement) {
       const remainingAdminReserve = calculateRemainingSystemAdminReserve(

@@ -60,8 +60,8 @@ function evaluateRechargeCredit({
   }
 
   const currentPrice = calculateGlobalUnitPrice(total, backed);
-  if (currentPrice.minus(price).abs().gt("0.000000000000000000000000000001")) {
-    throw new RangeError("Current XTU price is inconsistent with common reserve values");
+  if (currentPrice.minus(price).gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price must not be below the reserve valuation ratio");
   }
 
   const feeAmount = gross.multipliedBy(feeRate).dividedBy(100);
@@ -99,7 +99,7 @@ function evaluateRechargeCredit({
   if (!newBacked.isGreaterThan(0) || newBacked.lt(protectedFloor)) {
     return { allowed: false, reason: "system_reserve", allocation };
   }
-  const newPrice = calculateGlobalUnitPrice(newTotal, newBacked);
+  const newPrice = calculateGlobalUnitPrice(newTotal, newBacked, price);
   const stockLimit = typeof stockLimitEvaluator === "function"
     ? stockLimitEvaluator(balance, requestedInitialAsset, newPrice)
     : isUserBalanceWithinMaxStock(balance, requestedInitialAsset, newPrice, maximumXtu);

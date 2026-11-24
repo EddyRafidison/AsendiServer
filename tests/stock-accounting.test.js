@@ -16,9 +16,11 @@ const {
 
 const fixed = (value) => value.toFixed();
 
-test("the only live unit price is total_units_price divided by backed_units", () => {
+test("the global unit price is the reserve ratio, subject to a caller-supplied monotone floor", () => {
   assert.equal(fixed(calculateGlobalUnitPrice("10000000", "10000000")), "1");
   assert.equal(fixed(calculateGlobalUnitPrice("10000000", "8000000")), "1.25");
+  assert.equal(fixed(calculateGlobalUnitPrice("90", "100", "1.2")), "1.2");
+  assert.equal(fixed(calculateGlobalUnitPrice("150", "100", "1.2")), "1.5");
   assert.equal(fixed(xtuToInitialAsset("125000", "1.25")), "100000");
   assert.equal(fixed(initialAssetToXtu("100000", "1.25")), "125000");
   assert.throws(() => calculateGlobalUnitPrice("100", "0"), /backed_units/);

@@ -6,6 +6,7 @@ const { calculateGlobalUnitPrice } = require("./stock-accounting");
 const COMMON_NUMERIC_FIELDS = Object.freeze([
   "total_units_price",
   "unit_price",
+  "xtu_wallets",
   "backed_units",
   "inactive_init_asset",
   "sys_inactive_init_asset",
@@ -26,7 +27,13 @@ function commonSnapshotValues(row, overrides = {}) {
     if (field === "unit_price") continue;
     values[field] = String(overrides[field] ?? row?.[field] ?? "0");
   }
-  const calculatedPrice = calculateGlobalUnitPrice(values.total_units_price, values.backed_units);
+  const previousPrice = new BigNumber(row?.unit_price ?? "0");
+  const requestedPrice = new BigNumber(overrides.unit_price ?? row?.unit_price ?? "0");
+  if (!previousPrice.isFinite() || previousPrice.isNegative() || !requestedPrice.isFinite() || requestedPrice.isNegative()) {
+    throw new RangeError("The global XTU price floor must be finite and non-negative.");
+  }
+  const minimumPrice = BigNumber.maximum(previousPrice, requestedPrice);
+  const calculatedPrice = calculateGlobalUnitPrice(values.total_units_price, values.backed_units, minimumPrice);
   values.unit_price = calculatedPrice.toFixed(30);
   return values;
 }
@@ -45,6 +52,11 @@ function assertCumulativeNonNegative(fieldName, previousValue, nextValue) {
 
 async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
   const values = commonSnapshotValues(currentRow, overrides);
+  assertCumulativeNonNegative(
+    "xtu_wallets",
+    currentRow?.xtu_wallets || "0",
+    values.xtu_wallets,
+  );
   assertCumulativeNonNegative(
     "sys_inactive_init_asset",
     currentRow?.sys_inactive_init_asset || "0",
@@ -93,10 +105,11 @@ async function getLatestCommonTx(tx, lock = true) {
   );
   if (!rows.length) throw new Error("Common reserve is not initialized");
   const row = rows[0];
-  const expected = calculateGlobalUnitPrice(row.total_units_price, row.backed_units);
+  const minimumRequired = calculateGlobalUnitPrice(row.total_units_price, row.backed_units);
   const stored = new BigNumber(row.unit_price);
-  if (!stored.isFinite() || stored.minus(expected).abs().gt("0.000000000000000000000000000001")) {
-    throw new Error("common.unit_price is inconsistent with common.total_units_price / common.backed_units");
+  if (!stored.isFinite() || !stored.isGreaterThan(0) ||
+      minimumRequired.minus(stored).gt("0.000000000000000000000000000001")) {
+    throw new Error("common.unit_price must be positive and not below common.total_units_price / common.backed_units");
   }
   return row;
 }

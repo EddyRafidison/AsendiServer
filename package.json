@@ -10,7 +10,8 @@
     "script-runner": "^0.1.8",
     "transliteration": "^2.3.5",
     "argon2": "0.41.1",
-    "ethers": "^6.17.0"
+    "ethers": "^6.17.0",
+    "@openzeppelin/contracts": "^5.6.1"
   },
   "name": "onex",
   "version": "1.0.0",
@@ -21,12 +22,15 @@
     "check": "node scripts/syntax-check.js",
     "disburse": "node disbursement-worker.js",
     "telegram": "node telegram-worker.js",
-    "treasury": "node treasury-worker.js"
+    "treasury": "node treasury-worker.js",
+    "xtu-withdrawals": "node xtu-withdrawal-worker.js",
+    "compile:xtu": "node scripts/compile-xtu.js",
+    "deploy:xtu": "node scripts/deploy-xtu.js"
   },
   "keywords": [],
   "author": "Eddy Rafidison",
   "license": "UNLICENSED",
-  "description": "OneX backend: BNB Smart Chain deposit, P2P accounting, treasury disbursement and reconciliation.",
+  "description": "OneX backend: BNB Smart Chain XTU token, deposits, P2P accounting, treasury disbursement and reconciliation.",
   "repository": "git+https://github.com/EddyRafidison/AsendiServer.git",
   "bugs": {
     "url": "https://github.com/EddyRafidison/AsendiServer/issues"
@@ -34,5 +38,9 @@
   "homepage": "https://github.com/EddyRafidison/AsendiServer#readme",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "ganache": "^7.9.2",
+    "solc": "0.8.30"
   }
 }

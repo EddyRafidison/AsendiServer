@@ -1,0 +1,189 @@
+"use strict";
+
+const path = require("path");
+const dotenv = require("dotenv");
+const BigNumber = require("bignumber.js");
+const {
+  Contract,
+  JsonRpcProvider,
+  Wallet,
+  isAddress,
+  getAddress,
+  keccak256,
+} = require("ethers");
+const { estimateBscTokenTransfer, calculateEstimatedGasFee } = require("./bsc-fee-accounting");
+const { getBnbUsdPrice } = require("./bsc-price-oracle");
+const { getConfiguredMaxBscTxFeeUsd, evaluateBscTxFee } = require("./bsc-transaction-policy");
+const { calculateXtuWithdrawalQuote, XTU_DECIMALS } = require("./xtu-withdrawal-policy");
+
+const CHAIN_ID = 56n;
+const XTU_ABI = Object.freeze([
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)",
+  "function balanceOf(address) view returns (uint256)",
+  "function feeCollector() view returns (address)",
+  "function TRANSFER_FEE_BPS() view returns (uint256)",
+  "function transfer(address to,uint256 value) returns (bool)",
+  "event Transfer(address indexed from,address indexed to,uint256 value)",
+  "event FeeCollected(address indexed from,address indexed collector,uint256 amount)",
+]);
+
+let cachedRuntime = null;
+
+function readBoundedInteger(name, fallback, min, max) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be an integer between ${min} and ${max}.`);
+  }
+  return value;
+}
+
+function loadXtuEnvironment() {
+  const envPath = path.resolve(process.env.XTU_ENV_FILE || ".env.xtu");
+  dotenv.config({ path: envPath });
+  return envPath;
+}
+
+function isXtuWorkerEnabled() {
+  loadXtuEnvironment();
+  return String(process.env.XTU_WITHDRAWAL_WORKER_ENABLED || "false").toLowerCase() === "true";
+}
+
+function getXtuSettings() {
+  loadXtuEnvironment();
+  const chainId = String(process.env.XTU_CHAIN_ID || "56");
+  if (chainId !== "56") throw new Error("XTU_CHAIN_ID must be 56 (BNB Smart Chain mainnet).");
+  const tokenAddress = String(process.env.XTU_TOKEN_CONTRACT_ADDRESS || "").trim();
+  const distributionAddress = String(process.env.XTU_DISTRIBUTION_ADDRESS || "").trim();
+  const privateKey = String(process.env.XTU_DISTRIBUTION_PRIVATE_KEY || "").trim();
+  const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
+  if (!isAddress(tokenAddress) || /^0x0{40}$/i.test(tokenAddress)) {
+    throw new Error("XTU_TOKEN_CONTRACT_ADDRESS must be a deployed contract address.");
+  }
+  if (!isAddress(distributionAddress) || /^0x0{40}$/i.test(distributionAddress)) {
+    throw new Error("XTU_DISTRIBUTION_ADDRESS must be a valid non-zero address.");
+  }
+  if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
+    throw new Error("XTU_DISTRIBUTION_PRIVATE_KEY must be a valid 32-byte private key.");
+  }
+  if (!rpcUrl) throw new Error("BSC_RPC_URL (Chainstack outgoing RPC) is required for XTU withdrawals.");
+  return {
+    envPath,
+    rpcUrl,
+    tokenAddress: getAddress(tokenAddress),
+    distributionAddress: getAddress(distributionAddress),
+    privateKey,
+    minConfirmations: readBoundedInteger("XTU_MIN_CONFIRMATIONS", 15, 1, 200),
+    pollMs: readBoundedInteger("XTU_WITHDRAWAL_POLL_MS", 15000, 5000, 300000),
+    gasLimitCeiling: BigInt(readBoundedInteger("XTU_WITHDRAWAL_GAS_LIMIT", 250000, 50000, 1000000)),
+    retryMs: readBoundedInteger("XTU_WITHDRAWAL_RETRY_MS", 60000, 10000, 3600000),
+    maxPendingPerUser: readBoundedInteger("XTU_MAX_PENDING_PER_USER", 1, 1, 5),
+    workerEnabled: String(process.env.XTU_WITHDRAWAL_WORKER_ENABLED || "false").toLowerCase() === "true",
+  };
+}
+
+async function getXtuRuntime({ requireSigner = true } = {}) {
+  const settings = getXtuSettings();
+  const cacheKey = `${settings.rpcUrl}|${settings.tokenAddress.toLowerCase()}|${settings.distributionAddress.toLowerCase()}|${requireSigner}`;
+  if (cachedRuntime?.cacheKey === cacheKey && (!requireSigner || cachedRuntime.signer)) return cachedRuntime;
+
+  const provider = new JsonRpcProvider(settings.rpcUrl, CHAIN_ID);
+  const network = await provider.getNetwork();
+  if (BigInt(network.chainId) !== CHAIN_ID) throw new Error("The outgoing RPC is not connected to BNB Smart Chain mainnet (chain ID 56).");
+  const code = await provider.getCode(settings.tokenAddress);
+  if (!code || code === "0x") throw new Error("The configured XTU contract address has no deployed bytecode.");
+
+  const contract = new Contract(settings.tokenAddress, XTU_ABI, provider);
+  const [name, symbol, decimals, supply, collector] = await Promise.all([
+    contract.name(), contract.symbol(), contract.decimals(), contract.totalSupply(), contract.feeCollector(),
+  ]);
+  const feeBps = await contract.TRANSFER_FEE_BPS();
+  if (String(name) !== "OneX Token" || String(symbol) !== "XTU" || Number(decimals) !== XTU_DECIMALS) {
+    throw new Error("The configured token contract is not the expected OneX Token (XTU, 18 decimals).");
+  }
+  const expectedSupply = 100_000_000_000n * (10n ** 18n);
+  if (BigInt(supply) !== expectedSupply) throw new Error("The XTU contract total supply does not match the fixed 100-billion XTU supply.");
+  if (getAddress(String(collector)) !== settings.distributionAddress || BigInt(feeBps) !== 10n) {
+    throw new Error("The XTU contract fee collector or mandatory 0.1% fee does not match the configured distribution wallet.");
+  }
+
+  let signer = null;
+  if (requireSigner) {
+    signer = new Wallet(settings.privateKey, provider);
+    if (signer.address !== settings.distributionAddress) {
+      throw new Error("XTU distribution private key does not match XTU_DISTRIBUTION_ADDRESS.");
+    }
+  }
+  cachedRuntime = { cacheKey, settings, provider, contract, signer };
+  return cachedRuntime;
+}
+
+async function estimateXtuWithdrawal({ destination, grossAmount }) {
+  const runtime = await getXtuRuntime({ requireSigner: true });
+  const to = getAddress(String(destination));
+  if (to === runtime.settings.distributionAddress) throw new Error("The registered wallet cannot be the XTU distribution wallet.");
+  const bnbUsdPrice = await getBnbUsdPrice(runtime.provider, { forceRefresh: true });
+  const grossRaw = BigInt(new BigNumber(grossAmount).multipliedBy("1e18").integerValue(BigNumber.ROUND_DOWN).toFixed(0));
+  if (grossRaw <= 0n) throw new Error("Gross XTU amount must be positive.");
+
+  // Estimate the gas using an amount close to the requested gross withdrawal.
+  const data = runtime.contract.interface.encodeFunctionData("transfer", [to, grossRaw]);
+  const estimate = await estimateBscTokenTransfer({
+    provider: runtime.provider,
+    fromAddress: runtime.settings.distributionAddress,
+    tokenAddress: runtime.settings.tokenAddress,
+    data,
+    maximumGasLimit: runtime.settings.gasLimitCeiling,
+    bnbUsdPrice,
+  });
+  const bufferedGasLimit = (estimate.gasLimit * 120n + 99n) / 100n;
+  if (bufferedGasLimit > runtime.settings.gasLimitCeiling) {
+    throw new RangeError("The buffered XTU withdrawal gas limit exceeds XTU_WITHDRAWAL_GAS_LIMIT.");
+  }
+  const gas = calculateEstimatedGasFee(bufferedGasLimit.toString(), estimate.gasPrice.toString(), bnbUsdPrice);
+  const decision = evaluateBscTxFee(gas.feeUsd, getConfiguredMaxBscTxFeeUsd());
+  if (!decision.allowed) {
+    const error = new Error(`Estimated BSC gas fee ${gas.feeUsd.toFixed(8)} exceeds the configured 0.4 BSC-USD ceiling.`);
+    error.code = "BSC_GAS_FEE_LIMIT_EXCEEDED";
+    throw error;
+  }
+
+  const quote = calculateXtuWithdrawalQuote(grossAmount, gas.feeUsd);
+  const [tokenBalance, nativeBalance] = await Promise.all([
+    runtime.contract.balanceOf(runtime.settings.distributionAddress),
+    runtime.provider.getBalance(runtime.settings.distributionAddress),
+  ]);
+  if (BigInt(tokenBalance) < BigInt(quote.netRaw)) throw new Error("The XTU distribution wallet does not have enough transferable XTU.");
+  if (BigInt(nativeBalance) < BigInt(gas.feeBnb.multipliedBy("1e18").integerValue(BigNumber.ROUND_CEIL).toFixed(0))) {
+    throw new Error("The XTU distribution wallet does not have enough BNB to pay the estimated network fee.");
+  }
+
+  return {
+    ...quote,
+    gasLimit: bufferedGasLimit.toString(),
+    gasPriceWei: estimate.gasPrice.toString(),
+    estimatedGasFeeBnb: gas.feeBnb.toFixed(30),
+    estimatedGasFeeUsd: gas.feeUsd.toFixed(30),
+    bnbUsdPrice: bnbUsdPrice.toFixed(18),
+    destination: to,
+    tokenContract: runtime.settings.tokenAddress,
+    distributionAddress: runtime.settings.distributionAddress,
+  };
+}
+
+function transactionHashFromRaw(rawTx) {
+  return keccak256(rawTx).toLowerCase();
+}
+
+module.exports = {
+  XTU_ABI,
+  getXtuSettings,
+  isXtuWorkerEnabled,
+  getXtuRuntime,
+  estimateXtuWithdrawal,
+  transactionHashFromRaw,
+};

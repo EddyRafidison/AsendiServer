@@ -11,12 +11,15 @@ function asBigNumber(value, fieldName) {
 }
 
 /** The only OneX price: public XTU value per initial asset. */
-function calculateGlobalUnitPrice(totalUnitsPriceValue, backedUnitsValue) {
+function calculateGlobalUnitPrice(totalUnitsPriceValue, backedUnitsValue, minimumPriceValue = 0) {
   const totalUnitsPrice = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
   const backedUnits = asBigNumber(backedUnitsValue, "common.backed_units");
   if (!totalUnitsPrice.isGreaterThan(0)) throw new RangeError("common.total_units_price must be positive");
   if (!backedUnits.isGreaterThan(0)) throw new RangeError("common.backed_units must remain positive");
-  const price = totalUnitsPrice.dividedBy(backedUnits);
+  const minimumPrice = asBigNumber(minimumPriceValue, "minimum global unit price");
+  if (minimumPrice.isNegative()) throw new RangeError("The minimum global unit price cannot be negative");
+  const reserveRatioPrice = totalUnitsPrice.dividedBy(backedUnits);
+  const price = BigNumber.maximum(reserveRatioPrice, minimumPrice);
   if (!price.isFinite() || !price.isGreaterThan(0)) throw new RangeError("The global unit price is invalid");
   return price;
 }
@@ -89,8 +92,8 @@ function calculateAdminCommonStockUpdate(
 
   if (!amount.isGreaterThan(0)) throw new RangeError("Administrative amount must be positive");
   if (!unitPrice.isGreaterThan(0)) throw new RangeError("common.unit_price must be positive");
-  if (calculatedPrice.minus(unitPrice).abs().gt("0.000000000000000000000000000001")) {
-    throw new RangeError("common.unit_price is inconsistent with total_units_price / backed_units");
+  if (calculatedPrice.minus(unitPrice).gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price must not be below total_units_price / backed_units");
   }
 
   const availableInitialAsset = BigNumber.minimum(reserve.remainingInitialAsset, backedUnits);
@@ -116,7 +119,7 @@ function calculateAdminCommonStockUpdate(
   const newBackedUnits = backedUnits.minus(spentInitialAsset);
   const newSysInactiveInitAsset = sysInactive.plus(spentInitialAsset);
   const newTotalUnitsPrice = totalUnitsPrice.minus(amount);
-  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits);
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits, unitPrice);
   const remainingAdminInitialAsset = reserve.remainingInitialAsset.minus(spentInitialAsset);
 
   if (
@@ -184,7 +187,7 @@ function calculateUnreservedDistributableInitialAssets(
  * Allocate a system-funded XTU top-up using initial-asset reserves. The XTU
  * amount is valued at the transaction's pre-operation global price. Inactive
  * assets are consumed first; backed assets may only be consumed above the
- * remaining administrative quota. New price is always recomputed as T / B.
+ * remaining administrative quota. New price is the maximum of the prior global price and the resulting T / B ratio.
  */
 function calculateTopUpReserveAllocation(
   amountValue,
@@ -207,9 +210,9 @@ function calculateTopUpReserveAllocation(
     throw new RangeError("Reserve amounts and protected floor cannot be negative");
   }
   if (!totalUnitsPrice.isGreaterThan(0)) throw new RangeError("common.total_units_price must be positive");
-  const currentPrice = calculateGlobalUnitPrice(totalUnitsPrice, backed);
-  if (currentPrice.minus(unitPrice).abs().gt("0.000000000000000000000000000001")) {
-    throw new RangeError("common.unit_price is inconsistent with total_units_price / backed_units");
+  const minimumRequiredPrice = calculateGlobalUnitPrice(totalUnitsPrice, backed);
+  if (minimumRequiredPrice.minus(unitPrice).gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price must not be below total_units_price / backed_units");
   }
 
   const activityAmount = xtuToInitialAsset(amountXtu, unitPrice);
@@ -239,7 +242,7 @@ function calculateTopUpReserveAllocation(
   const newInactive = inactive.minus(consumedInactive);
   const newBacked = backed.minus(consumedBacked);
   const newTotalUnitsPrice = totalUnitsPrice.plus(amountXtu);
-  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBacked);
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBacked, unitPrice);
   if (newBacked.isLessThan(nonDistributableFloor)) {
     throw new RangeError("Top-up allocation would consume the administrative reserve floor");
   }
@@ -297,9 +300,9 @@ function calculateRechargeFundingAllocation(
     throw new RangeError("common.backed_units is below the remaining administrative reserve quota");
   }
 
-  const currentPrice = calculateGlobalUnitPrice(total, backed);
-  if (currentPrice.minus(unitPrice).abs().gt("0.000000000000000000000000000001")) {
-    throw new RangeError("common.unit_price is inconsistent with total_units_price / backed_units");
+  const minimumRequiredPrice = calculateGlobalUnitPrice(total, backed);
+  if (minimumRequiredPrice.minus(unitPrice).gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price must not be below total_units_price / backed_units");
   }
 
   const distributableBacked = backed.minus(protectedFloor);
@@ -343,7 +346,7 @@ function calculateRechargeFundingAllocation(
   const newSellersReserve = sellers.minus(consumedSellers);
   const newBacked = backed.minus(consumedBacked);
   const newTotalUnitsPrice = total.plus(systemAmountXtu);
-  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBacked);
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBacked, unitPrice);
 
   if (newBacked.isLessThan(protectedFloor) || newInactive.isNegative() || newSellersReserve.isNegative()) {
     throw new RangeError("Recharge allocation would breach a protected reserve");

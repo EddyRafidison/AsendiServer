@@ -128,16 +128,19 @@ function calculateDisbursementReserveSettlement(
   inactiveInitAssetValue,
   disbursement,
   sysInactiveInitAssetValue = "0",
+  minimumUnitPriceValue = "0",
 ) {
   const totalUnitsPrice = new BigNumber(totalUnitsPriceValue);
   const backedUnits = new BigNumber(backedUnitsValue);
   const inactiveInitAsset = new BigNumber(inactiveInitAssetValue);
   const sysInactiveInitAsset = new BigNumber(sysInactiveInitAssetValue);
+  const minimumUnitPrice = new BigNumber(minimumUnitPriceValue);
   if (
     !totalUnitsPrice.isFinite() || !totalUnitsPrice.isGreaterThan(0) ||
     !backedUnits.isFinite() || !backedUnits.isGreaterThan(0) ||
     !inactiveInitAsset.isFinite() || inactiveInitAsset.isNegative() ||
-    !sysInactiveInitAsset.isFinite() || sysInactiveInitAsset.isNegative()
+    !sysInactiveInitAsset.isFinite() || sysInactiveInitAsset.isNegative() ||
+    !minimumUnitPrice.isFinite() || minimumUnitPrice.isNegative()
   ) {
     throw new RangeError("Common reserve values must be finite and non-negative, with positive backing");
   }
@@ -176,7 +179,7 @@ function calculateDisbursementReserveSettlement(
   if (!newTotalUnitsPrice.isGreaterThan(0) || !newBackedUnits.isGreaterThan(0)) {
     throw new RangeError("Disbursement would exhaust the common reserve or backing");
   }
-  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits);
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits, minimumUnitPrice);
   return {
     newTotalUnitsPrice,
     reserveExpenseAmount,

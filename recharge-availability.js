@@ -76,8 +76,8 @@ function calculateAvailableRechargeReserveXtu({
   }
 
   const verifiedPrice = calculateGlobalUnitPrice(total, backed);
-  if (verifiedPrice.minus(price).abs().gt("0.000000000000000000000000000001")) {
-    throw new RangeError("common.unit_price is inconsistent with common.total_units_price / common.backed_units");
+  if (verifiedPrice.minus(price).gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price must not be below common.total_units_price / common.backed_units");
   }
 
   const adminReserve = calculateRemainingSystemAdminReserve(

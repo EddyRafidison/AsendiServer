@@ -13,7 +13,7 @@ const P2Pallowed = String(process.env.P2P_ALLOWED || "false").toLowerCase() === 
 const stock_limit = process.env.STOCK_LIMIT || "18000000";
 // The default launch configuration initializes 18,000,000 public XTU and
 // 18,000,000 backed initial assets, giving an initial global price of 1.
-// Operators may override these values; the price is always derived from T / B.
+// Operators may override these values; the initial price is derived from T / B. Later snapshots preserve the prior global price as a floor.
 const initial_backed_units = process.env.INITIAL_BACKED_UNITS || stock_limit;
 const tfees = Number(process.env.FEES || 0);
 const admin_pswd = process.env.ADMIN_PSWD || "";
@@ -200,7 +200,7 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS activities(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     sender VARCHAR(30) NOT NULL,
-    receiver VARCHAR(30) NOT NULL,
+    receiver VARCHAR(40) NOT NULL,
     type INT NOT NULL,
     amount DECIMAL(50,30) NOT NULL,
     unit_price DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -222,6 +222,7 @@ const TABLES = [
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     total_units_price DECIMAL(50,30) NOT NULL DEFAULT 18000000,
     unit_price DECIMAL(50,30) NOT NULL DEFAULT 1,
+    xtu_wallets DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Cumulative net XTU externalized to user wallets; never add it to reserves',
     backed_units DECIMAL(50,30) NOT NULL DEFAULT 18000000,
     inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     sys_inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -295,7 +296,7 @@ const TABLES = [
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(30) NOT NULL,
     run_balance DECIMAL(50,30) NOT NULL COMMENT 'Initial assets; unit_price stores the frozen individual valuation',
-    reserved_initial_asset DECIMAL(50,30) NOT NULL,
+    reserved_initial_asset DECIMAL(50,30) NOT NULL COMMENT 'User initial-asset principal reserved until the XTU transaction is resolved',
     unit_price DECIMAL(50,30) NOT NULL COMMENT 'Immutable individual price captured when the seller submitted this campaign',
     price_cycle_number INT UNSIGNED NOT NULL,
     sold_initial_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -452,6 +453,82 @@ const TABLES = [
     changed_by VARCHAR(64) NOT NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
     KEY idx_individual_disbursement_control_events_created(created_at_ms,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_withdrawal_control(
+    control_id TINYINT UNSIGNED PRIMARY KEY,
+    is_open TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    reason VARCHAR(1000) NULL,
+    changed_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    started_at_ms BIGINT UNSIGNED NULL,
+    stopped_at_ms BIGINT UNSIGNED NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_withdrawal_control_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    action VARCHAR(16) NOT NULL,
+    previous_open TINYINT UNSIGNED NOT NULL,
+    current_open TINYINT UNSIGNED NOT NULL,
+    reason VARCHAR(1000) NOT NULL,
+    changed_by VARCHAR(64) NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_xtu_withdrawal_control_events_created(created_at_ms,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_withdrawals(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    reference VARCHAR(64) NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    payout_address CHAR(42) NOT NULL,
+    gross_amount DECIMAL(36,18) NOT NULL,
+    reserved_initial_asset DECIMAL(50,30) NOT NULL COMMENT 'User initial-asset principal reserved until the XTU transaction is resolved',
+    effective_unit_price DECIMAL(50,30) NOT NULL,
+    global_unit_price DECIMAL(50,30) NOT NULL,
+    estimated_gas_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
+    estimated_gas_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
+    estimated_gas_fee_xtu DECIMAL(36,18) NOT NULL DEFAULT 0,
+    contract_transfer_amount DECIMAL(36,18) NOT NULL,
+    contract_fee_amount DECIMAL(36,18) NOT NULL,
+    net_amount DECIMAL(36,18) NOT NULL,
+    reserved_xtu_value DECIMAL(50,30) NOT NULL COMMENT 'Gross XTU reserve value removed at the captured individual price',
+    bnb_usd_price DECIMAL(36,18) NOT NULL,
+    amount_raw VARCHAR(80) NOT NULL,
+    gas_limit BIGINT UNSIGNED NOT NULL,
+    gas_price_wei VARCHAR(80) NOT NULL,
+    token_contract_address CHAR(42) NOT NULL,
+    raw_tx LONGTEXT NULL,
+    tx_hash CHAR(66) NULL,
+    nonce BIGINT UNSIGNED NULL,
+    block_number BIGINT UNSIGNED NULL,
+    actual_gas_fee_bnb DECIMAL(50,30) NULL,
+    actual_gas_fee_usd DECIMAL(50,30) NULL,
+    actual_contract_fee_amount DECIMAL(36,18) NULL,
+    actual_net_amount DECIMAL(36,18) NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'queued',
+    last_error VARCHAR(1000) NULL,
+    next_attempt_at_ms BIGINT UNSIGNED NOT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    signed_at_ms BIGINT UNSIGNED NULL,
+    submitted_at_ms BIGINT UNSIGNED NULL,
+    confirmed_at_ms BIGINT UNSIGNED NULL,
+    failed_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_xtu_withdrawals_reference(reference),
+    UNIQUE KEY uq_xtu_withdrawals_tx_hash(tx_hash),
+    KEY idx_xtu_withdrawals_status_due(status,next_attempt_at_ms,id),
+    KEY idx_xtu_withdrawals_username_status(username,status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_withdrawal_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    event_key VARCHAR(100) NOT NULL,
+    withdrawal_id BIGINT UNSIGNED NOT NULL,
+    event_type VARCHAR(32) NOT NULL,
+    previous_status VARCHAR(24) NULL,
+    current_status VARCHAR(24) NOT NULL,
+    actor VARCHAR(64) NOT NULL,
+    tx_hash CHAR(66) NULL,
+    details VARCHAR(1000) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_xtu_withdrawal_event_key(event_key),
+    KEY idx_xtu_withdrawal_events_withdrawal(withdrawal_id,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS account_cleanup_holds(
     username VARCHAR(30) PRIMARY KEY,
@@ -1002,7 +1079,7 @@ async function assertLatestSchema() {
     ],
     telegram_bot_state: ["state_key", "state_value", "updated_at_ms"],
     common: [
-      "total_units_price", "unit_price", "backed_units", "inactive_init_asset", "sys_inactive_init_asset",
+      "total_units_price", "unit_price", "xtu_wallets", "backed_units", "inactive_init_asset", "sys_inactive_init_asset",
       "sellers_res", "total_run_balance", "total_tfees", "total_tfees_bsc_cost_usd", "total_tfees_bsc_uncovered_usd", "total_bnb_fee_actual", "total_bnb_fee_estimated",
       "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "record_date", "record_time",
     ],
@@ -1040,6 +1117,10 @@ async function assertLatestSchema() {
     recharge_service_control_events: ["action", "previous_suspended", "current_suspended", "reason", "changed_by", "created_at_ms"],
     individual_disbursement_control: ["control_id", "is_open", "opening_reason", "notice_reference", "changed_by", "opened_at_ms", "closed_at_ms", "updated_at_ms"],
     individual_disbursement_control_events: ["action", "previous_open", "current_open", "reason", "notice_reference", "changed_by", "created_at_ms"],
+    xtu_withdrawal_control: ["control_id", "is_open", "reason", "changed_by", "started_at_ms", "stopped_at_ms", "updated_at_ms"],
+    xtu_withdrawal_control_events: ["action", "previous_open", "current_open", "reason", "changed_by", "created_at_ms"],
+    xtu_withdrawals: ["reference", "username", "payout_address", "gross_amount", "reserved_initial_asset", "effective_unit_price", "global_unit_price", "estimated_gas_fee_bnb", "estimated_gas_fee_usd", "estimated_gas_fee_xtu", "contract_transfer_amount", "contract_fee_amount", "net_amount", "reserved_xtu_value", "bnb_usd_price", "amount_raw", "gas_limit", "gas_price_wei", "token_contract_address", "raw_tx", "tx_hash", "nonce", "block_number", "actual_gas_fee_bnb", "actual_gas_fee_usd", "actual_contract_fee_amount", "actual_net_amount", "status", "last_error", "next_attempt_at_ms", "created_at_ms", "updated_at_ms", "signed_at_ms", "submitted_at_ms", "confirmed_at_ms", "failed_at_ms"],
+    xtu_withdrawal_events: ["event_key", "withdrawal_id", "event_type", "previous_status", "current_status", "actor", "tx_hash", "details", "created_at_ms"],
     system_locks: ["lock_name"],
     bsc_wallet_address_registry: ["wallet_address_lower", "wallet_address", "username", "registered_at_ms"],
     bsc_incoming_scan_state: ["chain_id", "token_contract", "treasury_address", "scan_start_block", "last_scanned_block", "last_scanned_block_hash", "last_finalized_block", "finality_method", "health_status", "manual_review_code", "manual_review_at_ms", "last_error", "updated_at_ms"],
@@ -1129,6 +1210,9 @@ async function assertLatestSchema() {
     ],
     recharge_service_control_events: ["idx_recharge_control_events_created"],
     individual_disbursement_control_events: ["idx_individual_disbursement_control_events_created"],
+    xtu_withdrawal_control_events: ["idx_xtu_withdrawal_control_events_created"],
+    xtu_withdrawals: ["uq_xtu_withdrawals_reference", "uq_xtu_withdrawals_tx_hash", "idx_xtu_withdrawals_status_due", "idx_xtu_withdrawals_username_status"],
+    xtu_withdrawal_events: ["uq_xtu_withdrawal_event_key", "idx_xtu_withdrawal_events_withdrawal"],
     users_seller_reserve_lots: ["idx_seller_lot_availability"],
     users_usdt_disbursements: ["idx_usdt_disbursement_reserve_availability"],
     users_usdt_recharge_credits: ["uq_recharge_credit_sequence", "uq_recharge_credit_reference"],
@@ -1182,8 +1266,14 @@ async function initDbIfEmpty() {
     [String(Date.now())],
   );
   await db.queryAsync(
-    "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?),(?),(?)",
-    ["common_state", "onex_bsc_disbursement_worker", "onex_hot_wallet_spend", "onex_cold_wallet_sweep"],
+    `INSERT IGNORE INTO xtu_withdrawal_control
+     (control_id,is_open,reason,changed_by,started_at_ms,stopped_at_ms,updated_at_ms)
+     VALUES(1,0,NULL,'system',NULL,NULL,?)`,
+    [String(Date.now())],
+  );
+  await db.queryAsync(
+    "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?),(?),(?),(?),(?)",
+    ["common_state", "onex_bsc_disbursement_worker", "onex_hot_wallet_spend", "onex_cold_wallet_sweep", "onex_xtu_wallet_spend", "onex_xtu_withdrawal_worker"],
   );
   await db.queryAsync(
     "INSERT IGNORE INTO telegram_bot_state(state_key,state_value,updated_at_ms) VALUES('update_offset',0,?)",
@@ -1201,8 +1291,8 @@ async function initDbIfEmpty() {
   const commonRows = await db.queryAsync("SELECT id FROM common ORDER BY id DESC LIMIT 1");
   if (!commonRows.length) {
     await db.queryAsync(
-      "INSERT INTO common(total_units_price,unit_price,backed_units,inactive_init_asset,sys_inactive_init_asset,sellers_res,total_run_balance,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?)",
-      [initialTotal.toFixed(), initialTotal.dividedBy(initialBacked).toFixed(30), initialBacked.toFixed(), "0", "0", "0", "0", "0", date, time],
+      "INSERT INTO common(total_units_price,unit_price,xtu_wallets,backed_units,inactive_init_asset,sys_inactive_init_asset,sellers_res,total_run_balance,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+      [initialTotal.toFixed(), initialTotal.dividedBy(initialBacked).toFixed(30), "0", initialBacked.toFixed(), "0", "0", "0", "0", "0", date, time],
     );
   }
 
@@ -1229,9 +1319,10 @@ async function initDbIfEmpty() {
   if (currentBackedInitialAssets.isLessThan(remainingAdminReserve)) {
     throw new Error("common.backed_units does not cover the remaining non-distributable administrative reserve quota.");
   }
-  const expectedUnitPrice = currentTotalUnitsPrice.dividedBy(currentBackedInitialAssets);
-  if (!storedUnitPrice.isFinite() || storedUnitPrice.minus(expectedUnitPrice).abs().gt("0.000000000000000000000000000001")) {
-    throw new Error("common.unit_price must equal common.total_units_price / common.backed_units");
+  const minimumUnitPrice = currentTotalUnitsPrice.dividedBy(currentBackedInitialAssets);
+  if (!storedUnitPrice.isFinite() || !storedUnitPrice.isGreaterThan(0) ||
+      minimumUnitPrice.minus(storedUnitPrice).gt("0.000000000000000000000000000001")) {
+    throw new Error("common.unit_price must be positive and not below common.total_units_price / common.backed_units");
   }
 
   console.log(`OneX database ready. UTC time: ${date} ${time}`);

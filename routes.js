@@ -470,6 +470,7 @@ async function applyWelcomeBonusAtFirstLoginTx(tx, authRow, nowMs) {
   const resultingPrice = calculateGlobalUnitPrice(
     allocation.newTotalUnitsPrice,
     allocation.newBacked,
+    unitPrice,
   );
   await resetUserPriceBasisTx(tx, authRow.username, resultingPrice, tfees, { source: "welcome_bonus" });
   await tx.query(
@@ -641,6 +642,32 @@ async function withTransaction(work, maxAttempts = 3) {
   throw new Error("Transaction retry limit reached");
 }
 
+
+const { registerXtuWithdrawalRoutes } = require("./xtu-withdrawal-routes");
+registerXtuWithdrawalRoutes(router, {
+  db,
+  OneX,
+  admin_pswd,
+  admin_pin,
+  DB_CONFIG,
+  decrypt,
+  normalizeUsername,
+  normalizeFormValue,
+  requestTokenIsValid,
+  getUserActivityPasswordState,
+  accountApiLimitReached,
+  withTransaction,
+  getDate,
+  createFinancialReference,
+  getLatestCommonTx,
+  insertCommonSnapshotTx,
+  getUserPriceStateTx,
+  calculateEffectiveIndividualPrice,
+  xtuToInitialAsset,
+  calculateRemainingSystemAdminReserve,
+  stock_limit,
+  SYSTEM_ADMIN_RESERVE_RATIO,
+});
 
 /**
  * Read a consistent recharge-availability snapshot. The common-state lock
@@ -844,6 +871,12 @@ async function applyUserTopUp(
      ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
   );
   if (pendingDisbursementRows.length) return { error: "disbursement is pending" };
+  const [pendingXtuRows] = await tx.query(
+    `SELECT id FROM xtu_withdrawals
+     WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
+     ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
+  );
+  if (pendingXtuRows.length) return { error: "XTU withdrawal is pending" };
 
   const userBalanceInitial = new BigNumber(userRows[0].balance);
   if (!userBalanceInitial.isFinite() || userBalanceInitial.isNegative()) {
@@ -1030,7 +1063,7 @@ async function applyUserTopUp(
     total_tfees_bsc_uncovered_usd: totalTfeesBscUncovered.toFixed(30),
   }, date, time);
 
-  const resultingPrice = calculateGlobalUnitPrice(newTotal, newBacked);
+  const resultingPrice = calculateGlobalUnitPrice(newTotal, newBacked, new BigNumber(common.unit_price));
   await recordUserOperationTx(
     tx, username, "purchase", creditedBasis, userBalanceInitial, newBalanceInitial,
     resultingPrice, appliedTfeesRate, reference,
@@ -1197,6 +1230,12 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
      ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
   );
   if (activeRows.length) return { transf: "disbursement pending" };
+  const [activeXtuRows] = await tx.query(
+    `SELECT id FROM xtu_withdrawals
+     WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
+     ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
+  );
+  if (activeXtuRows.length) return { transf: "XTU withdrawal pending" };
 
   const userBalanceInitial = new BigNumber(stockRows[0].balance);
   if (!userBalanceInitial.isFinite() || !userBalanceInitial.isGreaterThan(0)) {
@@ -3155,10 +3194,10 @@ router.post("/app/user-last-stock", async (req, res) => {
       const latestCommon = await getLatestCommonTx(tx, true);
       const latestUnitPrice = new BigNumber(latestCommon.unit_price);
       const verifiedPrice = calculateGlobalUnitPrice(
-        latestCommon.total_units_price, latestCommon.backed_units,
+        latestCommon.total_units_price, latestCommon.backed_units, latestUnitPrice,
       );
       if (!latestUnitPrice.isFinite() || !latestUnitPrice.isGreaterThan(0) ||
-          verifiedPrice.minus(latestUnitPrice).abs().gt("0.000000000000000000000000000001")) {
+          verifiedPrice.minus(latestUnitPrice).gt("0.000000000000000000000000000001")) {
         throw new Error("The current XTU price snapshot is inconsistent");
       }
       const [latestStockRows] = await tx.query(
@@ -3627,6 +3666,12 @@ router.post("/app/join-system-sellers", async (req, res) => {
          LIMIT 1 FOR UPDATE`, [U],
       );
       if (pendingRows.length) return { msg: "not allowed", reason: "disbursement_pending" };
+      const [pendingXtuRows] = await tx.query(
+        `SELECT id FROM xtu_withdrawals
+         WHERE username=? AND status IN ('queued','signed','submitted','manual_review')
+         LIMIT 1 FOR UPDATE`, [U],
+      );
+      if (pendingXtuRows.length) return { msg: "not allowed", reason: "xtu_withdrawal_pending" };
 
       // A threshold crossing must be applied synchronously before seller eligibility is checked.
       await triggerUserPriceThresholdTx(tx, U, unitPrice);
@@ -4017,6 +4062,16 @@ router.post("/app/xtu-transfer", async (req, res) => {
       if (pendingDisbursements.length > 0) {
         return { transf: "disbursement pending" };
       }
+      const [pendingXtuWithdrawals] = await tx.query(
+        `SELECT id,username FROM xtu_withdrawals
+         WHERE username IN (?,?)
+           AND status IN ('queued','signed','submitted','manual_review')
+         LIMIT 1 FOR UPDATE`,
+        [S, D],
+      );
+      if (pendingXtuWithdrawals.length > 0) {
+        return { transf: "XTU withdrawal pending" };
+      }
 
       const stockNames = [...new Set([S, D])].sort();
       const stockByName = new Map();
@@ -4093,7 +4148,7 @@ router.post("/app/xtu-transfer", async (req, res) => {
       const feesXtu = feesInitialAsset.multipliedBy(unitPrice);
       const newTotalUnitsPrice = lastTotal.plus(feesXtu);
       const newBackedUnits = backedUnits.plus(feesInitialAsset);
-      const resultingPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits);
+      const resultingPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits, unitPrice);
       const destinationLimit = previewUserOperationCapacity(
         destinationPriceState, "purchase", recipientCreditInitial,
         destinationBalanceInitial, futureDestinationBalanceInitial, resultingPrice,
@@ -5306,6 +5361,10 @@ router.post("/app/delete-user", async (req, res) => {
         `SELECT id FROM users_usdt_disbursements
          WHERE username=? AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`, [U],
       );
+      const [pendingXtuWithdrawals] = await tx.query(
+        `SELECT id FROM xtu_withdrawals
+         WHERE username=? AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`, [U],
+      );
       const [pendingBatches] = await tx.query(
         `SELECT id FROM users_usdt_deposit_batches
          WHERE username=? AND status IN ('collecting','batched','ready','finalizing','pending_minimum','pending_credit','pending_weekly','pending_reserve','pending_support','pending_global','refund_queued')
@@ -5338,6 +5397,7 @@ router.post("/app/delete-user", async (req, res) => {
          LIMIT 1 FOR UPDATE`, [U],
       );
       if (pendingDisbursements.length) return { auth: "failed, disbursement pending" };
+      if (pendingXtuWithdrawals.length) return { auth: "failed, XTU withdrawal pending" };
       if (pendingBatches.length || pendingEvents.length || pendingRefunds.length) return { auth: "failed, recharge pending" };
       if (
         Number(stockRows[0].seller_status || 0) !== 0 || sellerCampaignRows.length ||
@@ -5784,6 +5844,7 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
 
       const blockers = [
         ["individual_disbursements", `SELECT id FROM users_usdt_disbursements WHERE disbursement_mode='individual' AND status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`],
+        ["xtu_withdrawals", `SELECT id FROM xtu_withdrawals WHERE status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`],
         ["seller_campaigns", `SELECT id FROM users_seller_campaigns WHERE status IN ('active','cancel_requested') LIMIT 1 FOR UPDATE`],
         ["seller_payouts", `SELECT id FROM users_usdt_seller_payouts WHERE status IN ('queued','signed','submitted','manual_review') LIMIT 1 FOR UPDATE`],
         ["seller_lots", `SELECT id FROM users_seller_reserve_lots WHERE status='active' AND remaining_initial_asset>0 LIMIT 1 FOR UPDATE`],

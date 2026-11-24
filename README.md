@@ -7,7 +7,7 @@ Node.js backend for the OneX platform. The current payment rail accepts **Binanc
 XTU is the single public transfer and valuation unit of the OneX system. It is not a separately stored user-balance unit. All user, seller and internal reserve balances are stored in **initial assets**. The platform has one live public/global price, `common.unit_price`, expressed as XTU per initial asset:
 
 ```text
-common.unit_price = common.total_units_price / common.backed_units
+common.unit_price = max(previous_global_unit_price, common.total_units_price / common.backed_units)
 user_individual_price = effective_price(user_price_state, users_stock.balance, common.unit_price)
 user_balance_xtu = users_stock.balance * user_individual_price
 sender_initial_asset_amount = public_xtu_amount / sender_individual_price
@@ -21,8 +21,9 @@ XTU remains unique and public for P2P transfers, but each account has an effecti
 
 - `users_stock.balance` and `users_stock.run_balance` are initial assets. A one-time welcome credit, when enabled, is posted to the ordinary balance and recorded in `auths` and `activities`; it is not a separate withdrawable balance.
 - `common.backed_units`, `common.inactive_init_asset`, `common.sys_inactive_init_asset`, `common.sellers_res` and `common.total_run_balance` are initial assets.
-- `common.total_units_price` is XTU. `common.unit_price` is always recomputed as `total_units_price / backed_units` on every common snapshot; `backed_units` must remain strictly positive.
-- `activities.amount` and `activities.fees` are initial assets. `activities.unit_price` preserves the effective price used for the transaction's asset conversion (for P2P, the sender's individual price). Where populated, `activities.fee_unit_price` preserves the public/global price used to value system tfees in common reserves. Historical transaction and fee XTU values must use their corresponding recorded prices.
+- `common.total_units_price` is XTU. `common.unit_price` is an absolute, monotone global price: each snapshot stores `max(previous unit_price, total_units_price / backed_units)`. It must never fall automatically when reserve or backing values decrease; `backed_units` must remain strictly positive.
+- `activities.amount` and `activities.fees` are normally initial assets. `activities.unit_price` preserves the effective price used for the transaction's asset conversion (for P2P, the sender's individual price). For XTU externalization (`type=5`), the worker stores the net XTU amount and combined XTU-equivalent fees converted back into initial-asset units at the saved individual price, so `/app/transactions-history` returns the correct XTU values. `activities.bsc_fee_cost_usd` separately records the actual BNB gas cost.
+- `common.xtu_wallets` is a cumulative audit counter of net XTU actually externalized to personal wallets. It is not added to `common.total_units_price` or any reserve and does not count gross requests or the contract fee retained by the distribution wallet.
 - Seller campaign and reserve-lot `unit_price` fields are immutable request-time valuation snapshots used to settle seller obligations at the price locked when the seller submitted `/app/join-system-sellers`. They are not live per-user prices.
 - `users_usdt_disbursements.price_value` is the immutable price captured when the user submitted the sale-to-ONEX request. The payout is not revalued by a later common price.
 - Seller payout and disbursement amounts persisted in BSC-USD payout columns are token liabilities, not XTU balances. BNB gas amounts remain in BNB; their captured BSC-USD equivalents remain separately identified.
@@ -30,13 +31,13 @@ XTU remains unique and public for P2P transfers, but each account has an effecti
 
 ## Global price and reserve invariants
 
-Every common snapshot derives the global price from the same formula:
+Every common snapshot derives a lower bound for the global price from the reserve ratio and applies the previously stored price as a floor:
 
 ```text
-unit_price = total_units_price / backed_units
+unit_price_after = max(unit_price_before, total_units_price_after / backed_units_after)
 ```
 
-All common writes are serialized with the `common_state` lock and inserted through `insertCommonSnapshotTx()`, which recomputes `unit_price`. `getLatestCommonTx()` verifies that the stored value matches the ratio. A zero or negative `backed_units`, or a non-positive `total_units_price`, blocks the operation because the global price would be undefined or invalid.
+All common writes are serialized with the `common_state` lock and inserted through `insertCommonSnapshotTx()`, which enforces this monotone floor. `getLatestCommonTx()` verifies that the stored value is positive and not below the current reserve ratio. A zero or negative `backed_units`, or a non-positive `total_units_price`, blocks the operation because the reserve ratio would be undefined or invalid.
 
 The initial reserve is split by a fixed quota based on `STOCK_LIMIT`, not on the fluctuating public value:
 
@@ -56,7 +57,7 @@ spent_initial_asset = amount / current_unit_price
 total_units_price_after = total_units_price_before - amount
 backed_units_after = backed_units_before - spent_initial_asset
 sys_inactive_init_asset_after = sys_inactive_init_asset_before + spent_initial_asset
-unit_price_after = total_units_price_after / backed_units_after
+unit_price_after = max(unit_price_before, total_units_price_after / backed_units_after)
 ```
 
 Because numerator and denominator decrease proportionally, the price remains unchanged, subject to storage precision. The operation cannot spend more than the remaining administrative quota and cannot leave `backed_units` at or below zero.
@@ -90,7 +91,7 @@ All users send Binance-Peg BSC-USD directly to one shared OneX treasury address.
 - No per-user token sweep or deposit-consolidation transaction occurs. The user's own wallet/provider fee for sending a deposit is not charged again by OneX.
 - Funding priority is strictly `common.inactive_init_asset` first, then active seller lots in FIFO order, then `common.backed_units` above the remaining administrative quota. Pending disbursement reservations reduce system-funded capacity.
 - Seller-funded credit transfers initial assets from the seller reserve to the recipient. The beneficiary's own active seller lot is excluded from the funding pool so a user cannot recycle their locked balance into their own recharge. It does not issue a second copy of the seller-funded amount.
-- The OneX-funded recharge portion converts its net public XTU value to initial assets using the pre-operation global price. The recipient’s individual valuation and 300 XTU capacity are then checked independently. `inactive_init_asset` is consumed before seller lots; `backed_units` is touched only after both earlier sources are exhausted. Common snapshots then recompute the global price from their resulting `total_units_price` and `backed_units`.
+- The OneX-funded recharge portion converts its net public XTU value to initial assets using the pre-operation global price. The recipient’s individual valuation and 300 XTU capacity are then checked independently. `inactive_init_asset` is consumed before seller lots; `backed_units` is touched only after both earlier sources are exhausted. Common snapshots preserve the prior global price as a floor and raise it only when the resulting `total_units_price / backed_units` ratio is higher.
 - A weekly-ineligible user receives no partial ONEX-funded credit. A pending batch is retried so it may be funded by sellers or after the weekly cooldown.
 
 ### Durable BSC incoming-transfer scanner and reconciliation
@@ -148,6 +149,45 @@ A priority seller is eligible only after the individual remuneration target has 
 `POST /app/near-transfer` (also exposed through the app's public transfer contract) accepts a public XTU amount for ordinary user-to-user transfers. XTU remains one public unit. The sender's requested XTU amount is converted into initial assets using the sender's effective individual price. `tfees` are charged to the recipient by deducting them from the gross amount before the net initial assets are credited. The recipient's resulting account valuation uses that recipient's own individual price; therefore, two users with equal initial-asset balances may have different XTU valuations. No BSC gas transaction is needed for an internal P2P transfer.
 
 The initial assets returned through `tfees` are added to common backing. Their XTU value is calculated using the public/global price immediately before the operation, and that value is added to `common.total_units_price`. This prevents a sender's personal price from changing the common reserve valuation. Recharges also deduct `tfees` from the gross deposit amount; incoming deposits do not require an outgoing BSC consolidation transaction.
+
+## XTU BEP-20 token and wallet externalization
+
+The on-chain XTU token is a separate BEP-20-compatible contract on BNB Smart Chain mainnet (chain ID 56), with 18 decimals and a fixed supply of `100,000,000,000 XTU`, minted once to the dedicated XTU distribution wallet. The contract has no public mint function. Its mandatory transfer fee is `0.1%` and is enforced inside the Solidity `_update` hook, so both `transfer` and `transferFrom` pay it. Fees are retained in the same distribution wallet; when that wallet sends XTU, its fee is left in that wallet instead of generating a self-transfer. This fee is distinct from internal P2P `tfees`.
+
+OneX uses a fixed accounting parity of `1 XTU = 1 BSC-USD` for the externalization and reserve calculation. There is no XTU price oracle. The Chainlink BNB/USD feed values only the actual or estimated BNB gas cost in BSC-USD/XTU equivalent. Outgoing transfers use the Chainstack endpoint configured by `BSC_RPC_URL` and do not fall back to the incoming PublicNode RPC. If the estimated gas cost exceeds `BSC_MAX_TX_FEE_BSC_USD` (default and hard maximum 0.4 BSC-USD), the request is deferred without being signed or broadcast.
+
+The XTU distribution private key must be stored separately in `.env.xtu`; it must never reuse `.env.treasury` or `.env.disbursement` keys. Copy `.env.xtu.example` to `.env.xtu`, then supply the real, separately funded distribution wallet address and private key. The example values are deliberately fictitious. The distribution wallet needs enough BNB for gas and the fixed XTU supply after deployment. The token contract is not deployed automatically by the server:
+
+```bash
+npm install
+npm run compile:xtu
+npm run deploy:xtu
+```
+
+`deploy:xtu` refuses to run unless the outgoing RPC reports chain ID 56 and the supplied key matches `XTU_DISTRIBUTION_ADDRESS`. After successful deployment, copy the printed contract address to `XTU_TOKEN_CONTRACT_ADDRESS` in `.env.xtu`. Verify the deployment and constructor parameters on BscScan before enabling the worker. Set `XTU_WITHDRAWAL_WORKER_ENABLED=true` only after the deployment and wallet balances have been checked. The worker also requires the root `.env` `BSC_RPC_URL`, Chainlink feed and BSC fee-cap settings. The server never obtains the personal wallet private key or seed of a user.
+
+The user-facing API is:
+
+- `POST /app/xtu2wallet` with `{ user, pswd, amount, tkn }`. The gross minimum is 1 XTU. No destination field is accepted; the server uses the fixed `auths.wallet_address` registered at signup.
+- `POST /app/xtu2wallet/status` with `{ user, pswd, reference, tkn }` to read the status of that account's request.
+- `POST /admin/withdraw/start` with the configured admin `{ pswd, pin, action, reason }`, where `action` is `start`, `stop` or `status`. The control defaults to closed and is independent of BSC-USD individual/global disbursement controls. A reason of 5–1000 characters is required for `start` and `stop`.
+
+The gas-equivalent amount is deducted from the gross request before the contract applies its 0.1% fee to the remaining transfer amount. The worker records the actual gas receipt cost and contract fee separately in `xtu_withdrawals`; `activities.type=5` stores the net transfer and combined fee equivalents in the initial-asset unit expected by transaction history. `activities.bsc_fee_cost_usd` records actual gas cost, and `common.xtu_wallets` increases only by the net amount received by the user's wallet. XTU externalization does not update `common.total_tfees` and does not start or reset the user's remuneration cycle.
+
+The common reserve debit uses the user's captured individual price, not the net on-chain transfer:
+
+```text
+reserved_initial_asset = gross_xtu_amount / individual_unit_price
+reserved_xtu_value = reserved_initial_asset * individual_unit_price
+total_units_price_after = total_units_price_before - reserved_xtu_value
+backed_units_after = backed_units_before - reserved_initial_asset
+```
+
+While the chain transaction is pending, the reserved initial assets are held outside both `backed_units` and the spendable `inactive_init_asset` pool. Only after a canonical, sufficiently confirmed transfer is verified are those initial assets added to `common.inactive_init_asset`. The global `common.unit_price` remains protected by its previous value as a floor and can only stay the same or increase. If the transaction definitively reverts, the principal and backing are restored; only the actual BNB gas cost remains charged to the common reserve. A failed or ambiguous transaction is never counted in `common.xtu_wallets`.
+
+The worker persists the signed raw transaction, hash and nonce before broadcasting. An uncertain broadcast is reconciled or re-broadcast only with the identical raw transaction; if the distribution nonce advances without the persisted hash being visible, the request moves to `manual_review` and blocks later worker sends to prevent a duplicate. A confirmed receipt must include the expected XTU `Transfer` and `FeeCollected` events and reach the configured confirmation depth before accounting, transaction history and Telegram notification are finalized. While an XTU withdrawal is unresolved, balance-changing user operations for that account and global-disbursement activation are blocked. Once confirmed, OneX records the outgoing transaction only and does not monitor the user's personal wallet balances or later transactions.
+
+This pre-deployment project uses the current `db.js` fresh-schema definition. It does not include SQL migration scripts or legacy-data backfills. Create a new database from the current schema; `initDbIfEmpty()` creates the XTU tables, initializes the control closed and inserts the system lock rows. The server archive includes a protocol guide at `android-integration/XTU_EXTERNALIZATION.md`; it does not include the full Android application source or a rebuilt APK.
 
 ## Individual and global disbursements
 
@@ -240,7 +280,7 @@ Do not run this code against a database containing older OneX table definitions 
 ## Configuration
 
 1. Copy `.env.example` to `.env` and configure MySQL, SMTP and admin credentials. Set `BSC_RPC_URL` to the real Chainstack BSC Mainnet HTTPS endpoint for outgoing transactions; set `BSC_INCOMING_RPC_URL` and `BSC_INCOMING_WS_RPC_URL` to PublicNode; set `BSC_INCOMING_RPC_FALLBACK_URL` to the Chainstack HTTPS endpoint (or leave it blank to reuse `BSC_RPC_URL`). The `.env.example` endpoint/token strings are deliberately fictitious examples and must be replaced before deployment. Then configure the shared treasury address, token contract, Chainlink feed and initial reserve.
-2. By default, a new database starts with `common.total_units_price=18000000`, `common.backed_units=18000000` and the derived `common.unit_price=1`. `STOCK_LIMIT` and `INITIAL_BACKED_UNITS` can override the initial amounts; `INITIAL_BACKED_UNITS` defaults to `STOCK_LIMIT`, must cover the initial 10% administrative quota, and must correspond to assets actually available to the system. When the configured values differ, the initial price is derived as `total_units_price / backed_units`, not hard-coded to 1.
+2. By default, a new database starts with `common.total_units_price=18000000`, `common.backed_units=18000000` and the derived `common.unit_price=1`. `STOCK_LIMIT` and `INITIAL_BACKED_UNITS` can override the initial amounts; `INITIAL_BACKED_UNITS` defaults to `STOCK_LIMIT`, must cover the initial 10% administrative quota, and must correspond to assets actually available to the system. When the configured values differ, the initial price is initialized from `total_units_price / backed_units`; later snapshots never reduce the stored global price.
 3. Set `STOCK_LIMIT=18000000`, `INITIAL_BACKED_UNITS=18000000` and `SYSTEM_ADMIN_RESERVE_RATIO=0.10` in `.env`. `GLOBAL_DISBURSEMENT_BONUS` may be omitted to inherit `FEES`; an explicit value must be between 0 and 10. Keep `GLOBAL_DISBURSEMENT_REQUEST_WINDOW_DAYS` at 90 or higher and `GLOBAL_DISBURSEMENT_EXTENSION_DAYS` at 30 or higher. Remove the retired `RECHARGE_BSC_FEE_RECOVERY_USD` setting. Set `BSC_MAX_TX_FEE_BSC_USD` to a value from 0 through 0.4 (default 0.4; larger values prevent the HTTP server from starting). Keep the default `BSC_BNB_USD_FEED_ADDRESS` set to the official BNB/USD feed on BNB Chain Mainnet, or replace it only with a verified Chainlink feed on chain ID 56. Configure `BSC_PRICE_REFRESH_INTERVAL_MS` (default 60000) and `BSC_PRICE_MAX_AGE_SECONDS` (default 300); no manually maintained BNB/USD environment quote is required; remove the retired `BNB_USD_PRICE` variable from existing environment files. The oracle validates the feed code, description and decimals at startup and rechecks that metadata every 24 hours; ordinary price refreshes read only `latestRoundData()`.
 4. Copy `.env.treasury.example` to `.env.treasury` and `.env.disbursement.example` to `.env.disbursement`. `BSC_TREASURY_PRIVATE_KEY` must match `USDT_BEP20_TREASURY_ADDRESS`; `BSC_DISBURSEMENT_PRIVATE_KEY` must match `USDT_BEP20_DISBURSEMENT_ADDRESS`. Keep both files outside source control and restrict access to their respective workers. The Cold Wallet private key is never installed on the server. Leave `USDT_BEP20_COLD_WALLET_ADDRESS` empty to disable automatic sweeps; set the minimum operating balance deliberately rather than assuming that the default `0` is a recommended production reserve.
 5. Before accepting deposits, set `USDT_INCOMING_START_BLOCK` to a safe block number at or before the first payment that OneX must recognize. If it is left blank on the first startup, the scanner initializes at the then-current finalized block and will not index earlier deposits. After initialization, the persistent MySQL cursor controls recovery; changing the environment variable does not reset an existing cursor.

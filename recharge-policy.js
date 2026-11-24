@@ -90,8 +90,8 @@ function calculateMinimumRechargeCapacity({
   }
 
   const calculatedPrice = calculateGlobalUnitPrice(total, backed);
-  if (calculatedPrice.minus(price).abs().gt("0.000000000000000000000000000001")) {
-    throw new RangeError("Current XTU price is inconsistent with common reserve values");
+  if (calculatedPrice.minus(price).gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price must not be below the reserve valuation ratio");
   }
 
   const feeAmount = MIN_RECHARGE_AMOUNT.multipliedBy(feeRate).dividedBy(100);
@@ -124,7 +124,7 @@ function calculateMinimumRechargeCapacity({
     if (!projectedBacked.isGreaterThan(0)) {
       throw new RangeError("The minimum recharge would exhaust common.backed_units");
     }
-    projectedPrice = calculateGlobalUnitPrice(projectedTotal, projectedBacked);
+    projectedPrice = calculateGlobalUnitPrice(projectedTotal, projectedBacked, price);
     projectionMethod = "retained_tfees_post_recharge_price";
   }
 

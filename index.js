@@ -10,6 +10,7 @@ const { createHttpRateLimiter } = require("./http-rate-limiter");
 const { startSellerLifecycleWorker } = require("./seller-worker");
 const { startPriceWorker } = require("./price-worker");
 const { recalculateWatchingPriceTargets } = require("./user-price-accounting");
+const { startXtuWithdrawalWorker } = require("./xtu-withdrawal-worker");
 
 function boundedIntegerEnv(name, fallback, minimum, maximum) {
   const raw = process.env[name];
@@ -108,6 +109,7 @@ async function startServer() {
     const recalculatedPriceTargets = await recalculateWatchingPriceTargets(database);
     console.log(`Recalculated ${recalculatedPriceTargets.updated} active individual price target(s) using the current 3x fee rule.`);
     startPriceWorker(database);
+    await startXtuWithdrawalWorker(database);
     await routes.initializeRechargePayments();
   } catch (error) {
     console.error("Server initialization failed. Server startup aborted:", error);
