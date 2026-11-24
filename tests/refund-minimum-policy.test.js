@@ -29,7 +29,7 @@ test("minimum outgoing net payout is exactly twice the configured maximum BSC ga
   assert.equal(MINIMUM_REFUND_NET_BSC_USD.toFixed(8), getMinimumOutgoingNetBscUsd().toFixed(8));
 });
 
-test("recharge and unknown-transfer refunds check the derived minimum before queueing", () => {
+test("deposit and unknown-transfer refunds check the derived minimum before queueing", () => {
   assert.match(routes, /remaining\.minus\(maximumGasRecovery\)\.isLessThan\(MINIMUM_REFUND_NET_BSC_USD\)/);
   assert.match(routes, /grossAmount\.minus\(maximumGasRecovery\)\.isLessThan\(MINIMUM_REFUND_NET_BSC_USD\)/);
   assert.match(disbursement, /finalPayoutAmount\.isGreaterThanOrEqualTo\(MINIMUM_REFUND_NET_BSC_USD\)/);

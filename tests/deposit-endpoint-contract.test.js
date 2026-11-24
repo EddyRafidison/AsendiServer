@@ -9,7 +9,7 @@ const root = path.join(__dirname, "..");
 const routesSource = fs.readFileSync(path.join(root, "routes.js"), "utf8");
 const limiterSource = fs.readFileSync(path.join(root, "http-rate-limiter.js"), "utf8");
 const dbSource = fs.readFileSync(path.join(root, "db.js"), "utf8");
-const rechargePolicySource = fs.readFileSync(path.join(root, "recharge-policy.js"), "utf8");
+const depositPolicySource = fs.readFileSync(path.join(root, "deposit-policy.js"), "utf8");
 const feePolicySource = fs.readFileSync(path.join(root, "bsc-transaction-policy.js"), "utf8");
 const feeAccountingSource = fs.readFileSync(path.join(root, "bsc-fee-accounting.js"), "utf8");
 const disbursementSource = fs.readFileSync(path.join(root, "disbursement.js"), "utf8");
@@ -25,56 +25,56 @@ function getRouteBlock(routePath, nextRoutePath) {
 }
 
 test("user-last-stock is the only app endpoint that returns the shared treasury deposit address", () => {
-  const stockRoute = getRouteBlock("/app/user-last-stock", "/app/recharge");
-  const rechargeRoute = getRouteBlock("/app/recharge", "/app/recharge/status");
+  const stockRoute = getRouteBlock("/app/user-last-stock", "/app/deposit");
+  const depositRoute = getRouteBlock("/app/deposit", "/app/deposit/status");
   assert.match(stockRoute, /paymentConfig\.treasuryAddress/);
   assert.doesNotMatch(stockRoute, /getOrCreateUserDepositAddress/);
   assert.match(stockRoute, /deposit_addr:\s*depositAddress/);
-  assert.match(stockRoute, /has_pending_recharge:\s*hasPendingRecharge/);
+  assert.match(stockRoute, /has_pending_deposit:\s*hasPendingDeposit/);
   assert.match(stockRoute, /SELECT 1 AS pending[\s\S]*remaining_amount>0/);
   assert.match(stockRoute, /getVisibleDepositAddress/);
-  assert.doesNotMatch(rechargeRoute, /getOrCreateUserDepositAddress/);
-  assert.doesNotMatch(rechargeRoute, /deposit_addr/);
+  assert.doesNotMatch(depositRoute, /getOrCreateUserDepositAddress/);
+  assert.doesNotMatch(depositRoute, /deposit_addr/);
 });
 
-test("manual recharge control is admin-authenticated, serialized and audited", () => {
-  const controlRoute = getRouteBlock("/admin/recharge/control", "/admin/recharge/credit");
+test("manual deposit control is admin-authenticated, serialized and audited", () => {
+  const controlRoute = getRouteBlock("/admin/deposit/control", "/admin/deposit/credit");
   assert.match(controlRoute, /decrypt\(admin_pswd/);
   assert.match(controlRoute, /decrypt\(admin_pin/);
   assert.match(controlRoute, /\[\"suspend\", \"resume\", \"status\"\]/);
   assert.match(controlRoute, /lock_name='common_state' FOR UPDATE/);
-  assert.match(controlRoute, /UPDATE recharge_service_control/);
-  assert.match(controlRoute, /INSERT INTO recharge_service_control_events/);
-  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS recharge_service_control/);
-  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS recharge_service_control_events/);
-  assert.match(limiterSource, /POST \/admin\/recharge\/control/);
+  assert.match(controlRoute, /UPDATE deposit_service_control/);
+  assert.match(controlRoute, /INSERT INTO deposit_service_control_events/);
+  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS deposit_service_control/);
+  assert.match(dbSource, /CREATE TABLE IF NOT EXISTS deposit_service_control_events/);
+  assert.match(limiterSource, /POST \/admin\/deposit\/control/);
 });
 
 test("manual suspension holds automated credit while reviewed admin resolution has an explicit override", () => {
   assert.match(routesSource, /const reviewedAdminCredit = options\.allowReviewedAdminCredit === true/);
   assert.match(routesSource, /allowReviewedAdminCredit: true/);
-  assert.match(routesSource, /manual_recharge_suspended/);
+  assert.match(routesSource, /manual_deposit_suspended/);
   assert.match(routesSource, /status='pending_support'/);
 });
 
 
 test("public reserve availability endpoint is authenticated, cached and separate from user-specific deposit disclosure", () => {
-  const availabilityRoute = getRouteBlock("/app/recharge/availability", "/app/recharge/status");
+  const availabilityRoute = getRouteBlock("/app/deposit/availability", "/app/deposit/status");
   assert.match(availabilityRoute, /requestTokenIsValid/);
-  assert.match(availabilityRoute, /getPublicRechargeAvailability/);
+  assert.match(availabilityRoute, /getPublicDepositAvailability/);
   assert.match(availabilityRoute, /available_reserve_xtu/);
-  assert.match(availabilityRoute, /minimum_recharge_amount_bsc_usd/);
-  assert.match(availabilityRoute, /maximum_recharge_amount_bsc_usd/);
-  assert.doesNotMatch(availabilityRoute, /unit_price|recharge_available|availability_reason|updated_at_ms|refresh_after_ms/);
+  assert.match(availabilityRoute, /minimum_deposit_amount_bsc_usd/);
+  assert.match(availabilityRoute, /maximum_deposit_amount_bsc_usd/);
+  assert.doesNotMatch(availabilityRoute, /unit_price|deposit_available|availability_reason|updated_at_ms|refresh_after_ms/);
   assert.doesNotMatch(availabilityRoute, /getOrCreateUserDepositAddress/);
-  assert.match(limiterSource, /POST \/app\/recharge\/availability/);
+  assert.match(limiterSource, /POST \/app\/deposit\/availability/);
 });
 
 
-test("minimum automatic recharge is 20 BSC-USD across validation and API metadata", () => {
-  assert.match(rechargePolicySource, /const MIN_RECHARGE_AMOUNT = new BigNumber\("20"\)/);
-  assert.match(routesSource, /minimum_not_reached: "The 60-minute session total has not reached the 20 BSC-USD minimum\."/);
-  assert.match(routesSource, /minimum_recharge_amount_bsc_usd: MIN_RECHARGE_AMOUNT\.toFixed\(0\)/);
+test("automatic deposit receipt minimum is 70 BSC-USD across validation and API metadata", () => {
+  assert.match(depositPolicySource, /const MIN_DEPOSIT_AMOUNT = new BigNumber\("70"\)/);
+  assert.match(routesSource, /minimum_not_reached: "The 60-minute session total has not reached the 70 BSC-USD minimum\."/);
+  assert.match(routesSource, /minimum_deposit_amount_bsc_usd: MIN_DEPOSIT_AMOUNT\.toFixed\(0\)/);
   assert.match(envExample, /^BSC_MAX_TX_FEE_BSC_USD=0\.4$/m);
 });
 

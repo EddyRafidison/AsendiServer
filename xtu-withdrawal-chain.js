@@ -24,10 +24,12 @@ const XTU_ABI = Object.freeze([
   "function totalSupply() view returns (uint256)",
   "function balanceOf(address) view returns (uint256)",
   "function feeCollector() view returns (address)",
+  "function initialWallet() view returns (address)",
   "function TRANSFER_FEE_BPS() view returns (uint256)",
   "function transfer(address to,uint256 value) returns (bool)",
   "event Transfer(address indexed from,address indexed to,uint256 value)",
   "event FeeCollected(address indexed from,address indexed collector,uint256 amount)",
+  "event TransferWithFee(address indexed from,address indexed to,uint256 grossAmount,uint256 netAmount,uint256 feeAmount,bool feeExempt)",
 ]);
 
 let cachedRuntime = null;
@@ -48,47 +50,82 @@ function loadXtuEnvironment() {
   return envPath;
 }
 
+function loadXtuSecretEnvironment(role) {
+  const variable = role === "main" ? "XTU_MAIN_ENV_FILE" : "XTU_DISTRIBUTION_ENV_FILE";
+  const fallback = role === "main" ? ".env.xtu-main" : ".env.xtu-distribution";
+  dotenv.config({ path: path.resolve(process.env[variable] || fallback) });
+}
+
 function isXtuWorkerEnabled() {
   loadXtuEnvironment();
   return String(process.env.XTU_WITHDRAWAL_WORKER_ENABLED || "false").toLowerCase() === "true";
 }
 
-function getXtuSettings() {
+function isXtuDepositWorkerEnabled() {
   loadXtuEnvironment();
+  return String(process.env.XTU_DEPOSIT_WORKER_ENABLED || "false").toLowerCase() === "true";
+}
+
+function getXtuSettings() {
+  const envPath = loadXtuEnvironment();
   const chainId = String(process.env.XTU_CHAIN_ID || "56");
   if (chainId !== "56") throw new Error("XTU_CHAIN_ID must be 56 (BNB Smart Chain mainnet).");
   const tokenAddress = String(process.env.XTU_TOKEN_CONTRACT_ADDRESS || "").trim();
+  const mainWalletAddress = String(process.env.XTU_MAIN_WALLET_ADDRESS || "").trim();
   const distributionAddress = String(process.env.XTU_DISTRIBUTION_ADDRESS || "").trim();
-  const privateKey = String(process.env.XTU_DISTRIBUTION_PRIVATE_KEY || "").trim();
   const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
   if (!isAddress(tokenAddress) || /^0x0{40}$/i.test(tokenAddress)) {
     throw new Error("XTU_TOKEN_CONTRACT_ADDRESS must be a deployed contract address.");
   }
+  if (!isAddress(mainWalletAddress) || /^0x0{40}$/i.test(mainWalletAddress)) {
+    throw new Error("XTU_MAIN_WALLET_ADDRESS must be a valid non-zero BSC address.");
+  }
   if (!isAddress(distributionAddress) || /^0x0{40}$/i.test(distributionAddress)) {
     throw new Error("XTU_DISTRIBUTION_ADDRESS must be a valid non-zero address.");
   }
-  if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
-    throw new Error("XTU_DISTRIBUTION_PRIVATE_KEY must be a valid 32-byte private key.");
+  if (getAddress(mainWalletAddress) === getAddress(distributionAddress)) {
+    throw new Error("The XTU Hot Wallet and Distribution Wallet must be different addresses.");
   }
-  if (!rpcUrl) throw new Error("BSC_RPC_URL (Chainstack outgoing RPC) is required for XTU withdrawals.");
+  if (!rpcUrl) throw new Error("BSC_RPC_URL (outgoing BSC RPC) is required for XTU operations.");
+  const depositMinAmount = String(process.env.XTU_DEPOSIT_MIN_AMOUNT || "70").trim();
+  const depositMaxAmount = String(process.env.XTU_DEPOSIT_MAX_AMOUNT || "140").trim();
+  if (depositMinAmount !== "70" || depositMaxAmount !== "140") {
+    throw new RangeError("XTU deposit intake limits are fixed at 70 minimum and 140 maximum per user per rolling seven-day period.");
+  }
+  const depositInitialCreditCap = new BigNumber(process.env.XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU || "100");
+  if (!depositInitialCreditCap.isFinite() || !depositInitialCreditCap.isGreaterThan(0) || depositInitialCreditCap.gt("140")) {
+    throw new RangeError("XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU must be positive and cannot exceed the 140 XTU rolling-week intake maximum.");
+  }
   return {
     envPath,
     rpcUrl,
     tokenAddress: getAddress(tokenAddress),
+    mainWalletAddress: getAddress(mainWalletAddress),
     distributionAddress: getAddress(distributionAddress),
-    privateKey,
     minConfirmations: readBoundedInteger("XTU_MIN_CONFIRMATIONS", 15, 1, 200),
     pollMs: readBoundedInteger("XTU_WITHDRAWAL_POLL_MS", 15000, 5000, 300000),
     gasLimitCeiling: BigInt(readBoundedInteger("XTU_WITHDRAWAL_GAS_LIMIT", 250000, 50000, 1000000)),
     retryMs: readBoundedInteger("XTU_WITHDRAWAL_RETRY_MS", 60000, 10000, 3600000),
     maxPendingPerUser: readBoundedInteger("XTU_MAX_PENDING_PER_USER", 1, 1, 5),
     workerEnabled: String(process.env.XTU_WITHDRAWAL_WORKER_ENABLED || "false").toLowerCase() === "true",
+    depositPollMs: readBoundedInteger("XTU_DEPOSIT_POLL_MS", 15000, 5000, 300000),
+    depositMaxLogBlockRange: readBoundedInteger("XTU_DEPOSIT_MAX_LOG_BLOCK_RANGE", 1000, 1, 5000),
+    depositMinAmount,
+    depositMaxAmount,
+    depositInitialCreditCap: depositInitialCreditCap.toFixed(18),
+    depositGasLimitCeiling: BigInt(readBoundedInteger("XTU_DEPOSIT_GAS_LIMIT", 250000, 50000, 1000000)),
+    depositBatchWindowMs: readBoundedInteger("XTU_DEPOSIT_BATCH_WINDOW_MS", 3600000, 3600000, 3600000),
+    depositInitialGroupingTimeoutMs: readBoundedInteger("XTU_DEPOSIT_INITIAL_GROUPING_TIMEOUT_DAYS", 30, 1, 30) * 24 * 60 * 60 * 1000,
+    depositPendingRetryMs: readBoundedInteger("XTU_DEPOSIT_PENDING_RETRY_DAYS", 7, 7, 7) * 24 * 60 * 60 * 1000,
+    depositWorkerEnabled: String(process.env.XTU_DEPOSIT_WORKER_ENABLED || "false").toLowerCase() === "true",
+    incomingStartBlock: String(process.env.XTU_INCOMING_START_BLOCK || "").trim(),
+    incomingRpcUrl: String(process.env.XTU_INCOMING_RPC_URL || process.env.BSC_INCOMING_RPC_URL || process.env.BSC_RPC_URL || "").trim(),
   };
 }
 
 async function getXtuRuntime({ requireSigner = true } = {}) {
   const settings = getXtuSettings();
-  const cacheKey = `${settings.rpcUrl}|${settings.tokenAddress.toLowerCase()}|${settings.distributionAddress.toLowerCase()}|${requireSigner}`;
+  const cacheKey = `${settings.rpcUrl}|${settings.tokenAddress.toLowerCase()}|${settings.mainWalletAddress.toLowerCase()}|${settings.distributionAddress.toLowerCase()}|${requireSigner}`;
   if (cachedRuntime?.cacheKey === cacheKey && (!requireSigner || cachedRuntime.signer)) return cachedRuntime;
 
   const provider = new JsonRpcProvider(settings.rpcUrl, CHAIN_ID);
@@ -98,8 +135,8 @@ async function getXtuRuntime({ requireSigner = true } = {}) {
   if (!code || code === "0x") throw new Error("The configured XTU contract address has no deployed bytecode.");
 
   const contract = new Contract(settings.tokenAddress, XTU_ABI, provider);
-  const [name, symbol, decimals, supply, collector] = await Promise.all([
-    contract.name(), contract.symbol(), contract.decimals(), contract.totalSupply(), contract.feeCollector(),
+  const [name, symbol, decimals, supply, collector, initialWallet] = await Promise.all([
+    contract.name(), contract.symbol(), contract.decimals(), contract.totalSupply(), contract.feeCollector(), contract.initialWallet(),
   ]);
   const feeBps = await contract.TRANSFER_FEE_BPS();
   if (String(name) !== "OneX Token" || String(symbol) !== "XTU" || Number(decimals) !== XTU_DECIMALS) {
@@ -107,19 +144,39 @@ async function getXtuRuntime({ requireSigner = true } = {}) {
   }
   const expectedSupply = 100_000_000_000n * (10n ** 18n);
   if (BigInt(supply) !== expectedSupply) throw new Error("The XTU contract total supply does not match the fixed 100-billion XTU supply.");
-  if (getAddress(String(collector)) !== settings.distributionAddress || BigInt(feeBps) !== 10n) {
-    throw new Error("The XTU contract fee collector or mandatory 0.1% fee does not match the configured distribution wallet.");
+  if (getAddress(String(collector)) !== settings.distributionAddress ||
+      getAddress(String(initialWallet)) !== settings.mainWalletAddress || BigInt(feeBps) !== 10n) {
+    throw new Error("The XTU contract Hot Wallet, fee collector or mandatory 0.1% fee does not match the configured wallet roles.");
   }
 
   let signer = null;
   if (requireSigner) {
-    signer = new Wallet(settings.privateKey, provider);
+    loadXtuSecretEnvironment("distribution");
+    const privateKey = String(process.env.XTU_DISTRIBUTION_PRIVATE_KEY || "").trim();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
+      throw new Error("XTU_DISTRIBUTION_PRIVATE_KEY must be configured in .env.xtu-distribution.");
+    }
+    signer = new Wallet(privateKey, provider);
     if (signer.address !== settings.distributionAddress) {
       throw new Error("XTU distribution private key does not match XTU_DISTRIBUTION_ADDRESS.");
     }
   }
   cachedRuntime = { cacheKey, settings, provider, contract, signer };
   return cachedRuntime;
+}
+
+async function getXtuMainSigner(runtime = null) {
+  const activeRuntime = runtime || await getXtuRuntime({ requireSigner: false });
+  loadXtuSecretEnvironment("main");
+  const privateKey = String(process.env.XTU_MAIN_PRIVATE_KEY || "").trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(privateKey)) {
+    throw new Error("XTU_MAIN_PRIVATE_KEY must be configured in .env.xtu-main.");
+  }
+  const signer = new Wallet(privateKey, activeRuntime.provider);
+  if (signer.address !== activeRuntime.settings.mainWalletAddress) {
+    throw new Error("XTU main private key does not match XTU_MAIN_WALLET_ADDRESS.");
+  }
+  return signer;
 }
 
 async function estimateXtuWithdrawal({ destination, grossAmount }) {
@@ -172,6 +229,7 @@ async function estimateXtuWithdrawal({ destination, grossAmount }) {
     destination: to,
     tokenContract: runtime.settings.tokenAddress,
     distributionAddress: runtime.settings.distributionAddress,
+    distributionTokenBalance: BigInt(tokenBalance).toString(),
   };
 }
 
@@ -183,7 +241,9 @@ module.exports = {
   XTU_ABI,
   getXtuSettings,
   isXtuWorkerEnabled,
+  isXtuDepositWorkerEnabled,
   getXtuRuntime,
+  getXtuMainSigner,
   estimateXtuWithdrawal,
   transactionHashFromRaw,
 };

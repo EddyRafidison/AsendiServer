@@ -2,12 +2,12 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { calculateRechargeFundingAllocation } = require("../stock-accounting");
+const { calculateDepositFundingAllocation } = require("../stock-accounting");
 
 const fixed = (value) => value.toFixed();
 
-test("recharge funding consumes inactive assets, then seller lots, then backed assets", () => {
-  const result = calculateRechargeFundingAllocation(
+test("deposit funding consumes inactive assets, then seller lots, then backed assets", () => {
+  const result = calculateDepositFundingAllocation(
     "100", "2", "100", "30", "20", "200", "10", "0",
   );
   assert.equal(result.available, true);
@@ -21,8 +21,8 @@ test("recharge funding consumes inactive assets, then seller lots, then backed a
   assert.equal(result.newBacked.gte("10"), true);
 });
 
-test("inactive reserve is consumed before any seller lot when it covers the full recharge", () => {
-  const result = calculateRechargeFundingAllocation(
+test("inactive reserve is consumed before any seller lot when it covers the full deposit", () => {
+  const result = calculateDepositFundingAllocation(
     "20", "1.5", "100", "25", "50", "150", "10", "0",
   );
   assert.equal(result.available, true);
@@ -35,7 +35,7 @@ test("inactive reserve is consumed before any seller lot when it covers the full
 });
 
 test("seller reserve is the second priority and protects the administrative backed floor", () => {
-  const result = calculateRechargeFundingAllocation(
+  const result = calculateDepositFundingAllocation(
     "41", "2", "100", "5", "15", "200", "80", "0",
   );
   assert.equal(result.available, false);
@@ -48,7 +48,7 @@ test("seller reserve is the second priority and protects the administrative back
 });
 
 test("pending disbursement reservations reduce system capacity without consuming seller lots", () => {
-  const result = calculateRechargeFundingAllocation(
+  const result = calculateDepositFundingAllocation(
     "15", "1", "100", "10", "5", "100", "10", "80",
   );
   assert.equal(result.available, true);
@@ -59,8 +59,8 @@ test("pending disbursement reservations reduce system capacity without consuming
 });
 
 test("rejects invalid reserve amounts, price inconsistency and administrative floor breaches", () => {
-  assert.throws(() => calculateRechargeFundingAllocation("10", "0", "2", "3", "0", "10"), /unit_price/);
-  assert.throws(() => calculateRechargeFundingAllocation("10", "1", "-1", "3", "0", "10"), /negative/);
-  assert.throws(() => calculateRechargeFundingAllocation("10", "2", "3", "3", "100"), /inconsistent/);
-  assert.throws(() => calculateRechargeFundingAllocation("10", "1", "5", "0", "0", "5", "6"), /below/);
+  assert.throws(() => calculateDepositFundingAllocation("10", "0", "2", "3", "0", "10"), /unit_price/);
+  assert.throws(() => calculateDepositFundingAllocation("10", "1", "-1", "3", "0", "10"), /negative/);
+  assert.throws(() => calculateDepositFundingAllocation("10", "2", "3", "3", "100"), /inconsistent/);
+  assert.throws(() => calculateDepositFundingAllocation("10", "1", "5", "0", "0", "5", "6"), /below/);
 });

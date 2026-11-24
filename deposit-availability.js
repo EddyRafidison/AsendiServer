@@ -6,7 +6,7 @@ const {
   calculateRemainingSystemAdminReserve,
 } = require("./stock-accounting");
 
-const PUBLIC_RECHARGE_SNAPSHOT_SQL = `
+const PUBLIC_DEPOSIT_SNAPSHOT_SQL = `
   SELECT
     c.total_units_price,
     c.unit_price,
@@ -39,12 +39,12 @@ function asFiniteNonNegative(value, fieldName) {
 }
 
 /**
- * Calculate the public reserve capacity available to fund new recharges.
+ * Calculate the public reserve capacity available to fund new deposits.
  * All reserve components and pending reservations are initial assets; the
  * combined free amount is converted to public XTU at the current global price.
  * The remaining administrative quota is excluded from backed_units.
  */
-function calculateAvailableRechargeReserveXtu({
+function calculateAvailableDepositReserveXtu({
   totalUnitsPrice,
   unitPrice,
   backedUnits,
@@ -114,9 +114,9 @@ function calculateAvailableRechargeReserveXtu({
  * Build a shared, short-lived cache so clients can poll once per second
  * without making each request scan reserve tables or lock financial rows.
  */
-function createRechargeAvailabilityCache({ ttlMs = 1000, now = Date.now } = {}) {
+function createDepositAvailabilityCache({ ttlMs = 1000, now = Date.now } = {}) {
   if (!Number.isInteger(ttlMs) || ttlMs < 100) {
-    throw new RangeError("Recharge availability cache TTL must be at least 100 milliseconds");
+    throw new RangeError("Deposit availability cache TTL must be at least 100 milliseconds");
   }
 
   let cached = null;
@@ -136,12 +136,12 @@ function createRechargeAvailabilityCache({ ttlMs = 1000, now = Date.now } = {}) 
     if (inFlight) return inFlight;
 
     inFlight = (async () => {
-      const rows = await db.queryAsync(PUBLIC_RECHARGE_SNAPSHOT_SQL);
+      const rows = await db.queryAsync(PUBLIC_DEPOSIT_SNAPSHOT_SQL);
       if (!Array.isArray(rows) || rows.length === 0) {
         throw new Error("The common reserve snapshot is not initialized");
       }
       const row = rows[0];
-      const calculated = calculateAvailableRechargeReserveXtu({
+      const calculated = calculateAvailableDepositReserveXtu({
         totalUnitsPrice: row.total_units_price,
         unitPrice: row.unit_price,
         backedUnits: row.backed_units,
@@ -179,15 +179,15 @@ function createRechargeAvailabilityCache({ ttlMs = 1000, now = Date.now } = {}) 
   return { get, invalidate };
 }
 
-const publicRechargeAvailabilityCache = createRechargeAvailabilityCache({ ttlMs: 1000 });
+const publicDepositAvailabilityCache = createDepositAvailabilityCache({ ttlMs: 1000 });
 
-async function getPublicRechargeAvailability(db, options) {
-  return publicRechargeAvailabilityCache.get(db, options);
+async function getPublicDepositAvailability(db, options) {
+  return publicDepositAvailabilityCache.get(db, options);
 }
 
 module.exports = {
-  PUBLIC_RECHARGE_SNAPSHOT_SQL,
-  calculateAvailableRechargeReserveXtu,
-  createRechargeAvailabilityCache,
-  getPublicRechargeAvailability,
+  PUBLIC_DEPOSIT_SNAPSHOT_SQL,
+  calculateAvailableDepositReserveXtu,
+  createDepositAvailabilityCache,
+  getPublicDepositAvailability,
 };

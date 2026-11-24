@@ -1,6 +1,6 @@
 "use strict";
 
-async function markPendingRechargeBatchesDueTx(tx, username, excludedBatchId = null) {
+async function markPendingDepositBatchesDueTx(tx, username, excludedBatchId = null) {
   const safeUsername = String(username || "").trim();
   if (!safeUsername) return 0;
   const now = String(Date.now());
@@ -25,4 +25,4 @@ async function markPendingRechargeBatchesDueTx(tx, username, excludedBatchId = n
   return Number(result.affectedRows || 0);
 }
 
-module.exports = { markPendingRechargeBatchesDueTx };
+module.exports = { markPendingDepositBatchesDueTx };

@@ -1,60 +1,81 @@
 "use strict";
 
 const BigNumber = require("bignumber.js");
-const { calculateGlobalUnitPrice, calculateRechargeFundingAllocation } = require("./stock-accounting");
+const { calculateGlobalUnitPrice, calculateDepositFundingAllocation } = require("./stock-accounting");
 
 const MAX_DEFAULT_STOCK = "300";
-// The minimum applies to the initial 60-minute deposit session. The 100 BSC-USD
-// maximum limits only its first credit tranche; any remaining balance stays pending.
-const MIN_RECHARGE_AMOUNT = new BigNumber("20");
-const MAX_RECHARGE_AMOUNT = new BigNumber("100");
+// The minimum and maximum govern the accepted intake per user per rolling 7-day period.
+// The first-credit tranche is tracked separately by the batch-crediting worker.
+const MIN_DEPOSIT_AMOUNT = new BigNumber("70");
+const MAX_DEPOSIT_AMOUNT = new BigNumber("140");
+// Keep the first automatically credited tranche distinct from the rolling seven-day intake ceiling.
+const MAX_INITIAL_CREDIT_TRANCHE_AMOUNT = new BigNumber(
+  process.env.MAX_DEPOSIT_INITIAL_CREDIT_BSC_USD || "100",
+);
 const SYSTEM_ADMIN_RESERVE_RATIO = new BigNumber(
   process.env.SYSTEM_ADMIN_RESERVE_RATIO || "0.10",
 );
-const RECHARGE_COOLDOWN_DAYS = 7;
-const RECHARGE_BATCH_WINDOW_MINUTES = 60;
+const DEPOSIT_COOLDOWN_DAYS = 7;
+const DEPOSIT_BATCH_WINDOW_MINUTES = 60;
 const DISBURSEMENT_COOLDOWN_DAYS = 30;
 const DISBURSEMENT_RESERVATION_MINUTES = 60;
 
 if (
-  !MIN_RECHARGE_AMOUNT.isFinite() || !MIN_RECHARGE_AMOUNT.isGreaterThan(0) ||
-  !MAX_RECHARGE_AMOUNT.isFinite() || MAX_RECHARGE_AMOUNT.lt(MIN_RECHARGE_AMOUNT)
+  !MIN_DEPOSIT_AMOUNT.isFinite() || !MIN_DEPOSIT_AMOUNT.isGreaterThan(0) ||
+  !MAX_DEPOSIT_AMOUNT.isFinite() || MAX_DEPOSIT_AMOUNT.lt(MIN_DEPOSIT_AMOUNT) ||
+  !MAX_INITIAL_CREDIT_TRANCHE_AMOUNT.isFinite() ||
+  !MAX_INITIAL_CREDIT_TRANCHE_AMOUNT.isGreaterThan(0) ||
+  MAX_INITIAL_CREDIT_TRANCHE_AMOUNT.gt(MAX_DEPOSIT_AMOUNT)
 ) {
-  throw new RangeError("Recharge limits must be finite positive values with maximum >= minimum");
+  throw new RangeError("Deposit limits must be finite positive values with maximum >= minimum");
 }
 
-const RECHARGE_COOLDOWN_MS = RECHARGE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
-const RECHARGE_BATCH_WINDOW_MS = RECHARGE_BATCH_WINDOW_MINUTES * 60 * 1000;
+const DEPOSIT_COOLDOWN_MS = DEPOSIT_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+const DEPOSIT_BATCH_WINDOW_MS = DEPOSIT_BATCH_WINDOW_MINUTES * 60 * 1000;
 const DISBURSEMENT_COOLDOWN_MS = DISBURSEMENT_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
 const DISBURSEMENT_RESERVATION_MS = DISBURSEMENT_RESERVATION_MINUTES * 60 * 1000;
 
-function validateRechargeAmount(amountValue) {
+function classifyRollingDepositReceipt(rollingSevenDayGross) {
+  const gross = new BigNumber(rollingSevenDayGross);
+  if (!gross.isFinite() || gross.isNegative()) {
+    throw new RangeError("Rolling seven-day deposit gross must be finite and non-negative");
+  }
+  return {
+    allowed: gross.lte(MAX_DEPOSIT_AMOUNT),
+    status: gross.lte(MAX_DEPOSIT_AMOUNT) ? "eligible" : "pending_weekly",
+    rollingSevenDayGross: gross,
+    maximumSevenDayGross: new BigNumber(MAX_DEPOSIT_AMOUNT),
+    remainingCapacity: BigNumber.maximum(0, MAX_DEPOSIT_AMOUNT.minus(gross)),
+  };
+}
+
+function validateDepositAmount(amountValue) {
   const amount = new BigNumber(amountValue);
   if (!amount.isFinite() || !amount.isGreaterThan(0)) {
     return { allowed: false, reason: "invalid_amount" };
   }
-  if (amount.isLessThan(MIN_RECHARGE_AMOUNT)) {
+  if (amount.isLessThan(MIN_DEPOSIT_AMOUNT)) {
     return { allowed: false, reason: "below_minimum" };
   }
   return {
     allowed: true,
     reason: null,
     amount,
-    initialCreditLimit: MAX_RECHARGE_AMOUNT,
-    exceedsInitialCreditLimit: amount.isGreaterThan(MAX_RECHARGE_AMOUNT),
+    initialCreditLimit: MAX_INITIAL_CREDIT_TRANCHE_AMOUNT,
+    exceedsInitialCreditLimit: amount.isGreaterThan(MAX_INITIAL_CREDIT_TRANCHE_AMOUNT),
   };
 }
 
 
 /**
- * Determine whether the account can accept one minimum automatic recharge
+ * Determine whether the account can accept one minimum automatic deposit
  * without exceeding its public XTU stock limit.
  *
- * Incoming recharges have no OneX-paid consolidation gas. All tfees are retained
+ * Incoming deposits have no OneX-paid consolidation gas. All tfees are retained
  * in the common accounting model. This projection mirrors applyUserTopUp and
  * includes the resulting tfees in both total valuation and backed initial assets.
  */
-function calculateMinimumRechargeCapacity({
+function calculateMinimumDepositCapacity({
   currentBalanceInitialAsset,
   totalUnitsPrice,
   backedUnits,
@@ -78,7 +99,7 @@ function calculateMinimumRechargeCapacity({
 
   const values = [currentBalance, total, backed, inactive, sellers, protectedFloor, price, feeRate, maximumXtu];
   if (values.some((value) => !value.isFinite())) {
-    throw new TypeError("Minimum-recharge capacity inputs must be finite");
+    throw new TypeError("Minimum-deposit capacity inputs must be finite");
   }
   if (
     currentBalance.isNegative() || total.isLessThanOrEqualTo(0) || backed.isLessThanOrEqualTo(0) ||
@@ -86,7 +107,7 @@ function calculateMinimumRechargeCapacity({
     price.isLessThanOrEqualTo(0) || feeRate.isNegative() || feeRate.isGreaterThanOrEqualTo(100) ||
     maximumXtu.isLessThanOrEqualTo(0)
   ) {
-    throw new RangeError("Minimum-recharge capacity inputs are outside their valid ranges");
+    throw new RangeError("Minimum-deposit capacity inputs are outside their valid ranges");
   }
 
   const calculatedPrice = calculateGlobalUnitPrice(total, backed);
@@ -94,13 +115,13 @@ function calculateMinimumRechargeCapacity({
     throw new RangeError("common.unit_price must not be below the reserve valuation ratio");
   }
 
-  const feeAmount = MIN_RECHARGE_AMOUNT.multipliedBy(feeRate).dividedBy(100);
-  const minimumNetAmount = MIN_RECHARGE_AMOUNT.minus(feeAmount);
+  const feeAmount = MIN_DEPOSIT_AMOUNT.multipliedBy(feeRate).dividedBy(100);
+  const minimumNetAmount = MIN_DEPOSIT_AMOUNT.minus(feeAmount);
   if (!minimumNetAmount.isGreaterThan(0)) {
-    throw new RangeError("The minimum recharge is fully consumed by tfees");
+    throw new RangeError("The minimum deposit is fully consumed by tfees");
   }
   const requiredInitialAsset = minimumNetAmount.dividedBy(price);
-  const allocation = calculateRechargeFundingAllocation(
+  const allocation = calculateDepositFundingAllocation(
     requiredInitialAsset,
     price,
     backed,
@@ -114,7 +135,7 @@ function calculateMinimumRechargeCapacity({
   let projectedPrice = price;
   let projectionMethod = "current_price_fallback";
   if (allocation.available) {
-    // Incoming recharge tfees are retained by OneX and added to the common valuation.
+    // Incoming deposit tfees are retained by OneX and added to the common valuation.
     // No BSC gas is deducted from the incoming amount or from the retained tfees.
     const projectedTotal = total
       .plus(allocation.systemInitialAsset.multipliedBy(price))
@@ -122,10 +143,10 @@ function calculateMinimumRechargeCapacity({
     const feeInitialAsset = feeAmount.dividedBy(price);
     const projectedBacked = backed.minus(allocation.consumedBacked).plus(feeInitialAsset);
     if (!projectedBacked.isGreaterThan(0)) {
-      throw new RangeError("The minimum recharge would exhaust common.backed_units");
+      throw new RangeError("The minimum deposit would exhaust common.backed_units");
     }
     projectedPrice = calculateGlobalUnitPrice(projectedTotal, projectedBacked, price);
-    projectionMethod = "retained_tfees_post_recharge_price";
+    projectionMethod = "retained_tfees_post_deposit_price";
   }
 
   const stockLimit = typeof stockLimitEvaluator === "function"
@@ -135,7 +156,7 @@ function calculateMinimumRechargeCapacity({
   const projectedBalanceXtu = stockLimit.projectedXtu;
   return {
     allowed: stockLimit.allowed,
-    minimumGrossAmount: new BigNumber(MIN_RECHARGE_AMOUNT),
+    minimumGrossAmount: new BigNumber(MIN_DEPOSIT_AMOUNT),
     minimumTfeesAmount: feeAmount,
     minimumNetAmount,
     requiredInitialAsset,
@@ -171,7 +192,7 @@ function recordDateTimeToUtcMs(recordDate, recordTime) {
   return value;
 }
 
-async function getLastOnexRecharge(queryable, username, onexUsername) {
+async function getLastOnexDeposit(queryable, username, onexUsername) {
   const [rows] = await queryable.query(
     `SELECT id,record_date,record_time
      FROM activities
@@ -183,14 +204,14 @@ async function getLastOnexRecharge(queryable, username, onexUsername) {
   return rows.length ? rows[0] : null;
 }
 
-function assessRechargeCooldown(lastRecharge, nowMs = Date.now()) {
-  if (!lastRecharge) return { allowed: true, remainingMs: 0, lastRechargeMs: null };
-  const lastRechargeMs = recordDateTimeToUtcMs(lastRecharge.record_date, lastRecharge.record_time);
-  if (lastRechargeMs === null || lastRechargeMs > nowMs) {
-    return { allowed: false, remainingMs: RECHARGE_COOLDOWN_MS, lastRechargeMs: null, invalidDate: true };
+function assessDepositCooldown(lastDeposit, nowMs = Date.now()) {
+  if (!lastDeposit) return { allowed: true, remainingMs: 0, lastDepositMs: null };
+  const lastDepositMs = recordDateTimeToUtcMs(lastDeposit.record_date, lastDeposit.record_time);
+  if (lastDepositMs === null || lastDepositMs > nowMs) {
+    return { allowed: false, remainingMs: DEPOSIT_COOLDOWN_MS, lastDepositMs: null, invalidDate: true };
   }
-  const remainingMs = Math.max(0, RECHARGE_COOLDOWN_MS - (nowMs - lastRechargeMs));
-  return { allowed: remainingMs === 0, remainingMs, lastRechargeMs };
+  const remainingMs = Math.max(0, DEPOSIT_COOLDOWN_MS - (nowMs - lastDepositMs));
+  return { allowed: remainingMs === 0, remainingMs, lastDepositMs };
 }
 
 function formatUtcRecordDateTime(timestampMs) {
@@ -205,30 +226,32 @@ function formatUtcRecordDateTime(timestampMs) {
   return [Number(`${yyyy}${mm}${dd}`), `${hh}${mi}${ss}`];
 }
 
-function getWeeklyReleaseAt(pendingSinceMs, lastRechargeMs) {
-  const pendingRelease = Number(pendingSinceMs) + RECHARGE_COOLDOWN_MS;
-  const rechargeRelease = lastRechargeMs == null ? 0 : Number(lastRechargeMs) + RECHARGE_COOLDOWN_MS;
+function getWeeklyReleaseAt(pendingSinceMs, lastDepositMs) {
+  const pendingRelease = Number(pendingSinceMs) + DEPOSIT_COOLDOWN_MS;
+  const depositRelease = lastDepositMs == null ? 0 : Number(lastDepositMs) + DEPOSIT_COOLDOWN_MS;
   if (!Number.isSafeInteger(pendingRelease) || pendingRelease <= 0) throw new TypeError("Invalid pending timestamp");
-  return Math.max(pendingRelease, rechargeRelease);
+  return Math.max(pendingRelease, depositRelease);
 }
 
 module.exports = {
   MAX_DEFAULT_STOCK,
-  MIN_RECHARGE_AMOUNT,
-  MAX_RECHARGE_AMOUNT,
+  MIN_DEPOSIT_AMOUNT,
+  MAX_DEPOSIT_AMOUNT,
+  MAX_INITIAL_CREDIT_TRANCHE_AMOUNT,
   SYSTEM_ADMIN_RESERVE_RATIO,
-  RECHARGE_COOLDOWN_DAYS,
-  RECHARGE_COOLDOWN_MS,
-  RECHARGE_BATCH_WINDOW_MINUTES,
-  RECHARGE_BATCH_WINDOW_MS,
+  DEPOSIT_COOLDOWN_DAYS,
+  DEPOSIT_COOLDOWN_MS,
+  DEPOSIT_BATCH_WINDOW_MINUTES,
+  DEPOSIT_BATCH_WINDOW_MS,
   DISBURSEMENT_COOLDOWN_DAYS,
   DISBURSEMENT_COOLDOWN_MS,
   DISBURSEMENT_RESERVATION_MINUTES,
   DISBURSEMENT_RESERVATION_MS,
-  getLastOnexRecharge,
-  assessRechargeCooldown,
+  getLastOnexDeposit,
+  assessDepositCooldown,
   formatUtcRecordDateTime,
   getWeeklyReleaseAt,
-  validateRechargeAmount,
-  calculateMinimumRechargeCapacity,
+  validateDepositAmount,
+  classifyRollingDepositReceipt,
+  calculateMinimumDepositCapacity,
 };

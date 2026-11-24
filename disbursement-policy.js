@@ -1,7 +1,7 @@
 "use strict";
 
 const BigNumber = require("bignumber.js");
-const { DISBURSEMENT_COOLDOWN_MS } = require("./recharge-policy");
+const { DISBURSEMENT_COOLDOWN_MS } = require("./deposit-policy");
 const { calculateGlobalUnitPrice } = require("./stock-accounting");
 
 const TOKEN_DECIMALS = 18;

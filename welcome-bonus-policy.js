@@ -2,7 +2,7 @@
 
 const BigNumber = require("bignumber.js");
 const crypto = require("crypto");
-const { MAX_DEFAULT_STOCK } = require("./recharge-policy");
+const { MAX_DEFAULT_STOCK } = require("./deposit-policy");
 
 const DEFAULT_WELCOME_BONUS_BENEFICIARIES = 1000;
 const MAX_WELCOME_BONUS_BENEFICIARIES = 1_000_000;

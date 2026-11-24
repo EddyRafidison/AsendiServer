@@ -60,16 +60,16 @@ test("incoming scanner has a durable, idempotent cursor and audited rollback rec
   assert.match(pay, /validateRpcEndpoint\(rpcUrl\)/);
   assert.match(pay, /The payment scanner will remain active and retry without advancing its database cursor/);
   assert.ok(pay.includes('if (startBlock > safeBlock.number)'));
-  assert.match(read("routes.js"), /sharedTreasuryAddress = rechargeAvailability.allowed && paymentConfig.enabled && depositScannerReady/);
+  assert.match(read("routes.js"), /sharedTreasuryAddress = depositAvailability.allowed && paymentConfig.enabled && depositScannerReady/);
   assert.match(pay, /let watcherWsProvider = null/);
   assert.match(routes, /\/admin\/bsc\/incoming-scanner\/status/);
   assert.match(routes, /\/admin\/bsc\/incoming-scanner\/reconcile\/preview/);
   assert.match(routes, /\/admin\/bsc\/incoming-scanner\/reconcile\/resolve-event/);
   assert.match(routes, /\/admin\/bsc\/incoming-scanner\/reconcile\/commit/);
   assert.match(routes, /preview_required/);
-  assert.match(routes, /startRechargeBatchWorker\(\)/);
-  assert.match(routes, /isRechargeBatchSafeDuringScannerReview/);
-  assert.match(routes, /USDT_RECHARGE_QUEUE_POLL_MS/);
+  assert.match(routes, /startDepositBatchWorker\(\)/);
+  assert.match(routes, /isDepositBatchSafeDuringScannerReview/);
+  assert.match(routes, /USDT_DEPOSIT_QUEUE_POLL_MS/);
 });
 
 test("deposit batches persist the shared treasury, not a per-user deposit address", () => {

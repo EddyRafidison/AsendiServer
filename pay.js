@@ -1179,7 +1179,7 @@ async function loadAffectedIncomingEvents(db, ancestorBlock, previousBlock, rpcU
             e.tx_hash,e.log_index,e.block_number,e.block_hash,e.block_timestamp_ms,e.status,
             b.credited_amount AS batch_credited_amount,b.refunded_amount AS batch_refunded_amount,
             b.reserved_refund_amount AS batch_reserved_refund_amount,
-            (SELECT COUNT(*) FROM users_usdt_recharge_credits c WHERE c.batch_id=e.batch_id) AS recharge_credit_count,
+            (SELECT COUNT(*) FROM users_usdt_deposit_credits c WHERE c.batch_id=e.batch_id) AS deposit_credit_count,
             (SELECT COUNT(*) FROM users_usdt_refunds r WHERE r.batch_id=e.batch_id) AS refund_count,
             (SELECT COUNT(*) FROM users_usdt_refunds r WHERE r.batch_id=e.batch_id
                AND r.status IN ('signed','submitted','completed','manual_review')) AS externally_effective_refund_count
@@ -1214,7 +1214,7 @@ async function loadAffectedIncomingEvents(db, ancestorBlock, previousBlock, rpcU
       new BigNumber(row.batch_reserved_refund_amount || "0").isGreaterThan(0) &&
       Number(row.refund_count || 0) === 0;
     const financialImpact = !batchExists ||
-      Number(row.recharge_credit_count || 0) > 0 ||
+      Number(row.deposit_credit_count || 0) > 0 ||
       new BigNumber(row.batch_credited_amount || "0").isGreaterThan(0) ||
       new BigNumber(row.batch_refunded_amount || "0").isGreaterThan(0) ||
       Number(row.externally_effective_refund_count || 0) > 0 ||
@@ -1665,7 +1665,7 @@ async function commitIncomingScannerReconciliation(db, options = {}) {
         const [batchRows] = await tx.query(
           "SELECT * FROM users_usdt_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [batchKey],
         );
-        if (!batchRows.length) throw new Error(`Recharge batch ${batchKey} is missing; manual ledger review is required`);
+        if (!batchRows.length) throw new Error(`Deposit batch ${batchKey} is missing; manual ledger review is required`);
         const batch = batchRows[0];
         const [refundRows] = await tx.query(
           `SELECT * FROM users_usdt_refunds WHERE batch_id=? ORDER BY id ASC FOR UPDATE`, [batchKey],
@@ -1675,7 +1675,7 @@ async function commitIncomingScannerReconciliation(db, options = {}) {
         if (unsafeRefunds.length > 0 ||
             new BigNumber(batch.credited_amount || "0").isGreaterThan(0) ||
             new BigNumber(batch.refunded_amount || "0").isGreaterThan(0)) {
-          throw new Error(`Recharge batch ${batchKey} acquired a financial effect or has a potentially broadcast refund. Compensation and payout reconciliation are required before commit.`);
+          throw new Error(`Deposit batch ${batchKey} acquired a financial effect or has a potentially broadcast refund. Compensation and payout reconciliation are required before commit.`);
         }
         const cancellationTime = String(Date.now());
         for (const refund of refundRows) {
@@ -1730,7 +1730,7 @@ async function commitIncomingScannerReconciliation(db, options = {}) {
         const rawBefore = BigInt(batch.total_amount_raw || "0");
         if (amountToRemove.gt(totalBefore) || amountToRemove.gt(remainingBefore) || rawToRemove > rawBefore ||
             Number(batch.transfer_count || 0) < batchItems.length) {
-          throw new Error(`Recharge batch ${batchKey} cannot be safely reduced by the orphaned event amounts`);
+          throw new Error(`Deposit batch ${batchKey} cannot be safely reduced by the orphaned event amounts`);
         }
         const totalAfter = totalBefore.minus(amountToRemove);
         const remainingAfter = remainingBefore.minus(amountToRemove);

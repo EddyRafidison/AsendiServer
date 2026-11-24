@@ -41,9 +41,11 @@ test("common snapshots raise the global XTU unit price when the reserve ratio ri
   assert.equal(values.unit_price, "2.500000000000000000000000000000");
 });
 
-test("common.xtu_wallets is cumulative and remains unchanged unless explicitly increased", () => {
+test("common.xtu_wallets is an evolving non-negative externalized balance that can decrease on returned deposits", () => {
   const values = commonSnapshotValues(commonRow({ xtu_wallets: "12.5" }), {
+    xtu_wallets: "7.5",
     total_units_price: "100",
   });
-  assert.equal(values.xtu_wallets, "12.5");
+  assert.equal(values.xtu_wallets, "7.5");
+  assert.throws(() => commonSnapshotValues(commonRow({ xtu_wallets: "1" }), { xtu_wallets: "-0.01" }), /non-negative/);
 });

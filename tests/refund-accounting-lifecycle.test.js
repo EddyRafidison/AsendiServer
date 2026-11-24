@@ -30,8 +30,8 @@ test("refund request and refund record have unique direct one-to-one links", () 
 });
 
 test("administrative approval reserves the pending remainder without counting it as refunded", () => {
-  const adminRoute = between(routes, 'router.post("/admin/recharge/refund"', '// Requeue an unsubmitted disbursement');
-  assert.match(adminRoute, /MAX_RECHARGE_AMOUNT\.multipliedBy\(3\)/);
+  const adminRoute = between(routes, 'router.post("/admin/deposit/refund"', '// Requeue an unsubmitted disbursement');
+  assert.match(adminRoute, /MAX_INITIAL_CREDIT_TRANCHE_AMOUNT\.multipliedBy\(3\)/);
   assert.match(adminRoute, /reserved_refund_amount=reserved_refund_amount\+\?,remaining_amount=remaining_amount-\?/);
   assert.doesNotMatch(adminRoute, /refunded_amount=refunded_amount\+/);
   assert.match(adminRoute, /user_request_id/);
@@ -48,14 +48,14 @@ test("only a confirmed blockchain refund converts reserved amount into refunded 
   assert.match(finalize, /blockchain_confirmed/);
 });
 
-test("a finalized reverted refund restores the full gross amount to the pending recharge remainder", () => {
+test("a finalized reverted refund restores the full gross amount to the pending deposit remainder", () => {
   const worker = between(disbursement, "async function processOneRefundJob", "async function processRefundQueue");
   const failure = between(worker, "if (Number(receipt.status) !== 1)", "if (!receiptConfirmsExpectedTransfer");
   assert.match(failure, /reserved_refund_amount=reserved_refund_amount-\?/);
   assert.match(failure, /remaining_amount=remaining_amount\+\?/);
   assert.match(failure, /status='pending_support'/);
   assert.match(failure, /blockchain_reverted/);
-  assert.match(failure, /restored to pending recharge/);
+  assert.match(failure, /restored to pending deposit/);
 });
 
 test("refund request lifecycle and persisted state recovery are recorded", () => {
@@ -74,7 +74,7 @@ test("administrator user-info endpoint exists and is rate limited without exposi
   const endpoint = between(routes, 'router.post("/admin/user-info"', '// Apply an administrator-approved credit');
   assert.match(endpoint, /SELECT username,name,email,birthdate,wallet_address/);
   assert.match(endpoint, /balance: \{/);
-  assert.match(endpoint, /recharges: \{/);
+  assert.match(endpoint, /deposits: \{/);
   assert.match(endpoint, /disbursements:/);
   assert.match(endpoint, /refund_requests:/);
   assert.match(endpoint, /refunds:/);

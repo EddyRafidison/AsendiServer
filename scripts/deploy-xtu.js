@@ -8,11 +8,17 @@ const { compileOneXToken } = require("./compile-xtu");
 async function main() {
   dotenv.config();
   dotenv.config({ path: path.resolve(process.cwd(), ".env.xtu") });
+  dotenv.config({ path: path.resolve(process.env.XTU_MAIN_ENV_FILE || ".env.xtu-main") });
+
   const rpcUrl = String(process.env.BSC_RPC_URL || "").trim();
-  const privateKey = String(process.env.XTU_DISTRIBUTION_PRIVATE_KEY || "").trim();
+  const privateKey = String(process.env.XTU_MAIN_PRIVATE_KEY || "").trim();
+  const hotWalletAddress = String(process.env.XTU_MAIN_WALLET_ADDRESS || "").trim();
   const distributionAddress = String(process.env.XTU_DISTRIBUTION_ADDRESS || "").trim();
-  if (!rpcUrl || !/^0x[0-9a-fA-F]{64}$/.test(privateKey) || !isAddress(distributionAddress)) {
-    throw new Error("Set BSC_RPC_URL in .env and XTU_DISTRIBUTION_ADDRESS / XTU_DISTRIBUTION_PRIVATE_KEY in .env.xtu first.");
+  if (
+    !rpcUrl || !/^0x[0-9a-fA-F]{64}$/.test(privateKey) ||
+    !isAddress(hotWalletAddress) || !isAddress(distributionAddress)
+  ) {
+    throw new Error("Set BSC_RPC_URL, XTU_MAIN_WALLET_ADDRESS and XTU_DISTRIBUTION_ADDRESS in .env.xtu, plus XTU_MAIN_PRIVATE_KEY in .env.xtu-main.");
   }
 
   const provider = new JsonRpcProvider(rpcUrl, 56n);
@@ -20,27 +26,32 @@ async function main() {
   if (BigInt(network.chainId) !== 56n) throw new Error("Refusing to deploy: the RPC is not BNB Smart Chain mainnet (chain ID 56).");
 
   const signer = new Wallet(privateKey, provider);
+  const normalizedHotWallet = getAddress(hotWalletAddress);
   const normalizedDistribution = getAddress(distributionAddress);
-  if (signer.address !== normalizedDistribution) {
-    throw new Error("The deployment key must belong to XTU_DISTRIBUTION_ADDRESS; do not reuse a treasury or disbursement key.");
+  if (signer.address !== normalizedHotWallet) {
+    throw new Error("The deployment key must belong to XTU_MAIN_WALLET_ADDRESS. Do not reuse the XTU distribution or BSC-USD keys.");
+  }
+  if (normalizedHotWallet === normalizedDistribution) {
+    throw new Error("The XTU Hot Wallet and Distribution Wallet must be different addresses.");
   }
   const balance = await provider.getBalance(signer.address);
-  if (balance === 0n) throw new Error("The dedicated XTU distribution wallet has no BNB for deployment gas.");
+  if (balance === 0n) throw new Error("The XTU Hot Wallet has no BNB for deployment gas.");
 
   const artifact = compileOneXToken();
   const factory = new ContractFactory(artifact.abi, artifact.bytecode, signer);
-  const contract = await factory.deploy(normalizedDistribution);
+  const contract = await factory.deploy(normalizedHotWallet, normalizedDistribution);
   const deploymentTransaction = contract.deploymentTransaction();
-  if (!deploymentTransaction) throw new Error("The XTU deployment transaction was not created.");
+  if (!deploymentTransaction) throw new Error("The deployment transaction was not created.");
   process.stdout.write(`XTU deployment submitted: ${deploymentTransaction.hash}\n`);
   await contract.waitForDeployment();
   const address = await contract.getAddress();
   process.stdout.write([
     "OneXToken deployed successfully.",
     `Contract address: ${address}`,
-    `Distribution wallet: ${normalizedDistribution}`,
+    `Initial supply recipient (Hot Wallet): ${normalizedHotWallet}`,
+    `Commission recipient (Distribution Wallet): ${normalizedDistribution}`,
     `Deployment transaction: ${deploymentTransaction.hash}`,
-    "Copy the contract address into XTU_TOKEN_CONTRACT_ADDRESS in .env.xtu, then verify the contract on BscScan.",
+    "Verify the constructor parameters and fixed supply on BscScan before enabling XTU deposits or withdrawals.",
   ].join("\n") + "\n");
 }
 

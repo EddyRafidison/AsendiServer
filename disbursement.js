@@ -31,12 +31,12 @@ const {
 const { getBnbUsdPrice, startBnbUsdPriceOracle } = require("./bsc-price-oracle");
 const { attachEthersRpcMetrics } = require("./bsc-rpc-ethers-metrics");
 const { createBscFeeLimitError, getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
-const { SYSTEM_ADMIN_RESERVE_RATIO } = require("./recharge-policy");
+const { SYSTEM_ADMIN_RESERVE_RATIO } = require("./deposit-policy");
 const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
 const {
   calculateRequiredAdminBonusReserve,
 } = require("./global-disbursement-policy");
-const { markPendingRechargeBatchesDueTx } = require("./recharge-retry");
+const { markPendingDepositBatchesDueTx } = require("./deposit-retry");
 const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
 const { getMinimumOutgoingNetBscUsd } = require("./outgoing-payout-policy");
 const { db: sharedDb } = require("./db");
@@ -271,8 +271,8 @@ async function getDisbursementSpendableTokenRaw(tokenBalanceRaw, reservationCred
 async function getHotWalletSpendableTokenRaw(tokenBalanceRaw, reservationCredit = "0", queryable = sharedDb) {
   const reserves = await getHotWalletReserveAmounts(queryable);
   const reservedTotal = [
-    reserves.pendingRechargeAmount,
-    reserves.reservedRechargeRefundAmount,
+    reserves.pendingDepositAmount,
+    reserves.reservedDepositRefundAmount,
     reserves.unresolvedUnknownIncomingAmount,
     reserves.pendingSellerPayoutAmount,
     reserves.otherPendingRefundAmount,
@@ -785,7 +785,7 @@ async function restoreUserBalanceAfterFailedPayout(db, jobId, message, receipt) 
       "UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?",
       [currentBalanceInitial.plus(job.gross_initial_asset).toFixed(30), date, time, username],
     );
-    await markPendingRechargeBatchesDueTx(tx, username);
+    await markPendingDepositBatchesDueTx(tx, username);
     const failedAt = String(Date.now());
     await tx.query(
       `UPDATE users_usdt_disbursements
@@ -1676,7 +1676,7 @@ async function finalizeRefund(db, refundId, receipt) {
       reservedAmount.isFinite() && grossAmount.isFinite() && reservedAmount.gte(grossAmount)
     );
     if (!sourceIsQueued || !reservationIsValid || (userRequestId != null && !requestRows.length)) {
-      const reviewReason = "The refund was confirmed on-chain, but its linked recharge/request reservation is inconsistent and requires manual reconciliation.";
+      const reviewReason = "The refund was confirmed on-chain, but its linked deposit/request reservation is inconsistent and requires manual reconciliation.";
       await tx.query(
         "UPDATE users_usdt_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
         [reviewReason, String(Date.now()), refundId],
@@ -1691,7 +1691,7 @@ async function finalizeRefund(db, refundId, receipt) {
       });
       await queueTelegramMessageTx(tx, refund.username, `refund:${refundId}:manual_review`, [
         "OneX Refund Update",
-        "Your refund transaction was confirmed on-chain, but the linked recharge/request reservation requires manual reconciliation.",
+        "Your refund transaction was confirmed on-chain, but the linked deposit/request reservation requires manual reconciliation.",
         `Refund ID: ${refundId}`,
         `Transaction: ${refund.tx_hash}`,
         `Reason: ${reviewReason}`,
@@ -1716,7 +1716,7 @@ async function finalizeRefund(db, refundId, receipt) {
         [grossAmount.toFixed(18), grossAmount.toFixed(18), now, batchId, grossAmount.toFixed(18)],
       );
       if (Number(batchUpdate.affectedRows || 0) !== 1) {
-        throw new Error("Unable to settle the reserved recharge refund amount after confirmation.");
+        throw new Error("Unable to settle the reserved deposit refund amount after confirmation.");
       }
       await tx.query(
         "UPDATE users_usdt_transfer_events SET status='refunded' WHERE batch_id=?",
@@ -1801,7 +1801,7 @@ async function markRefundManualReview(db, job, reason) {
       "The refund requires manual review because its net amount would be below the permitted minimum or the payment needs reconciliation.",
       `Refund ID: ${job.id}`,
       `Reason: ${String(reason).slice(0, 500)}`,
-      "The reserved recharge remainder remains blocked and has not been counted as refunded.",
+      "The reserved deposit remainder remains blocked and has not been counted as refunded.",
       "Status: MANUAL REVIEW",
     ].join("\n"));
   });
@@ -2025,14 +2025,14 @@ async function processOneRefundJob(db, job, activeRuntime) {
             refund.batch_id, grossAmount.toFixed(18)],
         );
         if (Number(batchUpdate.affectedRows || 0) !== 1) {
-          throw new Error("The failed refund reservation could not be restored to its recharge remainder.");
+          throw new Error("The failed refund reservation could not be restored to its deposit remainder.");
         }
         await tx.query(
           "UPDATE users_usdt_transfer_events SET status='pending_support',reason_codes=? WHERE batch_id=?",
           [JSON.stringify(["refund_failed"]), refund.batch_id],
         );
         await tx.query(
-          "UPDATE admin_payment_resolutions SET action='refund_failed',tx_hash=?,reason=CONCAT(reason,' | Refund reverted on-chain; reserved amount restored to pending recharge.') WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')",
+          "UPDATE admin_payment_resolutions SET action='refund_failed',tx_hash=?,reason=CONCAT(reason,' | Refund reverted on-chain; reserved amount restored to pending deposit.') WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')",
           [job.tx_hash, job.id],
         );
       } else if (refund.unknown_transfer_id != null) {
@@ -2048,7 +2048,7 @@ async function processOneRefundJob(db, job, activeRuntime) {
       }
       await transitionUserRefundRequestTx(tx, refund, {
         newStatus: "failed", eventType: "blockchain_reverted",
-        reason: "The refund transaction was finalized with a revert. The BSC-USD amount reserved for the refund has been restored to the recharge remainder; no token refund was completed.",
+        reason: "The refund transaction was finalized with a revert. The BSC-USD amount reserved for the refund has been restored to the deposit remainder; no token refund was completed.",
         txHash: job.tx_hash, feeAmount: String(refund.fee_amount || "0"),
         netAmount: String(refund.amount || "0"), createdAtMs: now,
       });
@@ -2057,9 +2057,9 @@ async function processOneRefundJob(db, job, activeRuntime) {
         "The refund transaction was finalized but reverted on BNB Smart Chain. No BSC-USD refund transfer was completed.",
         `Refund ID: ${job.id}`,
         `Transaction: ${job.tx_hash}`,
-        `Reserved gross amount restored to pending recharge: ${grossAmount.toFixed(8)} BSC-USD`,
+        `Reserved gross amount restored to pending deposit: ${grossAmount.toFixed(8)} BSC-USD`,
         `Actual gas paid by OneX: ${actualFee.feeBnb.toFixed(8)} BNB (${actualFee.feeUsd.toFixed(8)} BSC-USD)`,
-        "The pending recharge will be evaluated again under the normal credit rules. A new exceptional refund request may be submitted if the applicable conditions are still met.",
+        "The pending deposit will be evaluated again under the normal credit rules. A new exceptional refund request may be submitted if the applicable conditions are still met.",
         "Status: FAILED - AMOUNT RESTORED",
       ].join("\n"));
     });

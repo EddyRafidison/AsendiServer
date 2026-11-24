@@ -35,9 +35,9 @@ The Chainstack endpoint shown in `.env.example` is deliberately fictional. Repla
 
 ## 4. Financial invariants preserved
 
-This RPC routing change does not introduce an amount filter and does not discard low-value incoming transfers. Every positive, finalized incoming `Transfer` log matching the treasury continues into the existing financial processing pipeline. The project's existing 20 BSC-USD initial grouped-session minimum, 60-minute grouping window, first-credit tranche cap, remainder handling, registered-wallet checks, account-capacity checks, `tfees`, reserve priority and administrative hold rules remain the responsibility of the existing financial logic.
+This RPC routing change does not introduce an amount filter and does not discard low-value incoming transfers. Every positive, finalized incoming `Transfer` log matching the treasury continues into the existing financial processing pipeline. The existing BSC-USD reception limits (70–140 BSC-USD per user over a rolling seven-day period), 60-minute grouping window, separate 100 BSC-USD first-credit-tranche cap, remainder handling, registered-wallet checks, account-capacity checks, `tfees`, reserve priority and administrative hold rules remain the responsibility of the financial deposit pipeline.
 
-No SQL migration or recharge/disbursement rule change is introduced by this routing update.
+No SQL migration or deposit/disbursement rule change is introduced by this routing update.
 
 ## 5. Why no automatic outgoing RPC fallback is enabled
 

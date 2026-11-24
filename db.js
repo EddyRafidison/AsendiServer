@@ -4,7 +4,7 @@ require("dotenv").config();
 const mysql = require("mysql2");
 const BigNumber = require("bignumber.js");
 const { getDate, getDateBefore } = require("./utils");
-const { MAX_DEFAULT_STOCK, SYSTEM_ADMIN_RESERVE_RATIO } = require("./recharge-policy");
+const { MAX_DEFAULT_STOCK, SYSTEM_ADMIN_RESERVE_RATIO } = require("./deposit-policy");
 const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
 
 const OneX = "ONEX";
@@ -211,7 +211,7 @@ const TABLES = [
     record_date INT NOT NULL,
     record_time CHAR(6) NOT NULL,
     UNIQUE KEY uq_activities_reference(reference),
-    KEY idx_activities_recharge_user(sender,receiver,type,record_date,record_time,id),
+    KEY idx_activities_deposit_user(sender,receiver,type,record_date,record_time,id),
     KEY idx_activities_sender_type(sender,type,id),
     KEY idx_activities_sender_id(sender,id),
     KEY idx_activities_receiver_id(receiver,id),
@@ -222,7 +222,8 @@ const TABLES = [
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     total_units_price DECIMAL(50,30) NOT NULL DEFAULT 18000000,
     unit_price DECIMAL(50,30) NOT NULL DEFAULT 1,
-    xtu_wallets DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Cumulative net XTU externalized to user wallets; never add it to reserves',
+    xtu_wallets DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Net XTU currently externalized to user wallets and not yet returned; never add it to reserves',
+    xtu_wallets_reserved DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'BSC-USD cover provisionally reserved for in-flight XTU withdrawals',
     backed_units DECIMAL(50,30) NOT NULL DEFAULT 18000000,
     inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
     sys_inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -416,14 +417,14 @@ const TABLES = [
     PRIMARY KEY(username,action,window_start_ms),
     KEY idx_account_api_rate_cleanup(window_start_ms)
   ) ENGINE=InnoDB`,
-  `CREATE TABLE IF NOT EXISTS recharge_service_control(
+  `CREATE TABLE IF NOT EXISTS deposit_service_control(
     control_id TINYINT UNSIGNED PRIMARY KEY,
     is_suspended TINYINT UNSIGNED NOT NULL DEFAULT 0,
     suspension_reason VARCHAR(1000) NULL,
     changed_by VARCHAR(64) NOT NULL DEFAULT 'system',
     updated_at_ms BIGINT UNSIGNED NOT NULL
   ) ENGINE=InnoDB`,
-  `CREATE TABLE IF NOT EXISTS recharge_service_control_events(
+  `CREATE TABLE IF NOT EXISTS deposit_service_control_events(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     action VARCHAR(16) NOT NULL,
     previous_suspended TINYINT UNSIGNED NOT NULL,
@@ -431,7 +432,7 @@ const TABLES = [
     reason VARCHAR(1000) NOT NULL,
     changed_by VARCHAR(64) NOT NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
-    KEY idx_recharge_control_events_created(created_at_ms,id)
+    KEY idx_deposit_control_events_created(created_at_ms,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS individual_disbursement_control(
     control_id TINYINT UNSIGNED PRIMARY KEY,
@@ -502,6 +503,7 @@ const TABLES = [
     actual_gas_fee_usd DECIMAL(50,30) NULL,
     actual_contract_fee_amount DECIMAL(36,18) NULL,
     actual_net_amount DECIMAL(36,18) NULL,
+    receipt_json LONGTEXT NULL,
     status VARCHAR(24) NOT NULL DEFAULT 'queued',
     last_error VARCHAR(1000) NULL,
     next_attempt_at_ms BIGINT UNSIGNED NOT NULL,
@@ -529,6 +531,196 @@ const TABLES = [
     created_at_ms BIGINT UNSIGNED NOT NULL,
     UNIQUE KEY uq_xtu_withdrawal_event_key(event_key),
     KEY idx_xtu_withdrawal_events_withdrawal(withdrawal_id,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_deposit_scan_state(
+    singleton_id TINYINT UNSIGNED PRIMARY KEY,
+    chain_id BIGINT UNSIGNED NOT NULL,
+    token_contract CHAR(42) NOT NULL,
+    hot_wallet_address CHAR(42) NOT NULL,
+    start_block BIGINT UNSIGNED NOT NULL,
+    last_scanned_block BIGINT UNSIGNED NOT NULL,
+    last_scanned_block_hash CHAR(66) NULL,
+    last_finalized_block BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    finality_method VARCHAR(24) NOT NULL DEFAULT 'confirmations',
+    health_status VARCHAR(24) NOT NULL DEFAULT 'initializing',
+    last_error VARCHAR(1000) NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_deposit_batches(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(30) NOT NULL,
+    hot_wallet_address CHAR(42) NOT NULL,
+    opened_at_ms BIGINT UNSIGNED NOT NULL,
+    expires_at_ms BIGINT UNSIGNED NOT NULL,
+    initial_group_deadline_ms BIGINT UNSIGNED NOT NULL,
+    gross_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    hot_wallet_received_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    commission_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    returned_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    credited_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    remaining_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    transfer_count INT UNSIGNED NOT NULL DEFAULT 0,
+    credit_sequence INT UNSIGNED NOT NULL DEFAULT 0,
+    pending_since_ms BIGINT UNSIGNED NULL,
+    release_at_ms BIGINT UNSIGNED NULL,
+    gas_allocated_usd DECIMAL(36,18) NOT NULL DEFAULT 0,
+    gas_allocated_xtu DECIMAL(36,18) NOT NULL DEFAULT 0,
+    deposit_fee_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    status VARCHAR(32) NOT NULL DEFAULT 'collecting',
+    reason_codes TEXT NULL,
+    global_run_id BIGINT UNSIGNED NULL,
+    tfees_rate_percent DECIMAL(20,10) NOT NULL DEFAULT 0,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    KEY idx_xtu_deposit_batch_user_status(username,status,id),
+    KEY idx_xtu_deposit_batch_due(status,expires_at_ms,release_at_ms,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_deposit_transfer_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(30) NULL,
+    batch_id BIGINT UNSIGNED NULL,
+    token_contract CHAR(42) NOT NULL,
+    from_address CHAR(42) NOT NULL,
+    hot_wallet_address CHAR(42) NOT NULL,
+    gross_amount DECIMAL(36,18) NOT NULL,
+    net_amount DECIMAL(36,18) NOT NULL,
+    commission_amount DECIMAL(36,18) NOT NULL,
+    gross_amount_raw DECIMAL(65,0) NOT NULL,
+    net_amount_raw DECIMAL(65,0) NOT NULL,
+    commission_amount_raw DECIMAL(65,0) NOT NULL,
+    allocated_gas_fee_usd DECIMAL(36,18) NOT NULL DEFAULT 0,
+    allocated_gas_fee_xtu DECIMAL(36,18) NOT NULL DEFAULT 0,
+    tx_hash CHAR(66) NOT NULL,
+    log_index INT UNSIGNED NOT NULL,
+    block_number BIGINT UNSIGNED NOT NULL,
+    block_hash CHAR(66) NOT NULL,
+    block_timestamp_ms BIGINT UNSIGNED NOT NULL,
+    event_identity CHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'detected',
+    reason_codes TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_xtu_deposit_event_identity(event_identity),
+    UNIQUE KEY uq_xtu_deposit_event_tx_log(tx_hash,log_index),
+    KEY idx_xtu_deposit_event_user_status(username,status,id),
+    KEY idx_xtu_deposit_event_batch(batch_id,status,id),
+    KEY idx_xtu_deposit_event_block(block_number)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_deposit_consolidations(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    batch_id BIGINT UNSIGNED NOT NULL,
+    amount DECIMAL(36,18) NOT NULL,
+    amount_raw DECIMAL(65,0) NOT NULL,
+    hot_wallet_address CHAR(42) NOT NULL,
+    distribution_address CHAR(42) NOT NULL,
+    estimated_gas_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
+    estimated_gas_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
+    actual_gas_fee_bnb DECIMAL(50,30) NULL,
+    actual_gas_fee_usd DECIMAL(50,30) NULL,
+    gas_bnb_usd_price DECIMAL(36,18) NULL,
+    gas_limit BIGINT UNSIGNED NOT NULL,
+    gas_price_wei VARCHAR(80) NULL,
+    raw_tx LONGTEXT NULL,
+    tx_hash CHAR(66) NULL,
+    nonce BIGINT UNSIGNED NULL,
+    block_number BIGINT UNSIGNED NULL,
+    receipt_json LONGTEXT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'queued',
+    last_error VARCHAR(1000) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    confirmed_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_xtu_deposit_consolidation_batch(batch_id),
+    UNIQUE KEY uq_xtu_deposit_consolidation_hash(tx_hash),
+    KEY idx_xtu_deposit_consolidation_status(status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_deposit_credits(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    batch_id BIGINT UNSIGNED NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    credit_sequence INT UNSIGNED NOT NULL,
+    gross_returned_xtu DECIMAL(36,18) NOT NULL,
+    deposit_fee_xtu DECIMAL(36,18) NOT NULL,
+    gas_fee_xtu DECIMAL(36,18) NOT NULL,
+    creditable_xtu DECIMAL(36,18) NOT NULL,
+    credited_initial_asset DECIMAL(50,30) NOT NULL,
+    global_unit_price DECIMAL(50,30) NOT NULL,
+    reference VARCHAR(64) NOT NULL,
+    global_run_id BIGINT UNSIGNED NULL,
+    source_event_hashes_json LONGTEXT NOT NULL,
+    consolidation_tx_hash CHAR(66) NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'credited',
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_xtu_deposit_credit_batch_seq(batch_id,credit_sequence),
+    UNIQUE KEY uq_xtu_deposit_credit_reference(reference),
+    KEY idx_xtu_deposit_credit_user(username,created_at_ms,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_global_settlement_ledger(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    global_run_id BIGINT UNSIGNED NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    deposit_batch_id BIGINT UNSIGNED NOT NULL,
+    credit_sequence INT UNSIGNED NOT NULL,
+    tx_hash CHAR(66) NOT NULL,
+    source_event_hashes_json LONGTEXT NOT NULL,
+    consolidation_tx_hash CHAR(66) NOT NULL,
+    gross_returned_xtu DECIMAL(36,18) NOT NULL,
+    deposit_fee_xtu DECIMAL(36,18) NOT NULL DEFAULT 0,
+    gas_fee_xtu DECIMAL(36,18) NOT NULL,
+    global_unit_price DECIMAL(50,30) NOT NULL,
+    credited_initial_asset DECIMAL(50,30) NOT NULL,
+    reserved_xtu_amount DECIMAL(36,18) NOT NULL,
+    remaining_xtu_amount DECIMAL(36,18) NOT NULL,
+    settled_xtu_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    status VARCHAR(24) NOT NULL DEFAULT 'reserved',
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_xtu_global_settlement_deposit_tranche(deposit_batch_id,credit_sequence),
+    KEY idx_xtu_global_settlement_run_user(global_run_id,username,status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_deposit_email_outbox(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    event_key VARCHAR(120) NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    recipient VARCHAR(254) NOT NULL,
+    subject VARCHAR(200) NOT NULL,
+    message_text TEXT NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    next_attempt_at_ms BIGINT UNSIGNED NOT NULL,
+    last_error VARCHAR(1000) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    sent_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_xtu_deposit_email_event(event_key),
+    KEY idx_xtu_deposit_email_due(status,next_attempt_at_ms,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS xtu_global_settlement_payouts(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    ledger_id BIGINT UNSIGNED NOT NULL,
+    global_run_id BIGINT UNSIGNED NOT NULL,
+    username VARCHAR(30) NOT NULL,
+    payout_address CHAR(42) NOT NULL,
+    net_amount DECIMAL(36,18) NOT NULL,
+    gross_amount DECIMAL(36,18) NOT NULL,
+    contract_fee_amount DECIMAL(36,18) NOT NULL,
+    estimated_gas_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
+    estimated_gas_fee_usd DECIMAL(50,30) NOT NULL DEFAULT 0,
+    actual_gas_fee_bnb DECIMAL(50,30) NULL,
+    actual_gas_fee_usd DECIMAL(50,30) NULL,
+    raw_tx LONGTEXT NULL,
+    tx_hash CHAR(66) NULL,
+    nonce BIGINT UNSIGNED NULL,
+    gas_limit BIGINT UNSIGNED NULL,
+    gas_price_wei DECIMAL(50,0) NULL,
+    block_number BIGINT UNSIGNED NULL,
+    receipt_json LONGTEXT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'queued',
+    last_error VARCHAR(1000) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    confirmed_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_xtu_global_settlement_payout_ledger(ledger_id),
+    UNIQUE KEY uq_xtu_global_settlement_payout_hash(tx_hash),
+    KEY idx_xtu_global_settlement_payout_status(status,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS account_cleanup_holds(
     username VARCHAR(30) PRIMARY KEY,
@@ -759,6 +951,7 @@ const TABLES = [
     treasury_address CHAR(42) NOT NULL,
     opened_at_ms BIGINT UNSIGNED NOT NULL,
     expires_at_ms BIGINT UNSIGNED NOT NULL,
+    initial_group_deadline_ms BIGINT UNSIGNED NOT NULL,
     total_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
     total_amount_raw DECIMAL(65,0) NOT NULL DEFAULT 0,
     credited_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
@@ -782,7 +975,7 @@ const TABLES = [
     KEY idx_deposit_batches_due(status,expires_at_ms,release_at_ms,next_attempt_at_ms),
     KEY idx_deposit_batches_pending_user(username,status,remaining_amount,id)
   ) ENGINE=InnoDB`,
-  `CREATE TABLE IF NOT EXISTS users_usdt_recharge_credits(
+  `CREATE TABLE IF NOT EXISTS users_usdt_deposit_credits(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     batch_id BIGINT UNSIGNED NOT NULL,
     username VARCHAR(30) NOT NULL,
@@ -795,9 +988,9 @@ const TABLES = [
     unit_price DECIMAL(50,30) NOT NULL,
     financial_reference VARCHAR(64) NOT NULL,
     created_at_ms BIGINT UNSIGNED NOT NULL,
-    UNIQUE KEY uq_recharge_credit_sequence(batch_id,credit_sequence),
-    UNIQUE KEY uq_recharge_credit_reference(financial_reference),
-    KEY idx_recharge_credit_user(username,created_at_ms,id)
+    UNIQUE KEY uq_deposit_credit_sequence(batch_id,credit_sequence),
+    UNIQUE KEY uq_deposit_credit_reference(financial_reference),
+    KEY idx_deposit_credit_user(username,created_at_ms,id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS users_usdt_transfer_events(
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -1079,7 +1272,7 @@ async function assertLatestSchema() {
     ],
     telegram_bot_state: ["state_key", "state_value", "updated_at_ms"],
     common: [
-      "total_units_price", "unit_price", "xtu_wallets", "backed_units", "inactive_init_asset", "sys_inactive_init_asset",
+      "total_units_price", "unit_price", "xtu_wallets", "xtu_wallets_reserved", "backed_units", "inactive_init_asset", "sys_inactive_init_asset",
       "sellers_res", "total_run_balance", "total_tfees", "total_tfees_bsc_cost_usd", "total_tfees_bsc_uncovered_usd", "total_bnb_fee_actual", "total_bnb_fee_estimated",
       "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "record_date", "record_time",
     ],
@@ -1113,14 +1306,22 @@ async function assertLatestSchema() {
     welcome_bonus_claims: ["subject_type", "subject_hash", "username", "amount_xtu", "credited_at_ms"],
     account_security_events: ["username", "action", "outcome", "created_at_ms"],
     account_api_rate_limits: ["username", "action", "window_start_ms", "request_count", "updated_at_ms"],
-    recharge_service_control: ["control_id", "is_suspended", "suspension_reason", "changed_by", "updated_at_ms"],
-    recharge_service_control_events: ["action", "previous_suspended", "current_suspended", "reason", "changed_by", "created_at_ms"],
+    deposit_service_control: ["control_id", "is_suspended", "suspension_reason", "changed_by", "updated_at_ms"],
+    deposit_service_control_events: ["action", "previous_suspended", "current_suspended", "reason", "changed_by", "created_at_ms"],
     individual_disbursement_control: ["control_id", "is_open", "opening_reason", "notice_reference", "changed_by", "opened_at_ms", "closed_at_ms", "updated_at_ms"],
     individual_disbursement_control_events: ["action", "previous_open", "current_open", "reason", "notice_reference", "changed_by", "created_at_ms"],
     xtu_withdrawal_control: ["control_id", "is_open", "reason", "changed_by", "started_at_ms", "stopped_at_ms", "updated_at_ms"],
     xtu_withdrawal_control_events: ["action", "previous_open", "current_open", "reason", "changed_by", "created_at_ms"],
-    xtu_withdrawals: ["reference", "username", "payout_address", "gross_amount", "reserved_initial_asset", "effective_unit_price", "global_unit_price", "estimated_gas_fee_bnb", "estimated_gas_fee_usd", "estimated_gas_fee_xtu", "contract_transfer_amount", "contract_fee_amount", "net_amount", "reserved_xtu_value", "bnb_usd_price", "amount_raw", "gas_limit", "gas_price_wei", "token_contract_address", "raw_tx", "tx_hash", "nonce", "block_number", "actual_gas_fee_bnb", "actual_gas_fee_usd", "actual_contract_fee_amount", "actual_net_amount", "status", "last_error", "next_attempt_at_ms", "created_at_ms", "updated_at_ms", "signed_at_ms", "submitted_at_ms", "confirmed_at_ms", "failed_at_ms"],
+    xtu_withdrawals: ["reference", "username", "payout_address", "gross_amount", "reserved_initial_asset", "effective_unit_price", "global_unit_price", "estimated_gas_fee_bnb", "estimated_gas_fee_usd", "estimated_gas_fee_xtu", "contract_transfer_amount", "contract_fee_amount", "net_amount", "reserved_xtu_value", "bnb_usd_price", "amount_raw", "gas_limit", "gas_price_wei", "token_contract_address", "raw_tx", "tx_hash", "nonce", "block_number", "actual_gas_fee_bnb", "actual_gas_fee_usd", "actual_contract_fee_amount", "actual_net_amount", "receipt_json", "status", "last_error", "next_attempt_at_ms", "created_at_ms", "updated_at_ms", "signed_at_ms", "submitted_at_ms", "confirmed_at_ms", "failed_at_ms"],
     xtu_withdrawal_events: ["event_key", "withdrawal_id", "event_type", "previous_status", "current_status", "actor", "tx_hash", "details", "created_at_ms"],
+    xtu_deposit_scan_state: ["chain_id", "token_contract", "hot_wallet_address", "start_block", "last_scanned_block", "last_scanned_block_hash", "last_finalized_block", "finality_method", "health_status", "last_error", "updated_at_ms"],
+    xtu_deposit_batches: ["username", "hot_wallet_address", "opened_at_ms", "expires_at_ms", "initial_group_deadline_ms", "gross_amount", "hot_wallet_received_amount", "commission_amount", "returned_amount", "credited_amount", "remaining_amount", "transfer_count", "credit_sequence", "pending_since_ms", "release_at_ms", "gas_allocated_usd", "gas_allocated_xtu", "deposit_fee_amount", "status", "reason_codes", "global_run_id", "tfees_rate_percent", "created_at_ms", "updated_at_ms"],
+    xtu_deposit_transfer_events: ["username", "batch_id", "token_contract", "from_address", "hot_wallet_address", "gross_amount", "net_amount", "commission_amount", "gross_amount_raw", "net_amount_raw", "commission_amount_raw", "allocated_gas_fee_usd", "allocated_gas_fee_xtu", "tx_hash", "log_index", "block_number", "block_hash", "block_timestamp_ms", "event_identity", "status", "reason_codes", "created_at_ms"],
+    xtu_deposit_consolidations: ["batch_id", "amount", "amount_raw", "hot_wallet_address", "distribution_address", "estimated_gas_fee_bnb", "estimated_gas_fee_usd", "actual_gas_fee_bnb", "actual_gas_fee_usd", "gas_bnb_usd_price", "gas_limit", "gas_price_wei", "raw_tx", "tx_hash", "nonce", "block_number", "receipt_json", "status", "last_error", "created_at_ms", "updated_at_ms", "confirmed_at_ms"],
+    xtu_deposit_credits: ["batch_id", "username", "credit_sequence", "gross_returned_xtu", "deposit_fee_xtu", "gas_fee_xtu", "creditable_xtu", "credited_initial_asset", "global_unit_price", "reference", "global_run_id", "source_event_hashes_json", "consolidation_tx_hash", "status", "created_at_ms"],
+    xtu_global_settlement_ledger: ["global_run_id", "username", "deposit_batch_id", "credit_sequence", "tx_hash", "source_event_hashes_json", "consolidation_tx_hash", "gross_returned_xtu", "deposit_fee_xtu", "gas_fee_xtu", "global_unit_price", "credited_initial_asset", "reserved_xtu_amount", "remaining_xtu_amount", "settled_xtu_amount", "status", "created_at_ms", "updated_at_ms"],
+    xtu_deposit_email_outbox: ["event_key", "username", "recipient", "subject", "message_text", "status", "attempts", "next_attempt_at_ms", "last_error", "created_at_ms", "sent_at_ms"],
+    xtu_global_settlement_payouts: ["ledger_id", "global_run_id", "username", "payout_address", "net_amount", "gross_amount", "contract_fee_amount", "estimated_gas_fee_bnb", "estimated_gas_fee_usd", "actual_gas_fee_bnb", "actual_gas_fee_usd", "raw_tx", "tx_hash", "nonce", "gas_limit", "gas_price_wei", "block_number", "receipt_json", "status", "last_error", "created_at_ms", "updated_at_ms", "confirmed_at_ms"],
     system_locks: ["lock_name"],
     bsc_wallet_address_registry: ["wallet_address_lower", "wallet_address", "username", "registered_at_ms"],
     bsc_incoming_scan_state: ["chain_id", "token_contract", "treasury_address", "scan_start_block", "last_scanned_block", "last_scanned_block_hash", "last_finalized_block", "finality_method", "health_status", "manual_review_code", "manual_review_at_ms", "last_error", "updated_at_ms"],
@@ -1130,13 +1331,13 @@ async function assertLatestSchema() {
     bsc_scan_admin_events: ["admin_username", "action", "previous_block", "previous_block_hash", "resume_after_block", "resume_block_hash", "observed_finalized_block", "reason", "created_at_ms"],
     bsc_unknown_incoming_transfers: ["token_contract", "from_address", "to_address", "amount", "amount_raw", "tx_hash", "log_index", "block_number", "block_hash", "block_timestamp_ms", "previous_username", "status", "decision_action", "decision_username", "decision_reason", "decided_by", "decided_at_ms", "refund_id", "created_at_ms", "updated_at_ms", "event_identity"],
     users_usdt_deposit_batches: [
-      "username", "treasury_address", "opened_at_ms", "expires_at_ms",
+      "username", "treasury_address", "opened_at_ms", "expires_at_ms", "initial_group_deadline_ms",
       "total_amount", "total_amount_raw", "credited_amount", "remaining_amount", "refunded_amount", "reserved_refund_amount",
       "tfees_rate_percent", "transfer_count", "credit_sequence", "minimum_met_at_ms", "status",
       "pending_since_ms", "release_at_ms", "next_attempt_at_ms", "reason_codes",
       "last_credit_at_ms", "credited_at_ms", "created_at_ms", "updated_at_ms",
     ],
-    users_usdt_recharge_credits: [
+    users_usdt_deposit_credits: [
       "batch_id", "username", "credit_sequence", "gross_amount", "tfees_rate_percent",
       "fee_amount", "net_amount", "credited_initial_asset", "unit_price", "financial_reference", "created_at_ms",
     ],
@@ -1208,14 +1409,21 @@ async function assertLatestSchema() {
       "idx_activities_history_sender",
       "idx_activities_history_receiver",
     ],
-    recharge_service_control_events: ["idx_recharge_control_events_created"],
+    deposit_service_control_events: ["idx_deposit_control_events_created"],
     individual_disbursement_control_events: ["idx_individual_disbursement_control_events_created"],
     xtu_withdrawal_control_events: ["idx_xtu_withdrawal_control_events_created"],
     xtu_withdrawals: ["uq_xtu_withdrawals_reference", "uq_xtu_withdrawals_tx_hash", "idx_xtu_withdrawals_status_due", "idx_xtu_withdrawals_username_status"],
     xtu_withdrawal_events: ["uq_xtu_withdrawal_event_key", "idx_xtu_withdrawal_events_withdrawal"],
+    xtu_deposit_batches: ["idx_xtu_deposit_batch_user_status", "idx_xtu_deposit_batch_due"],
+    xtu_deposit_transfer_events: ["uq_xtu_deposit_event_identity", "uq_xtu_deposit_event_tx_log", "idx_xtu_deposit_event_user_status", "idx_xtu_deposit_event_batch"],
+    xtu_deposit_consolidations: ["uq_xtu_deposit_consolidation_batch", "uq_xtu_deposit_consolidation_hash", "idx_xtu_deposit_consolidation_status"],
+    xtu_deposit_credits: ["uq_xtu_deposit_credit_batch_seq", "uq_xtu_deposit_credit_reference"],
+    xtu_global_settlement_ledger: ["uq_xtu_global_settlement_deposit_tranche", "idx_xtu_global_settlement_run_user"],
+    xtu_global_settlement_payouts: ["uq_xtu_global_settlement_payout_ledger", "uq_xtu_global_settlement_payout_hash"],
+    xtu_deposit_email_outbox: ["uq_xtu_deposit_email_event", "idx_xtu_deposit_email_due"],
     users_seller_reserve_lots: ["idx_seller_lot_availability"],
     users_usdt_disbursements: ["idx_usdt_disbursement_reserve_availability"],
-    users_usdt_recharge_credits: ["uq_recharge_credit_sequence", "uq_recharge_credit_reference"],
+    users_usdt_deposit_credits: ["uq_deposit_credit_sequence", "uq_deposit_credit_reference"],
     users_usdt_transfer_events: ["uq_usdt_transfer_event_identity", "idx_usdt_transfer_event_tx_log"],
     users_usdt_refunds: ["uq_usdt_refund_user_request"],
     user_usdt_refund_requests: ["uq_user_usdt_refund_request_reference", "uq_user_usdt_refund_request_refund"],
@@ -1254,7 +1462,7 @@ async function initDbIfEmpty() {
   for (const statement of TABLES) await db.queryAsync(statement);
   await assertLatestSchema();
   await db.queryAsync(
-    `INSERT IGNORE INTO recharge_service_control
+    `INSERT IGNORE INTO deposit_service_control
      (control_id,is_suspended,suspension_reason,changed_by,updated_at_ms)
      VALUES(1,0,NULL,'system',?)`,
     [String(Date.now())],
@@ -1272,8 +1480,8 @@ async function initDbIfEmpty() {
     [String(Date.now())],
   );
   await db.queryAsync(
-    "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?),(?),(?),(?),(?)",
-    ["common_state", "onex_bsc_disbursement_worker", "onex_hot_wallet_spend", "onex_cold_wallet_sweep", "onex_xtu_wallet_spend", "onex_xtu_withdrawal_worker"],
+    "INSERT IGNORE INTO system_locks(lock_name) VALUES(?),(?),(?),(?),(?),(?),(?),(?)",
+    ["common_state", "onex_bsc_disbursement_worker", "onex_hot_wallet_spend", "onex_cold_wallet_sweep", "onex_xtu_wallet_spend", "onex_xtu_withdrawal_worker", "onex_xtu_deposit_worker", "onex_xtu_main_wallet_spend"],
   );
   await db.queryAsync(
     "INSERT IGNORE INTO telegram_bot_state(state_key,state_value,updated_at_ms) VALUES('update_offset',0,?)",
@@ -1291,8 +1499,8 @@ async function initDbIfEmpty() {
   const commonRows = await db.queryAsync("SELECT id FROM common ORDER BY id DESC LIMIT 1");
   if (!commonRows.length) {
     await db.queryAsync(
-      "INSERT INTO common(total_units_price,unit_price,xtu_wallets,backed_units,inactive_init_asset,sys_inactive_init_asset,sellers_res,total_run_balance,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-      [initialTotal.toFixed(), initialTotal.dividedBy(initialBacked).toFixed(30), "0", initialBacked.toFixed(), "0", "0", "0", "0", "0", date, time],
+      "INSERT INTO common(total_units_price,unit_price,xtu_wallets,xtu_wallets_reserved,backed_units,inactive_init_asset,sys_inactive_init_asset,sellers_res,total_run_balance,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+      [initialTotal.toFixed(), initialTotal.dividedBy(initialBacked).toFixed(30), "0", "0", initialBacked.toFixed(), "0", "0", "0", "0", "0", date, time],
     );
   }
 
@@ -1390,6 +1598,10 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
         ["activities", "SELECT id FROM activities WHERE sender=? OR receiver=? LIMIT 1 FOR UPDATE", [candidate.username, candidate.username]],
         ["deposit_batches", "SELECT id FROM users_usdt_deposit_batches WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
         ["deposit_events", "SELECT id FROM users_usdt_transfer_events WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["xtu_deposit_batches", "SELECT id FROM xtu_deposit_batches WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["xtu_deposit_events", "SELECT id FROM xtu_deposit_transfer_events WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["xtu_deposit_credits", "SELECT id FROM xtu_deposit_credits WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
+        ["xtu_global_settlements", "SELECT id FROM xtu_global_settlement_ledger WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
         ["disbursements", "SELECT id FROM users_usdt_disbursements WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
         ["refunds", "SELECT id FROM users_usdt_refunds WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
         ["seller_campaigns", "SELECT id FROM users_seller_campaigns WHERE username=? LIMIT 1 FOR UPDATE", [candidate.username]],
@@ -1433,6 +1645,7 @@ async function cleanupNeverSignedInAccounts(nowMs = Date.now()) {
       await tx.query("DELETE FROM account_security_email_outbox WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM telegram_outbox WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM global_disbursement_email_outbox WHERE username=?", [candidate.username]);
+      await tx.query("DELETE FROM xtu_deposit_email_outbox WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM users_stock WHERE username=?", [candidate.username]);
       await tx.query("DELETE FROM auths WHERE username=? AND last_login_at_ms IS NULL", [candidate.username]);
       await tx.query("DELETE FROM account_cleanup_holds WHERE username=?", [candidate.username]);
@@ -1470,6 +1683,10 @@ async function cleanup() {
     await db.queryAsync(
       "DELETE FROM auth_device_request_nonces WHERE expires_at_ms<?",
       [String(now)],
+    );
+    await db.queryAsync(
+      "DELETE FROM xtu_deposit_email_outbox WHERE status IN ('sent','failed') AND created_at_ms<?",
+      [String(now - 365 * 24 * 60 * 60 * 1000)],
     );
     await db.queryAsync(
       "DELETE FROM account_security_email_outbox WHERE status IN ('sent','failed') AND created_at_ms<?",

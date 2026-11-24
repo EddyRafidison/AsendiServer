@@ -37,12 +37,14 @@ function configuredSweepPercent() {
 
 function calculateHotWalletLiquidity({
   onchainBalance,
-  pendingRechargeAmount = 0,
-  reservedRechargeRefundAmount = 0,
+  pendingDepositAmount = 0,
+  reservedDepositRefundAmount = 0,
   unresolvedUnknownIncomingAmount = 0,
   pendingSellerPayoutAmount = 0,
   otherPendingRefundAmount = 0,
   pendingColdWalletSweepAmount = 0,
+  xtuExternalizedCoverageAmount = 0,
+  xtuInFlightCoverageAmount = 0,
   minimumOperatingAmount = 0,
   coldSweepThreshold = 500,
   coldSweepPercent = 90,
@@ -50,12 +52,14 @@ function calculateHotWalletLiquidity({
 }) {
   const total = finiteNonNegative(onchainBalance, "Hot Wallet on-chain BSC-USD balance");
   const categories = {
-    pending_recharges: finiteNonNegative(pendingRechargeAmount, "Pending recharge reserve"),
-    recharge_refunds: finiteNonNegative(reservedRechargeRefundAmount, "Recharge refund reserve"),
+    pending_deposits: finiteNonNegative(pendingDepositAmount, "Pending deposit reserve"),
+    deposit_refunds: finiteNonNegative(reservedDepositRefundAmount, "Deposit refund reserve"),
     unknown_incoming_transfers: finiteNonNegative(unresolvedUnknownIncomingAmount, "Unknown incoming transfer reserve"),
     seller_payouts: finiteNonNegative(pendingSellerPayoutAmount, "Seller payout reserve"),
     other_refunds: finiteNonNegative(otherPendingRefundAmount, "Other refund reserve"),
     pending_cold_wallet_sweeps: finiteNonNegative(pendingColdWalletSweepAmount, "Pending Cold Wallet sweep reserve"),
+    xtu_externalized_coverage: finiteNonNegative(xtuExternalizedCoverageAmount, "XTU externalized BSC-USD coverage"),
+    xtu_inflight_withdrawal_coverage: finiteNonNegative(xtuInFlightCoverageAmount, "XTU in-flight withdrawal BSC-USD coverage"),
   };
   const minimum = finiteNonNegative(minimumOperatingAmount, "Hot Wallet minimum operating balance");
   const threshold = finiteNonNegative(coldSweepThreshold, "Cold Wallet sweep threshold");
@@ -103,7 +107,7 @@ async function queryRows(queryable, sql, params = []) {
 }
 
 async function getHotWalletReserveAmounts(queryable) {
-  const [rechargeRows, unknownRows, sellerRows, otherRefundRows, sweepRows] = await Promise.all([
+  const [depositRows, unknownRows, sellerRows, otherRefundRows, sweepRows, commonRows] = await Promise.all([
     queryRows(queryable,
       `SELECT COALESCE(SUM(remaining_amount),0) AS pending_amount,
               COALESCE(SUM(reserved_refund_amount),0) AS refund_reserved_amount
@@ -125,6 +129,8 @@ async function getHotWalletReserveAmounts(queryable) {
       `SELECT COALESCE(SUM(amount),0) AS amount
        FROM bsc_treasury_sweeps
        WHERE status IN ('queued','signed','submitted','manual_review')`),
+    queryRows(queryable,
+      `SELECT xtu_wallets,xtu_wallets_reserved FROM common ORDER BY id DESC LIMIT 1`),
   ]);
 
   const sellerReserve = sellerRows.reduce((sum, row) => {
@@ -134,12 +140,14 @@ async function getHotWalletReserveAmounts(queryable) {
   }, new BigNumber(0));
 
   return {
-    pendingRechargeAmount: rechargeRows[0]?.pending_amount || "0",
-    reservedRechargeRefundAmount: rechargeRows[0]?.refund_reserved_amount || "0",
+    pendingDepositAmount: depositRows[0]?.pending_amount || "0",
+    reservedDepositRefundAmount: depositRows[0]?.refund_reserved_amount || "0",
     unresolvedUnknownIncomingAmount: unknownRows[0]?.amount || "0",
     pendingSellerPayoutAmount: sellerReserve.toFixed(TOKEN_DECIMALS),
     otherPendingRefundAmount: otherRefundRows[0]?.amount || "0",
     pendingColdWalletSweepAmount: sweepRows[0]?.amount || "0",
+    xtuExternalizedCoverageAmount: commonRows[0]?.xtu_wallets || "0",
+    xtuInFlightCoverageAmount: commonRows[0]?.xtu_wallets_reserved || "0",
   };
 }
 
@@ -291,12 +299,14 @@ async function getHotWalletTreasurySnapshot(queryable) {
   const coldAddress = String(process.env.USDT_BEP20_COLD_WALLET_ADDRESS || "").trim();
   const treasuryAddress = String(process.env.USDT_BEP20_TREASURY_ADDRESS || "").trim();
   const reserveValues = {
-    pending_recharges: new BigNumber(reserveAmounts.pendingRechargeAmount).toFixed(18),
-    recharge_refunds: new BigNumber(reserveAmounts.reservedRechargeRefundAmount).toFixed(18),
+    pending_deposits: new BigNumber(reserveAmounts.pendingDepositAmount).toFixed(18),
+    deposit_refunds: new BigNumber(reserveAmounts.reservedDepositRefundAmount).toFixed(18),
     unknown_incoming_transfers: new BigNumber(reserveAmounts.unresolvedUnknownIncomingAmount).toFixed(18),
     seller_payouts: new BigNumber(reserveAmounts.pendingSellerPayoutAmount).toFixed(18),
     other_refunds: new BigNumber(reserveAmounts.otherPendingRefundAmount).toFixed(18),
     pending_cold_wallet_sweeps: new BigNumber(reserveAmounts.pendingColdWalletSweepAmount).toFixed(18),
+    xtu_externalized_coverage: new BigNumber(reserveAmounts.xtuExternalizedCoverageAmount).toFixed(18),
+    xtu_inflight_withdrawal_coverage: new BigNumber(reserveAmounts.xtuInFlightCoverageAmount).toFixed(18),
   };
   const totalReserved = Object.values(reserveAmounts).reduce((sum, value) => sum.plus(value), new BigNumber(0));
   const base = {
@@ -327,12 +337,14 @@ async function getHotWalletTreasurySnapshot(queryable) {
 
   const calculation = calculateHotWalletLiquidity({
     onchainBalance: chain.token_balance,
-    pendingRechargeAmount: reserveAmounts.pendingRechargeAmount,
-    reservedRechargeRefundAmount: reserveAmounts.reservedRechargeRefundAmount,
+    pendingDepositAmount: reserveAmounts.pendingDepositAmount,
+    reservedDepositRefundAmount: reserveAmounts.reservedDepositRefundAmount,
     unresolvedUnknownIncomingAmount: reserveAmounts.unresolvedUnknownIncomingAmount,
     pendingSellerPayoutAmount: reserveAmounts.pendingSellerPayoutAmount,
     otherPendingRefundAmount: reserveAmounts.otherPendingRefundAmount,
     pendingColdWalletSweepAmount: reserveAmounts.pendingColdWalletSweepAmount,
+    xtuExternalizedCoverageAmount: reserveAmounts.xtuExternalizedCoverageAmount,
+    xtuInFlightCoverageAmount: reserveAmounts.xtuInFlightCoverageAmount,
     minimumOperatingAmount: minimum,
     coldSweepThreshold: threshold,
     coldSweepPercent: percent,

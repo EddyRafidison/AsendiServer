@@ -3,7 +3,7 @@ Date: 2026-11-23
 
 Scope
 - Applied to the supplied OneXServer project archive.
-- No business rules, recharge eligibility rules, payout rules, wallet ownership rules, reserve priorities, or database schema were changed.
+- No business rules, deposit eligibility rules, payout rules, wallet ownership rules, reserve priorities, or database schema were changed.
 - No production .env file or API credentials were included or modified.
 
 Changes

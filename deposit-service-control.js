@@ -1,6 +1,6 @@
 "use strict";
 
-function resolveRechargeAvailability({
+function resolveDepositAvailability({
   globalDisbursementActive = false,
   manuallySuspended = false,
   paymentServiceEnabled = true,
@@ -10,7 +10,7 @@ function resolveRechargeAvailability({
     return { allowed: false, reason: "global_disbursement_active" };
   }
   if (manuallySuspended) {
-    return { allowed: false, reason: "recharge_manually_suspended" };
+    return { allowed: false, reason: "deposit_manually_suspended" };
   }
   if (!paymentServiceEnabled) {
     return { allowed: false, reason: "payment_service_disabled" };
@@ -21,10 +21,10 @@ function resolveRechargeAvailability({
   return { allowed: true, reason: null };
 }
 
-// Hiding recharge availability never changes the shared treasury address configured by the server.
+// Hiding deposit availability never changes the shared treasury address configured by the server.
 function getVisibleDepositAddress(availability, storedAddress) {
   if (!availability || availability.allowed !== true || !storedAddress) return null;
   return storedAddress;
 }
 
-module.exports = { resolveRechargeAvailability, getVisibleDepositAddress };
+module.exports = { resolveDepositAvailability, getVisibleDepositAddress };

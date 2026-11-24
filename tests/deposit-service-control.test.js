@@ -2,10 +2,10 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { resolveRechargeAvailability, getVisibleDepositAddress } = require("../recharge-service-control");
+const { resolveDepositAvailability, getVisibleDepositAddress } = require("../deposit-service-control");
 
 test("global disbursement hides deposit addresses before other availability reasons", () => {
-  const availability = resolveRechargeAvailability({
+  const availability = resolveDepositAvailability({
     globalDisbursementActive: true,
     manuallySuspended: true,
     capacityAllowed: false,
@@ -13,33 +13,33 @@ test("global disbursement hides deposit addresses before other availability reas
   assert.deepEqual(availability, { allowed: false, reason: "global_disbursement_active" });
 });
 
-test("manual recharge suspension hides an existing deposit address without deleting it", () => {
-  const availability = resolveRechargeAvailability({ manuallySuspended: true });
+test("manual deposit suspension hides an existing deposit address without deleting it", () => {
+  const availability = resolveDepositAvailability({ manuallySuspended: true });
   const previouslyAssignedAddress = "0x1111111111111111111111111111111111111111";
   assert.equal(getVisibleDepositAddress(availability, previouslyAssignedAddress), null);
   assert.equal(previouslyAssignedAddress, "0x1111111111111111111111111111111111111111");
 });
 
-test("a disabled BSC recharge provider hides the existing deposit address", () => {
-  const availability = resolveRechargeAvailability({ paymentServiceEnabled: false });
+test("a disabled BSC deposit provider hides the existing deposit address", () => {
+  const availability = resolveDepositAvailability({ paymentServiceEnabled: false });
   assert.equal(availability.allowed, false);
   assert.equal(availability.reason, "payment_service_disabled");
   assert.equal(getVisibleDepositAddress(availability, "0x1111111111111111111111111111111111111111"), null);
 });
 
 test("maximum-stock capacity hides an existing deposit address", () => {
-  const availability = resolveRechargeAvailability({ capacityAllowed: false });
+  const availability = resolveDepositAvailability({ capacityAllowed: false });
   assert.equal(availability.reason, "maximum_user_balance");
   assert.equal(getVisibleDepositAddress(availability, "0x1111111111111111111111111111111111111111"), null);
 });
 
-test("available recharge exposes the existing address", () => {
-  const availability = resolveRechargeAvailability({ capacityAllowed: true });
+test("available deposit exposes the existing address", () => {
+  const availability = resolveDepositAvailability({ capacityAllowed: true });
   const address = "0x1111111111111111111111111111111111111111";
   assert.equal(getVisibleDepositAddress(availability, address), address);
 });
 
-test("missing address remains hidden even when recharge is available", () => {
-  const availability = resolveRechargeAvailability({ capacityAllowed: true });
+test("missing address remains hidden even when deposit is available", () => {
+  const availability = resolveDepositAvailability({ capacityAllowed: true });
   assert.equal(getVisibleDepositAddress(availability, null), null);
 });

@@ -15,23 +15,23 @@ const {
   DISBURSEMENT_COOLDOWN_MS,
 } = require("../disbursement-policy");
 const {
-  MIN_RECHARGE_AMOUNT,
-  MAX_RECHARGE_AMOUNT,
+  MIN_DEPOSIT_AMOUNT,
+  MAX_DEPOSIT_AMOUNT,
   MAX_DEFAULT_STOCK,
   SYSTEM_ADMIN_RESERVE_RATIO,
-  RECHARGE_BATCH_WINDOW_MS,
+  DEPOSIT_BATCH_WINDOW_MS,
   getWeeklyReleaseAt,
   recordDateTimeToUtcMs,
-} = require("../recharge-policy");
+} = require("../deposit-policy");
 
 const fixed = (value) => value.toFixed();
 
 test("current OneX business limits are centralized", () => {
-  assert.equal(fixed(MIN_RECHARGE_AMOUNT), "20");
-  assert.equal(fixed(MAX_RECHARGE_AMOUNT), "100");
+  assert.equal(fixed(MIN_DEPOSIT_AMOUNT), "70");
+  assert.equal(fixed(MAX_DEPOSIT_AMOUNT), "140");
   assert.equal(MAX_DEFAULT_STOCK, "300");
   assert.equal(fixed(SYSTEM_ADMIN_RESERVE_RATIO), "0.1");
-  assert.equal(RECHARGE_BATCH_WINDOW_MS, 60 * 60 * 1000);
+  assert.equal(DEPOSIT_BATCH_WINDOW_MS, 60 * 60 * 1000);
   assert.equal(DISBURSEMENT_COOLDOWN_MS, 30 * 24 * 60 * 60 * 1000);
 });
 
@@ -132,11 +132,11 @@ test("rejects invalid individual payout fees, amounts and participant prices", (
   assert.throws(() => calculateIndividualDisbursement("375", "300", "0", 3), /unit_price/);
 });
 
-test("weekly pending release is at least seven days after first pending and last successful recharge", () => {
+test("weekly pending release is at least seven days after first pending and last successful deposit", () => {
   const day = 24 * 60 * 60 * 1000;
   const pendingAt = Date.UTC(2026, 0, 10);
-  const lastRechargeAt = Date.UTC(2026, 0, 8);
-  assert.equal(getWeeklyReleaseAt(pendingAt, lastRechargeAt), pendingAt + 7 * day);
+  const lastDepositAt = Date.UTC(2026, 0, 8);
+  assert.equal(getWeeklyReleaseAt(pendingAt, lastDepositAt), pendingAt + 7 * day);
   assert.equal(getWeeklyReleaseAt(pendingAt, Date.UTC(2026, 0, 20)), Date.UTC(2026, 0, 27));
 });
 

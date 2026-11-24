@@ -42,7 +42,7 @@ test("user-last-stock returns individual valuation and remuneration details", ()
 });
 
 test("user-last-stock uses the immutable participant price snapshot during an effective global disbursement", () => {
-  assert.match(routes, /if \(!rechargeAvailability\.globalEffective\) \{\s*await triggerUserPriceThresholdTx/);
+  assert.match(routes, /if \(!depositAvailability\.globalEffective\) \{\s*await triggerUserPriceThresholdTx/);
   assert.match(routes, /FROM global_disbursement_participants\s+WHERE run_id=\? AND username=\? LIMIT 1/);
   assert.match(routes, /individualPrice = new BigNumber\(globalParticipantSnapshot\.snapshot_unit_price\)/);
   assert.match(routes, /price_snapshot_mode: globalParticipantSnapshot \? "global_disbursement" : "live_individual"/);

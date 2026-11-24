@@ -8,3 +8,8 @@ npm-debug.log*
 .DS_Store
 coverage/
 !.env.xtu.example
+.env.xtu-main
+.env.xtu-distribution
+
+!.env.xtu-main.example
+!.env.xtu-distribution.example

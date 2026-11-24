@@ -246,8 +246,8 @@ async function createAndSubmitSweep(dbPool, provider, signer, token, addresses) 
   const percent = String(process.env.USDT_COLD_SWEEP_PERCENT || "90").trim() || "90";
   const liquidity = calculateHotWalletLiquidity({
     onchainBalance: tokenBalance,
-    pendingRechargeAmount: reserveAmounts.pendingRechargeAmount,
-    reservedRechargeRefundAmount: reserveAmounts.reservedRechargeRefundAmount,
+    pendingDepositAmount: reserveAmounts.pendingDepositAmount,
+    reservedDepositRefundAmount: reserveAmounts.reservedDepositRefundAmount,
     unresolvedUnknownIncomingAmount: reserveAmounts.unresolvedUnknownIncomingAmount,
     pendingSellerPayoutAmount: reserveAmounts.pendingSellerPayoutAmount,
     otherPendingRefundAmount: reserveAmounts.otherPendingRefundAmount,

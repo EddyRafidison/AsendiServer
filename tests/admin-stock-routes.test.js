@@ -26,11 +26,11 @@ test("administrative user-stock credit and common-stock expenditure use separate
   const commonRoute = getRouteBlock(
     routesSource,
     "/admin/update-common-stock",
-    "async function initializeRechargePayments()",
+    "async function initializeDepositPayments()",
   );
 
   assert.match(userRoute, /applyUserTopUp\(/);
-  assert.match(userRoute, /enforceRechargeRange:\s*false/);
+  assert.match(userRoute, /enforceDepositRange:\s*false/);
   assert.doesNotMatch(userRoute, /calculateAdminCommonStockUpdate\(/);
   assert.match(commonRoute, /calculateAdminCommonStockUpdate\(/);
   assert.doesNotMatch(commonRoute, /applyUserTopUp\(/);

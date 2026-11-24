@@ -2,7 +2,7 @@
 
 const BigNumber = require("bignumber.js");
 const { queueTelegramMessageTx } = require("./telegram");
-const { MAX_DEFAULT_STOCK } = require("./recharge-policy");
+const { MAX_DEFAULT_STOCK } = require("./deposit-policy");
 
 BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP });
 

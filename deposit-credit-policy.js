@@ -3,7 +3,7 @@
 const BigNumber = require("bignumber.js");
 const {
   calculateGlobalUnitPrice,
-  calculateRechargeFundingAllocation,
+  calculateDepositFundingAllocation,
   isUserBalanceWithinMaxStock,
 } = require("./stock-accounting");
 
@@ -18,7 +18,7 @@ function asAmount(value, name) {
   return amount;
 }
 
-function evaluateRechargeCredit({
+function evaluateDepositCredit({
   grossAmount,
   currentBalanceInitialAsset,
   totalUnitsPrice,
@@ -37,7 +37,7 @@ function evaluateRechargeCredit({
   alreadyReservedAdminBonusInitialAsset = 0,
   stockLimitEvaluator = null,
 }) {
-  const gross = asAmount(grossAmount, "Recharge gross amount");
+  const gross = asAmount(grossAmount, "Deposit gross amount");
   const balance = asAmount(currentBalanceInitialAsset, "User balance");
   const total = asAmount(totalUnitsPrice, "Common total units price");
   const backed = asAmount(backedUnits, "Common backed units");
@@ -47,7 +47,7 @@ function evaluateRechargeCredit({
   const protectedFloor = asAmount(protectedAdminInitialAsset, "Protected administrative reserve");
   const pendingPayouts = asAmount(pendingDisbursementInitialAsset, "Pending disbursement reserve");
   const price = asAmount(currentUnitPrice, "Common unit price");
-  const feeRate = asAmount(tfeesRatePercent, "Recharge tfees rate");
+  const feeRate = asAmount(tfeesRatePercent, "Deposit tfees rate");
   const maximumXtu = asAmount(maximumUserXtu, "Maximum user XTU");
   const bonusRate = asAmount(globalBonusRatePercent, "Global bonus rate");
   const remainingAdmin = asAmount(remainingAdminReserveInitialAsset, "Remaining administrative reserve");
@@ -56,7 +56,7 @@ function evaluateRechargeCredit({
   if (!gross.isGreaterThan(0) || !total.isGreaterThan(0) || !backed.isGreaterThan(0) ||
       !price.isGreaterThan(0) || !maximumXtu.isGreaterThan(0) || feeRate.isGreaterThanOrEqualTo(100) ||
       bonusRate.isGreaterThan(10) || activeSellers.gt(sellers) || backed.lt(protectedFloor)) {
-    throw new RangeError("Recharge credit inputs are outside their valid ranges");
+    throw new RangeError("Deposit credit inputs are outside their valid ranges");
   }
 
   const currentPrice = calculateGlobalUnitPrice(total, backed);
@@ -69,7 +69,7 @@ function evaluateRechargeCredit({
   if (!netAmount.isGreaterThan(0)) return { allowed: false, reason: "fees_exhaust_amount" };
 
   const requestedInitialAsset = netAmount.dividedBy(price);
-  const allocation = calculateRechargeFundingAllocation(
+  const allocation = calculateDepositFundingAllocation(
     requestedInitialAsset,
     price,
     backed,
@@ -140,11 +140,11 @@ function evaluateRechargeCredit({
   };
 }
 
-function findMaximumRechargeCredit(options) {
-  const target = asAmount(options.targetGrossAmount, "Target recharge amount");
+function findMaximumDepositCredit(options) {
+  const target = asAmount(options.targetGrossAmount, "Target deposit amount");
   if (!target.isGreaterThan(0)) return { allowed: false, reason: "invalid_amount" };
 
-  const evaluate = (gross) => evaluateRechargeCredit({ ...options, grossAmount: gross });
+  const evaluate = (gross) => evaluateDepositCredit({ ...options, grossAmount: gross });
   const full = evaluate(target);
   if (full.allowed) return { ...full, partial: false, targetGrossAmount: target };
 
@@ -182,6 +182,6 @@ function findMaximumRechargeCredit(options) {
 
 module.exports = {
   CREDIT_DECIMALS,
-  evaluateRechargeCredit,
-  findMaximumRechargeCredit,
+  evaluateDepositCredit,
+  findMaximumDepositCredit,
 };

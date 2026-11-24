@@ -108,8 +108,22 @@ async function refreshQueuedQuote(pool, row, runtime) {
     );
     if (!rows.length || rows[0].status !== "queued") return;
     // The user's reserved principal is fixed at the captured individual price.
-    // A refreshed gas quote changes only the net on-chain amount, not the reserve debit.
-    await getLatestCommonTx(tx, true);
+    // The XTU coverage reservation must track the refreshed net amount exactly.
+    const common = await getLatestCommonTx(tx, true);
+    const currentReservedCoverage = new BigNumber(common.xtu_wallets_reserved || "0");
+    const previousNetAmount = new BigNumber(rows[0].net_amount || "0");
+    const nextReservedCoverage = currentReservedCoverage.minus(previousNetAmount).plus(quote.netAmount);
+    if (!currentReservedCoverage.isFinite() || currentReservedCoverage.isNegative() ||
+        !previousNetAmount.isFinite() || previousNetAmount.isNegative() ||
+        !nextReservedCoverage.isFinite() || nextReservedCoverage.isNegative()) {
+      throw new Error("The refreshed XTU withdrawal quote cannot be reconciled with the in-flight coverage reservation.");
+    }
+    if (!nextReservedCoverage.eq(currentReservedCoverage)) {
+      const [date, time] = utcDateTime();
+      await insertCommonSnapshotTx(tx, common, {
+        xtu_wallets_reserved: nextReservedCoverage.toFixed(30),
+      }, date, time);
+    }
     await tx.query(
       `UPDATE xtu_withdrawals SET estimated_gas_fee_bnb=?,estimated_gas_fee_usd=?,estimated_gas_fee_xtu=?,
        contract_transfer_amount=?,contract_fee_amount=?,net_amount=?,bnb_usd_price=?,
@@ -147,6 +161,20 @@ async function signQueuedWithdrawal(pool, row, runtime) {
       [String(row.id)],
     );
     if (!rows.length || rows[0].status !== "queued") return;
+    const [settlementRows] = await tx.query(
+      `SELECT COALESCE(SUM(remaining_xtu_amount),0) AS amount FROM xtu_global_settlement_ledger
+       WHERE status IN ('reserved','partially_settled')`,
+    );
+    const [withdrawalRows] = await tx.query(
+      `SELECT COALESCE(SUM(net_amount),0) AS amount FROM xtu_withdrawals
+       WHERE status IN ('queued','signed','submitted','manual_review')`,
+    );
+    const distributionBalance = new BigNumber((await runtime.contract.balanceOf(runtime.settings.distributionAddress)).toString()).shiftedBy(-18);
+    const reservedSettlement = new BigNumber(settlementRows[0]?.amount || "0");
+    const allPendingWithdrawals = new BigNumber(withdrawalRows[0]?.amount || "0");
+    if (!distributionBalance.isFinite() || distributionBalance.lt(reservedSettlement.plus(allPendingWithdrawals))) {
+      throw new Error("The XTU Distribution Wallet balance does not cover all queued withdrawals and protected global XTU settlement amounts.");
+    }
     await recordEstimatedBscFeeTx(tx, {
       txHash,
       operation: "xtu_withdrawal",
@@ -255,30 +283,40 @@ async function submitSignedTransaction(pool, row, runtime) {
 }
 
 function parseXtuTransferEvents(runtime, receipt, row) {
-  let netRaw = null;
-  let feeRaw = null;
+  let transferWithFee = null;
+  let netTransferFound = false;
+  let unexpectedSelfFeeTransfer = false;
   for (const log of receipt.logs || []) {
     if (String(log.address).toLowerCase() !== runtime.settings.tokenAddress.toLowerCase()) continue;
     let parsed;
     try { parsed = runtime.contract.interface.parseLog(log); } catch { continue; }
     if (!parsed) continue;
+    if (parsed.name === "TransferWithFee" &&
+        String(parsed.args.from).toLowerCase() === runtime.settings.distributionAddress.toLowerCase() &&
+        String(parsed.args.to).toLowerCase() === String(row.payout_address).toLowerCase()) {
+      transferWithFee = parsed;
+    }
     if (parsed.name === "Transfer" &&
         String(parsed.args.from).toLowerCase() === runtime.settings.distributionAddress.toLowerCase() &&
         String(parsed.args.to).toLowerCase() === String(row.payout_address).toLowerCase()) {
-      netRaw = BigInt(parsed.args.value);
+      const expectedNet = BigInt(new BigNumber(row.net_amount).multipliedBy("1e18").integerValue(BigNumber.ROUND_DOWN).toFixed(0));
+      netTransferFound = BigInt(parsed.args.value) === expectedNet;
     }
     if (parsed.name === "FeeCollected" &&
-        String(parsed.args.from).toLowerCase() === runtime.settings.distributionAddress.toLowerCase() &&
-        String(parsed.args.collector).toLowerCase() === runtime.settings.distributionAddress.toLowerCase()) {
-      feeRaw = BigInt(parsed.args.amount);
+        String(parsed.args.from).toLowerCase() === runtime.settings.distributionAddress.toLowerCase()) {
+      unexpectedSelfFeeTransfer = true;
     }
   }
-  const expectedNet = BigInt(new BigNumber(row.net_amount).multipliedBy("1e18").integerValue(BigNumber.ROUND_DOWN).toFixed(0));
-  const expectedFee = BigInt(new BigNumber(row.contract_fee_amount).multipliedBy("1e18").integerValue(BigNumber.ROUND_DOWN).toFixed(0));
-  if (netRaw == null) return { valid: false, reason: "The finalized XTU transaction does not contain the expected distribution-wallet-to-user Transfer event." };
-  if (feeRaw == null) return { valid: false, reason: "The finalized XTU transaction is missing the mandatory FeeCollected event." };
-  if (netRaw !== expectedNet || feeRaw !== expectedFee) {
-    return { valid: false, reason: "Finalized XTU Transfer/FeeCollected amounts do not match the reserved withdrawal quote." };
+  if (!transferWithFee) return { valid: false, reason: "The finalized XTU transaction is missing the distribution-wallet TransferWithFee event." };
+  const grossRaw = BigInt(transferWithFee.args.grossAmount);
+  const netRaw = BigInt(transferWithFee.args.netAmount);
+  const feeRaw = BigInt(transferWithFee.args.feeAmount);
+  const expectedGross = BigInt(String(row.amount_raw));
+  const expectedFee = (expectedGross * 10n) / 10000n;
+  const expectedNet = expectedGross - expectedFee;
+  if (Boolean(transferWithFee.args.feeExempt) || grossRaw !== expectedGross ||
+      feeRaw !== expectedFee || netRaw !== expectedNet || !netTransferFound || unexpectedSelfFeeTransfer) {
+    return { valid: false, reason: "Finalized XTU transfer gross, net, 0.1% fee or distributor-origin event semantics do not match the reserved withdrawal quote." };
   }
   return { valid: true, netRaw, feeRaw };
 }
@@ -339,8 +377,8 @@ async function recordActualFeeAndRequireReview(pool, row, receipt, runtime, reas
       const now = String(Date.now());
       await tx.query(
         `UPDATE xtu_withdrawals SET status='manual_review',block_number=?,actual_gas_fee_bnb=?,
-         actual_gas_fee_usd=?,last_error=?,next_attempt_at_ms=?,updated_at_ms=? WHERE id=?`,
-        [String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30), String(reason).slice(0, 990), now, now, String(row.id)],
+         actual_gas_fee_usd=?,receipt_json=?,last_error=?,next_attempt_at_ms=?,updated_at_ms=? WHERE id=?`,
+        [String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30), JSON.stringify(receipt), String(reason).slice(0, 990), now, now, String(row.id)],
       );
       await appendEvent(tx, rows[0], "manual_review", "manual_review", reason);
     });
@@ -377,9 +415,17 @@ async function finalizeFailedWithdrawal(pool, row, receipt, runtime) {
     if (!restoredTotal.isFinite() || !restoredTotal.isGreaterThan(0) || !restoredBacked.isFinite() || !restoredBacked.isGreaterThan(0)) {
       throw new Error("Failed XTU withdrawal cannot be automatically reversed without violating common reserve invariants.");
     }
+    const reservedCoverage = new BigNumber(common.xtu_wallets_reserved || "0");
+    const coverageToRelease = new BigNumber(current.net_amount || "0");
+    const nextReservedCoverage = reservedCoverage.minus(coverageToRelease);
+    if (!reservedCoverage.isFinite() || reservedCoverage.isNegative() ||
+        !coverageToRelease.isFinite() || coverageToRelease.isNegative() || nextReservedCoverage.isNegative()) {
+      throw new Error("Failed XTU withdrawal requires manual coverage-reserve reconciliation.");
+    }
     await insertCommonSnapshotTx(tx, common, {
       total_units_price: restoredTotal.toFixed(30),
       backed_units: restoredBacked.toFixed(30),
+      xtu_wallets_reserved: nextReservedCoverage.toFixed(30),
     }, date, time);
     const [stockRows] = await tx.query("SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [current.username]);
     if (!stockRows.length) throw new Error("User stock is missing while reversing a failed XTU withdrawal.");
@@ -391,9 +437,9 @@ async function finalizeFailedWithdrawal(pool, row, receipt, runtime) {
     const now = String(Date.now());
     await tx.query(
       `UPDATE xtu_withdrawals SET status='failed',block_number=?,actual_gas_fee_bnb=?,actual_gas_fee_usd=?,
-       failed_at_ms=?,last_error='The XTU token transfer reverted on-chain; principal reservation was restored.',
+       failed_at_ms=?,receipt_json=?,last_error='The XTU token transfer reverted on-chain; principal reservation was restored.',
        next_attempt_at_ms=?,updated_at_ms=? WHERE id=?`,
-      [String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30), now, now, now, String(row.id)],
+      [String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30), now, JSON.stringify(receipt), now, now, String(row.id)],
     );
     await appendEvent(tx, current, "failed", "failed", "The XTU transfer reverted on-chain; reserved principal was restored.");
   });
@@ -424,14 +470,20 @@ async function finalizeSuccessfulWithdrawal(pool, row, receipt, events, runtime)
       current.reserved_initial_asset,
     );
     const newXtuWallets = new BigNumber(common.xtu_wallets || "0").plus(actualNetAmount);
-    if (!newXtuWallets.isFinite() || newXtuWallets.isNegative()) {
-      throw new Error("Confirmed XTU withdrawal requires manual reserve reconciliation because the XTU wallet ledger is invalid.");
+    const reservedCoverage = new BigNumber(common.xtu_wallets_reserved || "0");
+    const coverageToRelease = new BigNumber(current.net_amount || "0");
+    const nextReservedCoverage = reservedCoverage.minus(coverageToRelease);
+    if (!newXtuWallets.isFinite() || newXtuWallets.isNegative() ||
+        !reservedCoverage.isFinite() || reservedCoverage.isNegative() ||
+        !coverageToRelease.isFinite() || coverageToRelease.isNegative() || nextReservedCoverage.isNegative()) {
+      throw new Error("Confirmed XTU withdrawal requires manual reserve reconciliation because the XTU coverage ledger is invalid.");
     }
 
     const [date, time] = utcDateTime();
     await insertCommonSnapshotTx(tx, common, {
       inactive_init_asset: newInactiveInitialAsset.toFixed(30),
       xtu_wallets: newXtuWallets.toFixed(30),
+      xtu_wallets_reserved: nextReservedCoverage.toFixed(30),
     }, date, time);
 
     const [existingActivityRows] = await tx.query(
@@ -468,11 +520,11 @@ async function finalizeSuccessfulWithdrawal(pool, row, receipt, events, runtime)
     const now = String(Date.now());
     await tx.query(
       `UPDATE xtu_withdrawals SET status='confirmed',block_number=?,actual_gas_fee_bnb=?,actual_gas_fee_usd=?,
-       actual_contract_fee_amount=?,actual_net_amount=?,confirmed_at_ms=?,last_error=NULL,
+       actual_contract_fee_amount=?,actual_net_amount=?,receipt_json=?,confirmed_at_ms=?,last_error=NULL,
        next_attempt_at_ms=?,updated_at_ms=? WHERE id=?`,
       [
         String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30),
-        actualContractFee.toFixed(18), actualNetAmount.toFixed(18), now, now, now, String(row.id),
+        actualContractFee.toFixed(18), actualNetAmount.toFixed(18), JSON.stringify(receipt), now, now, now, String(row.id),
       ],
     );
     await appendEvent(tx, current, "confirmed", "confirmed", `Confirmed ${actualNetAmount.toFixed(18)} XTU to the registered wallet.`, current.tx_hash);
@@ -517,7 +569,7 @@ async function processOne(pool, runtime) {
   const row = rows[0];
   try {
     await refreshQueuedQuote(pool, row, runtime);
-    const [freshRows] = await pool.queryAsync("SELECT * FROM xtu_withdrawals WHERE id=? LIMIT 1", [String(row.id)]);
+    const freshRows = await pool.queryAsync("SELECT * FROM xtu_withdrawals WHERE id=? LIMIT 1", [String(row.id)]);
     if (!freshRows.length || freshRows[0].status !== "queued") return;
     const signed = await signQueuedWithdrawal(pool, freshRows[0], runtime);
     try {

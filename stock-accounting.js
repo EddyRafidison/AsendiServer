@@ -265,13 +265,13 @@ function calculateTopUpReserveAllocation(
 }
 
 /**
- * Allocate a recharge in the required funding order:
+ * Allocate a deposit in the required funding order:
  * inactive OneX reserve, active seller lots, then distributable backed assets.
  * `pendingDisbursementInitialAssetValue` is a system-reserve reservation and
- * must remain available after this recharge. Seller lots are tracked
+ * must remain available after this deposit. Seller lots are tracked
  * separately and are therefore not included in that reservation pool.
  */
-function calculateRechargeFundingAllocation(
+function calculateDepositFundingAllocation(
   requestedInitialAssetValue,
   unitPriceValue,
   backedValue,
@@ -281,7 +281,7 @@ function calculateRechargeFundingAllocation(
   protectedFloorValue = 0,
   pendingDisbursementInitialAssetValue = 0,
 ) {
-  const requested = asBigNumber(requestedInitialAssetValue, "recharge initial-asset amount");
+  const requested = asBigNumber(requestedInitialAssetValue, "deposit initial-asset amount");
   const unitPrice = asBigNumber(unitPriceValue, "common.unit_price");
   const backed = asBigNumber(backedValue, "common.backed_units");
   const inactive = asBigNumber(inactiveValue, "common.inactive_init_asset");
@@ -290,11 +290,11 @@ function calculateRechargeFundingAllocation(
   const protectedFloor = asBigNumber(protectedFloorValue, "remaining administrative reserve");
   const pending = asBigNumber(pendingDisbursementInitialAssetValue, "pending disbursement initial assets");
 
-  if (!requested.isGreaterThan(0)) throw new RangeError("Recharge initial-asset amount must be positive");
+  if (!requested.isGreaterThan(0)) throw new RangeError("Deposit initial-asset amount must be positive");
   if (!unitPrice.isGreaterThan(0)) throw new RangeError("common.unit_price must be positive");
   if (!total.isGreaterThan(0)) throw new RangeError("common.total_units_price must be positive");
   if ([backed, inactive, sellers, protectedFloor, pending].some((value) => value.isNegative())) {
-    throw new RangeError("Recharge reserve amounts cannot be negative");
+    throw new RangeError("Deposit reserve amounts cannot be negative");
   }
   if (backed.isLessThan(protectedFloor)) {
     throw new RangeError("common.backed_units is below the remaining administrative reserve quota");
@@ -349,7 +349,7 @@ function calculateRechargeFundingAllocation(
   const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBacked, unitPrice);
 
   if (newBacked.isLessThan(protectedFloor) || newInactive.isNegative() || newSellersReserve.isNegative()) {
-    throw new RangeError("Recharge allocation would breach a protected reserve");
+    throw new RangeError("Deposit allocation would breach a protected reserve");
   }
 
   return {
@@ -403,6 +403,6 @@ module.exports = {
   calculateDistributableInitialAssets,
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,
-  calculateRechargeFundingAllocation,
+  calculateDepositFundingAllocation,
   isUserBalanceWithinMaxStock,
 };

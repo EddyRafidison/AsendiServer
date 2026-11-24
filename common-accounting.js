@@ -7,6 +7,7 @@ const COMMON_NUMERIC_FIELDS = Object.freeze([
   "total_units_price",
   "unit_price",
   "xtu_wallets",
+  "xtu_wallets_reserved",
   "backed_units",
   "inactive_init_asset",
   "sys_inactive_init_asset",
@@ -38,6 +39,13 @@ function commonSnapshotValues(row, overrides = {}) {
   return values;
 }
 
+function assertNonNegative(fieldName, nextValue) {
+  const next = new BigNumber(nextValue ?? "0");
+  if (!next.isFinite() || next.isNegative()) {
+    throw new RangeError(`common.${fieldName} must remain finite and non-negative.`);
+  }
+}
+
 function assertCumulativeNonNegative(fieldName, previousValue, nextValue) {
   const previous = new BigNumber(previousValue ?? "0");
   const next = new BigNumber(nextValue ?? "0");
@@ -52,11 +60,9 @@ function assertCumulativeNonNegative(fieldName, previousValue, nextValue) {
 
 async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
   const values = commonSnapshotValues(currentRow, overrides);
-  assertCumulativeNonNegative(
-    "xtu_wallets",
-    currentRow?.xtu_wallets || "0",
-    values.xtu_wallets,
-  );
+  // Unlike cumulative counters, this is the outstanding net XTU amount and must rise/fall.
+  assertNonNegative("xtu_wallets", values.xtu_wallets);
+  assertNonNegative("xtu_wallets_reserved", values.xtu_wallets_reserved);
   assertCumulativeNonNegative(
     "sys_inactive_init_asset",
     currentRow?.sys_inactive_init_asset || "0",

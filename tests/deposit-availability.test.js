@@ -3,9 +3,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  calculateAvailableRechargeReserveXtu,
-  createRechargeAvailabilityCache,
-} = require("../recharge-availability");
+  calculateAvailableDepositReserveXtu,
+  createDepositAvailabilityCache,
+} = require("../deposit-availability");
 
 function baseInput(overrides = {}) {
   return {
@@ -23,8 +23,8 @@ function baseInput(overrides = {}) {
   };
 }
 
-test("available recharge reserve excludes the remaining administrative quota and pending disbursements", () => {
-  const result = calculateAvailableRechargeReserveXtu(baseInput());
+test("available deposit reserve excludes the remaining administrative quota and pending disbursements", () => {
+  const result = calculateAvailableDepositReserveXtu(baseInput());
   // 17.7m backed - 1.5m remaining admin reserve + 100 inactive - 200 pending + 20 seller.
   assert.equal(result.availableReserveXtu.toFixed(18), "16199920.000000000000000000");
   assert.equal(result.remainingAdministrativeInitialAsset.toFixed(0), "1500000");
@@ -32,7 +32,7 @@ test("available recharge reserve excludes the remaining administrative quota and
 });
 
 test("administrative expenditure is not subtracted twice from the public reserve", () => {
-  const spent = calculateAvailableRechargeReserveXtu(baseInput({
+  const spent = calculateAvailableDepositReserveXtu(baseInput({
     totalUnitsPrice: "17700000",
     backedUnits: "17700000",
     unitPrice: "1",
@@ -42,7 +42,7 @@ test("administrative expenditure is not subtracted twice from the public reserve
     totalSellerReserve: "0",
     pendingDisbursementInitialAsset: "0",
   }));
-  const unspent = calculateAvailableRechargeReserveXtu(baseInput({
+  const unspent = calculateAvailableDepositReserveXtu(baseInput({
     totalUnitsPrice: "18000000",
     backedUnits: "18000000",
     unitPrice: "1",
@@ -57,7 +57,7 @@ test("administrative expenditure is not subtracted twice from the public reserve
 });
 
 test("seller reserve remains available when pending system disbursements exceed system reserves", () => {
-  const result = calculateAvailableRechargeReserveXtu(baseInput({
+  const result = calculateAvailableDepositReserveXtu(baseInput({
     backedUnits: "1800000",
     totalUnitsPrice: "1800000",
     unitPrice: "1",
@@ -71,21 +71,21 @@ test("seller reserve remains available when pending system disbursements exceed 
 });
 
 test("rejects active seller lots exceeding the seller-reserve ledger", () => {
-  assert.throws(() => calculateAvailableRechargeReserveXtu(baseInput({
+  assert.throws(() => calculateAvailableDepositReserveXtu(baseInput({
     totalSellerReserve: "10",
     activeSellerInitialAsset: "11",
   })), /exceed common\.sellers_res/);
 });
 
 test("rejects inconsistent global price and invalid reserve values", () => {
-  assert.throws(() => calculateAvailableRechargeReserveXtu(baseInput({ unitPrice: "2" })), /inconsistent/);
-  assert.throws(() => calculateAvailableRechargeReserveXtu(baseInput({ inactiveInitialAsset: "-1" })), /non-negative/);
+  assert.throws(() => calculateAvailableDepositReserveXtu(baseInput({ unitPrice: "2" })), /inconsistent/);
+  assert.throws(() => calculateAvailableDepositReserveXtu(baseInput({ inactiveInitialAsset: "-1" })), /non-negative/);
 });
 
 test("availability cache coalesces concurrent reads and reuses a one-second snapshot", async () => {
   let now = 1000;
   let queryCount = 0;
-  const cache = createRechargeAvailabilityCache({ ttlMs: 1000, now: () => now });
+  const cache = createDepositAvailabilityCache({ ttlMs: 1000, now: () => now });
   const db = {
     async queryAsync() {
       queryCount += 1;
@@ -124,13 +124,13 @@ test("availability cache coalesces concurrent reads and reuses a one-second snap
   assert.notEqual(refreshed, first);
 });
 
-test("public reserve calculation does not depend on recharge suspension, provider status or tfees", async () => {
-  const cache = createRechargeAvailabilityCache({ ttlMs: 1000 });
+test("public reserve calculation does not depend on deposit suspension, provider status or tfees", async () => {
+  const cache = createDepositAvailabilityCache({ ttlMs: 1000 });
   let queryCount = 0;
   const db = {
     async queryAsync(sql) {
       queryCount += 1;
-      assert.doesNotMatch(sql, /global_disbursement_runs|recharge_service_control/);
+      assert.doesNotMatch(sql, /global_disbursement_runs|deposit_service_control/);
       return [{
         total_units_price: "18000000",
         unit_price: "1",

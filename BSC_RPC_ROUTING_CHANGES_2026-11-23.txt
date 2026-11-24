@@ -42,6 +42,6 @@ FINANCIAL RULES PRESERVED
 
 VALIDATION
 - JavaScript syntax check: 78 files passed.
-- Targeted RPC routing, budget, reconciliation and recharge-policy tests: 40 passed, 0 failed.
+- Targeted RPC routing, budget, reconciliation and deposit-policy tests: 40 passed, 0 failed.
 - Full suite: 142 total; 126 completed successfully. 16 tests could not start because the working test environment does not have the project runtime dependencies ethers and bignumber.js installed.
 - No live PublicNode or Chainstack RPC test was possible because no production credentials were supplied.

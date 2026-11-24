@@ -177,6 +177,21 @@ function registerXtuWithdrawalRoutes(router, context) {
           return { status: "global_disbursement_in_progress" };
         }
 
+        const [settlementRows] = await tx.query(
+          `SELECT COALESCE(SUM(remaining_xtu_amount),0) AS amount FROM xtu_global_settlement_ledger
+           WHERE status IN ('reserved','partially_settled')`,
+        );
+        const [pendingWithdrawalRows] = await tx.query(
+          `SELECT COALESCE(SUM(net_amount),0) AS amount FROM xtu_withdrawals
+           WHERE status IN ('queued','signed','submitted','manual_review')`,
+        );
+        const distributionBalance = new BigNumber(quote.distributionTokenBalance || "0").shiftedBy(-18);
+        const requiredDistributionBalance = new BigNumber(settlementRows[0]?.amount || "0")
+          .plus(pendingWithdrawalRows[0]?.amount || "0");
+        if (!distributionBalance.isFinite() || distributionBalance.lt(requiredDistributionBalance)) {
+          return { status: "distribution_balance_reserved" };
+        }
+
         const [stockRows] = await tx.query(
           `SELECT balance,seller_status,run_balance FROM users_stock
            WHERE username=? LIMIT 1 FOR UPDATE`,
@@ -236,9 +251,16 @@ function registerXtuWithdrawalRoutes(router, context) {
           `UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?`,
           [futurePrincipal.toFixed(30), date, time, username],
         );
+        const currentCoverageReserved = new BigNumber(common.xtu_wallets_reserved || "0");
+        const nextCoverageReserved = currentCoverageReserved.plus(quote.netAmount);
+        if (!currentCoverageReserved.isFinite() || currentCoverageReserved.isNegative() ||
+            !nextCoverageReserved.isFinite() || nextCoverageReserved.isLessThan(currentCoverageReserved)) {
+          throw new Error("The XTU externalized-coverage reservation is invalid.");
+        }
         await insertCommonSnapshotTx(tx, common, {
           total_units_price: futureTotalUnitsPrice.toFixed(30),
           backed_units: futureBackedUnits.toFixed(30),
+          xtu_wallets_reserved: nextCoverageReserved.toFixed(30),
         }, date, time);
 
         const [insertResult] = await tx.query(
@@ -289,6 +311,7 @@ function registerXtuWithdrawalRoutes(router, context) {
           global_disbursement_in_progress: [409, "A global disbursement is in progress."],
           stock_missing: [409, "The account's initial-asset balance is unavailable."],
           seller_campaign_active: [409, "Cancel or complete the active seller campaign before requesting an XTU withdrawal."],
+          distribution_balance_reserved: [409, "The XTU Distribution Wallet's free balance is reserved for pending global XTU settlements or withdrawals."],
           insufficient_balance: [409, "Insufficient XTU balance for this withdrawal."],
           protected_reserve: [409, "The protected system reserve cannot cover this withdrawal."],
           system_reserve: [409, "The system reserve cannot cover this withdrawal at the moment."],

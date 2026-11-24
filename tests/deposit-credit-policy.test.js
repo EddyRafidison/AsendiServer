@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { evaluateRechargeCredit, findMaximumRechargeCredit } = require("../recharge-credit-policy");
+const { evaluateDepositCredit, findMaximumDepositCredit } = require("../deposit-credit-policy");
 
 function baseline(overrides = {}) {
   return {
@@ -26,8 +26,8 @@ function baseline(overrides = {}) {
   };
 }
 
-test("recharge credit retains all tfees and does not deduct incoming BSC gas", () => {
-  const result = evaluateRechargeCredit({ ...baseline(), grossAmount: "100" });
+test("deposit credit retains all tfees and does not deduct incoming BSC gas", () => {
+  const result = evaluateDepositCredit({ ...baseline(), grossAmount: "100" });
   assert.equal(result.allowed, true);
   assert.equal(result.grossAmount.toFixed(2), "100.00");
   assert.equal(result.feeAmount.toFixed(2), "3.00");
@@ -37,16 +37,16 @@ test("recharge credit retains all tfees and does not deduct incoming BSC gas", (
 });
 
 test("initial credit request can be capped at 100 while any later remainder is submitted without that cap", () => {
-  const initial = findMaximumRechargeCredit({ ...baseline(), targetGrossAmount: "250" });
+  const initial = findMaximumDepositCredit({ ...baseline(), targetGrossAmount: "250" });
   assert.equal(initial.allowed, true);
   assert.equal(initial.grossAmount.toFixed(2), "250.00");
-  const firstTranche = findMaximumRechargeCredit({ ...baseline(), targetGrossAmount: "100" });
+  const firstTranche = findMaximumDepositCredit({ ...baseline(), targetGrossAmount: "100" });
   assert.equal(firstTranche.allowed, true);
   assert.equal(firstTranche.grossAmount.toFixed(2), "100.00");
 });
 
 test("credit planner finds a partial tranche under the 300 XTU account ceiling", () => {
-  const result = findMaximumRechargeCredit({
+  const result = findMaximumDepositCredit({
     ...baseline({ currentBalanceInitialAsset: "250" }),
     targetGrossAmount: "100",
   });
@@ -59,14 +59,14 @@ test("credit planner finds a partial tranche under the 300 XTU account ceiling",
 });
 
 test("weekly cooldown blocks system-funded tranche but allows seller-funded tranche", () => {
-  const systemOnly = findMaximumRechargeCredit({
+  const systemOnly = findMaximumDepositCredit({
     ...baseline({ totalSellerReserve: "0", availableSellerReserve: "0", weeklyCooldownAllowed: false }),
     targetGrossAmount: "20",
   });
   assert.equal(systemOnly.allowed, false);
   assert.equal(systemOnly.reason, "weekly_limit");
 
-  const sellerOnly = findMaximumRechargeCredit({
+  const sellerOnly = findMaximumDepositCredit({
     ...baseline({ inactiveInitialAsset: "0", totalSellerReserve: "1000", availableSellerReserve: "1000", weeklyCooldownAllowed: false }),
     targetGrossAmount: "20",
   });
