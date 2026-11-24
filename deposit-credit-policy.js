@@ -4,6 +4,7 @@ const BigNumber = require("bignumber.js");
 const {
   calculateGlobalUnitPrice,
   calculateDepositFundingAllocation,
+  calculateSellerOnlyDepositFundingAllocation,
   isUserBalanceWithinMaxStock,
 } = require("./stock-accounting");
 
@@ -31,7 +32,7 @@ function evaluateDepositCredit({
   currentUnitPrice,
   tfeesRatePercent,
   maximumUserXtu = "300",
-  weeklyCooldownAllowed = true,
+  systemFundingAllowed = true,
   globalBonusRatePercent = 0,
   remainingAdminReserveInitialAsset = 0,
   alreadyReservedAdminBonusInitialAsset = 0,
@@ -69,17 +70,38 @@ function evaluateDepositCredit({
   if (!netAmount.isGreaterThan(0)) return { allowed: false, reason: "fees_exhaust_amount" };
 
   const requestedInitialAsset = netAmount.dividedBy(price);
-  const allocation = calculateDepositFundingAllocation(
-    requestedInitialAsset,
-    price,
-    backed,
-    inactive,
-    activeSellers,
-    total,
-    protectedFloor,
-    pendingPayouts,
-  );
+  // Once the weekly OneX system-funded purchase has been used, new deposits
+  // may still be credited from seller campaign reserves. Never fall back to
+  // inactive/backed system reserves during that cooldown.
+  const allocation = systemFundingAllowed === true
+    ? calculateDepositFundingAllocation(
+      requestedInitialAsset,
+      price,
+      backed,
+      inactive,
+      activeSellers,
+      total,
+      protectedFloor,
+      pendingPayouts,
+    )
+    : calculateSellerOnlyDepositFundingAllocation(
+      requestedInitialAsset,
+      price,
+      backed,
+      inactive,
+      activeSellers,
+      total,
+      protectedFloor,
+    );
   if (!allocation.available) {
+    if (systemFundingAllowed !== true) {
+      return {
+        allowed: false,
+        reason: "system_funding_cooldown",
+        allocation,
+        availableSellerInitialAsset: activeSellers,
+      };
+    }
     return {
       allowed: false,
       reason: "system_reserve",
@@ -89,9 +111,6 @@ function evaluateDepositCredit({
   }
 
   const systemAmountXtu = allocation.systemInitialAsset.multipliedBy(price);
-  if (systemAmountXtu.isGreaterThan(0) && weeklyCooldownAllowed !== true) {
-    return { allowed: false, reason: "weekly_limit", allocation };
-  }
 
   const feeBasis = feeAmount.dividedBy(price);
   const newTotal = total.plus(systemAmountXtu).plus(feeAmount);

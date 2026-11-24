@@ -3,6 +3,7 @@
 const path = require("path");
 const dotenv = require("dotenv");
 const BigNumber = require("bignumber.js");
+const { DEPOSIT_MIN_AMOUNT, DEPOSIT_MAX_AMOUNT } = require("./deposit-limits");
 const {
   Contract,
   JsonRpcProvider,
@@ -68,6 +69,11 @@ function isXtuDepositWorkerEnabled() {
 
 function getXtuSettings() {
   const envPath = loadXtuEnvironment();
+  const legacyDepositLimitVariables = ["XTU_DEPOSIT_MIN_AMOUNT", "XTU_DEPOSIT_MAX_AMOUNT"]
+    .filter((name) => String(process.env[name] || "").trim() !== "");
+  if (legacyDepositLimitVariables.length) {
+    throw new Error(`${legacyDepositLimitVariables.join(", ")} are obsolete; use the shared DEPOSIT_MIN_AMOUNT and DEPOSIT_MAX_AMOUNT settings in the main .env.`);
+  }
   const chainId = String(process.env.XTU_CHAIN_ID || "56");
   if (chainId !== "56") throw new Error("XTU_CHAIN_ID must be 56 (BNB Smart Chain mainnet).");
   const tokenAddress = String(process.env.XTU_TOKEN_CONTRACT_ADDRESS || "").trim();
@@ -87,14 +93,15 @@ function getXtuSettings() {
     throw new Error("The XTU Hot Wallet and Distribution Wallet must be different addresses.");
   }
   if (!rpcUrl) throw new Error("BSC_RPC_URL (outgoing BSC RPC) is required for XTU operations.");
-  const depositMinAmount = String(process.env.XTU_DEPOSIT_MIN_AMOUNT || "70").trim();
-  const depositMaxAmount = String(process.env.XTU_DEPOSIT_MAX_AMOUNT || "140").trim();
-  if (depositMinAmount !== "70" || depositMaxAmount !== "140") {
-    throw new RangeError("XTU deposit intake limits are fixed at 70 minimum and 140 maximum per user per rolling seven-day period.");
-  }
+  const depositMinAmount = DEPOSIT_MIN_AMOUNT;
+  const depositMaxAmount = DEPOSIT_MAX_AMOUNT;
   const depositInitialCreditCap = new BigNumber(process.env.XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU || "100");
-  if (!depositInitialCreditCap.isFinite() || !depositInitialCreditCap.isGreaterThan(0) || depositInitialCreditCap.gt("140")) {
-    throw new RangeError("XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU must be positive and cannot exceed the 140 XTU rolling-week intake maximum.");
+  if (!depositInitialCreditCap.isFinite() || !depositInitialCreditCap.isGreaterThan(0) || depositInitialCreditCap.gt(depositMaxAmount)) {
+    throw new RangeError("XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU must be positive and cannot exceed the shared DEPOSIT_MAX_AMOUNT.");
+  }
+  const depositConsolidationMinBatch = new BigNumber(process.env.XTU_DEPOSIT_CONSOLIDATION_MIN_BATCH_XTU || "100");
+  if (!depositConsolidationMinBatch.isFinite() || depositConsolidationMinBatch.lt("100") || depositConsolidationMinBatch.decimalPlaces() > 18) {
+    throw new RangeError("XTU_DEPOSIT_CONSOLIDATION_MIN_BATCH_XTU must be at least 100 XTU and have at most 18 decimal places.");
   }
   return {
     envPath,
@@ -113,6 +120,7 @@ function getXtuSettings() {
     depositMinAmount,
     depositMaxAmount,
     depositInitialCreditCap: depositInitialCreditCap.toFixed(18),
+    depositConsolidationMinBatchXtu: depositConsolidationMinBatch.toFixed(18),
     depositGasLimitCeiling: BigInt(readBoundedInteger("XTU_DEPOSIT_GAS_LIMIT", 250000, 50000, 1000000)),
     depositBatchWindowMs: readBoundedInteger("XTU_DEPOSIT_BATCH_WINDOW_MS", 3600000, 3600000, 3600000),
     depositInitialGroupingTimeoutMs: readBoundedInteger("XTU_DEPOSIT_INITIAL_GROUPING_TIMEOUT_DAYS", 30, 1, 30) * 24 * 60 * 60 * 1000,

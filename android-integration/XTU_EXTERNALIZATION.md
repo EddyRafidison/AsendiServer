@@ -17,7 +17,7 @@ Required JSON body:
 }
 ```
 
-`amount` must be a decimal string with at most 18 decimal places and a gross minimum of `1` XTU. Do not send `to`, `destination`, a wallet address, a private key or a recovery seed. The server uses the fixed `auths.wallet_address` recorded at signup. The route requires the normal device-bound request signature headers documented in `README.md` and the current Android device-authentication protocol.
+`amount` must be a decimal string with at most 18 decimal places and a gross minimum of `5` XTU. Do not send `to`, `destination`, a wallet address, a private key or a recovery seed. The server uses the fixed `auths.wallet_address` recorded at signup. The route requires the normal device-bound request signature headers documented in `README.md` and the current Android device-authentication protocol.
 
 The service is available only when both `XTU_WITHDRAWAL_WORKER_ENABLED=true` and the admin-controlled XTU withdrawal gate is open. The request is accepted with HTTP 202 while the worker processes it. The response includes the unique `reference`, gross amount, estimated BNB gas cost and XTU equivalent, estimated 0.1% contract fee, estimated net amount and registered destination address. These values are estimates until the transaction is finalized.
 

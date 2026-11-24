@@ -14,6 +14,8 @@ const feePolicySource = fs.readFileSync(path.join(root, "bsc-transaction-policy.
 const feeAccountingSource = fs.readFileSync(path.join(root, "bsc-fee-accounting.js"), "utf8");
 const disbursementSource = fs.readFileSync(path.join(root, "disbursement.js"), "utf8");
 const envExample = fs.readFileSync(path.join(root, ".env.example"), "utf8");
+const xtuEnvExample = fs.readFileSync(path.join(root, ".env.xtu.example"), "utf8");
+const depositLimitsSource = fs.readFileSync(path.join(root, "deposit-limits.js"), "utf8");
 
 function getRouteBlock(routePath, nextRoutePath) {
   const startMarker = `router.post("${routePath}"`;
@@ -71,9 +73,14 @@ test("public reserve availability endpoint is authenticated, cached and separate
 });
 
 
-test("automatic deposit receipt minimum is 70 BSC-USD across validation and API metadata", () => {
-  assert.match(depositPolicySource, /const MIN_DEPOSIT_AMOUNT = new BigNumber\("70"\)/);
-  assert.match(routesSource, /minimum_not_reached: "The 60-minute session total has not reached the 70 BSC-USD minimum\."/);
+test("shared deposit receipt limits are 20-100 for BSC-USD and XTU with no legacy duplicate settings", () => {
+  assert.match(depositPolicySource, /DEPOSIT_MIN_AMOUNT, DEPOSIT_MAX_AMOUNT/);
+  assert.match(depositLimitsSource, /DEPOSIT_MIN_AMOUNT \|\| "20"/);
+  assert.match(depositLimitsSource, /DEPOSIT_MAX_AMOUNT \|\| "100"/);
+  assert.match(routesSource, /minimum_not_reached: "The 60-minute session total has not reached the 20 BSC-USD minimum\."/);
+  assert.match(routesSource, /consolidation_minimum_batch_xtu: state\.consolidationMinBatchXtu/);
+  assert.match(xtuEnvExample, /XTU_DEPOSIT_CONSOLIDATION_MIN_BATCH_XTU=100/);
+  assert.doesNotMatch(xtuEnvExample, /XTU_DEPOSIT_(?:MIN|MAX)_AMOUNT=/);
   assert.match(routesSource, /minimum_deposit_amount_bsc_usd: MIN_DEPOSIT_AMOUNT\.toFixed\(0\)/);
   assert.match(envExample, /^BSC_MAX_TX_FEE_BSC_USD=0\.4$/m);
 });

@@ -6,7 +6,7 @@ BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP })
 
 const XTU_DECIMALS = 18;
 const XTU_SCALE = 10n ** BigInt(XTU_DECIMALS);
-const MIN_XTU_WITHDRAWAL = new BigNumber("1");
+const MIN_XTU_WITHDRAWAL = new BigNumber("5");
 const XTU_TRANSFER_FEE_BPS = 10n;
 const BPS_DENOMINATOR = 10000n;
 
@@ -37,7 +37,7 @@ function calculateXtuWithdrawalQuote(grossAmountValue, estimatedGasFeeUsdValue) 
   const gross = positiveAmount(grossAmountValue, "Gross XTU withdrawal");
   const gasUsd = new BigNumber(String(estimatedGasFeeUsdValue));
   if (!gasUsd.isFinite() || gasUsd.isNegative()) throw new RangeError("Estimated BSC gas fee must be non-negative.");
-  if (gross.lt(MIN_XTU_WITHDRAWAL)) throw new RangeError("The minimum gross XTU withdrawal is 1 XTU.");
+  if (gross.lt(MIN_XTU_WITHDRAWAL)) throw new RangeError("The minimum gross XTU withdrawal is 5 XTU.");
 
   const grossRaw = tokenRawFromDecimal(gross.toFixed(XTU_DECIMALS), BigNumber.ROUND_DOWN);
   const gasRaw = gasUsd.multipliedBy(new BigNumber(XTU_SCALE.toString()))
@@ -78,7 +78,7 @@ function validateWithdrawalRequestAmount(value) {
     throw new TypeError("amount must be a positive decimal with no more than 18 decimal places.");
   }
   const amount = positiveAmount(text, "XTU withdrawal amount");
-  if (amount.lt(MIN_XTU_WITHDRAWAL)) throw new RangeError("The minimum gross XTU withdrawal is 1 XTU.");
+  if (amount.lt(MIN_XTU_WITHDRAWAL)) throw new RangeError("The minimum gross XTU withdrawal is 5 XTU.");
   return amount;
 }
 

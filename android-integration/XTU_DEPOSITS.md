@@ -15,11 +15,11 @@ Endpoint: `POST /app/deposit`
 }
 ```
 
-The successful response identifies BNB Smart Chain Mainnet (chain ID 56), the XTU token contract, the OneX Hot Wallet destination, the registered sender wallet, minimum/maximum values, rolling seven-day limit, first-credit-tranche cap, contract fee, OneX deposit fee and gas treatment. The app must display the exact destination and fee policy returned by the server. Users must send from the BSC address registered on their OneX account. The app must never request a wallet private key or recovery phrase.
+The successful response identifies BNB Smart Chain Mainnet (chain ID 56), the XTU token contract, the OneX Hot Wallet destination, the registered sender wallet, 20-100 gross session limits, the one-per-seven-day OneX system-funded purchase rule (regardless of amount), seller-campaign funding availability and the separate first-credit-tranche cap, contract fee, OneX deposit fee and gas treatment. The app must display the exact destination and fee policy returned by the server. Users must send from the BSC address registered on their OneX account. The app must never request a wallet private key or recovery phrase.
 
 ## Availability
 
-Endpoint: `POST /app/deposit/availability`, with the same authenticated body and `asset: "XTU"`. The response provides `deposit_allowed`, any hold reason, the 70 XTU minimum, 140 XTU maximum per user per rolling seven-day period, the separate first-credit-tranche cap (100 XTU by default), the 60-minute collection window and the seven-day automatic retry interval. A pending deposit or a temporary restriction must be displayed as pending, not as a completed credit.
+Endpoint: `POST /app/deposit/availability`, with the same authenticated body and `asset: "XTU"`. The response provides `deposit_allowed`, any hold reason, and the shared 20-100 XTU gross limits per 60-minute deposit session. There is no rolling seven-day ceiling on incoming XTU amounts. A separate weekly rule allows one purchase funded from OneX system reserves per user in any rolling seven-day period, regardless of amount; that rule is shared with BSC-USD deposits. When the allowance has been used, an otherwise eligible deposit may still be credited exclusively from active seller-campaign reserves. An eligible seller explicitly opts in through `POST /app/join-system-sellers`; OneX then creates the campaign and commits 50% of that seller's principal under the eligibility rules. Seller funds are not locked without consent. The response also provides the separate first-credit-tranche cap (100 XTU by default), the `consolidation_minimum_batch_xtu` threshold (100 XTU by default) for a Hot Wallet-to-Distribution Wallet consolidation lot, the 60-minute collection window and current OneX system-funding cooldown metadata. An individual transfer or a 60-minute session above 100 XTU is held for support review. A pending deposit or a temporary restriction must be displayed as pending, not as a completed credit.
 
 ## Status
 
@@ -40,7 +40,7 @@ The response distinguishes gross XTU detected, net amount received by the Hot Wa
 ## Financial rules shown in the app
 
 - The XTU contract applies a 0.1% commission to external transfers. The only commission exemption is the exact Hot Wallet → Distribution Wallet transfer; the app should not imply that sending to the Hot Wallet is fee-free.
-- Incoming XTU is consolidated only after finality and only for identified deposit amounts. The Hot Wallet's remaining token supply is never swept.
+- Incoming XTU is consolidated only after finality and only for identified deposit amounts. Eligible user batches are aggregated until the Hot Wallet-to-Distribution Wallet transfer lot reaches at least 100 XTU actually received by the Hot Wallet. The lot may contain multiple users’ eligible batches, with gas allocated deterministically and auditable per source batch. The Hot Wallet's remaining token supply and initial 100-billion-token allocation are never swept.
 - Outside global disbursement, the OneX XTU deposit fee is 75% of the normal `tfees` rate. During an active global disbursement, the OneX deposit fee is zero.
 - Actual BNB gas is always charged to the XTU deposit, including during global disbursement. The estimated gas ceiling of 0.4 BSC-USD is a refusal/deferral threshold, not a fixed fee.
 - Initial assets are calculated using the absolute global `common.unit_price`, not the user's individual price. The reserve allocator checks `inactive_init_asset`, seller reserve and eligible `backed_units` in that order.

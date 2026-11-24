@@ -20,15 +20,15 @@ const {
   MAX_DEFAULT_STOCK,
   SYSTEM_ADMIN_RESERVE_RATIO,
   DEPOSIT_BATCH_WINDOW_MS,
-  getWeeklyReleaseAt,
+  getSystemFundingCooldownReleaseAt,
   recordDateTimeToUtcMs,
 } = require("../deposit-policy");
 
 const fixed = (value) => value.toFixed();
 
 test("current OneX business limits are centralized", () => {
-  assert.equal(fixed(MIN_DEPOSIT_AMOUNT), "70");
-  assert.equal(fixed(MAX_DEPOSIT_AMOUNT), "140");
+  assert.equal(fixed(MIN_DEPOSIT_AMOUNT), "20");
+  assert.equal(fixed(MAX_DEPOSIT_AMOUNT), "100");
   assert.equal(MAX_DEFAULT_STOCK, "300");
   assert.equal(fixed(SYSTEM_ADMIN_RESERVE_RATIO), "0.1");
   assert.equal(DEPOSIT_BATCH_WINDOW_MS, 60 * 60 * 1000);
@@ -132,12 +132,13 @@ test("rejects invalid individual payout fees, amounts and participant prices", (
   assert.throws(() => calculateIndividualDisbursement("375", "300", "0", 3), /unit_price/);
 });
 
-test("weekly pending release is at least seven days after first pending and last successful deposit", () => {
+test("weekly OneX system-funding cooldown expires seven days after the last OneX-funded purchase", () => {
   const day = 24 * 60 * 60 * 1000;
-  const pendingAt = Date.UTC(2026, 0, 10);
-  const lastDepositAt = Date.UTC(2026, 0, 8);
-  assert.equal(getWeeklyReleaseAt(pendingAt, lastDepositAt), pendingAt + 7 * day);
-  assert.equal(getWeeklyReleaseAt(pendingAt, Date.UTC(2026, 0, 20)), Date.UTC(2026, 0, 27));
+  const pendingAt = Date.UTC(2026, 0, 12);
+  const lastOnexPurchaseAt = Date.UTC(2026, 0, 8);
+  assert.equal(getSystemFundingCooldownReleaseAt(pendingAt, lastOnexPurchaseAt), Date.UTC(2026, 0, 15));
+  assert.equal(getSystemFundingCooldownReleaseAt(pendingAt, Date.UTC(2026, 0, 20)), Date.UTC(2026, 0, 27));
+  assert.equal(getSystemFundingCooldownReleaseAt(pendingAt, null), pendingAt + 7 * day);
 });
 
 test("activity date/time parser treats database values as UTC and rejects invalid dates", () => {

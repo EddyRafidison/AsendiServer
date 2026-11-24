@@ -374,6 +374,68 @@ function calculateDepositFundingAllocation(
   };
 }
 
+
+/**
+ * Allocate a deposit exclusively from eligible seller campaign reserves.
+ * This path is used after the user's one-per-seven-day OneX system-funded
+ * purchase has already been consumed. It must never consume inactive or
+ * backed system reserves, even when those reserves are available.
+ */
+function calculateSellerOnlyDepositFundingAllocation(
+  requestedInitialAssetValue,
+  unitPriceValue,
+  backedValue,
+  inactiveValue,
+  sellersReserveValue,
+  totalUnitsPriceValue,
+  protectedFloorValue = 0,
+) {
+  const requested = asBigNumber(requestedInitialAssetValue, "seller-funded deposit initial-asset amount");
+  const unitPrice = asBigNumber(unitPriceValue, "common.unit_price");
+  const backed = asBigNumber(backedValue, "common.backed_units");
+  const inactive = asBigNumber(inactiveValue, "common.inactive_init_asset");
+  const sellers = asBigNumber(sellersReserveValue, "common.sellers_res");
+  const total = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
+  const protectedFloor = asBigNumber(protectedFloorValue, "remaining administrative reserve");
+
+  if (!requested.isGreaterThan(0) || !unitPrice.isGreaterThan(0) || !total.isGreaterThan(0)) {
+    throw new RangeError("Seller-funded deposit amount, global price and total valuation must be positive");
+  }
+  if ([backed, inactive, sellers, protectedFloor].some((value) => value.isNegative())) {
+    throw new RangeError("Seller-funded deposit reserve amounts cannot be negative");
+  }
+  if (backed.isLessThan(protectedFloor)) {
+    throw new RangeError("common.backed_units is below the remaining administrative reserve quota");
+  }
+  const minimumRequiredPrice = calculateGlobalUnitPrice(total, backed);
+  if (minimumRequiredPrice.minus(unitPrice).gt("0.000000000000000000000000000001")) {
+    throw new RangeError("common.unit_price must not be below total_units_price / backed_units");
+  }
+
+  const available = sellers.isGreaterThanOrEqualTo(requested);
+  const consumedSellers = available ? requested : new BigNumber(0);
+  const remainingSellerAmount = available ? sellers.minus(requested) : sellers;
+  return {
+    available,
+    requestedInitialAsset: requested,
+    availableSellerInitialAsset: sellers,
+    remainingSellerInitialAsset: available ? new BigNumber(0) : requested.minus(sellers),
+    consumedInactive: new BigNumber(0),
+    consumedSellers,
+    consumedBacked: new BigNumber(0),
+    systemInitialAsset: new BigNumber(0),
+    sellerInitialAsset: consumedSellers,
+    systemAmountXtu: new BigNumber(0),
+    sellerAmountXtu: consumedSellers.multipliedBy(unitPrice),
+    newInactive: inactive,
+    newSellersReserve: remainingSellerAmount,
+    newBacked: backed,
+    newTotalUnitsPrice: total,
+    newUnitPrice: unitPrice,
+    usedBackedAssets: false,
+  };
+}
+
 /** Check a user's projected XTU balance against the global stock cap. */
 function isUserBalanceWithinMaxStock(currentInitialAssetValue, creditInitialAssetValue, unitPriceValue, maximumXtuValue) {
   const currentInitialAsset = asBigNumber(currentInitialAssetValue, "current user initial-asset balance");
@@ -404,5 +466,6 @@ module.exports = {
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,
   calculateDepositFundingAllocation,
+  calculateSellerOnlyDepositFundingAllocation,
   isUserBalanceWithinMaxStock,
 };

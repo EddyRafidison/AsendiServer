@@ -23,7 +23,8 @@ const {
   calculateXtuDepositCredit,
   calculateXtuDepositTranche,
   allocateBatchGasByGross,
-  classifyWeeklyDeposit,
+  classifyDepositSession,
+  selectXtuConsolidationBatches,
   calculateXtuSettlementQuote,
   MIN_XTU_DEPOSIT,
   MAX_XTU_DEPOSIT,
@@ -38,10 +39,15 @@ const {
 } = require("./bsc-fee-accounting");
 const { getBnbUsdPrice } = require("./bsc-price-oracle");
 const { getConfiguredMaxBscTxFeeUsd, evaluateBscTxFee } = require("./bsc-transaction-policy");
-const { calculateDepositFundingAllocation, calculateRemainingSystemAdminReserve } = require("./stock-accounting");
+const {
+  calculateDepositFundingAllocation,
+  calculateSellerOnlyDepositFundingAllocation,
+  calculateRemainingSystemAdminReserve,
+} = require("./stock-accounting");
 const { getActiveSellerReserveAvailableTx, consumeSellerReserveTx } = require("./seller-accounting");
 const { getUserPriceStateTx, previewUserOperationCapacity } = require("./user-price-accounting");
 const { isGlobalDisbursementEffective } = require("./global-disbursement-policy");
+const { getLastOneXSystemFundedPurchase, assessOneXSystemFundingCooldown, getSystemFundingCooldownReleaseAt } = require("./deposit-policy");
 const { queueTelegramMessageTx } = require("./telegram");
 const { db: defaultDb, OneX, tfees, stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, MAIL_PORT, SERVER_MAIL, SERVER_MAIL_PSWD } = require("./db");
 
@@ -221,7 +227,8 @@ async function createDepositBatchTx(tx, username, settings, blockTimestampMs, st
   const expiresAt = timestamp + settings.depositBatchWindowMs;
   const initialDeadline = timestamp + settings.depositInitialGroupingTimeoutMs;
   const pendingSince = status === "collecting" ? null : timestamp;
-  const releaseAt = status === "collecting" ? null : timestamp + settings.depositPendingRetryMs;
+  const retryAfterDelay = status === "pending_weekly" || status === "pending_minimum";
+  const releaseAt = retryAfterDelay ? timestamp + settings.depositPendingRetryMs : null;
   const [result] = await tx.query(
     `INSERT INTO xtu_deposit_batches
      (username,hot_wallet_address,opened_at_ms,expires_at_ms,initial_group_deadline_ms,global_run_id,
@@ -272,14 +279,6 @@ async function assignDepositEventTx(tx, event, settings) {
   const eventGlobalRunId = candidateGlobal && isGlobalDisbursementEffective(candidateGlobal.status) &&
     eventTimestamp >= Number(candidateGlobal.effective_at_ms || Number.MAX_SAFE_INTEGER)
     ? String(candidateGlobal.id) : null;
-  const weeklyFloor = eventTimestamp - 7 * 24 * 60 * 60 * 1000;
-  const [weeklyRows] = await tx.query(
-    `SELECT COALESCE(SUM(gross_amount),0) AS amount
-     FROM xtu_deposit_transfer_events
-     WHERE username=? AND CAST(block_timestamp_ms AS UNSIGNED)>? AND status NOT IN ('rejected','reversed')`,
-    [username, String(weeklyFloor)],
-  );
-  const weeklyBefore = new BigNumber(weeklyRows[0]?.amount || "0");
   const incoming = new BigNumber(event.gross.toString()).shiftedBy(-18);
   const [activeRows] = await tx.query(
     `SELECT * FROM xtu_deposit_batches WHERE username=? AND status='collecting'
@@ -288,35 +287,67 @@ async function assignDepositEventTx(tx, event, settings) {
   let activeBatch = activeRows[0] || null;
   if (activeBatch && String(activeBatch.global_run_id || "") !== String(eventGlobalRunId || "")) {
     const priorGross = new BigNumber(activeBatch.gross_amount || "0");
-    const priorStatus = priorGross.gte(MIN_XTU_DEPOSIT) && priorGross.lte(MAX_XTU_DEPOSIT) ? "ready" : "pending_minimum";
+    const priorStatus = priorGross.gte(MIN_XTU_DEPOSIT) && priorGross.lte(MAX_XTU_DEPOSIT)
+      ? "ready" : (priorGross.gt(MAX_XTU_DEPOSIT) ? "pending_support" : "pending_minimum");
+    const priorReason = priorStatus === "pending_support"
+      ? JSON.stringify(["deposit_session_above_maximum"])
+      : (priorStatus === "pending_minimum" ? JSON.stringify(["minimum_not_reached"]) : "[]");
     const [latestPriorEventRows] = await tx.query(
       "SELECT MAX(CAST(block_timestamp_ms AS UNSIGNED)) AS latest_event_ms FROM xtu_deposit_transfer_events WHERE batch_id=?",
       [String(activeBatch.id)],
     );
     const latestPriorEvent = Number(latestPriorEventRows[0]?.latest_event_ms || activeBatch.opened_at_ms);
     await tx.query(
-      `UPDATE xtu_deposit_batches SET status=?,pending_since_ms=?,release_at_ms=?,updated_at_ms=? WHERE id=? AND status='collecting'`,
-      [priorStatus, priorStatus === "ready" ? null : String(Date.now()),
-        priorStatus === "ready" ? null : String(latestPriorEvent + settings.depositPendingRetryMs), String(Date.now()), String(activeBatch.id)],
+      `UPDATE xtu_deposit_batches SET status=?,pending_since_ms=?,release_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=? AND status='collecting'`,
+      [priorStatus, priorStatus === "ready" || priorStatus === "pending_support" ? null : String(Date.now()),
+        priorStatus === "ready" || priorStatus === "pending_support" ? null : String(latestPriorEvent + settings.depositPendingRetryMs),
+        priorReason, String(Date.now()), String(activeBatch.id)],
     );
     activeBatch = null;
   }
   if (activeBatch && eventTimestamp > Number(activeBatch.expires_at_ms)) {
+    const priorGross = new BigNumber(activeBatch.gross_amount || "0");
+    const priorStatus = priorGross.gte(MIN_XTU_DEPOSIT) && priorGross.lte(MAX_XTU_DEPOSIT)
+      ? "ready" : (priorGross.gt(MAX_XTU_DEPOSIT) ? "pending_support" : "pending_minimum");
+    const priorReason = priorStatus === "pending_support"
+      ? JSON.stringify(["deposit_session_above_maximum"])
+      : (priorStatus === "pending_minimum" ? JSON.stringify(["minimum_not_reached"]) : "[]");
+    const [latestPriorEventRows] = await tx.query(
+      "SELECT MAX(CAST(block_timestamp_ms AS UNSIGNED)) AS latest_event_ms FROM xtu_deposit_transfer_events WHERE batch_id=?",
+      [String(activeBatch.id)],
+    );
+    const latestPriorEvent = Number(latestPriorEventRows[0]?.latest_event_ms || activeBatch.opened_at_ms);
     await tx.query(
-      `UPDATE xtu_deposit_batches SET status=IF(gross_amount>=? AND gross_amount<=?,'ready','pending_minimum'),
-       pending_since_ms=IF(gross_amount>=? AND gross_amount<=?,NULL,?),
-       release_at_ms=IF(gross_amount>=? AND gross_amount<=?,NULL,?),updated_at_ms=? WHERE id=? AND status='collecting'`,
-      [MIN_XTU_DEPOSIT.toFixed(), MAX_XTU_DEPOSIT.toFixed(), MIN_XTU_DEPOSIT.toFixed(), MAX_XTU_DEPOSIT.toFixed(), String(eventTimestamp),
-        MIN_XTU_DEPOSIT.toFixed(), MAX_XTU_DEPOSIT.toFixed(), String(eventTimestamp + settings.depositPendingRetryMs), String(Date.now()), String(activeBatch.id)],
+      `UPDATE xtu_deposit_batches SET status=?,pending_since_ms=?,release_at_ms=?,reason_codes=?,updated_at_ms=?
+       WHERE id=? AND status='collecting'`,
+      [priorStatus,
+        priorStatus === "ready" || priorStatus === "pending_support" ? null : String(Date.now()),
+        priorStatus === "ready" || priorStatus === "pending_support" ? null : String(latestPriorEvent + settings.depositPendingRetryMs),
+        priorReason, String(Date.now()), String(activeBatch.id)],
     );
     activeBatch = null;
   }
 
-  const weekly = classifyWeeklyDeposit({ previousSevenDayGross: weeklyBefore, incomingGross: incoming });
+  const currentSessionAmount = new BigNumber(activeBatch?.gross_amount || "0");
+  const sessionDecision = classifyDepositSession({
+    incomingGross: incoming,
+    currentBatchGross: activeBatch ? currentSessionAmount : 0,
+  });
   let batchId;
   let eventStatus = "detected";
   let reason = null;
-  if (!activeBatch && weekly.allowed && Number(authRows[0].account_active) === 1) {
+
+  if (Number(authRows[0].account_active) !== 1) {
+    reason = "account_inactive";
+    batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
+    eventStatus = "pending_support";
+  } else if (!sessionDecision.allowed) {
+    reason = sessionDecision.reason;
+    batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
+    eventStatus = "pending_support";
+  } else if (activeBatch) {
+    batchId = String(activeBatch.id);
+  } else {
     const [lastRows] = await tx.query(
       `SELECT * FROM xtu_deposit_batches WHERE username=? ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
     );
@@ -324,42 +355,28 @@ async function assignDepositEventTx(tx, event, settings) {
     if (lastBatch && lastBatch.status === "pending_minimum" &&
         String(lastBatch.global_run_id || "") === String(eventGlobalRunId || "") &&
         eventTimestamp <= Number(lastBatch.initial_group_deadline_ms || 0)) {
-      await tx.query(
-        `UPDATE xtu_deposit_batches SET status='collecting',expires_at_ms=?,pending_since_ms=NULL,
-         release_at_ms=NULL,reason_codes='[]',updated_at_ms=? WHERE id=? AND status='pending_minimum'`,
-        [String(eventTimestamp + settings.depositBatchWindowMs), String(Date.now()), String(lastBatch.id)],
-      );
-      activeBatch = { ...lastBatch, status: "collecting", expires_at_ms: String(eventTimestamp + settings.depositBatchWindowMs) };
+      const reopenedDecision = classifyDepositSession({ incomingGross: incoming, currentBatchGross: lastBatch.gross_amount || 0 });
+      if (!reopenedDecision.allowed) {
+        reason = reopenedDecision.reason;
+        batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
+        eventStatus = "pending_support";
+      } else {
+        await tx.query(
+          `UPDATE xtu_deposit_batches SET status='collecting',expires_at_ms=?,pending_since_ms=NULL,
+           release_at_ms=NULL,reason_codes='[]',updated_at_ms=? WHERE id=? AND status='pending_minimum'`,
+          [String(eventTimestamp + settings.depositBatchWindowMs), String(Date.now()), String(lastBatch.id)],
+        );
+        activeBatch = { ...lastBatch, status: "collecting", expires_at_ms: String(eventTimestamp + settings.depositBatchWindowMs) };
+        batchId = String(activeBatch.id);
+      }
     } else if (lastBatch && !["credited", "rejected", "reversed"].includes(String(lastBatch.status))) {
       reason = eventTimestamp > Number(lastBatch.initial_group_deadline_ms || 0)
         ? "outside_initial_grouping_window" : "previous_batch_unresolved";
       batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
       eventStatus = "pending_support";
-    }
-  }
-
-  if (Number(authRows[0].account_active) !== 1) {
-    reason = "account_inactive";
-    batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
-    eventStatus = "pending_support";
-  } else if (!weekly.allowed) {
-    reason = "weekly_limit_exceeded";
-    batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_weekly", reason, eventGlobalRunId);
-    eventStatus = "pending_weekly";
-  } else if (batchId != null) {
-    // The event was isolated in a pending-support batch above.
-  } else if (activeBatch) {
-    const currentBatchAmount = new BigNumber(activeBatch.gross_amount || "0");
-    const batchDecision = classifyWeeklyDeposit({ previousSevenDayGross: "0", incomingGross: incoming, currentBatchGross: currentBatchAmount });
-    if (!batchDecision.allowed) {
-      reason = "batch_maximum_exceeded";
-      batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_weekly", reason, eventGlobalRunId);
-      eventStatus = "pending_weekly";
     } else {
-      batchId = String(activeBatch.id);
+      batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "collecting", null, eventGlobalRunId);
     }
-  } else if (batchId == null) {
-    batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "collecting", null, eventGlobalRunId);
   }
 
   const [insertResult] = await tx.query(
@@ -468,6 +485,52 @@ async function getGlobalRunTx(tx, runId = null) {
   return row && isGlobalDisbursementEffective(row.status) ? row : null;
 }
 
+async function getXtuBatchSystemPurchaseStateTx(tx, batch) {
+  // This is the same cross-asset allowance as BSC-USD. A type-2 activity
+  // with sender=OneX counts once regardless of amount; XUSER seller funding
+  // is deliberately excluded. The same batch may continue in later tranches.
+  const lastSystemPurchase = await getLastOneXSystemFundedPurchase(tx, batch.username, OneX);
+  const cooldown = assessOneXSystemFundingCooldown(lastSystemPurchase, Date.now());
+  const [sameBatchSystemRows] = await tx.query(
+    `SELECT 1
+     FROM xtu_deposit_credits c
+     INNER JOIN activities a ON a.reference=CONCAT(c.reference,'O')
+     WHERE c.batch_id=? AND c.username=? AND a.sender=? AND a.receiver=? AND a.type=2
+     LIMIT 1 FOR UPDATE`,
+    [String(batch.id), batch.username, OneX, batch.username],
+  );
+  return {
+    cooldown,
+    sameBatchAlreadyUsedSystemPurchase: sameBatchSystemRows.length > 0,
+    systemFundingAllowed: cooldown.allowed || sameBatchSystemRows.length > 0,
+  };
+}
+
+function getXtuWeeklyCooldownReleaseAt(batch, cooldown) {
+  const pendingSince = Number(batch.pending_since_ms || Date.now());
+  return getSystemFundingCooldownReleaseAt(pendingSince, cooldown.lastPurchaseMs);
+}
+
+async function allocateXtuDepositFundingTx(tx, batch, credit, common, sellerAvailable) {
+  const purchaseState = await getXtuBatchSystemPurchaseStateTx(tx, batch);
+  const allocation = purchaseState.systemFundingAllowed
+    ? calculateDepositFundingAllocation(
+      credit.creditedInitialAsset, common.unit_price, common.backed_units,
+      common.inactive_init_asset, sellerAvailable, common.total_units_price,
+      calculateRemainingSystemAdminReserve(
+        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+      ).remainingInitialAsset, 0,
+    )
+    : calculateSellerOnlyDepositFundingAllocation(
+      credit.creditedInitialAsset, common.unit_price, common.backed_units,
+      common.inactive_init_asset, sellerAvailable, common.total_units_price,
+      calculateRemainingSystemAdminReserve(
+        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+      ).remainingInitialAsset,
+    );
+  return { ...purchaseState, allocation };
+}
+
 async function assessBatchCapacityTx(tx, batch, gasUsdEstimate, settings) {
   const common = await getLatestCommonTx(tx, true);
   const globalRun = await getGlobalRunTx(tx, batch.global_run_id || null);
@@ -486,14 +549,15 @@ async function assessBatchCapacityTx(tx, batch, gasUsdEstimate, settings) {
     maximumInitialCreditXtu: settings.depositInitialCreditCap,
   });
   const sellerAvailable = await getActiveSellerReserveAvailableTx(tx, batch.username);
-  const protectedAdmin = calculateRemainingSystemAdminReserve(
-    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
-  ).remainingInitialAsset;
-  const allocation = calculateDepositFundingAllocation(
-    credit.creditedInitialAsset, common.unit_price, common.backed_units,
-    common.inactive_init_asset, sellerAvailable, common.total_units_price, protectedAdmin, 0,
-  );
-  if (!allocation.available) return { allowed: false, reason: "insufficient_reserves", credit, allocation, common, globalRun };
+  const funding = await allocateXtuDepositFundingTx(tx, batch, credit, common, sellerAvailable);
+  const allocation = funding.allocation;
+  if (!allocation.available) {
+    return {
+      allowed: false,
+      reason: funding.systemFundingAllowed ? "insufficient_reserves" : "system_funding_cooldown",
+      credit, allocation, common, globalRun, cooldown: funding.cooldown,
+    };
+  }
   const [stockRows] = await tx.query("SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [batch.username]);
   if (!stockRows.length) return { allowed: false, reason: "stock_missing", credit, allocation, common, globalRun };
   const currentBalance = new BigNumber(stockRows[0].balance);
@@ -521,7 +585,17 @@ async function closeExpiredBatches(pool, settings) {
       const gross = new BigNumber(batch.gross_amount);
       const now = Date.now();
       if (gross.gte(MIN_XTU_DEPOSIT) && gross.lte(MAX_XTU_DEPOSIT)) {
-        await tx.query("UPDATE xtu_deposit_batches SET status='ready',updated_at_ms=? WHERE id=?", [String(now), String(row.id)]);
+        await tx.query("UPDATE xtu_deposit_batches SET status='ready',reason_codes='[]',updated_at_ms=? WHERE id=?", [String(now), String(row.id)]);
+      } else if (gross.gt(MAX_XTU_DEPOSIT)) {
+        await tx.query(
+          `UPDATE xtu_deposit_batches SET status='pending_support',pending_since_ms=NULL,release_at_ms=NULL,
+           reason_codes='["deposit_session_above_maximum"]',updated_at_ms=? WHERE id=?`,
+          [String(now), String(row.id)],
+        );
+        await notifyUserTx(
+          tx, batch.username, `xtu-deposit:${row.id}:session-maximum`, "OneX XTU deposit requires support review",
+          `Your 60-minute XTU deposit session exceeds the 100 XTU maximum. It is held for manual support review and will not be automatically released after seven days. Batch: ${row.id}.`,
+        );
       } else {
         const [latestRows] = await tx.query(
           "SELECT MAX(CAST(block_timestamp_ms AS UNSIGNED)) AS latest_event_ms FROM xtu_deposit_transfer_events WHERE batch_id=?",
@@ -530,72 +604,14 @@ async function closeExpiredBatches(pool, settings) {
         const releaseAt = Number(latestRows[0]?.latest_event_ms || row.opened_at_ms) + settings.depositPendingRetryMs;
         await tx.query(
           `UPDATE xtu_deposit_batches SET status='pending_minimum',pending_since_ms=?,release_at_ms=?,
-           reason_codes='["minimum_or_maximum_not_met"]',updated_at_ms=? WHERE id=?`,
+           reason_codes='["minimum_not_reached"]',updated_at_ms=? WHERE id=?`,
           [String(now), String(releaseAt), String(now), String(row.id)],
         );
         await notifyUserTx(
           tx, batch.username, `xtu-deposit:${row.id}:pending-minimum`, "OneX XTU deposit pending",
-          `Your XTU deposit batch is outside the accepted 70–140 XTU range. It remains pending for review and will be reassessed after the waiting period. Contact OneX support by email or phone. Batch: ${row.id}.`,
+          `Your XTU deposit session is below the 20 XTU minimum. It may be completed within the initial grouping period. Batch: ${row.id}.`,
         );
       }
-    });
-  }
-}
-
-async function releaseEligiblePendingBatches(pool) {
-  const now = Date.now();
-  const rows = await pool.queryAsync(
-    `SELECT id,username,gross_amount,global_run_id FROM xtu_deposit_batches
-     WHERE status='pending_weekly' AND CAST(release_at_ms AS UNSIGNED)<=?
-     ORDER BY release_at_ms ASC,id ASC LIMIT 20`, [String(now)],
-  );
-  for (const row of rows) {
-    await withTransaction(pool, async (tx) => {
-      const [lockedRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(row.id)]);
-      if (!lockedRows.length || lockedRows[0].status !== "pending_weekly") return;
-      const batch = lockedRows[0];
-      const gross = new BigNumber(batch.gross_amount || "0");
-      if (!gross.isFinite() || gross.lt(MIN_XTU_DEPOSIT) || gross.gt(MAX_XTU_DEPOSIT)) {
-        await tx.query(
-          `UPDATE xtu_deposit_batches SET status='pending_support',reason_codes=?,updated_at_ms=? WHERE id=?`,
-          [JSON.stringify(["weekly_wait_elapsed_but_batch_amount_is_outside_70_140_XTU"]), String(now), String(row.id)],
-        );
-        await notifyUserTx(
-          tx, batch.username, `xtu-deposit:${row.id}:weekly-review`, "OneX XTU deposit requires review",
-          `The 7-day waiting period has elapsed, but this XTU deposit batch is outside the permitted 70–140 XTU range. It remains pending for support review. Batch: ${row.id}.`,
-        );
-        return;
-      }
-      const floor = now - 7 * 24 * 60 * 60 * 1000;
-      const [recentRows] = await tx.query(
-        `SELECT COALESCE(SUM(gross_amount),0) AS amount,MAX(CAST(block_timestamp_ms AS UNSIGNED)) AS latest_event_ms
-         FROM xtu_deposit_transfer_events
-         WHERE username=? AND batch_id<>? AND CAST(block_timestamp_ms AS UNSIGNED)>?
-           AND status NOT IN ('rejected','reversed')`,
-        [batch.username, String(row.id), String(floor)],
-      );
-      const recent = new BigNumber(recentRows[0]?.amount || "0");
-      if (recent.plus(gross).gt(MAX_XTU_DEPOSIT)) {
-        const latest = Number(recentRows[0]?.latest_event_ms || now);
-        const releaseAt = latest + 7 * 24 * 60 * 60 * 1000;
-        await tx.query(
-          "UPDATE xtu_deposit_batches SET release_at_ms=?,pending_since_ms=COALESCE(pending_since_ms,?),updated_at_ms=? WHERE id=?",
-          [String(releaseAt), String(now), String(now), String(row.id)],
-        );
-        return;
-      }
-      await tx.query(
-        "UPDATE xtu_deposit_batches SET status='ready',release_at_ms=NULL,reason_codes='[]',updated_at_ms=? WHERE id=?",
-        [String(now), String(row.id)],
-      );
-      await tx.query(
-        "UPDATE xtu_deposit_transfer_events SET status='detected',reason_codes='[]' WHERE batch_id=? AND status='pending_weekly'",
-        [String(row.id)],
-      );
-      await notifyUserTx(
-        tx, batch.username, `xtu-deposit:${row.id}:weekly-released`, "OneX XTU deposit resumed",
-        `The 7-day waiting period has elapsed and your XTU deposit batch is now eligible for automatic processing, subject to final reserve and account checks. Batch: ${row.id}.`,
-      );
     });
   }
 }
@@ -618,9 +634,24 @@ async function setBatchPending(pool, batchId, status, reason) {
   });
 }
 
-async function prepareConsolidation(pool, batch, runtime, mainSigner) {
-  const rawAmount = BigInt(new BigNumber(batch.hot_wallet_received_amount).shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0));
-  if (rawAmount <= 0n) throw new Error("The XTU deposit batch has no confirmed Hot Wallet token amount to consolidate.");
+async function prepareConsolidation(pool, batches, runtime, mainSigner) {
+  if (!Array.isArray(batches) || batches.length < 1) {
+    throw new TypeError("At least one eligible XTU deposit batch is required for consolidation.");
+  }
+  const selected = selectXtuConsolidationBatches(
+    batches,
+    runtime.settings.depositConsolidationMinBatchXtu,
+  );
+  if (!selected || selected.batches.length !== batches.length) {
+    throw new Error("The selected XTU deposit consolidation lot is below its 100 XTU minimum.");
+  }
+
+  const totalReceived = selected.totalHotWalletReceivedXtu;
+  const totalGrossReturned = selected.totalGrossReturnedXtu;
+  const rawAmount = BigInt(totalReceived.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0));
+  if (rawAmount <= 0n || totalReceived.lt(runtime.settings.depositConsolidationMinBatchXtu)) {
+    throw new Error("The XTU consolidation lot must contain at least 100 XTU actually received by the Hot Wallet.");
+  }
   const data = runtime.contract.interface.encodeFunctionData("transfer", [runtime.settings.distributionAddress, rawAmount]);
   const bnbUsdPrice = await getBnbUsdPrice(runtime.provider, { forceRefresh: true });
   const estimate = await estimateBscTokenTransfer({
@@ -646,11 +677,14 @@ async function prepareConsolidation(pool, batch, runtime, mainSigner) {
     runtime.contract.balanceOf(runtime.settings.mainWalletAddress),
     runtime.provider.getBalance(runtime.settings.mainWalletAddress),
   ]);
-  if (BigInt(tokenBalance) < rawAmount) throw new Error("The XTU Hot Wallet does not currently hold the identified deposit amount.");
-  if (BigInt(nativeBalance) < gasEstimate.feeBnb.shiftedBy(18).integerValue(BigNumber.ROUND_CEIL).toFixed(0)) {
+  if (BigInt(tokenBalance) < rawAmount) throw new Error("The XTU Hot Wallet does not currently hold the exact identified deposit lot amount.");
+  if (BigInt(nativeBalance) < BigInt(gasEstimate.feeBnb.shiftedBy(18).integerValue(BigNumber.ROUND_CEIL).toFixed(0))) {
     throw new Error("The XTU Hot Wallet does not have enough BNB for deposit consolidation gas.");
   }
 
+  const grossRows = batches.map((batch) => ({ id: String(batch.id), gross_amount: String(batch.gross_amount) }));
+  const estimatedUsdByBatch = new Map(allocateBatchGasByGross(grossRows, gasEstimate.feeUsd, "id").map((row) => [row.key, row.gasFee]));
+  const estimatedBnbByBatch = new Map(allocateBatchGasByGross(grossRows, gasEstimate.feeBnb, "id").map((row) => [row.key, row.gasFee]));
   const nonce = await runtime.provider.getTransactionCount(runtime.settings.mainWalletAddress, "pending");
   const txRequest = {
     to: runtime.settings.tokenAddress,
@@ -664,14 +698,36 @@ async function prepareConsolidation(pool, batch, runtime, mainSigner) {
   const rawTx = await mainSigner.signTransaction(txRequest);
   const txHash = keccak256(rawTx).toLowerCase();
   let persisted = false;
+
   await withTransaction(pool, async (tx) => {
     await acquireDepositLocks(tx);
-    const [batchRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(batch.id)]);
-    if (!batchRows.length || !["ready", "pending_reserve"].includes(batchRows[0].status)) return;
-    const freshCapacity = await assessBatchCapacityTx(tx, batchRows[0], gasEstimate.feeUsd, runtime.settings);
-    if (!freshCapacity.allowed) throw new Error(freshCapacity.reason || "XTU deposit is not eligible after gas estimation.");
-    const [existing] = await tx.query("SELECT id FROM xtu_deposit_consolidations WHERE batch_id=? LIMIT 1 FOR UPDATE", [String(batch.id)]);
-    if (existing.length) return;
+    const ids = batches.map((batch) => String(batch.id));
+    const placeholders = ids.map(() => "?").join(",");
+    const [lockedBatches] = await tx.query(
+      `SELECT * FROM xtu_deposit_batches WHERE id IN (${placeholders}) ORDER BY id ASC FOR UPDATE`, ids,
+    );
+    if (lockedBatches.length !== ids.length) return;
+    const [existingItems] = await tx.query(
+      `SELECT batch_id FROM xtu_deposit_consolidation_items WHERE batch_id IN (${placeholders}) LIMIT 1 FOR UPDATE`, ids,
+    );
+    if (existingItems.length) return;
+
+    let lockedReceived = new BigNumber(0);
+    let lockedGross = new BigNumber(0);
+    for (const locked of lockedBatches) {
+      if (!["ready", "pending_reserve", "pending_credit", "pending_weekly"].includes(String(locked.status))) return;
+      if (locked.release_at_ms != null && Number(locked.release_at_ms) > Date.now() &&
+          !["ready", "pending_weekly"].includes(String(locked.status))) return;
+      const gross = new BigNumber(locked.gross_amount);
+      const received = new BigNumber(locked.hot_wallet_received_amount);
+      if (!gross.isFinite() || gross.lt(MIN_XTU_DEPOSIT) || gross.gt(MAX_XTU_DEPOSIT) ||
+          !received.isFinite() || !received.isGreaterThan(0)) return;
+      lockedReceived = lockedReceived.plus(received);
+      lockedGross = lockedGross.plus(gross);
+    }
+    if (!lockedReceived.eq(totalReceived) || !lockedGross.eq(totalGrossReturned) ||
+        lockedReceived.lt(runtime.settings.depositConsolidationMinBatchXtu)) return;
+
     await recordEstimatedBscFeeTx(tx, {
       txHash,
       operation: "xtu_deposit_consolidation",
@@ -680,19 +736,41 @@ async function prepareConsolidation(pool, batch, runtime, mainSigner) {
       bnbUsdPrice,
     });
     const now = String(Date.now());
-    await tx.query(
+    const [insertResult] = await tx.query(
       `INSERT INTO xtu_deposit_consolidations
-       (batch_id,amount,amount_raw,hot_wallet_address,distribution_address,estimated_gas_fee_bnb,
-        estimated_gas_fee_usd,gas_bnb_usd_price,gas_limit,gas_price_wei,raw_tx,tx_hash,nonce,status,created_at_ms,updated_at_ms)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?, ?,?,'signed',?,?)`,
-      [String(batch.id), new BigNumber(rawAmount.toString()).shiftedBy(-18).toFixed(18), rawAmount.toString(),
+       (anchor_batch_id,amount,amount_raw,hot_wallet_address,distribution_address,estimated_gas_fee_bnb,
+        estimated_gas_fee_usd,gas_bnb_usd_price,gas_limit,gas_price_wei,gas_allocation_method,
+        raw_tx,tx_hash,nonce,status,created_at_ms,updated_at_ms)
+       VALUES(?,?,?,?,?,?,?,?,?,?, 'gross_weighted_event_identity_v1', ?,?,?,'signed',?,?)`,
+      [ids[0], totalReceived.toFixed(18), rawAmount.toString(),
         runtime.settings.mainWalletAddress, runtime.settings.distributionAddress, gasEstimate.feeBnb.toFixed(30),
         gasEstimate.feeUsd.toFixed(30), bnbUsdPrice.toFixed(18), bufferedGasLimit.toString(), estimate.gasPrice.toString(),
         rawTx, txHash, String(nonce), now, now],
     );
-    await tx.query("UPDATE xtu_deposit_batches SET status='finalizing',updated_at_ms=? WHERE id=?", [now, String(batch.id)]);
+    const consolidationId = String(insertResult.insertId);
+    for (const locked of lockedBatches) {
+      const batchId = String(locked.id);
+      const received = new BigNumber(locked.hot_wallet_received_amount);
+      const gross = new BigNumber(locked.gross_amount);
+      await tx.query(
+        `INSERT INTO xtu_deposit_consolidation_items
+         (consolidation_id,batch_id,username,gross_returned_xtu,hot_wallet_received_xtu,contract_commission_xtu,
+          estimated_gas_fee_bnb,estimated_gas_fee_usd,allocated_gas_fee_bnb,allocated_gas_fee_usd,
+          allocated_gas_fee_xtu,status,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,'signed',?,?)`,
+        [consolidationId, batchId, locked.username, gross.toFixed(18), received.toFixed(18),
+          new BigNumber(locked.commission_amount || "0").toFixed(18),
+          estimatedBnbByBatch.get(batchId).toFixed(30), estimatedUsdByBatch.get(batchId).toFixed(30),
+          "0", "0", "0", now, now],
+      );
+      await tx.query(
+        "UPDATE xtu_deposit_batches SET status='finalizing',updated_at_ms=? WHERE id=?",
+        [now, batchId],
+      );
+    }
     persisted = true;
   });
+
   if (!persisted) return false;
   try {
     const sent = await runtime.provider.broadcastTransaction(rawTx);
@@ -702,12 +780,13 @@ async function prepareConsolidation(pool, batch, runtime, mainSigner) {
       [String(Date.now()), txHash],
     );
   } catch (error) {
-    // The exact raw transaction and deterministic hash have already been stored; the next cycle reconciles it.
+    // The exact raw transaction and deterministic hash are already persisted; the next cycle reconciles it.
     await pool.queryAsync(
       "UPDATE xtu_deposit_consolidations SET last_error=?,updated_at_ms=? WHERE tx_hash=? AND status IN ('signed','submitted')",
       [String(error.message || error).slice(0, 990), String(Date.now()), txHash],
     );
   }
+  return true;
 }
 
 async function parseConsolidationReceipt(runtime, receipt, row) {
@@ -737,7 +816,7 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
   const [batchRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(batch.id)]);
   if (!batchRows.length || ["credited", "manual_review"].includes(batchRows[0].status)) return;
   const currentBatch = batchRows[0];
-  if (! ["consolidated_pending_credit", "pending_reserve", "pending_credit"].includes(currentBatch.status)) {
+  if (! ["consolidated_pending_credit", "pending_reserve", "pending_credit", "pending_weekly"].includes(currentBatch.status)) {
     throw new Error(`XTU deposit batch ${currentBatch.id} is not in a creditable state.`);
   }
   const globalRun = await getGlobalRunTx(tx, currentBatch.global_run_id || null);
@@ -781,14 +860,17 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
   if (!capacity.allowed) throw new Error("The XTU deposit tranche would exceed the user's current initial-asset purchase capacity.");
 
   const sellerAvailable = await getActiveSellerReserveAvailableTx(tx, currentBatch.username);
-  const protectedAdmin = calculateRemainingSystemAdminReserve(
-    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
-  ).remainingInitialAsset;
-  const allocation = calculateDepositFundingAllocation(
-    credit.creditedInitialAsset, common.unit_price, common.backed_units,
-    common.inactive_init_asset, sellerAvailable, common.total_units_price, protectedAdmin, 0,
-  );
-  if (!allocation.available) throw new Error("The reserve hierarchy cannot cover this XTU deposit tranche at the final credit check.");
+  const funding = await allocateXtuDepositFundingTx(tx, currentBatch, credit, common, sellerAvailable);
+  const allocation = funding.allocation;
+  if (!allocation.available) {
+    if (!funding.systemFundingAllowed) {
+      const error = new Error("The user's weekly OneX system-funded purchase is already used and eligible seller campaign reserves cannot cover this XTU deposit tranche.");
+      error.code = "XTU_SYSTEM_FUNDING_COOLDOWN";
+      error.releaseAtMs = getXtuWeeklyCooldownReleaseAt(currentBatch, funding.cooldown);
+      throw error;
+    }
+    throw new Error("The reserve hierarchy cannot cover this XTU deposit tranche at the final credit check.");
+  }
 
   const [sourceEventRows] = await tx.query(
     `SELECT event_identity,tx_hash,log_index,block_hash,gross_amount,net_amount,commission_amount
@@ -851,14 +933,38 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
     `UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?`,
     [newBalance.toFixed(30), date, time, currentBatch.username],
   );
-  await tx.query(
-    `INSERT INTO activities
-     (sender,receiver,type,amount,unit_price,fees,fee_unit_price,bsc_fee_cost_usd,reference,record_date,record_time)
-     VALUES(?,?,2,?,?,?,?,?,?,?,?)`,
-    [OneX, currentBatch.username, credit.creditedInitialAsset.toFixed(30), common.unit_price,
-      depositFeeForThisTranche.dividedBy(common.unit_price).toFixed(30), common.unit_price,
-      gasFeeForThisTranche.isGreaterThan(0) ? actualGas.feeUsd.toFixed(30) : "0", reference, date, time],
-  );
+  const sellerBasis = new BigNumber(allocation.sellerInitialAsset || "0");
+  const systemBasis = new BigNumber(allocation.systemInitialAsset || "0");
+  if (!sellerBasis.plus(systemBasis).eq(credit.creditedInitialAsset)) {
+    throw new Error("The XTU deposit funding allocation does not reconcile to the credited initial assets.");
+  }
+  const totalFeeBasis = depositFeeForThisTranche.dividedBy(common.unit_price);
+  const sellerFeeBasis = credit.creditedInitialAsset.isGreaterThan(0)
+    ? totalFeeBasis.multipliedBy(sellerBasis).dividedBy(credit.creditedInitialAsset)
+    : new BigNumber(0);
+  const systemFeeBasis = totalFeeBasis.minus(sellerFeeBasis);
+  const sellerGasCost = credit.creditedInitialAsset.isGreaterThan(0)
+    ? actualGas.feeUsd.multipliedBy(sellerBasis).dividedBy(credit.creditedInitialAsset)
+    : new BigNumber(0);
+  const systemGasCost = actualGas.feeUsd.minus(sellerGasCost);
+  if (sellerBasis.isGreaterThan(0)) {
+    await tx.query(
+      `INSERT INTO activities
+       (sender,receiver,type,amount,unit_price,fees,fee_unit_price,bsc_fee_cost_usd,reference,record_date,record_time)
+       VALUES('XUSER',?,?,?, ?,?,?,?,?,?,?)`,
+      [currentBatch.username, 2, sellerBasis.toFixed(30), common.unit_price,
+        sellerFeeBasis.toFixed(30), common.unit_price, sellerGasCost.toFixed(30), `${reference}S`.slice(0, 64), date, time],
+    );
+  }
+  if (systemBasis.isGreaterThan(0)) {
+    await tx.query(
+      `INSERT INTO activities
+       (sender,receiver,type,amount,unit_price,fees,fee_unit_price,bsc_fee_cost_usd,reference,record_date,record_time)
+       VALUES(?,?,2,?,?,?,?,?,?,?,?)`,
+      [OneX, currentBatch.username, systemBasis.toFixed(30), common.unit_price,
+        systemFeeBasis.toFixed(30), common.unit_price, systemGasCost.toFixed(30), `${reference}O`.slice(0, 64), date, time],
+    );
+  }
   await insertCommonSnapshotTx(tx, common, {
     total_units_price: newTotal.toFixed(30),
     backed_units: allocation.newBacked.toFixed(30),
@@ -924,7 +1030,7 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
       `Creditable XTU remaining for a later tranche: ${remainingCredit.toFixed(8)}`,
       `Reference: ${reference}`,
       settlement ? `Global XTU-only settlement reference: ${settlement.ledgerId}` : "",
-      remainingCredit.isGreaterThan(0) ? `The remaining credit is scheduled for reassessment after the seven-day waiting period.` : "The XTU deposit batch is fully credited.",
+      remainingCredit.isGreaterThan(0) ? `The remaining credit remains pending and is rechecked automatically; eligible seller-campaign reserves may fund it before the seven-day OneX system-funding cooldown expires.` : "The XTU deposit batch is fully credited.",
     ].filter(Boolean).join("\n"),
   );
 }
@@ -939,36 +1045,82 @@ async function finalizeConsolidation(pool, row, receipt, runtime) {
     if (!conRows.length || ["confirmed", "manual_review"].includes(conRows[0].status)) return;
     const current = conRows[0];
     if (!["signed", "submitted"].includes(current.status)) return;
+
+    const [items] = await tx.query(
+      `SELECT * FROM xtu_deposit_consolidation_items
+       WHERE consolidation_id=? ORDER BY batch_id ASC FOR UPDATE`, [String(current.id)],
+    );
+    if (!items.length) throw new Error("The XTU consolidation transaction has no linked deposit batches.");
+    const batchIds = items.map((item) => String(item.batch_id));
+    const placeholders = batchIds.map(() => "?").join(",");
+    const [batchRows] = await tx.query(
+      `SELECT * FROM xtu_deposit_batches WHERE id IN (${placeholders}) ORDER BY id ASC FOR UPDATE`, batchIds,
+    );
+    if (batchRows.length !== items.length) throw new Error("An XTU deposit batch linked to the consolidation lot is missing.");
+
     await recordActualBscFeeTx(tx, {
       txHash: current.tx_hash,
       operation: "xtu_deposit_consolidation",
       receipt,
       bnbUsdPrice,
     });
-    const [batchRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(current.batch_id)]);
-    if (!batchRows.length) throw new Error("XTU deposit batch disappeared before consolidation finalization.");
-    const batch = batchRows[0];
+
+    const totalGrossReturned = items.reduce(
+      (sum, item) => sum.plus(item.gross_returned_xtu), new BigNumber(0),
+    );
     const common = await getLatestCommonTx(tx, true);
-    const grossReturned = new BigNumber(batch.gross_amount || "0");
-    const nextOutstanding = new BigNumber(common.xtu_wallets || "0").minus(grossReturned);
-    if (!grossReturned.isFinite() || !grossReturned.isGreaterThan(0) ||
+    const nextOutstanding = new BigNumber(common.xtu_wallets || "0").minus(totalGrossReturned);
+    if (!totalGrossReturned.isFinite() || !totalGrossReturned.isGreaterThan(0) ||
         !nextOutstanding.isFinite() || nextOutstanding.isNegative()) {
+      const reason = "The returned gross XTU exceeds the outstanding externalized counter; manual reconciliation is required and no negative balance was written.";
       await tx.query(
         `UPDATE xtu_deposit_consolidations SET status='manual_review',block_number=?,receipt_json=?,
          actual_gas_fee_bnb=?,actual_gas_fee_usd=?,confirmed_at_ms=?,last_error=?,updated_at_ms=? WHERE id=?`,
         [String(receipt.blockNumber), JSON.stringify(receipt), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30),
-          String(Date.now()), "The returned gross XTU exceeds the outstanding externalized counter; manual reconciliation is required and no negative balance was written.", String(Date.now()), String(current.id)],
+          String(Date.now()), reason, String(Date.now()), String(current.id)],
       );
       await tx.query(
-        `UPDATE xtu_deposit_batches SET status='manual_review',returned_amount=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
-        [grossReturned.toFixed(18), JSON.stringify(["returned_xtu_exceeds_common_xtu_wallets_manual_reconciliation"]), String(Date.now()), String(current.batch_id)],
+        `UPDATE xtu_deposit_consolidation_items SET status='manual_review',updated_at_ms=? WHERE consolidation_id=?`,
+        [String(Date.now()), String(current.id)],
       );
-      await notifyUserTx(
-        tx, batch.username, `xtu-deposit:${current.batch_id}:manual-reconcile`, "OneX XTU deposit requires reconciliation",
-        `Your XTU was returned to the OneX Distribution Wallet, but the outstanding externalized XTU ledger is insufficient to reconcile the gross returned amount. No negative accounting balance was created and no initial assets were credited automatically. Please contact OneX support. Batch: ${current.batch_id}.`,
-      );
+      for (const batch of batchRows) {
+        await tx.query(
+          `UPDATE xtu_deposit_batches SET status='manual_review',returned_amount=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
+          [String(batch.gross_amount), JSON.stringify(["returned_xtu_exceeds_common_xtu_wallets_manual_reconciliation"]), String(Date.now()), String(batch.id)],
+        );
+        await notifyUserTx(
+          tx, batch.username, `xtu-deposit:${batch.id}:manual-reconcile`, "OneX XTU deposit requires reconciliation",
+          `Your XTU was returned to the OneX Distribution Wallet, but the outstanding externalized XTU ledger is insufficient to reconcile the gross returned amount. No negative accounting balance was created and no initial assets were credited automatically. Please contact OneX support. Batch: ${batch.id}.`,
+        );
+      }
       return;
     }
+
+    const eventRows = (await tx.query(
+      `SELECT event_identity,batch_id,gross_amount FROM xtu_deposit_transfer_events
+       WHERE batch_id IN (${placeholders}) AND status NOT IN ('rejected','reversed')
+       ORDER BY event_identity ASC FOR UPDATE`, batchIds,
+    ))[0];
+    if (!eventRows.length) throw new Error("The XTU consolidation lot has no finalized source deposit events.");
+    const gasUsdByEvent = new Map(allocateBatchGasByGross(eventRows, actualGas.feeUsd).map((entry) => [entry.key, entry.gasFee]));
+    const gasBnbByEvent = new Map(allocateBatchGasByGross(eventRows, actualGas.feeBnb).map((entry) => [entry.key, entry.gasFee]));
+    const gasByBatch = new Map(batchIds.map((id) => [id, { usd: new BigNumber(0), bnb: new BigNumber(0) }]));
+    for (const event of eventRows) {
+      const key = String(event.event_identity);
+      const batchId = String(event.batch_id);
+      const gasUsd = gasUsdByEvent.get(key);
+      const gasBnb = gasBnbByEvent.get(key);
+      const bucket = gasByBatch.get(batchId);
+      if (!bucket || !gasUsd || !gasBnb) throw new Error("The deterministic XTU consolidation gas allocation is incomplete.");
+      bucket.usd = bucket.usd.plus(gasUsd);
+      bucket.bnb = bucket.bnb.plus(gasBnb);
+      await tx.query(
+        `UPDATE xtu_deposit_transfer_events SET status='returned',allocated_gas_fee_usd=?,allocated_gas_fee_xtu=?
+         WHERE event_identity=?`,
+        [gasUsd.toFixed(18), gasUsd.toFixed(18), key],
+      );
+    }
+
     const [date, time] = utcDateTime();
     await insertCommonSnapshotTx(tx, common, { xtu_wallets: nextOutstanding.toFixed(30) }, date, time);
     await tx.query(
@@ -977,40 +1129,86 @@ async function finalizeConsolidation(pool, row, receipt, runtime) {
       [String(receipt.blockNumber), JSON.stringify(receipt), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30),
         String(Date.now()), String(Date.now()), String(current.id)],
     );
-    await tx.query(
-      `UPDATE xtu_deposit_batches SET status='consolidated_pending_credit',returned_amount=?,
-       gas_allocated_usd=?,gas_allocated_xtu=?,updated_at_ms=? WHERE id=?`,
-      [grossReturned.toFixed(18), actualGas.feeUsd.toFixed(18), actualGas.feeUsd.toFixed(18), String(Date.now()), String(current.batch_id)],
-    );
-    const eventRows = (await tx.query(
-      `SELECT event_identity,gross_amount FROM xtu_deposit_transfer_events
-       WHERE batch_id=? AND status NOT IN ('rejected','reversed') ORDER BY event_identity ASC FOR UPDATE`,
-      [String(current.batch_id)],
-    ))[0];
-    const gasAllocations = allocateBatchGasByGross(eventRows, actualGas.feeUsd);
-    for (const allocationRow of gasAllocations) {
+
+    for (const item of items) {
+      const batchId = String(item.batch_id);
+      const batch = batchRows.find((entry) => String(entry.id) === batchId);
+      const allocation = gasByBatch.get(batchId);
+      if (!batch || !allocation) throw new Error("An XTU consolidation item is not linked to its expected batch or gas allocation.");
       await tx.query(
-        `UPDATE xtu_deposit_transfer_events SET status='returned',allocated_gas_fee_usd=?,allocated_gas_fee_xtu=?
-         WHERE event_identity=?`,
-        [allocationRow.gasFee.toFixed(18), allocationRow.gasFee.toFixed(18), allocationRow.key],
+        `UPDATE xtu_deposit_consolidation_items SET status='confirmed',allocated_gas_fee_bnb=?,
+         allocated_gas_fee_usd=?,allocated_gas_fee_xtu=?,updated_at_ms=?
+         WHERE consolidation_id=? AND batch_id=?`,
+        [allocation.bnb.toFixed(18), allocation.usd.toFixed(18), allocation.usd.toFixed(18),
+          String(Date.now()), String(current.id), batchId],
       );
-    }
-    await tx.query("SAVEPOINT xtu_credit_attempt");
-    try {
-      await creditConsolidatedBatchTx(tx, batch, current, receipt, actualGas, runtime.settings);
-      await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
-    } catch (error) {
-      await tx.query("ROLLBACK TO SAVEPOINT xtu_credit_attempt");
-      await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
       await tx.query(
-        `UPDATE xtu_deposit_batches SET status='pending_reserve',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),
-         release_at_ms=?,updated_at_ms=? WHERE id=?`,
-        [JSON.stringify([String(error.message || error).slice(0, 250)]), String(Date.now()),
-          String(Date.now() + DEPOSIT_PENDING_RETRY_MS), String(Date.now()), String(current.batch_id)],
+        `UPDATE xtu_deposit_batches SET status='consolidated_pending_credit',returned_amount=?,
+         gas_allocated_usd=?,gas_allocated_xtu=?,updated_at_ms=? WHERE id=?`,
+        [new BigNumber(item.gross_returned_xtu).toFixed(18), allocation.usd.toFixed(18), allocation.usd.toFixed(18),
+          String(Date.now()), batchId],
+      );
+
+      await tx.query("SAVEPOINT xtu_credit_attempt");
+      try {
+        await creditConsolidatedBatchTx(
+          tx,
+          { ...batch, returned_amount: String(item.gross_returned_xtu), status: "consolidated_pending_credit" },
+          current,
+          receipt,
+          { feeBnb: allocation.bnb, feeUsd: allocation.usd },
+          runtime.settings,
+        );
+        await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
+      } catch (error) {
+        await tx.query("ROLLBACK TO SAVEPOINT xtu_credit_attempt");
+        await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
+        const now = Date.now();
+        const systemFundingCooldown = error.code === "XTU_SYSTEM_FUNDING_COOLDOWN";
+        const pendingStatus = systemFundingCooldown ? "pending_weekly" : "pending_reserve";
+        const pendingReason = systemFundingCooldown ? "system_funding_cooldown" : String(error.message || error).slice(0, 250);
+        const releaseAt = systemFundingCooldown && Number.isSafeInteger(Number(error.releaseAtMs))
+          ? Number(error.releaseAtMs)
+          : now + DEPOSIT_PENDING_RETRY_MS;
+        await tx.query(
+          `UPDATE xtu_deposit_batches SET status=?,reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),
+           release_at_ms=?,updated_at_ms=? WHERE id=?`,
+          [pendingStatus, JSON.stringify([pendingReason]), String(now), String(releaseAt), String(now), batchId],
+        );
+        await notifyUserTx(
+          tx, batch.username, `xtu-deposit:${batchId}:${systemFundingCooldown ? "weekly-system-funding" : "pending-reserve"}`,
+          "OneX XTU deposit pending",
+          systemFundingCooldown
+            ? `Your XTU deposit has been returned to OneX and reconciled, but the weekly OneX-funded purchase has already been used. An active eligible seller campaign may fund this credit earlier; the worker will recheck seller reserves. Otherwise OneX system-reserve funding becomes available after the seven-day period. Batch: ${batchId}.`
+            : `Your XTU transfer has returned to OneX and the externalized XTU counter and coverage ledger have been reconciled. The initial-asset credit is pending a reserve or account check and will be reassessed automatically. Please contact OneX support if needed. Batch: ${batchId}.`,
+        );
+      }
+    }
+  });
+}
+
+async function markConsolidationBatchesManualReview(pool, consolidationId, reason) {
+  await withTransaction(pool, async (tx) => {
+    await acquireDepositLocks(tx);
+    const [items] = await tx.query(
+      `SELECT i.batch_id,b.username,b.gross_amount
+       FROM xtu_deposit_consolidation_items i
+       JOIN xtu_deposit_batches b ON b.id=i.batch_id
+       WHERE i.consolidation_id=? ORDER BY i.batch_id ASC FOR UPDATE`, [String(consolidationId)],
+    );
+    await tx.query(
+      `UPDATE xtu_deposit_consolidation_items SET status='manual_review',updated_at_ms=?
+       WHERE consolidation_id=?`, [String(Date.now()), String(consolidationId)],
+    );
+    for (const item of items) {
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET status='manual_review',reason_codes=?,updated_at_ms=? WHERE id=?`,
+        [JSON.stringify([String(reason).slice(0, 250)]), String(Date.now()), String(item.batch_id)],
       );
       await notifyUserTx(
-        tx, batch.username, `xtu-deposit:${current.batch_id}:pending-reserve`, "OneX XTU deposit pending",
-        `Your XTU transfer has returned to OneX and the externalized XTU counter and coverage ledger have been reconciled. The initial-asset credit is pending a reserve or account check and will be reassessed after the seven-day waiting period. Please contact OneX support if needed. Batch: ${current.batch_id}.`,
+        tx, item.username, `xtu-deposit:${item.batch_id}:consolidation-manual-review`,
+        "OneX XTU deposit requires reconciliation",
+        `Your finalized XTU deposit is part of a Hot Wallet consolidation that requires manual reconciliation: ${String(reason).slice(0, 300)}. No automatic asset credit will be issued until the reconciliation is complete. Batch: ${item.batch_id}.`,
       );
     }
   });
@@ -1033,6 +1231,9 @@ async function reconcileConsolidation(pool, row, runtime) {
         "UPDATE xtu_deposit_consolidations SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?",
         ["The Hot Wallet nonce advanced but the persisted XTU consolidation hash is not visible; automatic resend is blocked.", String(Date.now()), String(row.id)],
       );
+      await markConsolidationBatchesManualReview(
+        pool, row.id, "The Hot Wallet nonce advanced but the persisted transaction hash is not visible; automatic resend is blocked.",
+      );
       return;
     }
     const sent = await runtime.provider.broadcastTransaction(row.raw_tx);
@@ -1049,10 +1250,61 @@ async function reconcileConsolidation(pool, row, runtime) {
       "UPDATE xtu_deposit_consolidations SET status='failed',receipt_json=?,block_number=?,last_error=?,updated_at_ms=? WHERE id=?",
       [JSON.stringify(receipt), String(receipt.blockNumber), "Hot Wallet to Distribution Wallet consolidation reverted on-chain.", String(Date.now()), String(row.id)],
     );
-    await setBatchPending(pool, row.batch_id, "manual_review", "consolidation_reverted_on_chain");
+    await markConsolidationBatchesManualReview(pool, row.id, "The Hot Wallet to Distribution Wallet consolidation reverted on-chain.");
     return;
   }
-  await finalizeConsolidation(pool, row, receipt, runtime);
+}
+
+async function filterEligibleConsolidationBatches(pool, candidates, settings) {
+  return withTransaction(pool, async (tx) => {
+    await acquireDepositLocks(tx);
+    const eligible = [];
+    for (const candidate of candidates) {
+      const [rows] = await tx.query(
+        "SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(candidate.id)],
+      );
+      if (!rows.length) continue;
+      const batch = rows[0];
+      if (!["ready", "pending_reserve", "pending_credit", "pending_weekly"].includes(String(batch.status))) continue;
+      // Pending weekly batches are rechecked each worker cycle so a newly
+      // activated seller campaign can fund the purchase before the cooldown ends.
+      if (batch.release_at_ms != null && Number(batch.release_at_ms) > Date.now() &&
+          !["ready", "pending_weekly"].includes(String(batch.status))) continue;
+      const [linked] = await tx.query(
+        "SELECT id FROM xtu_deposit_consolidation_items WHERE batch_id=? LIMIT 1 FOR UPDATE", [String(batch.id)],
+      );
+      if (linked.length) continue;
+      const capacity = await assessBatchCapacityTx(tx, batch, "0", settings);
+      if (!capacity.allowed) {
+        const now = Date.now();
+        if (capacity.reason === "system_funding_cooldown") {
+          const releaseAt = getXtuWeeklyCooldownReleaseAt(batch, capacity.cooldown || { lastPurchaseMs: null });
+          await tx.query(
+            `UPDATE xtu_deposit_batches SET status='pending_weekly',pending_since_ms=COALESCE(pending_since_ms,?),
+             release_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
+            [String(now), String(releaseAt), JSON.stringify(["system_funding_cooldown"]), String(now), String(batch.id)],
+          );
+          await notifyUserTx(
+            tx, batch.username, `xtu-deposit:${batch.id}:weekly-system-funding`, "OneX XTU deposit pending",
+            `Your XTU deposit cannot currently be funded from OneX system reserves because your one system-funded purchase for the rolling seven-day period has already been used. An eligible seller campaign may fund this deposit earlier; otherwise system-reserve funding can be reconsidered after the cooldown. Batch: ${batch.id}.`,
+          );
+        } else {
+          await tx.query(
+            `UPDATE xtu_deposit_batches SET status='pending_reserve',pending_since_ms=COALESCE(pending_since_ms,?),
+             release_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
+            [String(now), String(now + DEPOSIT_PENDING_RETRY_MS), JSON.stringify([capacity.reason || "reserve_or_account_check_failed"]), String(now), String(batch.id)],
+          );
+          await notifyUserTx(
+            tx, batch.username, `xtu-deposit:${batch.id}:pending-reserve`, "OneX XTU deposit pending",
+            `Your XTU deposit is waiting because its current reserve or account-capacity check is not satisfied. It will be reassessed automatically when the relevant reserve or account condition changes. Batch: ${batch.id}.`,
+          );
+        }
+        continue;
+      }
+      eligible.push(batch);
+    }
+    return eligible;
+  });
 }
 
 async function processOneReadyBatch(pool, runtime, mainSigner) {
@@ -1064,48 +1316,63 @@ async function processOneReadyBatch(pool, runtime, mainSigner) {
     await reconcileConsolidation(pool, pendingConsolidations[0], runtime);
     return;
   }
-  const rows = await pool.queryAsync(
-    `SELECT * FROM xtu_deposit_batches
-     WHERE status IN ('ready','pending_reserve','pending_credit')
-       AND (status='ready' OR release_at_ms IS NULL OR CAST(release_at_ms AS UNSIGNED)<=?)
-     ORDER BY id ASC LIMIT 1`, [String(Date.now())],
+
+  const retryRows = await pool.queryAsync(
+    `SELECT b.id FROM xtu_deposit_batches b
+     JOIN xtu_deposit_consolidation_items i ON i.batch_id=b.id
+     JOIN xtu_deposit_consolidations c ON c.id=i.consolidation_id
+     WHERE b.status IN ('pending_reserve','pending_credit','pending_weekly') AND c.status='confirmed'
+       AND (b.status='pending_weekly' OR b.release_at_ms IS NULL OR CAST(b.release_at_ms AS UNSIGNED)<=?)
+     ORDER BY b.id ASC LIMIT 1`, [String(Date.now())],
   );
-  if (!rows.length) return;
-  const batch = rows[0];
-  const consolidationRows = await pool.queryAsync("SELECT id,status FROM xtu_deposit_consolidations WHERE batch_id=? LIMIT 1", [String(batch.id)]);
-  if (consolidationRows.length) {
-    if (consolidationRows[0].status === "confirmed") {
-      await retryCredit(pool, batch.id, runtime.settings);
-    }
+  if (retryRows.length) {
+    await retryCredit(pool, retryRows[0].id, runtime.settings);
     return;
   }
+
+  const candidates = await pool.queryAsync(
+    `SELECT b.* FROM xtu_deposit_batches b
+     WHERE b.status IN ('ready','pending_reserve','pending_credit','pending_weekly')
+       AND (b.status IN ('ready','pending_weekly') OR b.release_at_ms IS NULL OR CAST(b.release_at_ms AS UNSIGNED)<=?)
+       AND NOT EXISTS (
+         SELECT 1 FROM xtu_deposit_consolidation_items i WHERE i.batch_id=b.id
+       )
+     ORDER BY b.id ASC LIMIT 200`, [String(Date.now())],
+  );
+  if (!candidates.length) return;
+
+  const eligible = await filterEligibleConsolidationBatches(pool, candidates, runtime.settings);
+  const selected = selectXtuConsolidationBatches(
+    eligible,
+    runtime.settings.depositConsolidationMinBatchXtu,
+  );
+  if (!selected) return;
+
   try {
-    await withTransaction(pool, async (tx) => {
-      await acquireDepositLocks(tx);
-      const [lockedBatch] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(batch.id)]);
-      if (!lockedBatch.length || !["ready", "pending_reserve", "pending_credit"].includes(lockedBatch[0].status)) return;
-      const capacity = await assessBatchCapacityTx(tx, lockedBatch[0], "0", runtime.settings);
-      if (!capacity.allowed) throw new Error(capacity.reason || "XTU deposit batch is not eligible for credit.");
-      await tx.query("UPDATE xtu_deposit_batches SET status='ready',updated_at_ms=? WHERE id=?", [String(Date.now()), String(batch.id)]);
-    });
-    await prepareConsolidation(pool, batch, runtime, mainSigner);
+    await prepareConsolidation(pool, selected.batches, runtime, mainSigner);
   } catch (error) {
-    await setBatchPending(pool, batch.id, "pending_reserve", error.message || "reserve_or_account_check_failed");
+    for (const batch of selected.batches) {
+      await setBatchPending(pool, batch.id, "pending_reserve", error.message || "xtu_consolidation_preparation_failed");
+    }
   }
 }
 
 async function retryCredit(pool, batchId, settings) {
   const rows = await pool.queryAsync(
-    `SELECT b.*,c.actual_gas_fee_bnb,c.actual_gas_fee_usd,c.receipt_json,c.tx_hash
-     FROM xtu_deposit_batches b JOIN xtu_deposit_consolidations c ON c.batch_id=b.id
-     WHERE b.id=? AND b.status IN ('pending_reserve','pending_credit') AND c.status='confirmed' LIMIT 1`, [String(batchId)],
+    `SELECT b.*,i.allocated_gas_fee_bnb AS batch_gas_fee_bnb,
+            i.allocated_gas_fee_usd AS batch_gas_fee_usd,
+            c.receipt_json,c.tx_hash
+     FROM xtu_deposit_batches b
+     JOIN xtu_deposit_consolidation_items i ON i.batch_id=b.id
+     JOIN xtu_deposit_consolidations c ON c.id=i.consolidation_id
+     WHERE b.id=? AND b.status IN ('pending_reserve','pending_credit','pending_weekly') AND c.status='confirmed' LIMIT 1`, [String(batchId)],
   );
   if (!rows.length) return;
   const row = rows[0];
   const receipt = JSON.parse(row.receipt_json || "{}");
   const gas = {
-    feeBnb: new BigNumber(row.actual_gas_fee_bnb),
-    feeUsd: new BigNumber(row.actual_gas_fee_usd),
+    feeBnb: new BigNumber(row.batch_gas_fee_bnb || "0"),
+    feeUsd: new BigNumber(row.batch_gas_fee_usd || "0"),
   };
   await withTransaction(pool, async (tx) => {
     await acquireDepositLocks(tx);
@@ -1116,9 +1383,16 @@ async function retryCredit(pool, batchId, settings) {
     } catch (error) {
       await tx.query("ROLLBACK TO SAVEPOINT xtu_credit_attempt");
       await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
+      const now = Date.now();
+      const systemFundingCooldown = error.code === "XTU_SYSTEM_FUNDING_COOLDOWN";
+      const pendingStatus = systemFundingCooldown ? "pending_weekly" : "pending_reserve";
+      const pendingReason = systemFundingCooldown ? "system_funding_cooldown" : String(error.message || error).slice(0, 250);
+      const releaseAt = systemFundingCooldown && Number.isSafeInteger(Number(error.releaseAtMs))
+        ? Number(error.releaseAtMs)
+        : now + DEPOSIT_PENDING_RETRY_MS;
       await tx.query(
-        "UPDATE xtu_deposit_batches SET status='pending_reserve',reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,updated_at_ms=? WHERE id=? AND status IN ('pending_reserve','pending_credit')",
-        [JSON.stringify([String(error.message || error).slice(0, 250)]), String(Date.now()), String(Date.now() + DEPOSIT_PENDING_RETRY_MS), String(Date.now()), String(batchId)],
+        "UPDATE xtu_deposit_batches SET status=?,reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,updated_at_ms=? WHERE id=? AND status IN ('pending_reserve','pending_credit','pending_weekly')",
+        [pendingStatus, JSON.stringify([pendingReason]), String(now), String(releaseAt), String(now), String(batchId)],
       );
     }
   });
@@ -1346,7 +1620,6 @@ async function processOne(pool, context) {
   const { runtime, provider, mainSigner } = context;
   await scanIncomingEvents(pool, provider, runtime.settings);
   await closeExpiredBatches(pool, runtime.settings);
-  await releaseEligiblePendingBatches(pool);
   await processOneReadyBatch(pool, runtime, mainSigner);
   await processSettlementPayout(pool, runtime);
   await processEmailOutbox(pool);
@@ -1420,7 +1693,6 @@ module.exports = {
   scanIncomingEvents,
   verifyDepositReceipt,
   closeExpiredBatches,
-  releaseEligiblePendingBatches,
   processOne,
   processSettlementPayout,
 };

@@ -39,14 +39,12 @@ const {
   MAX_INITIAL_CREDIT_TRANCHE_AMOUNT,
   MAX_DEFAULT_STOCK,
   DEPOSIT_BATCH_WINDOW_MS,
-  DEPOSIT_COOLDOWN_MS,
   DISBURSEMENT_COOLDOWN_DAYS,
-  getLastOnexDeposit,
-  assessDepositCooldown,
+  getLastOneXSystemFundedPurchase,
+  assessOneXSystemFundingCooldown,
   formatUtcRecordDateTime,
-  getWeeklyReleaseAt,
+  getSystemFundingCooldownReleaseAt,
   validateDepositAmount,
-  classifyRollingDepositReceipt,
   calculateMinimumDepositCapacity,
   SYSTEM_ADMIN_RESERVE_RATIO,
 } = require("./deposit-policy");
@@ -914,8 +912,25 @@ async function applyUserTopUp(
   const pendingPayoutInitial = pendingPayoutRows.reduce(
     (sum, row) => sum.plus(row.sold_initial_asset), new BigNumber(0),
   );
-  const lastDeposit = await getLastOnexDeposit(tx, username, OneX);
-  const cooldown = assessDepositCooldown(lastDeposit, eventTimestampMs);
+  // Shared BSC-USD/XTU allowance: only a type-2 purchase funded by OneX
+  // system reserves counts, regardless of amount. XUSER seller credits do not.
+  const lastSystemPurchase = await getLastOneXSystemFundedPurchase(tx, username, OneX);
+  const cooldown = assessOneXSystemFundingCooldown(lastSystemPurchase, Date.now());
+  let sameBatchAlreadyUsedSystemPurchase = false;
+  if (options.depositBatchId != null) {
+    const [sameBatchSystemRows] = await tx.query(
+      `SELECT 1
+       FROM users_usdt_deposit_credits c
+       INNER JOIN activities a ON a.reference=CONCAT(c.financial_reference,'O')
+       WHERE c.batch_id=? AND c.username=? AND a.sender=? AND a.receiver=? AND a.type=2
+       LIMIT 1 FOR UPDATE`,
+      [String(options.depositBatchId), username, OneX, username],
+    );
+    sameBatchAlreadyUsedSystemPurchase = sameBatchSystemRows.length > 0;
+  }
+  // A multi-tranche credit is still one purchase. If this exact deposit batch
+  // already consumed the OneX weekly allowance, its own remainder may continue.
+  const systemFundingAllowed = cooldown.allowed || sameBatchAlreadyUsedSystemPurchase;
   const bonusRate = globalRun && globalRun.status === "announced" && !globalEffective
     ? new BigNumber(globalRun.bonus_rate_percent || "0")
     : new BigNumber(0);
@@ -936,7 +951,7 @@ async function applyUserTopUp(
     currentUnitPrice: price,
     tfeesRatePercent: appliedTfeesRate,
     maximumUserXtu: maxStockDefault,
-    weeklyCooldownAllowed: cooldown.allowed,
+    systemFundingAllowed,
     globalBonusRatePercent: bonusRate,
     remainingAdminReserveInitialAsset: adminQuotaRemaining,
     alreadyReservedAdminBonusInitialAsset: currentlyReserved,
@@ -954,12 +969,13 @@ async function applyUserTopUp(
       const availableTotal = availableSystem.plus(activeSellerReserve);
       return { limit: `BSC-USD ${availableTotal.multipliedBy(price).toFixed(18)}` };
     }
-    if (creditPlan.reason === "weekly_limit") {
+    if (creditPlan.reason === "system_funding_cooldown") {
       return {
-        error: "weekly deposit limit reached",
+        error: "weekly OneX-funded purchase cooldown active",
+        code: "weekly_system_funding_cooldown",
         remaining_seconds: Math.ceil(cooldown.remainingMs / 1000),
-        lastDepositMs: cooldown.lastDepositMs,
-        sellerReserveAvailable: sellersReserve.toFixed(),
+        lastPurchaseMs: cooldown.lastPurchaseMs,
+        sellerReserveAvailable: activeSellerReserve.toFixed(),
       };
     }
     if (creditPlan.reason === "maximum_user_balance") {
@@ -1473,12 +1489,12 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
 }
 
 const DEPOSIT_HOLD_REASON_TEXT = {
-  below_minimum: "The 60-minute session total has not reached the 70 BSC-USD minimum.",
-  minimum_not_reached: "The 60-minute session total has not reached the 70 BSC-USD minimum.",
+  below_minimum: "The 60-minute session total has not reached the 20 BSC-USD minimum.",
+  minimum_not_reached: "The 60-minute session total has not reached the 20 BSC-USD minimum.",
   initial_credit_limit: "The first credit tranche is capped at 100 BSC-USD. The remaining amount stays recorded and can be credited later without applying the 100 BSC-USD cap again.",
   maximum_user_balance: "Crediting the remaining amount would exceed the user's 300 XTU balance ceiling.",
-  weekly_limit: "The seven-day system-reserve funding cooldown has not elapsed. Seller-reserve funding may still become available earlier; otherwise OneX retries when the cooldown expires.",
-  weekly_receipt_limit: "The user's rolling seven-day BSC-USD receipt total exceeds 140 BSC-USD. This deposit remains pending until the earlier incoming amounts age out of the seven-day window.",
+  system_funding_cooldown: "The user has already used the one-per-seven-day purchase funded from OneX system reserves. This is not an incoming-amount limit; active seller-campaign reserves may fund the deposit earlier, and OneX rechecks their availability.",
+  deposit_amount_above_maximum: "This individual BSC-USD transfer exceeds the 100 BSC-USD maximum. It is held for support review and will not be automatically credited.",
   manual_deposit_suspended: "Automatic deposit crediting is temporarily suspended by OneX administration.",
   payment_service_unavailable: "The deposit processing service is temporarily unavailable. The received funds remain recorded and will be retried when service resumes.",
   account_deactivated: "The account has been administratively deactivated. Existing uncredited deposit amounts and any new incoming transfers are held; automatic crediting remains paused until an administrator reactivates the account.",
@@ -1532,13 +1548,13 @@ async function queueDepositBatchStatusTx(
   if (details.creditedAmount != null) lines.push(`Total gross amount already credited: ${details.creditedAmount} BSC-USD`);
   if (details.remainingAmount != null) lines.push(`Amount still pending: ${details.remainingAmount} BSC-USD`);
   if (reasons.length) lines.push("Reason:", ...getReasonText(reasons));
-  if (releaseAtMs != null) lines.push(`Next automatic retry no earlier than (UTC): ${formatTelegramUtc(releaseAtMs)}`);
+  if (releaseAtMs != null) lines.push(`OneX system-reserve funding may be reconsidered from (UTC): ${formatTelegramUtc(releaseAtMs)}. Eligible seller-campaign reserves may allow earlier processing.`);
 
   if (status === "collecting" || status === "batched") {
     lines.push("Current hold reason: the 60-minute grouping session is still open. OneX will calculate the exact first credit tranche after this window closes, using your account's XTU capacity, distributable reserves and applicable restrictions.");
   }
   if (reasons.includes("below_minimum") || reasons.includes("minimum_not_reached")) {
-    lines.push("Suggested action: while the session is open, you may send another payment from your registered wallet to bring the total to at least 70 BSC-USD. If the session has already closed below the minimum, a later payment can reopen the pending minimum session. The existing amount remains recorded.");
+    lines.push("Suggested action: while the session is open, you may send another payment from your registered wallet to bring the total to at least 20 BSC-USD. If the session has already closed below the minimum, a later payment can reopen the pending minimum session. The existing amount remains recorded.");
   }
   if (reasons.includes("maximum_user_balance")) {
     lines.push("Suggested action: do not send another payment for this pending amount. Wait until your eligible XTU balance capacity is released; OneX retries automatically after balance changes.");
@@ -1546,11 +1562,11 @@ async function queueDepositBatchStatusTx(
   if (reasons.includes("system_reserve")) {
     lines.push("Suggested action: no additional payment is required. Wait for distributable reserves to become available; OneX retries automatically.");
   }
-  if (reasons.includes("weekly_limit")) {
-    lines.push("Suggested action: no additional payment is required. Wait for the applicable seven-day cooldown; OneX retries automatically when it expires.");
+  if (reasons.includes("system_funding_cooldown")) {
+    lines.push("Suggested action: no additional payment is required. An active eligible seller campaign may fund this deposit earlier; otherwise OneX system-reserve funding can be reconsidered when the seven-day cooldown expires.");
   }
-  if (reasons.includes("weekly_receipt_limit")) {
-    lines.push("Suggested action: do not send another deposit while the rolling seven-day receipt limit is exceeded. OneX will recheck automatically after earlier transfers age out of the seven-day window.");
+  if (reasons.includes("deposit_amount_above_maximum")) {
+    lines.push("Suggested action: contact OneX support by email or phone and provide this transaction reference. Do not send another deposit until the oversized transfer has been reviewed.");
   }
   if (reasons.includes("manual_deposit_suspended")) {
     lines.push("Suggested action: do not send another payment while deposits are suspended. The recorded amount will be reconsidered when the administration resumes the service.");
@@ -1565,7 +1581,7 @@ async function queueDepositBatchStatusTx(
     lines.push("Account access has been restored. OneX has immediately requeued this pending deposit for automatic eligibility checks; credit remains subject to the session window, FIFO order, account balance capacity and available reserves.");
   }
   if (reasons.includes("initial_credit_limit")) {
-    lines.push("Suggested action: no additional payment is required for the retained remainder. The first credit tranche is capped at 100 BSC-USD; the remainder will be retried automatically without reapplying the 100 BSC-USD tranche cap or the 70 BSC-USD minimum reception threshold when account and reserve capacity permit.");
+    lines.push("Suggested action: no additional payment is required for the retained remainder. The first credit tranche is capped at 100 BSC-USD; the remainder will be retried automatically without reapplying the 100 BSC-USD tranche cap or the 20 BSC-USD minimum reception threshold when account and reserve capacity permit.");
   }
   if (reasons.includes("payment_service_unavailable")) {
     lines.push("Suggested action: no further payment is required. Keep the payment reference; OneX will retry processing when the payment service is restored.");
@@ -1583,7 +1599,7 @@ async function queueDepositBatchStatusTx(
     lines.push("Suggested action: do not send another payment. Contact OneX support and provide this transaction reference because the transfer was received after the global-disbursement cutoff and requires administrative review.");
   }
   if (!reasons.length && (status === "collecting" || status === "batched")) {
-    lines.push("Suggested action: no additional payment is required if the session total is at least 70 BSC-USD. Wait for the 60-minute session to close and for OneX to run the eligibility checks.");
+    lines.push("Suggested action: no additional payment is required if the session total is at least 20 BSC-USD. Wait for the 60-minute session to close and for OneX to run the eligibility checks.");
   }
 
   lines.push("Incoming deposit tfees are applied only to each amount actually credited; OneX does not deduct BSC network gas from incoming deposits.");
@@ -1686,24 +1702,8 @@ async function processConfirmedUsdtPayment(event) {
       cutoffStarted && effectiveAt > 0 && Number(event.blockTimestampMs) >= effectiveAt,
     );
     const eventTimestampMs = Number(event.blockTimestampMs);
-    const weeklyReceiptFloorMs = eventTimestampMs - DEPOSIT_COOLDOWN_MS;
-    const [weeklyReceiptRows] = await tx.query(
-      `SELECT COALESCE(SUM(amount),0) AS gross_amount,
-              MIN(CAST(block_timestamp_ms AS UNSIGNED)) AS oldest_event_ms
-       FROM users_usdt_transfer_events
-       WHERE username=?
-         AND CAST(block_timestamp_ms AS UNSIGNED)>?
-         AND CAST(block_timestamp_ms AS UNSIGNED)<=?
-         AND status NOT IN ('rejected','reversed')`,
-      [username, String(weeklyReceiptFloorMs), String(eventTimestampMs)],
-    );
-    const weeklyReceiptGross = new BigNumber(weeklyReceiptRows[0]?.gross_amount || "0");
-    const weeklyReceiptDecision = classifyRollingDepositReceipt(weeklyReceiptGross);
-    const weeklyReceiptExceeded = !weeklyReceiptDecision.allowed;
-    const weeklyReceiptReleaseAtMs = weeklyReceiptExceeded
-      ? Math.max(now, Number(weeklyReceiptRows[0]?.oldest_event_ms || eventTimestampMs) + DEPOSIT_COOLDOWN_MS)
-      : null;
-    const [activeBatchRows] = (transferAfterCutoff || manualDepositSuspended || weeklyReceiptExceeded) ? [ [] ] : await tx.query(
+    const individualDepositAboveMaximum = amountValue.isGreaterThan(MAX_DEPOSIT_AMOUNT);
+    const [activeBatchRows] = (transferAfterCutoff || manualDepositSuspended || individualDepositAboveMaximum) ? [ [] ] : await tx.query(
       `SELECT * FROM users_usdt_deposit_batches
        WHERE username=? AND status IN ('collecting','pending_minimum')
        ORDER BY id ASC LIMIT 1 FOR UPDATE`,
@@ -1739,17 +1739,24 @@ async function processConfirmedUsdtPayment(event) {
       }
     }
 
+    const currentBatchGross = batch && batch.status === "collecting"
+      ? new BigNumber(batch.total_amount || "0") : new BigNumber(0);
+    const sessionMaximumExceeded = !individualDepositAboveMaximum && batch != null &&
+      currentBatchGross.plus(amountValue).isGreaterThan(MAX_DEPOSIT_AMOUNT);
+    if (sessionMaximumExceeded) batch = null;
+
     const accountDeactivated = Number(account.account_active) !== 1;
     const accountUnavailable = account.last_login_at_ms == null || !stockRows.length;
     let initialStatus = transferAfterCutoff
       ? "pending_global"
-      : (manualDepositSuspended || initialGroupingExpired
-        ? "pending_support" : (weeklyReceiptExceeded ? "pending_weekly" : "collecting"));
+      : (manualDepositSuspended || initialGroupingExpired || individualDepositAboveMaximum || sessionMaximumExceeded
+        ? "pending_support" : "collecting");
     let initialReasons = transferAfterCutoff
       ? ["received_after_global_disbursement_cutoff"]
       : (manualDepositSuspended ? ["manual_deposit_suspended"]
         : (initialGroupingExpired ? ["outside_initial_grouping_window"]
-          : (weeklyReceiptExceeded ? ["weekly_receipt_limit"] : [])));
+          : (individualDepositAboveMaximum ? ["deposit_amount_above_maximum"]
+            : (sessionMaximumExceeded ? ["deposit_session_above_maximum"] : []))));
     if (accountDeactivated) {
       initialStatus = "pending_support";
       initialReasons.push("account_deactivated");
@@ -1790,10 +1797,10 @@ async function processConfirmedUsdtPayment(event) {
       batch = createdRows[0];
     }
 
-    const nextStatus = (accountDeactivated || accountUnavailable || manualDepositSuspended || initialGroupingExpired)
+    const nextStatus = (accountDeactivated || accountUnavailable || manualDepositSuspended || initialGroupingExpired ||
+      ((individualDepositAboveMaximum || sessionMaximumExceeded) && !transferAfterCutoff))
       ? "pending_support"
-      : (transferAfterCutoff ? "pending_global"
-        : (weeklyReceiptExceeded ? "pending_weekly" : (batch.status === "collecting" ? "batched" : batch.status)));
+      : (transferAfterCutoff ? "pending_global" : (batch.status === "collecting" ? "batched" : batch.status));
     let reasonCodes = initialReasons;
     if (batch.reason_codes) {
       try {
@@ -1822,20 +1829,13 @@ async function processConfirmedUsdtPayment(event) {
     const batchTotal = new BigNumber(batch.total_amount || 0).plus(amountValue);
     const immediateReasons = [...reasonCodes];
     if (batchTotal.lt(MIN_DEPOSIT_AMOUNT)) immediateReasons.push("minimum_not_reached");
-    if (weeklyReceiptExceeded && nextStatus === "pending_weekly") immediateReasons.push("weekly_receipt_limit");
-    if (weeklyReceiptExceeded && reasonCodes.includes("weekly_receipt_limit")) {
-      await tx.query(
-        `UPDATE users_usdt_deposit_batches SET next_attempt_at_ms=?,updated_at_ms=? WHERE id=?`,
-        [String(weeklyReceiptReleaseAtMs), String(now), String(batch.id)],
-      );
-    }
     await queueDepositBatchStatusTx(
       tx,
       username,
       batch.id,
       nextStatus,
       immediateReasons,
-      weeklyReceiptExceeded && reasonCodes.includes("weekly_receipt_limit") ? weeklyReceiptReleaseAtMs : null,
+      null,
       {
         txHash: event.txHash,
         receivedAmount: amountValue.toFixed(8),
@@ -2019,40 +2019,10 @@ async function processOneDepositBatch(batchId) {
     } catch {
       batchReasonCodes = ["invalid_stored_reason_data"];
     }
-    if (batchReasonCodes.includes("weekly_receipt_limit")) {
-      const rollingFloor = now - DEPOSIT_COOLDOWN_MS;
-      const [rollingRows] = await tx.query(
-        `SELECT COALESCE(SUM(amount),0) AS gross_amount,
-                MIN(CAST(block_timestamp_ms AS UNSIGNED)) AS oldest_event_ms
-         FROM users_usdt_transfer_events
-         WHERE username=? AND CAST(block_timestamp_ms AS UNSIGNED)>?
-           AND status NOT IN ('rejected','reversed')`,
-        [batch.username, String(rollingFloor)],
-      );
-      const rollingGross = new BigNumber(rollingRows[0]?.gross_amount || "0");
-      const rollingDecision = classifyRollingDepositReceipt(rollingGross);
-      if (!rollingDecision.allowed) {
-        const oldestEventMs = Number(rollingRows[0]?.oldest_event_ms || now);
-        const nextAttemptAt = Math.max(now + 30_000, oldestEventMs + DEPOSIT_COOLDOWN_MS);
-        const stillHeldReasons = [...new Set([...batchReasonCodes, "weekly_receipt_limit"])];
-        const holdStatus = batch.status === "pending_support" ? "pending_support" : "pending_weekly";
-        await tx.query(
-          `UPDATE users_usdt_deposit_batches SET status=?,next_attempt_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
-          [holdStatus, String(nextAttemptAt), safeJson(stillHeldReasons), String(now), String(batchId)],
-        );
-        await updateBatchEventStatus(tx, batchId, holdStatus, stillHeldReasons);
-        await queueDepositBatchStatusTx(tx, batch.username, batchId, holdStatus, stillHeldReasons, nextAttemptAt, {
-          sessionTotal: new BigNumber(batch.total_amount || "0").toFixed(8),
-          creditedAmount: String(batch.credited_amount || "0"),
-          remainingAmount: String(batch.remaining_amount || "0"),
-        });
-        return { waiting: true, reason: "weekly_receipt_limit", nextAttemptAtMs: nextAttemptAt };
-      }
-      const remainingReasons = batchReasonCodes.filter((reason) => reason !== "weekly_receipt_limit");
-      await tx.query(
-        `UPDATE users_usdt_deposit_batches SET reason_codes=?,updated_at_ms=? WHERE id=?`,
-        [remainingReasons.length ? safeJson(remainingReasons) : null, String(now), String(batchId)],
-      );
+    if (batchReasonCodes.includes("deposit_amount_above_maximum") ||
+        batchReasonCodes.includes("deposit_session_above_maximum")) {
+      return { held: true, reason: batchReasonCodes.includes("deposit_amount_above_maximum")
+        ? "deposit_amount_above_maximum" : "deposit_session_above_maximum" };
     }
 
     const totalAmount = new BigNumber(batch.total_amount || "0");
@@ -2190,12 +2160,14 @@ async function processOneDepositBatch(batchId) {
         status = "pending_reserve";
         reasons = ["system_reserve"];
         retryAt = now + 30_000;
-      } else if (creditResult?.error === "weekly deposit limit reached") {
+      } else if (creditResult?.code === "weekly_system_funding_cooldown") {
         status = "pending_weekly";
-        reasons = ["weekly_limit"];
+        reasons = ["system_funding_cooldown"];
         const pendingSince = Number(batch.pending_since_ms || now);
-        releaseAt = getWeeklyReleaseAt(pendingSince, creditResult.lastDepositMs);
-        retryAt = Math.max(now + 30_000, releaseAt);
+        releaseAt = getSystemFundingCooldownReleaseAt(pendingSince, creditResult.lastPurchaseMs);
+        // Recheck seller campaign reserves frequently; the OneX cooldown only
+        // gates system-funded purchases and must not block seller-funded credit.
+        retryAt = now + 30_000;
       } else if (creditResult?.error === "maximum user balance exceeded") {
         status = "pending_credit";
         reasons = ["maximum_user_balance"];
@@ -2267,8 +2239,8 @@ async function processOneDepositBatch(batchId) {
         nextReasons.push("maximum_user_balance");
       } else if (creditResult.partialReason === "system_reserve") {
         nextReasons.push("system_reserve");
-      } else if (creditResult.partialReason === "weekly_limit") {
-        nextReasons.push("weekly_limit");
+      } else if (creditResult.partialReason === "system_funding_cooldown") {
+        nextReasons.push("system_funding_cooldown");
       }
       if (!nextReasons.length) nextReasons.push("maximum_user_balance");
     }
@@ -2353,6 +2325,7 @@ async function processDepositBatchQueue() {
             AND CASE
               WHEN status='pending_support' AND JSON_VALID(reason_codes)=1
                 THEN JSON_CONTAINS(reason_codes, JSON_QUOTE('account_deactivated'))=0
+                 AND JSON_CONTAINS(reason_codes, JSON_QUOTE('deposit_amount_above_maximum'))=0
               ELSE 1
             END)
         OR (status='pending_weekly' AND (next_attempt_at_ms<=? OR release_at_ms<=?))
@@ -3231,9 +3204,18 @@ async function getXtuDepositPublicState(username) {
     mainWalletAddress: null,
     tokenAddress: null,
     registeredSenderWallet: null,
-    minAmount: "70",
-    maxAmount: "140",
+    minAmount: MIN_DEPOSIT_AMOUNT.toFixed(0),
+    maxAmount: MAX_DEPOSIT_AMOUNT.toFixed(0),
     initialCreditCap: "100",
+    consolidationMinBatchXtu: "100",
+    weeklySystemFundedPurchaseLimit: 1,
+    weeklySystemFundedPurchasePeriodDays: 7,
+    weeklySystemFundedPurchaseAmountIndependent: true,
+    weeklySystemFundedPurchaseScope: "onex_system_reserves_only",
+    weeklySystemFundedPurchaseSharedAcrossAssets: true,
+    sellerCampaignFundingMayBypassWeeklyCooldown: true,
+    sellerCampaignActivationRequiresOptIn: true,
+    sellerCampaignCreatedAfterEligibleOptIn: true,
     globalDisbursementActive: false,
     globalRunId: null,
   };
@@ -3276,6 +3258,15 @@ async function getXtuDepositPublicState(username) {
       minAmount: settings.depositMinAmount,
       maxAmount: settings.depositMaxAmount,
       initialCreditCap: settings.depositInitialCreditCap,
+      consolidationMinBatchXtu: settings.depositConsolidationMinBatchXtu,
+      weeklySystemFundedPurchaseLimit: 1,
+      weeklySystemFundedPurchasePeriodDays: 7,
+      weeklySystemFundedPurchaseAmountIndependent: true,
+      weeklySystemFundedPurchaseScope: "onex_system_reserves_only",
+      weeklySystemFundedPurchaseSharedAcrossAssets: true,
+      sellerCampaignFundingMayBypassWeeklyCooldown: true,
+      sellerCampaignActivationRequiresOptIn: true,
+      sellerCampaignCreatedAfterEligibleOptIn: true,
       globalDisbursementActive: globalActive,
       globalRunId: globalActive ? String(run.id) : null,
       minConfirmations: settings.minConfirmations,
@@ -3465,6 +3456,7 @@ router.post("/app/user-last-stock", async (req, res) => {
       xtu_deposit_minimum: xtuDepositState.minAmount,
       xtu_deposit_maximum: xtuDepositState.maxAmount,
       xtu_deposit_initial_credit_cap: xtuDepositState.initialCreditCap,
+      xtu_deposit_consolidation_minimum_batch: xtuDepositState.consolidationMinBatchXtu,
       xtu_deposit_fee_percent: xtuDepositState.globalDisbursementActive ? "0" : new BigNumber(tfees).multipliedBy("0.75").toFixed(10),
       xtu_deposit_gas_fee_deducted: true,
       xtu_blockchain_transfer_fee_percent: "0.1",
@@ -3556,8 +3548,16 @@ router.post("/app/deposit", async (req, res) => {
         registered_sender_wallet: state.registeredSenderWallet,
         minimum_amount: state.minAmount,
         maximum_amount: state.maxAmount,
-        per_user_limit_days: 7,
+        weekly_system_funded_purchase_limit: state.weeklySystemFundedPurchaseLimit,
+        weekly_system_funded_purchase_period_days: state.weeklySystemFundedPurchasePeriodDays,
+        weekly_system_funded_purchase_amount_independent: state.weeklySystemFundedPurchaseAmountIndependent,
+        weekly_system_funded_purchase_scope: state.weeklySystemFundedPurchaseScope,
+        weekly_system_funded_purchase_shared_across_assets: state.weeklySystemFundedPurchaseSharedAcrossAssets,
+        seller_campaign_funding_may_bypass_weekly_cooldown: state.sellerCampaignFundingMayBypassWeeklyCooldown,
+        seller_campaign_activation_requires_opt_in: state.sellerCampaignActivationRequiresOptIn,
+        seller_campaign_created_by_system_after_eligible_opt_in: state.sellerCampaignCreatedAfterEligibleOptIn,
         maximum_initial_credit_tranche_xtu: state.initialCreditCap,
+        consolidation_minimum_batch_xtu: state.consolidationMinBatchXtu,
         blockchain_transfer_fee_percent: "0.1",
         onex_deposit_fee_percent: state.globalDisbursementActive ? "0" : new BigNumber(tfees).multipliedBy("0.75").toFixed(10),
         onex_deposit_fee_rate_factor: "0.75",
@@ -3609,9 +3609,16 @@ router.post("/app/deposit", async (req, res) => {
       token_contract: config.tokenContract,
       minimum_amount: MIN_DEPOSIT_AMOUNT.toFixed(0),
       maximum_amount: MAX_DEPOSIT_AMOUNT.toFixed(0),
+      maximum_amount_semantics: "gross_maximum_per_60_minute_deposit_session",
+      weekly_system_funded_purchase_limit: 1,
+      weekly_system_funded_purchase_period_days: 7,
+      weekly_system_funded_purchase_amount_independent: true,
+      weekly_system_funded_purchase_scope: "onex_system_reserves_only",
+      weekly_system_funded_purchase_shared_across_assets: true,
+      seller_campaign_funding_may_bypass_weekly_cooldown: true,
+      seller_campaign_activation_requires_opt_in: true,
+      seller_campaign_created_by_system_after_eligible_opt_in: true,
       maximum_initial_credit_tranche_bsc_usd: MAX_INITIAL_CREDIT_TRANCHE_AMOUNT.toFixed(0),
-      maximum_amount_semantics: "first_credit_tranche_only; later pending remainder is not capped again",
-      maximum_system_funded_amount: MAX_INITIAL_CREDIT_TRANCHE_AMOUNT.toFixed(0),
       seller_funding_priority: true,
       maximum_user_stock: maxStockDefault,
       batch_window_minutes: 60,
@@ -3642,7 +3649,16 @@ router.post("/app/deposit/availability", async (req, res) => {
         reason: state.reason,
         minimum_deposit_amount_xtu: state.minAmount,
         maximum_deposit_amount_xtu: state.maxAmount,
+        weekly_system_funded_purchase_limit: 1,
+        weekly_system_funded_purchase_period_days: 7,
+        weekly_system_funded_purchase_amount_independent: state.weeklySystemFundedPurchaseAmountIndependent,
+        weekly_system_funded_purchase_scope: state.weeklySystemFundedPurchaseScope,
+        weekly_system_funded_purchase_shared_across_assets: state.weeklySystemFundedPurchaseSharedAcrossAssets,
+        seller_campaign_funding_may_bypass_weekly_cooldown: state.sellerCampaignFundingMayBypassWeeklyCooldown,
+        seller_campaign_activation_requires_opt_in: state.sellerCampaignActivationRequiresOptIn,
+        seller_campaign_created_by_system_after_eligible_opt_in: state.sellerCampaignCreatedAfterEligibleOptIn,
         maximum_initial_credit_tranche_xtu: state.initialCreditCap,
+        consolidation_minimum_batch_xtu: state.consolidationMinBatchXtu,
         batch_window_minutes: state.batchWindowMinutes || 60,
         pending_retry_days: state.pendingRetryDays || 7,
       });
@@ -3664,6 +3680,14 @@ router.post("/app/deposit/availability", async (req, res) => {
       available_reserve_xtu: snapshot.availableReserveXtu,
       minimum_deposit_amount_bsc_usd: MIN_DEPOSIT_AMOUNT.toFixed(0),
       maximum_deposit_amount_bsc_usd: MAX_DEPOSIT_AMOUNT.toFixed(0),
+      weekly_system_funded_purchase_limit: 1,
+      weekly_system_funded_purchase_period_days: 7,
+      weekly_system_funded_purchase_amount_independent: true,
+      weekly_system_funded_purchase_scope: "onex_system_reserves_only",
+      weekly_system_funded_purchase_shared_across_assets: true,
+      seller_campaign_funding_may_bypass_weekly_cooldown: true,
+      seller_campaign_activation_requires_opt_in: true,
+      seller_campaign_created_by_system_after_eligible_opt_in: true,
     });
   } catch (error) {
     console.error("Public deposit-availability lookup failed:", error.message);
@@ -3711,8 +3735,12 @@ router.post("/app/deposit/status", async (req, res) => {
       let reasons = [];
       try { reasons = JSON.parse(row.reason_codes || "[]"); } catch { reasons = ["invalid_reason_codes"]; }
       const consolidationRows = await db.queryAsync(
-        `SELECT tx_hash,status,estimated_gas_fee_usd,actual_gas_fee_usd,block_number
-         FROM xtu_deposit_consolidations WHERE batch_id=? LIMIT 1`, [String(row.id)],
+        `SELECT c.tx_hash,c.status,c.estimated_gas_fee_usd,c.actual_gas_fee_usd,c.block_number,
+                i.estimated_gas_fee_usd AS batch_estimated_gas_fee_usd,
+                i.allocated_gas_fee_usd AS batch_actual_gas_fee_usd
+         FROM xtu_deposit_consolidation_items i
+         JOIN xtu_deposit_consolidations c ON c.id=i.consolidation_id
+         WHERE i.batch_id=? LIMIT 1`, [String(row.id)],
       );
       return res.send({
         transf: row.status, asset: "XTU", batch_id: String(row.id),
@@ -3735,8 +3763,8 @@ router.post("/app/deposit/status", async (req, res) => {
         })),
         consolidation: consolidationRows[0] ? {
           tx_hash: consolidationRows[0].tx_hash, status: consolidationRows[0].status,
-          estimated_gas_fee_bsc_usd: consolidationRows[0].estimated_gas_fee_usd,
-          actual_gas_fee_bsc_usd: consolidationRows[0].actual_gas_fee_usd,
+          estimated_gas_fee_bsc_usd: consolidationRows[0].batch_estimated_gas_fee_usd,
+          actual_gas_fee_bsc_usd: consolidationRows[0].batch_actual_gas_fee_usd,
           block_number: consolidationRows[0].block_number == null ? null : Number(consolidationRows[0].block_number),
         } : null,
         updated_at_ms: Number(row.updated_at_ms),
@@ -4747,7 +4775,7 @@ router.post("/admin/deposit/control", async (req, res) => {
 
 // Exceptional administrative credit of a support-held deposit batch.
 // Normal weekly cooldown, 300 XTU stock cap and common reserve checks remain enforced.
-// The administrator may bypass the automatic 70-140 BSC-USD rolling seven-day receipt range and the 100 BSC-USD first-credit tranche cap only after a documented support review.
+// The administrator may bypass the 20-100 BSC-USD per-session limits and the separate first-credit tranche cap only after a documented support review.
 router.post("/admin/deposit/credit", async (req, res) => {
   const { pswd, pin, username, batch_id, reason } = req.body || {};
   if (
@@ -4847,7 +4875,7 @@ router.post("/admin/deposit/credit", async (req, res) => {
       );
       const nextStatus = newRemaining.isZero() ? "credited" : "pending_credit";
       const nextReasons = newRemaining.isZero() ? [] : [creditResult.partialReason === "system_reserve"
-        ? "system_reserve" : (creditResult.partialReason === "weekly_limit" ? "weekly_limit" : "maximum_user_balance")];
+        ? "system_reserve" : (creditResult.partialReason === "system_funding_cooldown" ? "system_funding_cooldown" : "maximum_user_balance")];
       const retryAt = newRemaining.isZero() ? null : String(now + (nextReasons[0] === "system_reserve" ? 30_000 : 5 * 60 * 1000));
       await tx.query(
         `UPDATE users_usdt_deposit_batches

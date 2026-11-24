@@ -15,7 +15,7 @@
 
 ## 2. Retraits XTU vers le portefeuille personnel
 
-- `POST /app/xtu2wallet` accepte un montant brut minimal de 1 XTU. La destination est exclusivement l'adresse BSC déjà enregistrée dans `auths.wallet_address` ; aucune adresse arbitraire, clé privée ou seed n'est demandée au client.
+- `POST /app/xtu2wallet` accepte un montant brut minimal de 5 XTU. La destination est exclusivement l'adresse BSC déjà enregistrée dans `auths.wallet_address` ; aucune adresse arbitraire, clé privée ou seed n'est demandée au client.
 - `POST /app/xtu2wallet/status` permet à l'utilisateur de consulter sa propre demande.
 - `POST /admin/withdraw/start` gère `start`, `stop` et `status`, avec le contrôle administratif password + PIN existant. La commande est fermée par défaut et reste indépendante des contrôles de décaissement BSC-USD.
 - Le serveur convertit l'estimation de gas BNB avec Chainlink BNB/USD, la déduit du brut avant l'appel au contrat, puis laisse le contrat prélever une seule fois la commission de 0,1 %. Une estimation supérieure à `BSC_MAX_TX_FEE_BSC_USD=0.4` reporte/refuse temporairement l'opération.
@@ -37,11 +37,19 @@
 - Les routes officielles sont `POST /app/deposit`, `/app/deposit/availability` et `/app/deposit/status`, avec `asset: "XTU"`. Les dépôts BSC-USD et XTU restent séparés par actif et par registre. Aucun endpoint `/app/recharge` n'est conservé.
 - Le scanner XTU surveille exclusivement le contrat XTU configuré. Il vérifie l'émetteur lié à un compte, le reçu, l'événement `TransferWithFee`, les transferts `Transfer` et `FeeCollected`, le contrat, le hash/log, le bloc et la finalité.
 - Les frais de réception contractuels de 0,1 % sont rapprochés séparément du net reçu par le Hot Wallet. Seul le montant de dépôt identifié est consolidé Hot Wallet → Distribution Wallet ; l'offre initiale et les autres soldes du Hot Wallet ne sont jamais balayés.
-- Les limites sont fixes : minimum 70 XTU, maximum 140 XTU par utilisateur et par période glissante de sept jours. Les sessions se regroupent pendant 60 minutes à partir du premier transfert finalisé ; le regroupement initial est limité à 30 jours ; les montants hors plage et dépassements sont mis en attente et réévalués après sept jours.
+- Les limites de dépôt sont communes et configurables : minimum brut de 20 XTU et maximum brut de 100 XTU par session de 60 minutes. Il n’existe pas de plafond hebdomadaire sur les montants entrants. La limite de sept jours compte uniquement les achats financés par les réserves système de OneX : un achat par utilisateur, quel que soit le montant. Les dépôts suivants peuvent être financés exclusivement par les réserves de campagnes vendeurs actives et disponibles sans consommer ce droit OneX ; les vendeurs activent volontairement leur participation. Un transfert individuel ou une session supérieure à 100 XTU est mis en attente pour examen du support.
 - Le plafond de première tranche de crédit est distinct de la limite de réception et vaut 100 XTU par défaut (`XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU`). Le reliquat est conservé et réévalué pour une tranche ultérieure ; frais OneX et gas ne sont pas déduits une seconde fois.
 - Hors disbursement global, les frais de dépôt OneX représentent 75 % du taux `tfees`. Pendant un disbursement global déjà activé, ces frais sont nuls. Dans les deux périodes, le gas BNB réel de la consolidation est calculé depuis le reçu et converti par Chainlink en équivalent XTU, puis déduit du montant créditable. Le plafond 0,4 BSC-USD concerne le coût estimé, pas un frais fixe.
 - Les actifs initiaux sont crédités au prix global `common.unit_price`, jamais au prix individuel. Les réserves sont consommées dans l'ordre `inactive_init_asset`, réserve vendeurs, puis `backed_units` en dernier recours. La capacité est contrôlée à la clôture et juste avant le crédit.
 - L'audit de crédit conserve les hashes/logs des transferts personnels d'origine ainsi que le hash distinct de la consolidation Hot Wallet → Distribution Wallet.
+
+### Règle hebdomadaire de financement OneX (commune BSC-USD / XTU)
+
+- La fenêtre de 7 jours ne plafonne pas les montants entrants. Les limites de réception restent 20 à 100 unités brutes par session de 60 minutes.
+- Elle autorise un seul achat financé par les réserves système OneX par utilisateur sur une période glissante de 7 jours, quel que soit le montant. Dès qu'une part positive d'un achat est financée par OneX, il consomme cette possibilité ; les tranches ultérieures du même lot ne la consomment pas une seconde fois.
+- Le compteur commun aux deux actifs est fondé sur une activité `type=2` dont `sender=OneX` et `receiver=username`. Les crédits issus des campagnes vendeurs sont enregistrés avec `sender=XUSER` et ne consomment pas ce droit.
+- Lorsque le droit est déjà utilisé, le nouvel achat ne peut être financé que par les réserves vendeurs actives et disponibles ; le chemin vendeur n'utilise pas `inactive_init_asset` ni `backed_units`. Le worker réévalue régulièrement les lots en attente afin qu'une campagne active puisse permettre un crédit avant la fin des sept jours.
+- Une campagne est créée par OneX après activation explicite d'un vendeur éligible via `POST /app/join-system-sellers`. L'activation réserve 50 % du principal du vendeur selon les règles d'éligibilité ; aucune réserve vendeuse n'est immobilisée sans participation volontaire.
 
 ## 5. Dépôts et règlements XTU après activation du disbursement global
 
@@ -58,13 +66,26 @@
 - La terminologie officielle « dépôt » remplace « recharge » dans les interfaces et commentaires métier concernés.
 - Le backend utilisait déjà les types d'activité `1` (P2P), `2` (achat/dépôt), `3` (vente) et `4` (welcome bonus). Le type `5` est utilisé pour le retrait XTU, premier type numérique inutilisé observé dans le code serveur. L'archive ne contient pas le code complet de l'application Android ni son mapping d'affichage des activités : ce mapping doit encore être vérifié/intégré dans le client avant publication.
 
-## 7. Vérifications effectuées et limites
+## 7. Vérifications effectuées et limites — révision du 24 novembre 2026
 
-- `node scripts/syntax-check.js` : réussi, 92 fichiers JavaScript contrôlés.
-- `node --check db.js`, `routes.js`, `xtu-deposit-worker.js` et `xtu-withdrawal-worker.js` : réussis.
-- Tests ciblés sans dépendances manquantes (`account-deactivation-deposits`, `deposit-pending-rules`, `refund-accounting-lifecycle`) : 28/28 réussis.
-- Suite complète `npm test` : 126 tests réussis sur 147. Les 21 fichiers de test restants n'ont pas pu être chargés à cause de dépendances absentes (`bignumber.js` dans 19 fichiers, `ethers` dans 1, `ganache` dans 1). L'installation npm a expiré avant de terminer ; ces erreurs ne constituent pas des échecs fonctionnels établis des tests concernés.
-- Le test EVM `tests/xtu-token-contract.test.js` n'a pas pu s'exécuter faute de `ganache`. Le compilateur `solc` et les packages OpenZeppelin ne sont pas installés dans l'environnement utilisé ; la compilation Solidity n'a donc pas été exécutée.
-- Aucun test d'intégration MySQL, RPC BSC, testnet, mainnet, déploiement ou transfert réel n'a été effectué. Aucun test blockchain n'est déclaré comme réalisé.
+- `node scripts/syntax-check.js` : réussi, 94 fichiers JavaScript contrôlés.
+- Tests de contrat source/configuration, règles de dépôt en attente et endpoints : 21/21 réussis (`deposit-endpoint-contract`, `deposit-pending-rules`, `xtu-new-thresholds-contract`). Ces tests vérifient les contrats d'interface et les invariants de source ; ils ne remplacent pas les tests numériques qui chargent les modules métier.
+- Schéma `db.js` : 65 déclarations `CREATE TABLE` analysées ; aucun nom de table ou de colonne dupliqué détecté.
+- Documents HTML : les quatre pages `terms_fr.html`, `terms_en.html`, `privacy_fr.html` et `privacy_en.html` passent le contrôle de structure.
+- Configuration : les seuls paramètres partagés de réception sont `DEPOSIT_MIN_AMOUNT=20` et `DEPOSIT_MAX_AMOUNT=100` dans `.env.example`. Les anciens paramètres `XTU_DEPOSIT_MIN_AMOUNT` et `XTU_DEPOSIT_MAX_AMOUNT` sont absents des exemples et rejetés s'ils sont encore définis dans l'environnement XTU.
+- Aucun script de migration SQL n'a été ajouté ; le schéma définitif reste intégré à `db.js` pour l'initialisation d'une nouvelle base.
 
-**Avant activation réelle :** installer les dépendances (`npm install`), exécuter `npm test` et `npm run compile:xtu`, exécuter les tests EVM locaux, valider le schéma sur une nouvelle base MySQL, puis effectuer des essais de bout en bout sur un environnement BSC de test. Le mapping d'affichage des activités dans l'application Android complète reste à confirmer, car cette application n'est pas incluse dans l'archive examinée.
+### Vérifications non exécutées
+
+L'environnement de travail ne contient pas `node_modules` et les modules `bignumber.js`, `ethers`, `mysql2` et `dotenv` ne sont pas résolus. Les tests métier numériques qui chargent ces bibliothèques, la suite complète `npm test`, la compilation Solidity et les tests EVM n'ont donc pas été exécutés dans cette révision. Aucun résultat de ces tests n'est présenté comme réussi ou échoué.
+
+Aucun test d'intégration MySQL, appel RPC de validation financière, essai BSC testnet/mainnet, transaction réelle ou déploiement n'a été effectué. L'archive ne contient pas l'application Android complète ; le mapping d'affichage du type d'activité `5` reste à confirmer dans le client natif.
+
+## 8. Ajustements complémentaires — configuration 20–100 et seuil de 100 XTU
+
+- Les dépôts BSC-USD et XTU partagent une seule paire de paramètres : `DEPOSIT_MIN_AMOUNT=20` et `DEPOSIT_MAX_AMOUNT=100`. Le minimum brut de 20 et le maximum brut de 100 s'appliquent au total d'une session de dépôt de 60 minutes ; il n'existe aucun plafond hebdomadaire sur le montant des transferts entrants. La règle hebdomadaire porte uniquement sur le financement par les réserves système : un achat financé par OneX par utilisateur sur sept jours glissants, quel que soit son montant. Après consommation de cette possibilité, un dépôt admissible peut encore être crédité exclusivement par les réserves de campagnes vendeurs actives et disponibles, sans consommer le droit OneX ; les vendeurs activent volontairement leur campagne. Un transfert individuel ou une session supérieure à 100 est mis en attente pour examen du support dans les deux scanners. Les lignes `pending_support` n'ont pas d'échéance de libération automatique. Les anciens paramètres XTU `XTU_DEPOSIT_MIN_AMOUNT` et `XTU_DEPOSIT_MAX_AMOUNT` ne constituent plus une seconde source de configuration.
+- Le retrait XTU vers le portefeuille personnel exige désormais un montant brut minimal de 5 XTU. Cette règle est limitée à `POST /app/xtu2wallet` et ne change pas le minimum distinct des transferts P2P ni celui des demandes de disbursement global.
+- Les dépôts XTU finalisés et éligibles sont consolidés du Hot Wallet vers le Distribution Wallet par lots FIFO d'au moins 100 XTU effectivement reçus par le Hot Wallet. Plusieurs lots utilisateurs peuvent être réunis. Le transfert porte uniquement sur les montants de dépôt identifiés ; l'offre initiale conservée dans le Hot Wallet n'est jamais balayée.
+- Le gas réel de consolidation est réparti de manière déterministe entre les lots sources et conservé dans le registre d'audit. Le seuil de 100 XTU est un minimum de consolidation interne, distinct du minimum et du maximum par session, de la règle de financement OneX limitée à un achat sur sept jours et du plafond de première tranche.
+- Le plafond de première tranche de crédit reste un paramètre distinct (`MAX_DEPOSIT_INITIAL_CREDIT_BSC_USD` ou `XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU`). Il ne constitue pas une deuxième limite de réception.
+- L'API XTU expose `consolidation_minimum_batch_xtu`, afin que le client Android distingue la limite de réception du minimum de consolidation interne.

@@ -4,18 +4,18 @@ const BigNumber = require("bignumber.js");
 const { calculateGlobalUnitPrice, calculateDepositFundingAllocation } = require("./stock-accounting");
 
 const MAX_DEFAULT_STOCK = "300";
-// The minimum and maximum govern the accepted intake per user per rolling 7-day period.
-// The first-credit tranche is tracked separately by the batch-crediting worker.
-const MIN_DEPOSIT_AMOUNT = new BigNumber("70");
-const MAX_DEPOSIT_AMOUNT = new BigNumber("140");
-// Keep the first automatically credited tranche distinct from the rolling seven-day intake ceiling.
+const { DEPOSIT_MIN_AMOUNT, DEPOSIT_MAX_AMOUNT } = require("./deposit-limits");
+// Shared limits: 20 gross minimum and 100 gross maximum per deposit session for both BSC-USD and XTU.
+const MIN_DEPOSIT_AMOUNT = new BigNumber(DEPOSIT_MIN_AMOUNT);
+const MAX_DEPOSIT_AMOUNT = new BigNumber(DEPOSIT_MAX_AMOUNT);
+// Keep the first automatically credited tranche distinct from the per-session deposit ceiling.
 const MAX_INITIAL_CREDIT_TRANCHE_AMOUNT = new BigNumber(
   process.env.MAX_DEPOSIT_INITIAL_CREDIT_BSC_USD || "100",
 );
 const SYSTEM_ADMIN_RESERVE_RATIO = new BigNumber(
   process.env.SYSTEM_ADMIN_RESERVE_RATIO || "0.10",
 );
-const DEPOSIT_COOLDOWN_DAYS = 7;
+const SYSTEM_FUNDED_PURCHASE_COOLDOWN_DAYS = 7;
 const DEPOSIT_BATCH_WINDOW_MINUTES = 60;
 const DISBURSEMENT_COOLDOWN_DAYS = 30;
 const DISBURSEMENT_RESERVATION_MINUTES = 60;
@@ -30,24 +30,10 @@ if (
   throw new RangeError("Deposit limits must be finite positive values with maximum >= minimum");
 }
 
-const DEPOSIT_COOLDOWN_MS = DEPOSIT_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+const SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS = SYSTEM_FUNDED_PURCHASE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
 const DEPOSIT_BATCH_WINDOW_MS = DEPOSIT_BATCH_WINDOW_MINUTES * 60 * 1000;
 const DISBURSEMENT_COOLDOWN_MS = DISBURSEMENT_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
 const DISBURSEMENT_RESERVATION_MS = DISBURSEMENT_RESERVATION_MINUTES * 60 * 1000;
-
-function classifyRollingDepositReceipt(rollingSevenDayGross) {
-  const gross = new BigNumber(rollingSevenDayGross);
-  if (!gross.isFinite() || gross.isNegative()) {
-    throw new RangeError("Rolling seven-day deposit gross must be finite and non-negative");
-  }
-  return {
-    allowed: gross.lte(MAX_DEPOSIT_AMOUNT),
-    status: gross.lte(MAX_DEPOSIT_AMOUNT) ? "eligible" : "pending_weekly",
-    rollingSevenDayGross: gross,
-    maximumSevenDayGross: new BigNumber(MAX_DEPOSIT_AMOUNT),
-    remainingCapacity: BigNumber.maximum(0, MAX_DEPOSIT_AMOUNT.minus(gross)),
-  };
-}
 
 function validateDepositAmount(amountValue) {
   const amount = new BigNumber(amountValue);
@@ -56,6 +42,9 @@ function validateDepositAmount(amountValue) {
   }
   if (amount.isLessThan(MIN_DEPOSIT_AMOUNT)) {
     return { allowed: false, reason: "below_minimum" };
+  }
+  if (amount.isGreaterThan(MAX_DEPOSIT_AMOUNT)) {
+    return { allowed: false, reason: "above_maximum" };
   }
   return {
     allowed: true,
@@ -192,7 +181,7 @@ function recordDateTimeToUtcMs(recordDate, recordTime) {
   return value;
 }
 
-async function getLastOnexDeposit(queryable, username, onexUsername) {
+async function getLastOneXSystemFundedPurchase(queryable, username, onexUsername) {
   const [rows] = await queryable.query(
     `SELECT id,record_date,record_time
      FROM activities
@@ -204,14 +193,14 @@ async function getLastOnexDeposit(queryable, username, onexUsername) {
   return rows.length ? rows[0] : null;
 }
 
-function assessDepositCooldown(lastDeposit, nowMs = Date.now()) {
-  if (!lastDeposit) return { allowed: true, remainingMs: 0, lastDepositMs: null };
-  const lastDepositMs = recordDateTimeToUtcMs(lastDeposit.record_date, lastDeposit.record_time);
-  if (lastDepositMs === null || lastDepositMs > nowMs) {
-    return { allowed: false, remainingMs: DEPOSIT_COOLDOWN_MS, lastDepositMs: null, invalidDate: true };
+function assessOneXSystemFundingCooldown(lastSystemPurchase, nowMs = Date.now()) {
+  if (!lastSystemPurchase) return { allowed: true, remainingMs: 0, lastPurchaseMs: null };
+  const lastPurchaseMs = recordDateTimeToUtcMs(lastSystemPurchase.record_date, lastSystemPurchase.record_time);
+  if (lastPurchaseMs === null || lastPurchaseMs > nowMs) {
+    return { allowed: false, remainingMs: SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS, lastPurchaseMs: null, invalidDate: true };
   }
-  const remainingMs = Math.max(0, DEPOSIT_COOLDOWN_MS - (nowMs - lastDepositMs));
-  return { allowed: remainingMs === 0, remainingMs, lastDepositMs };
+  const remainingMs = Math.max(0, SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS - (nowMs - lastPurchaseMs));
+  return { allowed: remainingMs === 0, remainingMs, lastPurchaseMs };
 }
 
 function formatUtcRecordDateTime(timestampMs) {
@@ -226,11 +215,21 @@ function formatUtcRecordDateTime(timestampMs) {
   return [Number(`${yyyy}${mm}${dd}`), `${hh}${mi}${ss}`];
 }
 
-function getWeeklyReleaseAt(pendingSinceMs, lastDepositMs) {
-  const pendingRelease = Number(pendingSinceMs) + DEPOSIT_COOLDOWN_MS;
-  const depositRelease = lastDepositMs == null ? 0 : Number(lastDepositMs) + DEPOSIT_COOLDOWN_MS;
-  if (!Number.isSafeInteger(pendingRelease) || pendingRelease <= 0) throw new TypeError("Invalid pending timestamp");
-  return Math.max(pendingRelease, depositRelease);
+function getSystemFundingCooldownReleaseAt(pendingSinceMs, lastPurchaseMs) {
+  // The weekly rule measures time from the last OneX-funded purchase, never
+  // from the amount received or from when a later seller-funded deposit queued.
+  if (lastPurchaseMs != null) {
+    const cooldownRelease = Number(lastPurchaseMs) + SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS;
+    if (!Number.isSafeInteger(cooldownRelease) || cooldownRelease <= 0) {
+      throw new TypeError("Invalid last OneX-funded purchase timestamp");
+    }
+    return cooldownRelease;
+  }
+  const pendingRelease = Number(pendingSinceMs) + SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS;
+  if (!Number.isSafeInteger(pendingRelease) || pendingRelease <= 0) {
+    throw new TypeError("Invalid pending timestamp");
+  }
+  return pendingRelease;
 }
 
 module.exports = {
@@ -239,19 +238,18 @@ module.exports = {
   MAX_DEPOSIT_AMOUNT,
   MAX_INITIAL_CREDIT_TRANCHE_AMOUNT,
   SYSTEM_ADMIN_RESERVE_RATIO,
-  DEPOSIT_COOLDOWN_DAYS,
-  DEPOSIT_COOLDOWN_MS,
+  SYSTEM_FUNDED_PURCHASE_COOLDOWN_DAYS,
+  SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS,
   DEPOSIT_BATCH_WINDOW_MINUTES,
   DEPOSIT_BATCH_WINDOW_MS,
   DISBURSEMENT_COOLDOWN_DAYS,
   DISBURSEMENT_COOLDOWN_MS,
   DISBURSEMENT_RESERVATION_MINUTES,
   DISBURSEMENT_RESERVATION_MS,
-  getLastOnexDeposit,
-  assessDepositCooldown,
+  getLastOneXSystemFundedPurchase,
+  assessOneXSystemFundingCooldown,
   formatUtcRecordDateTime,
-  getWeeklyReleaseAt,
+  getSystemFundingCooldownReleaseAt,
   validateDepositAmount,
-  classifyRollingDepositReceipt,
   calculateMinimumDepositCapacity,
 };

@@ -18,10 +18,10 @@ test("XTU withdrawal quote deducts gas first and the contract applies 0.1% exact
   assert.equal(quote.estimatedCombinedFees.toFixed(18), "0.199900000000000000");
 });
 
-test("XTU withdrawal amount validation enforces a gross minimum of one token and 18 decimals", () => {
-  assert.equal(validateWithdrawalRequestAmount("1").toFixed(), "1");
+test("XTU withdrawal amount validation enforces a gross minimum of five tokens and 18 decimals", () => {
+  assert.equal(validateWithdrawalRequestAmount("5").toFixed(), "5");
   assert.equal(validateWithdrawalRequestAmount("12.000000000000000001").toFixed(), "12.000000000000000001");
-  assert.throws(() => validateWithdrawalRequestAmount("0.999999999999999999"), /minimum gross XTU withdrawal is 1/);
+  assert.throws(() => validateWithdrawalRequestAmount("4.999999999999999999"), /minimum gross XTU withdrawal is 5/);
   assert.throws(() => validateWithdrawalRequestAmount("1.0000000000000000001"), /18 decimal places/);
   assert.throws(() => validateWithdrawalRequestAmount("1e2"), /decimal/);
 });

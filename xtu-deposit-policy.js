@@ -1,6 +1,7 @@
 "use strict";
 
 const BigNumber = require("bignumber.js");
+const { DEPOSIT_MIN_AMOUNT, DEPOSIT_MAX_AMOUNT } = require("./deposit-limits");
 
 BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP });
 
@@ -8,8 +9,8 @@ const XTU_DECIMALS = 18;
 const XTU_SCALE = 10n ** 18n;
 const XTU_TRANSFER_FEE_BPS = 10n;
 const BPS_DENOMINATOR = 10_000n;
-const MIN_XTU_DEPOSIT = new BigNumber("70");
-const MAX_XTU_DEPOSIT = new BigNumber("140");
+const MIN_XTU_DEPOSIT = new BigNumber(DEPOSIT_MIN_AMOUNT);
+const MAX_XTU_DEPOSIT = new BigNumber(DEPOSIT_MAX_AMOUNT);
 const MAX_INITIAL_CREDIT_XTU = new BigNumber(process.env.XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU || "100");
 const DEPOSIT_BATCH_WINDOW_MS = 60 * 60 * 1000;
 const DEPOSIT_MAX_INITIAL_GROUPING_MS = 30 * 24 * 60 * 60 * 1000;
@@ -59,7 +60,7 @@ function calculateXtuDepositCredit({
   const gas = nonNegative(actualGasFeeBscUsd, "Actual BSC gas fee");
   const price = positive(globalUnitPrice, "Global unit price");
   const trancheCap = positive(maximumInitialCreditXtu, "Maximum initial XTU credit tranche");
-  if (trancheCap.gt(MAX_XTU_DEPOSIT)) throw new RangeError("The initial XTU credit tranche cannot exceed the maximum weekly intake.");
+  if (trancheCap.gt(MAX_XTU_DEPOSIT)) throw new RangeError("The initial XTU credit tranche cannot exceed the per-session deposit maximum.");
   const feeRate = calculateDepositFeeRate(tfeesRatePercent, globalDisbursementActive);
   const depositFee = globalDisbursementActive
     ? new BigNumber(0)
@@ -125,7 +126,7 @@ function calculateXtuDepositTranche({
   }
   const firstTrancheCap = positive(maximumInitialCreditXtu, "Maximum first XTU credit tranche");
   if (firstTrancheCap.gt(MAX_XTU_DEPOSIT)) {
-    throw new RangeError("The first XTU credit tranche cannot exceed the maximum weekly intake.");
+    throw new RangeError("The first XTU credit tranche cannot exceed the per-session deposit maximum.");
   }
   const tranche = sequence === 0 ? BigNumber.minimum(remaining, firstTrancheCap) : remaining;
   const initialAsset = tranche.dividedBy(total.globalUnitPrice).decimalPlaces(30, BigNumber.ROUND_DOWN);
@@ -173,18 +174,61 @@ function allocateBatchGasByGross(rows, totalGasFee, key = "event_identity") {
   });
 }
 
-function classifyWeeklyDeposit({ previousSevenDayGross, incomingGross, currentBatchGross = 0 }) {
-  const previous = nonNegative(previousSevenDayGross, "Previous seven-day XTU deposits");
+function selectXtuConsolidationBatches(candidates, minimumConsolidationAmount = "100") {
+  if (!Array.isArray(candidates)) throw new TypeError("XTU consolidation candidates must be an array.");
+  const minimum = positive(minimumConsolidationAmount, "Minimum XTU consolidation batch");
+  if (minimum.lt("100")) throw new RangeError("The minimum XTU consolidation batch cannot be below 100 XTU.");
+
+  const ordered = [...candidates].sort((a, b) => {
+    const left = BigInt(String(a.id));
+    const right = BigInt(String(b.id));
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
+  const selected = [];
+  let received = new BigNumber(0);
+  let grossReturned = new BigNumber(0);
+  for (const batch of ordered) {
+    const batchReceived = positive(batch.hot_wallet_received_amount, "Hot Wallet received amount");
+    const batchGross = positive(batch.gross_amount, "Gross returned XTU amount");
+    selected.push(batch);
+    received = received.plus(batchReceived);
+    grossReturned = grossReturned.plus(batchGross);
+    if (received.gte(minimum)) {
+      return {
+        batches: selected,
+        totalHotWalletReceivedXtu: received,
+        totalGrossReturnedXtu: grossReturned,
+        minimumConsolidationAmount: minimum,
+      };
+    }
+  }
+  return null;
+}
+
+function classifyDepositSession({ incomingGross, currentBatchGross = 0 }) {
   const incoming = positive(incomingGross, "Incoming XTU deposit");
-  const batch = nonNegative(currentBatchGross, "Current XTU deposit batch");
-  const projectedWeekly = previous.plus(incoming);
-  const projectedBatch = batch.plus(incoming);
-  if (incoming.gt(MAX_XTU_DEPOSIT) || projectedBatch.gt(MAX_XTU_DEPOSIT) || projectedWeekly.gt(MAX_XTU_DEPOSIT)) {
-    return { allowed: false, status: "pending_weekly", projectedWeekly, projectedBatch };
+  const batch = nonNegative(currentBatchGross, "Current XTU deposit session");
+  const projectedSession = batch.plus(incoming);
+  if (incoming.gt(MAX_XTU_DEPOSIT)) {
+    return {
+      allowed: false,
+      status: "pending_support",
+      reason: "deposit_amount_above_maximum",
+      projectedSession,
+    };
+  }
+  if (projectedSession.gt(MAX_XTU_DEPOSIT)) {
+    return {
+      allowed: false,
+      status: "pending_support",
+      reason: "deposit_session_above_maximum",
+      projectedSession,
+    };
   }
   return {
     allowed: true,
-    status: projectedBatch.gte(MIN_XTU_DEPOSIT) ? "eligible" : "collecting", projectedWeekly, projectedBatch,
+    status: projectedSession.gte(MIN_XTU_DEPOSIT) ? "eligible" : "collecting",
+    projectedSession,
   };
 }
 
@@ -229,7 +273,8 @@ module.exports = {
   calculateXtuDepositCredit,
   calculateXtuDepositTranche,
   allocateBatchGasByGross,
-  classifyWeeklyDeposit,
+  classifyDepositSession,
+  selectXtuConsolidationBatches,
   grossForExactNetRaw,
   calculateXtuSettlementQuote,
 };

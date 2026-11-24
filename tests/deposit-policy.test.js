@@ -7,30 +7,48 @@ const {
   MAX_DEPOSIT_AMOUNT,
   DEPOSIT_BATCH_WINDOW_MINUTES,
   validateDepositAmount,
-  classifyRollingDepositReceipt,
+  getLastOneXSystemFundedPurchase,
+  assessOneXSystemFundingCooldown,
+  SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS,
   calculateMinimumDepositCapacity,
 } = require("../deposit-policy");
 
-test("automatic deposit receipt bounds are fixed at 70 and 140 BSC-USD, with a separate 100 BSC-USD first-credit tranche", () => {
-  assert.equal(MIN_DEPOSIT_AMOUNT.toFixed(), "70");
-  assert.equal(MAX_DEPOSIT_AMOUNT.toFixed(), "140");
+test("automatic deposit receipt bounds are fixed at 20 and 100 BSC-USD, with a separate 100 BSC-USD first-credit tranche", () => {
+  assert.equal(MIN_DEPOSIT_AMOUNT.toFixed(), "20");
+  assert.equal(MAX_DEPOSIT_AMOUNT.toFixed(), "100");
   assert.equal(DEPOSIT_BATCH_WINDOW_MINUTES, 60);
 });
 
-test("the rolling seven-day receipt minimum is enforced while the first-credit tranche remains separately capped at 100", () => {
-  assert.equal(validateDepositAmount("70").allowed, true);
-  assert.equal(validateDepositAmount("140").allowed, true);
-  assert.equal(validateDepositAmount("69.999999999999999999").reason, "below_minimum");
-  const oversized = validateDepositAmount("140.000000000000000001");
-  assert.equal(oversized.allowed, true);
-  assert.equal(oversized.exceedsInitialCreditLimit, true);
-  assert.equal(oversized.initialCreditLimit.toFixed(), "100");
+test("the 20-100 gross limits apply to each 60-minute deposit session, independently of weekly funding source", () => {
+  assert.equal(validateDepositAmount("20").allowed, true);
+  assert.equal(validateDepositAmount("100").allowed, true);
+  assert.equal(validateDepositAmount("19.999999999999999999").reason, "below_minimum");
+  const oversized = validateDepositAmount("100.000000000000000001");
+  assert.equal(oversized.allowed, false);
+  assert.equal(oversized.reason, "above_maximum");
 });
 
-test("the rolling seven-day BSC-USD receipt ceiling is enforced independently of the first credit tranche", () => {
-  assert.equal(classifyRollingDepositReceipt("140").allowed, true);
-  assert.equal(classifyRollingDepositReceipt("140.000000000000000001").status, "pending_weekly");
-  assert.equal(classifyRollingDepositReceipt("80").remainingCapacity.toFixed(), "60");
+test("the weekly limit counts one OneX-funded purchase regardless of amount", async () => {
+  let capturedSql = "";
+  let capturedParams = null;
+  const queryable = {
+    async query(sql, params) {
+      capturedSql = sql;
+      capturedParams = params;
+      return [[{ id: 17, record_date: 20261117, record_time: "120000" }]];
+    },
+  };
+  const lastPurchase = await getLastOneXSystemFundedPurchase(queryable, "USER001", "OneX");
+  assert.equal(lastPurchase.id, 17);
+  assert.match(capturedSql, /WHERE sender=\? AND receiver=\? AND type=2/);
+  assert.doesNotMatch(capturedSql, /SUM\(|amount\s*[<>]|gross_amount|xtu_amount/i);
+  assert.deepEqual(capturedParams, ["OneX", "USER001"]);
+
+  const purchaseTime = Date.UTC(2026, 10, 17, 12, 0, 0);
+  const samePurchaseCooldown = assessOneXSystemFundingCooldown(lastPurchase, purchaseTime + 6 * 24 * 60 * 60 * 1000);
+  assert.equal(samePurchaseCooldown.allowed, false);
+  assert.equal(samePurchaseCooldown.remainingMs, 24 * 60 * 60 * 1000);
+  assert.equal(assessOneXSystemFundingCooldown(lastPurchase, purchaseTime + SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS).allowed, true);
 });
 
 test("invalid, zero and negative deposit amounts are rejected", () => {
@@ -42,7 +60,7 @@ test("invalid, zero and negative deposit amounts are rejected", () => {
 
 test("deposit capacity includes the minimum deposit net of tfees", () => {
   const capacity = calculateMinimumDepositCapacity({
-    currentBalanceInitialAsset: "232.1",
+    currentBalanceInitialAsset: "280.6",
     totalUnitsPrice: "18000000",
     backedUnits: "18000000",
     inactiveInitialAsset: "0",
@@ -53,16 +71,16 @@ test("deposit capacity includes the minimum deposit net of tfees", () => {
     maximumUserXtu: "300",
   });
 
-  assert.equal(capacity.minimumGrossAmount.toFixed(2), "70.00");
-  assert.equal(capacity.minimumTfeesAmount.toFixed(2), "2.10");
-  assert.equal(capacity.minimumNetAmount.toFixed(2), "67.90");
+  assert.equal(capacity.minimumGrossAmount.toFixed(2), "20.00");
+  assert.equal(capacity.minimumTfeesAmount.toFixed(2), "0.60");
+  assert.equal(capacity.minimumNetAmount.toFixed(2), "19.40");
   assert.equal(capacity.projectedBalanceXtu.toFixed(2), "300.00");
   assert.equal(capacity.allowed, true);
 });
 
 test("deposit capacity becomes unavailable when the minimum net deposit exceeds 300 XTU", () => {
   const capacity = calculateMinimumDepositCapacity({
-    currentBalanceInitialAsset: "232.11",
+    currentBalanceInitialAsset: "280.61",
     totalUnitsPrice: "18000000",
     backedUnits: "18000000",
     inactiveInitialAsset: "0",
@@ -79,7 +97,7 @@ test("deposit capacity becomes unavailable when the minimum net deposit exceeds 
 
 test("system-funded minimum deposit capacity includes retained tfees in the post-deposit price", () => {
   const capacity = calculateMinimumDepositCapacity({
-    currentBalanceInitialAsset: "232.1",
+    currentBalanceInitialAsset: "280.6",
     totalUnitsPrice: "18000000",
     backedUnits: "18000000",
     inactiveInitialAsset: "0",

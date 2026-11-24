@@ -35,7 +35,7 @@ The Chainstack endpoint shown in `.env.example` is deliberately fictional. Repla
 
 ## 4. Financial invariants preserved
 
-This RPC routing change does not introduce an amount filter and does not discard low-value incoming transfers. Every positive, finalized incoming `Transfer` log matching the treasury continues into the existing financial processing pipeline. The existing BSC-USD reception limits (70–140 BSC-USD per user over a rolling seven-day period), 60-minute grouping window, separate 100 BSC-USD first-credit-tranche cap, remainder handling, registered-wallet checks, account-capacity checks, `tfees`, reserve priority and administrative hold rules remain the responsibility of the financial deposit pipeline.
+This RPC routing change does not introduce an amount filter and does not discard low-value incoming transfers. Every positive, finalized incoming `Transfer` log matching the treasury continues into the existing financial processing pipeline. The existing BSC-USD reception limits (20 BSC-USD gross minimum and 100 BSC-USD gross maximum per 60-minute session), 60-minute grouping window, separate 100 BSC-USD first-credit-tranche cap, remainder handling, registered-wallet checks, account-capacity checks, `tfees`, reserve priority and administrative hold rules remain the responsibility of the financial deposit pipeline. There is no rolling seven-day incoming-amount ceiling: the separate weekly rule permits one purchase funded from OneX system reserves per user, regardless of amount. Further purchases may be credited exclusively from active seller-campaign reserves without consuming that OneX-funded allowance.
 
 No SQL migration or deposit/disbursement rule change is introduced by this routing update.
 

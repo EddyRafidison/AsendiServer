@@ -18,7 +18,7 @@ function baseline(overrides = {}) {
     currentUnitPrice: "1",
     tfeesRatePercent: "3",
     maximumUserXtu: "300",
-    weeklyCooldownAllowed: true,
+    systemFundingAllowed: true,
     globalBonusRatePercent: "0",
     remainingAdminReserveInitialAsset: "1800000",
     alreadyReservedAdminBonusInitialAsset: "0",
@@ -60,16 +60,27 @@ test("credit planner finds a partial tranche under the 300 XTU account ceiling",
 
 test("weekly cooldown blocks system-funded tranche but allows seller-funded tranche", () => {
   const systemOnly = findMaximumDepositCredit({
-    ...baseline({ totalSellerReserve: "0", availableSellerReserve: "0", weeklyCooldownAllowed: false }),
+    ...baseline({ totalSellerReserve: "0", availableSellerReserve: "0", systemFundingAllowed: false }),
     targetGrossAmount: "20",
   });
   assert.equal(systemOnly.allowed, false);
-  assert.equal(systemOnly.reason, "weekly_limit");
+  assert.equal(systemOnly.reason, "system_funding_cooldown");
 
   const sellerOnly = findMaximumDepositCredit({
-    ...baseline({ inactiveInitialAsset: "0", totalSellerReserve: "1000", availableSellerReserve: "1000", weeklyCooldownAllowed: false }),
+    ...baseline({
+      inactiveInitialAsset: "5000",
+      backedUnits: "18000000",
+      totalUnitsPrice: "18005000",
+      totalSellerReserve: "1000",
+      availableSellerReserve: "1000",
+      systemFundingAllowed: false,
+    }),
     targetGrossAmount: "20",
   });
   assert.equal(sellerOnly.allowed, true);
   assert.equal(sellerOnly.grossAmount.toFixed(2), "20.00");
+  assert.equal(sellerOnly.allocation.consumedInactive.toFixed(8), "0.00000000");
+  assert.equal(sellerOnly.allocation.consumedBacked.toFixed(8), "0.00000000");
+  assert.equal(sellerOnly.allocation.consumedSellers.gt(0), true);
+  assert.equal(sellerOnly.allocation.systemInitialAsset.toFixed(8), "0.00000000");
 });
