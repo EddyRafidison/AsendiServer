@@ -1,0 +1,998 @@
+ONEXSERVER — SPÉCIFICATION CONSOLIDÉE DES RÈGLES XTU ET BSC-USD
+Version de référence : 25 novembre 2026
+Révision : 4 — traitement événementiel sans fenêtre de 60 minutes, échéance irréversible de 30 jours et protection comptable des XTU avant consolidation
+Statut : règles métier confirmées ; base de référence pour l'implémentation
+
+======================================================================
+0. PORTÉE, PRIORITÉ ET PRINCIPES
+======================================================================
+
+Cette spécification consolide :
+- les règles XTU déjà validées ;
+- les règles communes de dépôt BSC-USD et XTU ;
+- la limite hebdomadaire portant uniquement sur les achats financés par ONEX ;
+- le traitement partiel des dépôts supérieurs à 100 ;
+- le contrôle comptable de common.xtu_wallets ;
+- la suppression de toute fenêtre d'attente de 60 minutes et le contrôle d'éligibilité après chaque transfert finalisé ;
+- l'échéance fixe de 30 jours pour compléter et créditer chaque dossier de dépôt, puis l'affectation irréversible du reliquat non crédité aux réserves communes ;
+- la séparation entre crédit d'un dépôt XTU et consolidation interne XTU ;
+- la protection comptable des XTU reçus dans le Hot Wallet avant leur consolidation par lots d'au moins 100 XTU, sans exception à l'expiration ;
+- le traitement des dépôts XTU pendant le disbursement global et leur règlement exclusif en XTU hors photographie initiale ;
+- le règlement vendeur intégral selon FIFO ;
+- les règles de remboursement limitées aux transferts des deux tokens officiels BSC-USD/XTU provenant d'adresses expéditrices non enregistrées ;
+- l'exclusion des faux tokens, tokens non reconnus et transferts effectués hors BNB Smart Chain ;
+- les obligations de documentation, d'audit, de sécurité et de tests.
+
+Le projet n'étant pas déployé :
+- ne pas ajouter de script de migration SQL ;
+- intégrer le schéma final dans db.js et dans l'initialisation des nouvelles bases ;
+- conserver les mécanismes de transaction, verrouillage, idempotence et rapprochement blockchain ;
+- ne pas déclarer un test blockchain, un déploiement ou une transaction réelle comme effectué sans exécution réelle ;
+- ne pas conserver d'anciens endpoints « recharge » comme interface officielle.
+
+PRINCIPE CENTRAL : XTU est une voie de dépôt distincte de BSC-USD, mais les deux voies suivent les mêmes règles métier de dépôt, de crédit, de financement, de limites, de mise en attente, d'échéance de 30 jours, d'affectation aux réserves communes et de remboursement. Les seules différences opérationnelles propres au dépôt XTU sont les événements et commissions du contrat, le suivi de common.xtu_wallets, la provision et le rapprochement du gas, ainsi que la consolidation blockchain Hot Wallet → Distribution Wallet par lots d'au moins 100 XTU. Cette consolidation ne retarde jamais le crédit et ne peut jamais être forcée sous le seuil, même à l'expiration d'un dossier.
+
+Le remboursement exceptionnel d'un transfert inconnu est possible uniquement si le transfert concerne exactement le contrat BSC-USD officiel ou le contrat XTU officiel sur BNB Smart Chain (Chain ID 56), et si l'adresse expéditrice n'est enregistrée dans aucun compte OneX au moment de la réception. Un token inconnu, contrefait, portant un symbole similaire, un autre contrat BEP-20 ou un transfert réalisé sur un autre réseau n'est pas remboursable par OneX.
+
+Les registres, hashes, événements, lots, frais et rapprochements BSC-USD et XTU restent strictement séparés. Deux tokens ne peuvent jamais participer au même dépôt.
+
+======================================================================
+1. CONFIGURATION COMMUNE DES DÉPÔTS
+======================================================================
+
+Les seules limites configurables de dépôt, communes à BSC-USD et XTU, sont :
+
+DEPOSIT_MIN_AMOUNT=20
+DEPOSIT_MAX_AMOUNT=100
+
+`DEPOSIT_MIN_AMOUNT` fixe le minimum cumulé du dossier à atteindre. `DEPOSIT_MAX_AMOUNT` fixe le plafond de chaque tranche automatique de crédit, et non un plafond du montant total reçu : tout excédent au-delà de 100 reste dans le même dossier en attente selon la section 3.3. Ces limites s'appliquent quelle que soit l'origine du financement ultérieur (réserves ONEX ou réserves vendeurs).
+
+Ne pas conserver de limites XTU parallèles telles que XTU_DEPOSIT_MIN_AMOUNT ou XTU_DEPOSIT_MAX_AMOUNT. Ne pas réintroduire les anciennes limites 70-140.
+
+Paramètres de traitement communs :
+
+DEPOSIT_PENDING_EXPIRATION_DAYS=30
+
+- minimum brut à atteindre pour qu'un dossier soit admissible : 20 unités du token concerné ;
+- plafond d'une tranche automatique de crédit : 100 unités du token concerné ;
+- aucune fenêtre de 60 minutes, aucun temporisateur de collecte et aucune clôture différée : chaque transfert finalisé est contrôlé immédiatement ;
+- le délai maximal d'un dossier est de 30 jours consécutifs (30 × 24 heures) à partir du premier transfert finalisé affecté à ce dossier ; cette échéance est immuable et n'est pas repoussée par les transferts suivants ;
+- à l'échéance, tout montant encore non crédité est irréversiblement affecté aux réserves communes selon les règles de la section 4 et, pour XTU, de la section 6 ;
+- limite de valorisation individuelle : 300 XTU, calculée selon le prix individuel effectif ;
+- les dépôts sont identifiés et traités par utilisateur ET par token ;
+- les tranches successives d'un même dossier ne créent pas de nouveaux achats ONEX et ne comptent pas plusieurs fois dans la limite hebdomadaire ONEX ;
+- un seul dossier de collecte sous le minimum peut être ouvert à la fois pour un même utilisateur et un même token ; il reste ouvert pour recevoir d'autres transferts du même utilisateur et du même token jusqu'à l'atteinte du minimum ou l'expiration des 30 jours ; dès que le minimum est atteint, la collecte de ce dossier est clôturée et le traitement du crédit démarre immédiatement ; tout nouveau transfert ultérieur ouvre un nouveau dossier indépendant.
+
+Ne pas conserver de configuration de fenêtre telle que DEPOSIT_BATCH_WINDOW_MINUTES, DEPOSIT_BATCH_WINDOW_MS ou XTU_DEPOSIT_BATCH_WINDOW_MS. Ne pas conserver de mécanisme qui retarde le traitement après l'atteinte du minimum.
+
+Un dépôt BSC-USD et un dépôt XTU constituent toujours deux dossiers indépendants. Exemples :
+- 15 BSC-USD + 5 XTU ne forment pas un dépôt admissible de 20 ;
+- 80 BSC-USD + 40 XTU ne forment pas un dépôt de 120 ;
+- ces deux paiements peuvent être traités en parallèle, mais leurs minima, plafonds, frais, lots, statuts, crédits et remboursements sont séparés.
+
+======================================================================
+2. RÈGLE DE FINANCEMENT HEBDOMADAIRE ONEX
+======================================================================
+
+La limite de sept jours concerne UNIQUEMENT le droit d'obtenir un achat financé par les réserves système ONEX. Elle ne limite jamais le montant des transferts entrants ni le total reçu par l'utilisateur.
+
+Règles :
+- un utilisateur peut bénéficier d'au plus un achat financé positivement par ONEX pendant toute période glissante de sept jours ;
+- le montant de cet achat est sans importance : même un achat de faible montant consomme le droit ;
+- la règle est commune à BSC-USD et XTU ; un achat ONEX financé par BSC-USD bloque donc un autre achat ONEX financé par XTU pendant les sept jours suivants, et inversement ;
+- toute participation positive des réserves ONEX consomme le droit une seule fois pour le dossier d'achat concerné ;
+- les tranches ultérieures du même dossier ne consomment pas une deuxième fois le droit ;
+- un achat financé exclusivement par les réserves vendeurs ne consomme pas le droit hebdomadaire ONEX ;
+- un achat mixte ONEX + vendeurs consomme le droit ONEX dès lors qu'une part positive est financée par ONEX ;
+- le délai de sept jours est calculé depuis la date du dernier achat réellement financé par ONEX, et non depuis la réception d'un paiement ou la mise en attente du dépôt.
+
+Lorsque le droit ONEX est déjà utilisé :
+- ne pas financer un nouvel achat avec les réserves ONEX ;
+- chercher un financement exclusif par les réserves de campagnes vendeurs actives et disponibles ;
+- si les réserves vendeurs disponibles sont insuffisantes, conserver le crédit en attente et le réévaluer ;
+- ne jamais réutiliser une réserve déjà consommée ou engagée.
+
+L'activation d'une campagne vendeur est volontaire. Le système ne bloque pas automatiquement le principal d'un vendeur sans son accord. L'activation valide crée le registre de campagne et immobilise la part de principal prévue par les règles vendeur, notamment 50 % lorsque cette règle est applicable.
+
+Il n'existe aucun plafond hebdomadaire de montant reçu. Il existe uniquement la règle d'un achat ONEX sur sept jours.
+
+======================================================================
+3. RÉCEPTION ET REGROUPEMENT DES DÉPÔTS
+======================================================================
+
+3.1. Reconnaissance blockchain et périmètre des actifs acceptés
+
+OneX accepte exclusivement les deux contrats BEP-20 officiellement configurés sur BNB Smart Chain Mainnet (Chain ID 56) : le contrat Binance-Peg BSC-USD configuré et le contrat XTU officiel configuré.
+
+BSC-USD :
+- surveiller exclusivement l'adresse exacte du contrat Binance-Peg BSC-USD configuré sur BNB Smart Chain ;
+- vérifier le réseau, le contrat, le hash, l'événement Transfer, le bloc, l'horodatage et la finalité ;
+- reconnaître automatiquement un utilisateur uniquement si l'adresse expéditrice réelle du transfert est enregistrée et associée à son compte OneX ;
+- si le contrat est bien le BSC-USD officiel mais que l'adresse expéditrice n'est enregistrée dans aucun compte OneX au moment de la réception, classer le transfert dans le registre des transferts inconnus ; il n'est pas crédité automatiquement et relève uniquement de la procédure administrative décrite à la section 8.
+
+XTU :
+- surveiller exclusivement l'adresse exacte du contrat XTU officiel configuré sur BNB Smart Chain Mainnet, Chain ID 56 ;
+- vérifier le contrat, l'expéditeur, le destinataire Hot Wallet, le hash, les logs, les événements Transfer et TransferWithFee, le bloc et la finalité ;
+- reconstruire le brut envoyé, le montant reçu par le Hot Wallet et la commission transférée au Distribution Wallet ;
+- reconnaître automatiquement un utilisateur uniquement si l'adresse expéditrice réelle est enregistrée et associée à son compte OneX ;
+- si le contrat est bien le XTU officiel mais que l'adresse expéditrice n'est enregistrée dans aucun compte OneX au moment de la réception, classer le transfert dans le registre des transferts inconnus ; il n'est pas crédité automatiquement et relève uniquement de la procédure administrative décrite à la section 8.
+
+Exclusions communes :
+- tout token autre que les deux contrats officiels ci-dessus est ignoré par les scanners de dépôt et n'est ni crédité ni admis dans le workflow de remboursement ;
+- les tokens contrefaits, tokens d'imitation, tokens portant un symbole ou un nom similaire, autres contrats BEP-20 et actifs non pris en charge ne donnent aucun droit à remboursement ;
+- tout transfert effectué sur un réseau autre que BNB Smart Chain Mainnet (Chain ID 56), ou vers une adresse qui n'est pas l'adresse de réception officielle indiquée par OneX, n'est pas un dépôt admissible et n'est pas couvert par la procédure de remboursement ;
+- ne jamais déduire l'identité ou la nature d'un token de son seul nom, symbole, logo ou nombre de décimales : vérifier l'adresse exacte du contrat et le réseau.
+
+Pour les deux tokens acceptés, WebSocket n'est qu'un signal de réveil. La preuve financière repose sur le scanner HTTP, les événements vérifiés, le reçu et la finalité blockchain. Les événements provenant de contrats non acceptés ne doivent jamais être utilisés pour créer un dépôt ou un dossier de remboursement.
+
+3.2. Traitement événementiel immédiat — suppression définitive du délai de 60 minutes
+
+- aucun délai de 60 minutes n'est requis ou conservé pour BSC-USD ou XTU ;
+- chaque transfert détecté, vérifié et finalisé par le scanner HTTP déclenche immédiatement l'affectation à un dossier et une nouvelle évaluation d'éligibilité ;
+- le WebSocket reste uniquement un signal de réveil ; il ne constitue jamais la preuve du paiement ;
+- le premier transfert finalisé d'un utilisateur pour un token donné ouvre un dossier de collecte (un seul dossier sous le minimum ouvert par utilisateur et par token) et fixe une échéance immuable à `first_finalized_at + 30 × 24 heures` ;
+- tant que le cumul finalisé de ce dossier est inférieur à 20 unités, les transferts suivants du même utilisateur et du même token sont ajoutés au dossier ouvert ; chaque transfert ajouté est enregistré séparément avec son hash, son log index, son montant, son horodatage et sa finalité ;
+- les transferts BSC-USD et XTU ne sont jamais regroupés entre eux ; chaque utilisateur peut avoir des dossiers indépendants pour les deux tokens ;
+- dès que le cumul du dossier atteint ou dépasse 20 unités, la collecte de ce dossier est clôturée immédiatement et le serveur lance sans temporisation les contrôles de crédit, de plafond, de capacité, de financement, de réserves et de comptabilité ;
+- si les autres conditions sont réunies, le crédit de la partie admissible commence immédiatement ; s'il existe une restriction de capacité, de réserve, de financement ou un contrôle comptable non résolu, la partie concernée reste en attente jusqu'à résolution ou jusqu'à l'échéance de 30 jours ;
+- après clôture de la collecte, tout nouveau transfert du même utilisateur et du même token ouvre un nouveau dossier avec sa propre échéance de 30 jours ; il ne prolonge jamais l'échéance d'un dossier existant ;
+- le dossier conserve son échéance initiale même si plusieurs transferts sont ajoutés avant l'atteinte du minimum ; un transfert supplémentaire ne remet jamais le compteur à zéro ;
+- si le minimum de 20 n'est pas atteint à l'échéance, la totalité du montant du dossier encore non créditée est affectée irréversiblement aux réserves communes ;
+- si le minimum a été atteint mais qu'une partie reste non créditée à l'échéance, seul le reliquat non crédité est affecté irréversiblement aux réserves communes ; les tranches déjà créditées ne sont jamais reprises ;
+- aucun dossier expiré ne peut être réouvert ni crédité ultérieurement ; un transfert ultérieur ouvre un nouveau dossier ;
+- conserver le FIFO entre les dossiers d'un même utilisateur, sans permettre à un dossier plus récent de contourner un dossier antérieur bloqué ;
+- aucune fermeture, expiration ou reprise ne doit effacer les événements d'origine, hashes/logs, reçus ou traces de rapprochement.
+
+La suppression du délai de 60 minutes signifie que le traitement est déclenché par les événements finalisés et par les mises à jour d'état pertinentes, et non par une tâche qui attend une durée arbitraire. Les workers périodiques restent nécessaires uniquement comme mécanismes de reprise et de réconciliation des événements manqués.
+
+3.3. Plafond de 100 et traitement partiel des montants supérieurs
+
+Le plafond de 100 s'applique de la même manière aux dépôts financés ensuite par ONEX ou par les vendeurs.
+
+Lorsqu'un dossier dépasse 100 :
+- la partie admissible à une tranche de crédit ne dépasse jamais 100 unités du token ;
+- le montant excédentaire reste dans le même dossier, avec son propre montant restant et son historique ;
+- ne pas placer automatiquement la totalité du dépôt en attente simplement parce que le montant total dépasse 100 ;
+- ne pas supprimer, fusionner arbitrairement ni réattribuer l'excédent à un autre dossier ;
+- le crédit de l'excédent attend que la capacité de solde de l'utilisateur permette le crédit, sous réserve des autres règles de financement et de réserve ;
+- réexaminer les crédits en attente à chaque mise à jour du solde de l'utilisateur, notamment après vente, transfert, décaissement ou autre opération qui modifie sa capacité ;
+- conserver également un worker périodique de reprise pour récupérer les événements manqués, sans remplacer le déclenchement immédiat lors d'une mise à jour du solde ;
+- respecter le FIFO entre les dossiers en attente du même utilisateur ;
+- appliquer au plus 100 unités par tranche de crédit et par dossier ;
+- chaque tranche doit être idempotente et disposer d'une référence unique.
+
+Les frais ne doivent pas être recalculés ou prélevés deux fois lors des tranches successives. Le taux tfees applicable au dossier est figé selon la règle commune au moment de l'ouverture du dossier. Les frais de dépôt OneX sont imputés uniquement aux montants effectivement crédités, conformément aux règles communes BSC-USD/XTU et aux éventuelles suspensions. Le dossier conserve au minimum : total brut reçu, montant reconnu après commission contractuelle lorsqu'elle existe, montant crédité, frais OneX déjà prélevés, gas provisionné/réel imputé, montant restant, montant affecté aux réserves communes à l'expiration, et horodatages.
+
+La limite de solde utilisateur demeure indépendante du plafond de dépôt. Un crédit qui ferait dépasser la valorisation maximale individuelle de 300 XTU reste en attente jusqu'à ce que la capacité de solde soit suffisante, mais seulement jusqu'à l'échéance immuable de 30 jours du dossier. Après cette échéance, le reliquat non crédité est affecté aux réserves communes et ne peut plus être crédité à l'utilisateur.
+
+À chaque transfert reçu qui laisse un dossier en attente, envoyer une notification Telegram idempotente et précise. Le message doit indiquer le token, le montant reçu, le montant cumulé, le minimum restant à atteindre ou la capacité manquante, le montant encore en attente, la cause exacte du blocage, la date d'expiration et le temps restant. Selon le cas, inviter l'utilisateur à compléter le minimum ou à vendre/transférer/retirer une partie de ses actifs pour libérer la capacité de solde. Mentionner explicitement qu'à l'expiration le reliquat non crédité sera irréversiblement affecté aux réserves communes et ne sera pas remboursé. Ne pas envoyer un message générique lorsque la cause précise est connue.
+
+======================================================================
+4. CRÉDIT DES ACTIFS INITIAUX ET RÉSERVES
+======================================================================
+
+4.1. Calcul du crédit
+
+- convertir le montant créditable au prix global absolu common.unit_price ;
+- ne jamais utiliser le prix individuel du déposant pour calculer les actifs initiaux achetés ;
+- common.unit_price est un prix global absolu ; ne pas le recalculer automatiquement à la baisse à partir de total_units_price / backed_units ;
+- conserver le taux tfees applicable au dossier et l'appliquer une seule fois aux montants effectivement crédités ;
+- le crédit met à jour users_stock.balance avec les actifs initiaux calculés ;
+- ne pas redémarrer ou réinitialiser un cycle de rémunération existant à cause du dépôt ; les règles normales de démarrage/progression du cycle ne s'appliquent que lorsque le mécanisme d'accumulation le prévoit explicitement.
+
+4.1.1. Frais OneX propres au dépôt XTU
+
+- lorsque le dépôt XTU est accepté et traité hors cutoff de disbursement global, le taux des frais de dépôt OneX XTU est égal à 75 % du taux tfees normal : `xtu_deposit_fee_rate = tfees × 0.75` ; si tfees est exprimé en pourcentage, `xtu_deposit_fee = amount_XTU_eligible × tfees × 0.75 / 100` ;
+- après le cutoff du disbursement global, les nouveaux dépôts XTU sont suspendus comme les dépôts BSC-USD ; les transferts reçus sont tracés et traités selon l'état global approprié, sans crédit de dépôt ni création d'une nouvelle obligation ;
+- la commission contractuelle XTU de 0,1 % et le gas BNB restent applicables aux transactions XTU déjà autorisées et aux consolidations des lots antérieurement reçus ;
+- les frais de dépôt OneX ne sont prélevés qu'une fois sur les montants effectivement crédités ; aucune commission OneX n'est prélevée sur un reliquat non crédité qui expire et est affecté aux réserves communes ;
+- le taux tfees applicable au dossier est figé à l'ouverture du dossier ; les tranches ultérieures ne provoquent aucun recalcul rétroactif.
+
+4.2. Priorité des réserves
+
+Respecter l'ordre de financement suivant, sous réserve des règles hebdomadaires ONEX :
+1. common.inactive_init_asset ;
+2. réserves vendeurs actives et disponibles ;
+3. common.backed_units en dernier recours, uniquement selon les règles d'éligibilité.
+
+Lorsque le droit hebdomadaire ONEX est consommé, le financement d'un nouvel achat doit être limité aux réserves vendeurs. Ne pas utiliser indirectement les réserves système sous une autre qualification.
+
+Contrôler les réserves à la clôture du lot et immédiatement avant chaque crédit. Les fonds déjà réservés ou engagés sont indisponibles pour une seconde opération.
+
+4.3. Mise à jour du compte utilisateur
+
+Chaque crédit partiel est enregistré dans une table de crédits distincte avec : numéro de tranche, montant brut crédité, tfees, frais, montant net, actifs initiaux crédités, prix global appliqué, référence financière et horodatage.
+
+Après toute mise à jour du solde utilisateur, réveiller immédiatement les dossiers de dépôt qui attendent une capacité de solde. Conserver leur ordre FIFO et exclure ceux qui sont en examen administratif, en attente d'une finalité blockchain ou en conflit comptable.
+
+4.4. Échéance de 30 jours et affectation irréversible aux réserves communes
+
+- l'échéance de chaque dossier est fixée une seule fois à 30 jours après le premier transfert finalisé qui lui est affecté ; un transfert ajouté au dossier ne prolonge pas cette échéance ;
+- l'échéance s'applique à tous les montants non crédités : dépôt inférieur au minimum, excédent au-delà de 100, montant bloqué par la capacité du compte, financement insuffisant ou autre condition de crédit non satisfaite ;
+- à l'échéance, sous verrouillage transactionnel, calculer le reliquat exact non crédité, après exclusion des tranches déjà créditées, des frais déjà imputés et des montants déjà affectés ;
+- affecter ce reliquat aux réserves communes et augmenter `common.total_units_price` de sa valeur comptable éligible, après prise en compte des frais réels/provisions de gas qui lui sont imputables selon la règle de l'actif concerné ; pour XTU, cette écriture commune est exécutée par le mécanisme spécialisé de la section 6.8 et ne doit jamais être enregistrée une seconde fois par le worker générique d'expiration ;
+- cette affectation est définitive, irréversible et idempotente ; elle ne crée pas d'activité d'achat, ne modifie pas `users_stock.balance`, ne démarre pas de cycle de rémunération et ne crée aucun droit de remboursement ;
+- le montant expiré sort immédiatement du registre des crédits utilisateurs en attente et passe dans un état final `forfeited_to_common_reserve` ou équivalent ; aucune modification ultérieure du solde utilisateur ne peut le réactiver ;
+- le traitement doit produire une écriture d'audit liant le dossier, ses transferts sources, le montant expiré, la valorisation, le prix de référence éventuel, les provisions/frais, la ligne `common.total_units_price`, le statut final et l'horodatage ;
+- les BSC-USD expirés restent physiquement dans les portefeuilles de trésorerie OneX et sont simplement reclassés comptablement en réserve commune ;
+- les XTU expirés suivent en plus les règles de protection et de consolidation des sections 6.5 à 6.8 : ils sont comptabilisés comme actifs communs, protégés dans le Hot Wallet et transférés au Distribution Wallet uniquement dans un lot d'au moins 100 XTU nets consolidables ;
+- ne suspendre l'échéance que lorsqu'un blocage est exclusivement imputable à OneX ou à une suspension administrative formelle empêchant le traitement (panne interne documentée, scanner indisponible, réconciliation obligatoire ou gel explicite) ; cette suspension doit être auditée, bornée et ne peut être déclenchée par une simple insuffisance de réserve ou de capacité utilisateur ;
+- avant toute expiration, vérifier que les données blockchain sont finalisées et que le dossier ne présente aucun conflit comptable ; en cas de conflit technique, placer la clôture en état de réconciliation protégée et alerter l'administration plutôt que d'effectuer une écriture incertaine ;
+- notifier l'utilisateur avant l'expiration selon la politique de notification, puis notifier la clôture définitive et le montant affecté aux réserves communes.
+
+La règle des 30 jours remplace toutes les anciennes formulations indiquant que les excédents ou reliquats d'un compte connu restent en attente sans échéance. Aucun remboursement n'est autorisé pour un compte connu, même avant l'expiration.
+
+======================================================================
+5. RÈGLES COMMUNES PENDANT LE DISBURSEMENT GLOBAL
+======================================================================
+
+XTU suit les mêmes règles de dépôt que BSC-USD. Il n'existe donc pas d'exception de traitement XTU permettant de continuer à créditer des dépôts après le cutoff si les dépôts BSC-USD sont suspendus.
+
+À partir de la prise d'effet du disbursement global :
+- appliquer aux dépôts XTU le même cutoff et la même suspension qu'aux dépôts BSC-USD ;
+- les transferts reçus après le cutoff sont tracés et placés dans l'état approprié, sans crédit ni règlement contraire aux règles globales ;
+- la photographie initiale du disbursement global reste immuable ;
+- ne pas ajouter rétroactivement à cette photographie des dépôts ou actifs reçus après le cutoff ;
+- conserver les obligations déjà acquises et les registres de règlement XTU existants sans les réutiliser ;
+- aucune nouvelle obligation BSC-USD ou XTU ne doit être créée en contournant le cutoff.
+
+Cette règle remplace l'ancienne exception qui permettait aux dépôts XTU de rester actifs pendant que les dépôts BSC-USD étaient suspendus.
+
+6. SPÉCIFICITÉS XTU QUI RESTENT PROPRES À LA CONSOLIDATION
+======================================================================
+
+6.1. Token et portefeuilles
+
+- réseau : BNB Smart Chain Mainnet, Chain ID 56 ;
+- standard : BEP-20 ; 18 décimales ;
+- offre fixe : 100 000 000 000 XTU ; aucun mint ultérieur ;
+- l'offre initiale est attribuée au Hot Wallet principal OneX ;
+- le Distribution Wallet XTU reçoit les commissions contractuelles et les consolidations ; il ne reçoit pas l'offre initiale ;
+- le portefeuille personnel enregistré reçoit les retraits ;
+- séparer les clés privées XTU, Hot Wallet BSC-USD, Disbursement Wallet BSC-USD et Cold Wallet ; aucune clé privée du Cold Wallet ne doit être sur le serveur.
+
+6.2. Commission contractuelle
+
+- commission obligatoire de 0,1 % sur tous les transferts XTU externes, y compris transfer et transferFrom ;
+- commission conservée dans le Distribution Wallet ;
+- seule exemption : le transfert exact Hot Wallet principal → Distribution Wallet XTU ;
+- aucune exemption générale liée à l'une des adresses ;
+- lorsque le Distribution Wallet est l'expéditeur, la commission reste dans son solde sans transfert inutile vers lui-même ;
+- les événements du contrat doivent permettre de reconstituer montant brut, montant net et commission ;
+- cette commission reste distincte des frais internes tfees et des frais BNB.
+
+6.3. Crédit indépendant de la consolidation de 100 XTU
+
+Le minimum de consolidation interne de 100 XTU ne constitue PAS une condition d'admissibilité ou de déclenchement du crédit.
+
+Dès qu'un dépôt XTU a satisfait aux mêmes règles communes qu'un dépôt BSC-USD — finalité, minimum, session, plafond/tranche, statut du compte, capacité de solde, disponibilité des réserves, règle hebdomadaire ONEX et contrôles comptables — le crédit doit pouvoir être traité sans attendre que le Hot Wallet accumule 100 XTU.
+
+Le crédit XTU et la consolidation XTU sont deux processus indépendants :
+- le processus de dépôt/crédit décide de l'admissibilité et crédite les actifs initiaux ;
+- le processus de consolidation déplace uniquement les XTU des dépôts identifiés du Hot Wallet vers le Distribution Wallet quand le seuil de lot est atteint.
+
+6.4. Gas de consolidation et provision
+
+Le transfert Hot Wallet → Distribution Wallet consomme du BNB même si la commission contractuelle de token est exemptée.
+
+Comme le crédit peut précéder la consolidation, le système doit :
+1. estimer le gas du transfert interne avant de finaliser le calcul de crédit ;
+2. réserver provisoirement une provision de gas, exprimée en équivalent XTU/BSC-USD selon Chainlink BNB/USD ;
+3. créditer le dépôt éligible sans attendre le seuil de 100 XTU ;
+4. lorsqu'un lot de consolidation est exécuté, lire le reçu blockchain et calculer le gas réel ;
+5. répartir le gas réel entre les événements/dossiers du lot selon une méthode déterministe, FIFO et proportionnelle au montant brut/net retenu par la méthode documentée ;
+6. enregistrer le détail d'allocation et la méthode dans l'audit du lot ;
+7. comparer la provision et le gas réel, libérer le reliquat si le gas réel est inférieur et imputer le dépassement selon la règle de couverture OneX ;
+8. si le gas réel dépasse la provision, OneX couvre l'écart sans reprendre rétroactivement des actifs déjà crédités ; pour la part expirée devenue réserve commune, enregistrer l'écart comme dépense/coût de consolidation de la réserve, sans diminuer deux fois la valeur déjà reclassée.
+
+Le gas attribuable à un lot doit être comptabilisé une seule fois. Le seuil BSC_MAX_TX_FEE_BSC_USD=0.4 est un plafond du coût estimé, pas un frais fixe. Si l'estimation dépasse ce plafond, différer ou refuser temporairement le transfert sortant concerné ; cela ne doit pas provoquer une consolidation sous le seuil de 100 XTU.
+
+Calcul du crédit XTU :
+`xtu_creditable_amount = xtu_gross_returned - xtu_onex_deposit_fee - xtu_gas_equivalent`
+
+- `xtu_gross_returned` est reconstitué à partir des événements du contrat et comprend la ventilation entre le net reçu par le Hot Wallet et la commission reçue directement par le Distribution Wallet ;
+- `xtu_onex_deposit_fee` vaut 75 % de tfees pour un dépôt XTU accepté avant le cutoff global ; après le cutoff, aucun nouveau dépôt XTU n'est crédité conformément à la section 5 ;
+- `xtu_gas_equivalent` est imputé à partir du gas réel, ou d'une provision temporaire avant consolidation ;
+- si le gas réel est inférieur à la provision, libérer le trop-perçu ; s'il est supérieur, OneX couvre l'écart sans débiter rétroactivement un crédit utilisateur déjà confirmé ;
+- pour un reliquat qui expire sans crédit, aucun frais OneX de dépôt n'est prélevé ; le gas imputable au dossier reste enregistré et est traité par la provision et le rapprochement du lot, sans double imputation.
+
+6.5. Sélection FIFO et seuil strict de consolidation de 100 XTU
+
+- seuil minimal : 100 XTU nets effectivement reçus par le Hot Wallet et disponibles dans le registre de consolidation ; un lot peut contenir plus de 100 XTU ;
+- regrouper les montants XTU identifiés, finalisés, protégés et non déjà consolidés selon l'ordre FIFO (date/heure de finalité, puis hash/log index ou identifiant stable) ;
+- le lot peut réunir plusieurs dépôts et plusieurs dossiers, mais tous les éléments doivent être du contrat XTU officiel et traçables individuellement ; lorsqu'un lot FIFO admissible dépasse 100 XTU, privilégier un seul transfert consolidé de l'ensemble du montant disponible sélectionné plutôt que de le fragmenter artificiellement en plusieurs transactions de 100 XTU, sous réserve des limites techniques et de gas ;
+- transférer uniquement les montants XTU des dépôts identifiés, effectivement détenus dans le Hot Wallet, non déjà consolidés et non réservés à une autre opération ;
+- ne jamais vider le solde total du Hot Wallet, car il détient également l'offre initiale XTU et potentiellement d'autres allocations protégées ;
+- dédupliquer par hash/log et conserver le hash de chaque dépôt utilisateur ainsi que le hash de consolidation interne ;
+- la règle de lot minimal de 100 XTU reste obligatoire même lorsqu'un ou plusieurs dossiers atteignent leur échéance de 30 jours ;
+- aucune consolidation exceptionnelle inférieure à 100 XTU n'est autorisée, y compris pour des XTU expirés et affectés aux réserves communes ;
+- si le total XTU disponible à consolider est inférieur à 100, le solde reste dans le Hot Wallet, protégé et comptabilisé dans le registre de conservation XTU, jusqu'à ce que le cumul FIFO disponible atteigne au moins 100 XTU ;
+- l'expiration d'un dossier ne force donc jamais un petit transfert on-chain ; elle modifie l'affectation comptable du reliquat, pas le seuil ni le calendrier de consolidation ;
+- le seuil de 100 XTU ne doit jamais bloquer le crédit, la mise à jour de `users_stock.balance`, l'évaluation de capacité ou l'expiration comptable d'un dépôt ;
+- la consolidation est un mouvement interne de garde entre Hot Wallet et Distribution Wallet : elle ne constitue ni un nouveau dépôt, ni un crédit utilisateur, ni une deuxième diminution de `common.xtu_wallets`, ni une deuxième augmentation de `common.total_units_price`.
+
+6.6. Contrôle de common.xtu_wallets
+
+common.xtu_wallets représente le montant net de XTU externalisé vers les portefeuilles personnels et pas encore retourné au système. C'est un solde évolutif, pas un compteur historique cumulatif.
+
+Lors d'un dépôt XTU :
+- vérifier que le contrat XTU est exactement le contrat attendu ;
+- reconstituer le montant brut retourné avec les événements Transfer et TransferWithFee ;
+- rapprocher le montant reçu par le Hot Wallet et la commission reçue par le Distribution Wallet ;
+- vérifier, sous verrouillage transactionnel, que common.xtu_wallets couvre le montant brut effectivement retourné ;
+- ne jamais décrémenter le compteur d'un montant supérieur au brut vérifié et effectivement retourné ;
+- après confirmation et rapprochement, diminuer common.xtu_wallets du montant brut retourné, y compris la partie ultérieurement imputée aux frais de dépôt ou au gas ;
+- ne jamais laisser common.xtu_wallets devenir négatif ;
+- ne pas décrémenter à la simple détection, avant finalité, pour un dossier en attente non retourné ou deux fois pour le même hash/log.
+
+Si common.xtu_wallets est inférieur au montant brut XTU prétendument retourné, ou si les événements ne se rapprochent pas :
+- classer l'opération en attente administrative ;
+- ne pas décrémenter le compteur ;
+- ne pas créditer les actifs initiaux ;
+- ne pas consolider le lot ;
+- conserver les événements, le reçu, les soldes observés, le hash, le log index et le motif ;
+- émettre une alerte administrative ;
+- ne jamais corriger artificiellement le compteur.
+
+Un écart peut provenir d'un token incorrect, d'un événement non rapproché, d'une erreur comptable ou d'une manipulation. Le serveur doit enquêter sans conclure automatiquement à une fraude.
+
+6.7. Protection comptable des XTU détenus dans le Hot Wallet avant consolidation
+
+Tout XTU issu d'un dépôt utilisateur et effectivement reçu par le Hot Wallet doit être identifié, affecté et protégé comptablement dès sa finalité, avant toute consolidation interne.
+
+Créer un registre de conservation/lot XTU dédié (ou un schéma équivalent dans les tables financières existantes) avec au minimum :
+- contrat XTU et Chain ID ;
+- transaction hash et log index uniques ;
+- adresse expéditrice enregistrée, utilisateur et dossier de dépôt ;
+- montant brut envoyé, montant net reçu par le Hot Wallet et commission contractuelle reçue par le Distribution Wallet ;
+- montant déjà crédité, montant utilisateur encore en attente, montant expiré affecté aux réserves communes ;
+- montant encore détenu dans le Hot Wallet, montant réservé à un lot, montant consolidé ;
+- identifiant du lot FIFO, hash de consolidation, frais BNB estimés/réels imputés et statuts ;
+- horodatages de détection, finalité, crédit, expiration, réservation, consolidation et rapprochement.
+
+Règles de protection :
+- l'intégralité des XTU reçus au Hot Wallet depuis les dépôts identifiés doit être rapprochée du solde réel du portefeuille et ventilée dans le registre avant toute utilisation, sélection de lot ou consolidation ;
+- ces XTU ne sont pas disponibles pour les décaissements, paiements vendeurs, transferts vers Cold Wallet, dépenses ou autres opérations générales ; ils sont protégés comme actifs affectés, qu'ils soient encore liés à un crédit utilisateur en attente ou déjà réaffectés aux réserves communes ;
+- les XTU en attente de crédit restent affectés à leur dossier utilisateur jusqu'à crédit ou expiration ; les XTU expirés sont réaffectés aux réserves communes ;
+- avant toute consolidation, réserver atomiquement les lots FIFO concernés et vérifier que le solde réel du Hot Wallet couvre les montants réservés, en excluant l'offre initiale, les commissions et les autres allocations non transférables ;
+- un lot réservé ne peut pas être sélectionné par un second worker ; une réservation échouée ou définitivement annulée est restaurée une seule fois ;
+- le transfert vers le Distribution Wallet ne change pas la propriété comptable d'un montant déjà affecté : il ne fait que changer son portefeuille de garde ;
+- après confirmation de consolidation, marquer chaque ligne comme consolidée, enregistrer le hash et rapprocher le montant envoyé/reçu ; ne modifier ni `common.xtu_wallets` ni `common.total_units_price` une deuxième fois à cette étape ;
+- contrôler en permanence que la somme des allocations non consolidées ne dépasse pas le solde XTU réellement disponible du Hot Wallet, après exclusion des soldes réservés à l'offre initiale et des autres allocations explicitement séparées ;
+- si un écart apparaît, suspendre la consolidation concernée, protéger les montants déjà réservés et déclencher un rapprochement administratif ; ne jamais ajuster artificiellement le registre ou le solde commun.
+
+6.8. Expiration d'un reliquat XTU et affectation aux réserves communes
+
+À l'expiration de 30 jours, la portion d'un dossier XTU qui n'a pas été créditée à l'utilisateur est définitivement affectée aux réserves communes, selon la procédure commune de la section 4.4.
+
+- calculer le reliquat XTU réellement non crédité, sans inclure les tranches déjà créditées ni les montants déjà affectés ;
+- déterminer le reliquat à partir des montants XTU effectivement retournés et rapprochés, en respectant la ventilation entre le net reçu au Hot Wallet et la commission contractuelle déjà reçue par le Distribution Wallet ;
+- convertir ce reliquat en valeur comptable à la parité interne de 1 XTU = 1 BSC-USD ; cette parité est une convention comptable et ne constitue ni un transfert ni une création de BSC-USD ;
+- pour la part XTU expirée, calculer la contribution nette aux réserves comme le reliquat brut non crédité, diminué uniquement de la quote-part de gas de consolidation déjà imputée ou provisionnée ; aucun frais de dépôt OneX n'est prélevé sur cette part non créditée ;
+- augmenter `common.total_units_price` de la valeur du reliquat expiré reconnue, avec une écriture unique et un identifiant d'événement idempotent ; cette ligne constitue l'unique écriture de réserve pour le reliquat et réalise la règle générale de la section 4.4 ; si le gas réel n'est connu qu'après la consolidation, réserver d'abord la provision puis enregistrer une régularisation unique sur le reçu réel ;
+- le montant XTU correspondant est marqué `expired_common_reserve` dans le registre de conservation, protégé contre toute utilisation et conservé dans le Hot Wallet jusqu'à sa consolidation FIFO ; le sous-registre des dépôts XTU en attente est diminué du montant reclassé et le sous-registre des actifs XTU affectés aux réserves communes augmente du même montant, après la quote-part de gas applicable ;
+- si les XTU concernés sont déjà dans le Hot Wallet, ne pas effectuer de transfert individuel à l'expiration ; attendre que le cumul FIFO de XTU consolidables atteigne au moins 100 XTU nets ;
+- si une partie de la transaction d'origine a déjà été consolidée, ne transférer que la partie non consolidée et effectivement détenue au Hot Wallet ; ne jamais balayer le solde total du portefeuille ;
+- le transfert final Hot Wallet → Distribution Wallet reste exempté de commission de token pour cette paire exacte d'adresses, mais consomme du BNB ;
+- si le montant expiré est inférieur à 100 XTU, il reste protégé et comptabilisé dans le Hot Wallet jusqu'à ce que d'autres XTU éligibles permettent de former un lot d'au moins 100 XTU ; aucune exception sous le seuil n'est autorisée, même après l'expiration ;
+- l'expiration ne donne lieu à aucun crédit utilisateur ni remboursement ; le dossier est finalisé et ne peut pas être réactivé ;
+- `common.xtu_wallets` est diminué une seule fois, au moment où le retour XTU est finalisé et rapproché conformément à la section 6.6 ; l'expiration et la consolidation ne doivent jamais provoquer un second décrément. Si un ancien traitement a différé ce décrément, la finalisation doit le réaliser une seule fois au moyen d'une clé idempotente et d'un contrôle de solde ;
+- l'affectation finale aux réserves communes est un reclassement interne : le registre auxiliaire des XTU retournés mais encore affectés à un dossier utilisateur diminue, et le registre des XTU appartenant désormais aux réserves communes augmente ; ce mouvement de sous-registre est effectué à l'expiration sans toucher une deuxième fois à `common.xtu_wallets` ;
+- l'augmentation de `common.total_units_price` à l'expiration est une écriture distincte de la diminution de `common.xtu_wallets` : elle ne doit pas être interprétée comme une deuxième restitution XTU ;
+- le gas réel de consolidation est imputé et rapproché une seule fois. Le coût imputable à la partie expirée est pris en compte dans l'écriture de réserve ou comme dépense de consolidation selon la méthode comptable figée, sans double débit ni reprise rétroactive sur l'utilisateur ; tant que le reçu de consolidation n'existe pas, une provision est conservée et la régularisation est enregistrée à la confirmation du lot ;
+- pour le montant XTU expiré, la somme ajoutée à `common.total_units_price` correspond au reliquat non crédité reconnu à la parité interne, diminué uniquement des coûts de gas qui lui ont déjà été imputés de façon définitive ; ne pas appliquer de frais de dépôt OneX sur la part non créditée ; tout ajustement ultérieur de gas est une écriture de régularisation unique liée au même événement d'expiration et au même lot.
+
+La règle comptable essentielle est donc : le retour blockchain réduit une fois l'exposition XTU externalisée (`common.xtu_wallets`) ; l'expiration transforme le reliquat utilisateur non crédité en réserve commune (`common.total_units_price`) ; la consolidation ultérieure ne fait que déplacer les tokens vers le Distribution Wallet lorsque le lot atteint au moins 100 XTU. Ces trois opérations sont distinctes et chacune est idempotente.
+
+======================================================================
+7. RÈGLEMENT DES VENDEURS : FIFO ET PAIEMENT INTÉGRAL
+======================================================================
+
+Le système ne doit pas générer plusieurs paiements partiels au même vendeur pour une même dette accumulée.
+
+Règles :
+- consommer les lots de réserves vendeurs selon FIFO (activated_at_ms, puis identifiant du lot) ;
+- calculer les droits de paiement par vendeur à partir des lots effectivement consommés ;
+- accumuler les montants dus tant que le total des lots consommés ne couvre pas intégralement le paiement attendu ;
+- ne créer une demande de paiement que lorsque la totalité du paiement du vendeur est couverte ;
+- ne pas payer un vendeur par plusieurs transactions successives de petit montant pour une même obligation ;
+- une seule demande de paiement non résolue peut exister pour un vendeur ;
+- ne pas créer une nouvelle demande tant que la précédente est signée, diffusée, en cours de confirmation, en réconciliation ou en examen manuel ;
+- conserver les réserves correspondantes jusqu'à confirmation définitive ou résolution explicite ;
+- en cas de RPC incertain, rechercher hash, nonce et reçu avant toute nouvelle soumission ;
+- supprimer ou adapter tout plafond de lot qui découperait artificiellement une dette vendeur, notamment un ancien plafond de 300 si celui-ci produit des paiements multiples ;
+- si le gas estimé dépasse le plafond, conserver la dette intégrale en attente et réévaluer plus tard ;
+- les frais de transaction ordinaires tfees ne sont pas appliqués au paiement vendeur ; le gas BNB réel est comptabilisé séparément.
+
+Le seuil minimal net vendeur reste celui défini par la politique de paiement sortant : minimum net égal à deux fois BSC_MAX_TX_FEE_BSC_USD. Avec un plafond de gas de 0,4 BSC-USD, le minimum net est 0,8 BSC-USD et le brut doit couvrir le net plus le gas maximal autorisé, soit 1,2 BSC-USD au maximum configuré.
+
+Cette règle réduit les frais de gas en évitant les paiements fragmentés. Elle n'implique pas nécessairement un transfert multi-destinataire : un paiement agrégé par vendeur reste une transaction unique par vendeur.
+
+Un paiement déjà acquis, signé ou diffusé ne peut pas être annulé par une simple demande utilisateur. Une obligation en cours doit être réconciliée jusqu'à son état définitif.
+
+======================================================================
+8. REMBOURSEMENTS : UNIQUEMENT POUR BSC-USD/XTU OFFICIELS ENVOYÉS DEPUIS UNE ADRESSE NON ENREGISTRÉE
+======================================================================
+
+8.1. Confirmation définitive — aucun remboursement pour un compte connu
+
+Aucun utilisateur disposant d'un compte OneX ne peut demander ou obtenir le
+remboursement d'un dépôt BSC-USD ou XTU, d'un excédent ou d'un reliquat non
+crédité, lorsque l'adresse expéditrice réelle est enregistrée dans un compte
+OneX au moment de la réception.
+
+En conséquence :
+- les remboursements sont désactivés pour tous les dépôts associés à un
+  utilisateur connu, qu'il s'agisse de BSC-USD ou de XTU ;
+- aucune route utilisateur ne doit permettre à un compte connu de demander
+  le remboursement d'un dépôt, d'un excédent ou d'un reliquat ;
+- un montant dépassant le plafond de tranche de 100 reste dans le dossier
+  de dépôt et attend que la capacité de solde permette son crédit, mais
+  uniquement jusqu'à l'échéance fixe de 30 jours du dossier ;
+- ces montants en attente sont réévalués à chaque mise à jour du solde et
+  par le worker périodique de reprise ;
+- à l'échéance de 30 jours, tout reliquat encore non crédité est
+  irréversiblement affecté aux réserves communes selon les sections 4.4 et
+  6.8, sans remboursement ni crédit ultérieur ;
+- aucune durée d'attente, aucun seuil de 200 unités et aucune demande de
+  l'utilisateur ne déclenchent un remboursement d'un dépôt connu ;
+- toute correction d'un dépôt connu suit le mécanisme administratif et
+  comptable approprié, sans créer de remboursement dans le workflow des
+  transferts inconnus ;
+- l'utilisateur est responsable du montant, du token, du réseau, de
+  l'adresse de réception OneX et de l'adresse expéditrice qu'il utilise.
+
+La règle antérieure qui envisageait un remboursement sur demande lorsque le
+reliquat atteint deux fois le plafond maximal de dépôt (200 unités) est
+annulée. Le seuil de 200 unités n'est pas un seuil de remboursement et ne
+doit pas être exposé comme un droit dans l'API ou la documentation.
+
+8.2. Seule catégorie remboursable : contrat officiel BSC-USD ou XTU et adresse expéditrice non enregistrée
+
+Un transfert est admissible à une demande de remboursement uniquement si
+les DEUX conditions suivantes sont réunies :
+
+1. Le token transféré correspond exactement à l'un des deux contrats
+   officiellement acceptés et configurés par OneX :
+   - contrat Binance-Peg BSC-USD officiel sur BNB Smart Chain Mainnet ; ou
+   - contrat XTU officiel sur BNB Smart Chain Mainnet (Chain ID 56).
+2. L'adresse expéditrice réelle du transfert (champ `from` vérifié dans la
+   transaction et les événements) n'est enregistrée dans aucun compte OneX
+   au moment de la réception.
+
+Les deux conditions sont cumulatives. Une adresse expéditrice inconnue ne
+rend pas remboursable un token non accepté.
+
+Règles :
+- seul l'expéditeur du transfert provenant de l'adresse non enregistrée
+  peut présenter la demande ;
+- la demande n'est jamais automatique et reste soumise à l'examen et à la
+  décision administrative explicite ;
+- aucun crédit utilisateur automatique ni aucune attribution automatique
+  ne sont effectués avant la résolution du dossier ;
+- le transfert admissible est conservé dans le registre dédié des transferts
+  inconnus, avec le type de token exact, l'adresse exacte du contrat,
+  l'adresse expéditrice, le hash, le log index, le montant brut/net, le bloc,
+  le reçu et la finalité ;
+- les demandes, décisions, réservations et remboursements sont conservés
+  dans les tables et registres dédiés aux transferts inconnus ;
+- l'administration peut décider d'assigner le transfert à un compte après
+  vérification ou d'autoriser son remboursement ; ces deux résolutions sont
+  mutuellement exclusives pour le même montant ;
+- si le transfert est assigné à un compte, il sort du workflow de
+  remboursement des inconnus et suit les règles ordinaires de dépôt ;
+- si le remboursement est approuvé, il est exécuté dans le même token que
+  celui reçu, sans conversion automatique entre BSC-USD et XTU ;
+- conserver la décision administrative, le bénéficiaire, l'adresse source,
+  l'adresse de retour vérifiée, le montant, les frais, le gas estimé/réel,
+  le hash, le nonce, le reçu et les horodatages ;
+- ne jamais autoriser une adresse de destination arbitraire non vérifiée ;
+- le remboursement ne peut être signé qu'après décision administrative,
+  réservation atomique du montant et validation de la destination ;
+- en cas de résultat RPC incertain, réconcilier hash, nonce et reçu avant
+  toute nouvelle soumission ;
+- une transaction déjà signée ou diffusée doit être réconciliée et ne peut
+  pas être annulée ou remplacée par un second paiement.
+
+Exclusions absolues — aucun remboursement OneX :
+- tout token autre que les deux contrats officiels BSC-USD et XTU ;
+- tout token contrefait, token d'imitation, token portant un nom ou symbole
+  similaire, ou tout autre contrat BEP-20 non accepté ;
+- tout token envoyé sur un réseau autre que BNB Smart Chain Mainnet
+  (Chain ID 56), même si son nom ou son symbole est identique ;
+- tout transfert effectué vers une adresse autre que l'adresse officielle
+  de réception indiquée par OneX ;
+- tout actif ou transfert que les scanners OneX ne prennent pas en charge.
+
+Ces transferts exclus ne sont ni crédités, ni ajoutés au registre des
+transferts inconnus remboursables, ni couverts par une procédure de
+remboursement. OneX ne garantit ni leur détection, ni leur récupération,
+ni leur restitution. L'utilisateur doit vérifier le réseau, le contrat du
+token et l'adresse de réception avant de signer le transfert.
+
+Le minimum de remboursement actuellement configuré est conservé pour les
+remboursements administrativement approuvés des seuls transferts éligibles
+ci-dessus. Il s'applique au montant net selon la politique existante, avec
+les contrôles de gas, de solde et de destination. Aucune modification de ce
+minimum n'est autorisée dans le cadre de cette révision.
+
+8.3. Séparation des registres et des bases de données
+
+- le registre des transferts inconnus ne contient, pour le workflow de
+  remboursement, que les transferts des contrats officiels BSC-USD/XTU
+  provenant d'adresses expéditrices non enregistrées ;
+- les tokens non reconnus, faux tokens et transferts provenant d'autres
+  réseaux ne doivent pas être insérés dans ce registre comme créances
+  remboursables ;
+- les demandes de remboursement, leur statut, les décisions administratives,
+  les réservations et les transactions doivent être reliés au dossier de
+  transfert officiel éligible ;
+- aucune demande de remboursement ne doit être créée dans le registre
+  ordinaire des dépôts BSC-USD ou XTU d'un utilisateur connu ;
+- aucune dette de remboursement ne doit être créée à partir d'un excédent
+  ou d'un reliquat d'un dépôt connu ;
+- imposer des références uniques et des contraintes d'idempotence afin
+  qu'un même transfert ne puisse être assigné et remboursé, ni remboursé
+  deux fois ;
+- toute transition vers « assigné à un compte » ou « remboursement
+  approuvé » doit être exclusive, auditée et verrouillée.
+
+8.4. Obligations de communication
+
+Les documents terms et privacy en français et en anglais doivent indiquer
+sans ambiguïté que :
+- seuls les transferts du contrat officiel BSC-USD ou du contrat officiel
+  XTU sur BNB Smart Chain Mainnet, Chain ID 56, peuvent entrer dans la
+  procédure de remboursement ;
+- l'adresse expéditrice réelle doit être non enregistrée dans tout compte
+  OneX au moment de la réception ;
+- la demande appartient à l'expéditeur de cette adresse inconnue et reste
+  soumise à une approbation administrative explicite ;
+- les dépôts provenant d'une adresse expéditrice enregistrée, y compris
+  leurs excédents et reliquats, ne sont jamais remboursables ;
+- les faux tokens, tokens similaires, autres contrats BEP-20 et transferts
+  effectués sur d'autres réseaux ne sont pas pris en charge et ne sont
+  jamais remboursables par OneX ;
+- un excédent d'un dépôt connu reste en attente au maximum jusqu'à
+  l'échéance fixe de 30 jours ; s'il n'est pas crédité à cette date, il est
+  irréversiblement affecté aux réserves communes ;
+- le seuil historique de 200 unités n'ouvre aucun droit au remboursement ;
+- le minimum de remboursement existant s'applique uniquement aux
+  remboursements approuvés de transferts officiels provenant d'adresses
+  expéditrices non enregistrées ;
+- pour obtenir un crédit automatique, l'utilisateur doit envoyer depuis
+  une adresse expéditrice déjà enregistrée dans son compte OneX ; si cette
+  adresse n'est pas enregistrée, le transfert officiel ne sera pas crédité
+  automatiquement et relèvera uniquement du dossier administratif des
+  transferts inconnus ;
+- avant l'envoi, l'utilisateur doit vérifier l'adresse officielle de
+  réception OneX, le réseau BNB Smart Chain, le contrat exact du token, le
+  montant et l'adresse expéditrice utilisée.
+
+======================================================================
+9. RETRAIT XTU VERS LE PORTEFEUILLE PERSONNEL
+======================================================================
+
+Route utilisateur : POST /app/xtu2wallet.
+
+- montant brut minimum : 5 XTU ;
+- destination exclusivement l'adresse BSC personnelle enregistrée dans le compte ;
+- valider la syntaxe et l'enregistrement de l'adresse ;
+- l'utilisateur ne fournit pas une adresse arbitraire et ne communique jamais de clé privée ou de seed ;
+- retraits désactivés par défaut ; route administrative POST /admin/withdraw/start avec actions start, stop, status et authentification administrative existante (password + PIN).
+
+Frais :
+- le contrat prélève 0,1 % ; le backend ne déduit pas une seconde commission ;
+- estimer le gas BNB, convertir via Chainlink BNB/USD en équivalent XTU et le déduire du montant brut avant l'appel ;
+- ne pas signer si le coût estimé dépasse BSC_MAX_TX_FEE_BSC_USD=0.4 ;
+- enregistrer le gas réel à partir du reçu ;
+- après confirmation, common.xtu_wallets augmente du montant net réellement reçu par le portefeuille personnel.
+
+Historique :
+- activités sender=username, receiver=username + "-WALLET" ;
+- fees = frais combinés en XTU ;
+- bsc_fee_cost_usd = gas BNB réel en BSC-USD ;
+- reference unique ;
+- type numérique déterminé après contrôle du mapping Android existant, sans inventer un type.
+
+Continuité :
+- un retrait XTU ne réinitialise jamais le cycle de rémunération individuel ;
+- ne pas appeler une fonction qui redémarre ou modifie le cycle si elle a cet effet ;
+- principal réservé et couverture réservée avant l'envoi ;
+- après confirmation, enregistrer le principal immobilisé et le net externalisé ;
+- en cas d'échec définitif, restaurer une seule fois les réservations et comptabiliser le gas réellement consommé.
+
+Réserves :
+- capturer le prix individuel applicable ;
+- reserved_initial_asset = gross_XTU / individual_price ;
+- reserved_XTU_value = reserved_initial_asset * individual_price ;
+- lors de la réservation, sous verrou : common.total_units_price -= reserved_XTU_value ; common.backed_units -= reserved_initial_asset ;
+- après confirmation : common.inactive_init_asset += reserved_initial_asset ; common.xtu_wallets += net_XTU_externalisé ;
+- common.unit_price reste un prix global absolu et ne baisse pas par simple ratio total_units_price / backed_units.
+
+======================================================================
+10. COUVERTURE BSC-USD DES XTU EXTERNALISÉS
+======================================================================
+
+Un retrait XTU ne transfère ni ne consomme physiquement la réserve BSC-USD correspondante. Il immobilise une couverture dans la comptabilité de liquidité OneX.
+
+- couverture immobilisée = XTU nets externalisés non encore retournés, à la parité comptable ;
+- la réserve physique BSC-USD reste dans les portefeuilles OneX ;
+- la couverture immobilisée est exclue de la liquidité disponible pour remboursement, transfert Hot Wallet → Cold Wallet, paiement vendeur ou décaissement ;
+- inclure aussi les retraits XTU en cours dont la couverture a déjà été réservée ;
+- après dépôt XTU effectivement retourné et rapproché : réduire common.xtu_wallets du montant brut retourné et libérer la couverture correspondante ;
+- aucune libération avant finalité et rapprochement ;
+- réservation/libération atomique et idempotente ;
+- distinguer soldes blockchain réels, réserves comptables, couverture, montants réservés et montants déjà affectés.
+
+La parité 1 XTU = 1 BSC-USD est une convention comptable. Elle ne crée pas de BSC-USD et ne garantit ni conversion immédiate ni liquidité physique.
+
+======================================================================
+11. SÉCURITÉ, TRANSACTIONS ET IDEMPOTENCE
+======================================================================
+
+- toutes les opérations financières doivent être idempotentes ;
+- références financières uniques et contraintes SQL uniques sur hash/log, demandes, crédits, consolidations et paiements ;
+- verrouiller common, le compte utilisateur, le dossier de dépôt et les réserves concernées avant les écritures ;
+- réserver les fonds avant une transaction blockchain ;
+- finaliser les écritures après confirmation et finalité blockchain ;
+- restaurer les réservations une seule fois après échec définitif ;
+- en cas de résultat RPC incertain, rapprocher hash, nonce, reçu et événement avant toute nouvelle soumission ;
+- ne jamais rediffuser une transaction sans savoir si la précédente a été incluse ;
+- vérifier les soldes réels BNB et des tokens avant signature ;
+- imputer et rapprocher le gas réel une seule fois ;
+- utiliser les outboxes email/Telegram avec clés d'événement idempotentes ;
+- ne jamais traiter un transfert XTU comme un dépôt BSC-USD ou inversement.
+
+======================================================================
+12. TERMINOLOGIE, API ET DOCUMENTATION
+======================================================================
+
+Terminologie officielle : « dépôt » et non « recharge ».
+
+Route utilisateur recommandée : POST /app/deposit, avec routes associées de statut, disponibilité et traitement. Les dossiers BSC-USD et XTU doivent être distingués explicitement par le type d'actif.
+
+Ne pas exposer d'ancien endpoint /app/recharge ni conserver un alias de compatibilité inutile.
+
+Mettre à jour au minimum :
+- db.js et l'ensemble du schéma initial, sans script de migration ; prévoir les champs de première finalité, échéance immuable, montant crédité, reliquat, expiration, réserve enregistrée et clés d'événement ;
+- routes.js ;
+- pay.js et le scanner BSC-USD ;
+- deposit-policy.js ;
+- deposit-credit-policy.js ;
+- deposit-limits.js ;
+- deposit-availability.js ;
+- deposit-retry.js ;
+- deposit-expiration.js ou service partagé équivalent pour l'échéance de 30 jours ;
+- deposit-notifications.js ou outbox équivalente pour les notifications Telegram par état et par transfert ;
+- xtu-deposit-policy.js ;
+- xtu-deposit-worker.js ;
+- seller-accounting.js et les workers de paiement vendeur ;
+- disbursement.js et les contrôles de liquidité ;
+- refund-policy.js, les routes d'administration et les workers de remboursement ;
+- audits et outboxes ;
+- tests ;
+- README, changelog, guides Android ;
+- terms_fr.html, terms_en.html, privacy_fr.html et privacy_en.html.
+
+Fonctions XTU à examiner explicitement pour les aligner sur le flux BSC-USD :
+- assignDepositEventTx et scanIncomingEvents ;
+- assessBatchCapacityTx et allocateXtuDepositFundingTx ;
+- processOneXtuDepositCredit ;
+- creditConsolidatedBatchTx ;
+- finalizeConsolidation ;
+- retryCredit ;
+- processOneReadyBatch ;
+- processSettlementPayout ;
+- calculateXtuDepositCredit ;
+- calculateXtuDepositTranche ;
+- classifyDepositSession ;
+- selectXtuConsolidationBatches ;
+- allocateBatchGasByGross ;
+- le registre des XTU reçus/protégés dans le Hot Wallet (par exemple `xtu_hot_wallet_lots` ou schéma équivalent), ses contraintes uniques et ses fonctions de réservation FIFO ;
+- le traitement d'expiration XTU et l'affectation `expired_common_reserve` ;
+- les routes /app/deposit/status, /app/user-last-stock et les fonctions d'état/publication des dépôts XTU ;
+- les fonctions de remboursement et de rapprochement XTU ;
+- les fonctions partagées de clôture à 30 jours, de calcul du reliquat non crédité, d'écriture idempotente dans `common.total_units_price` et de réveil après mise à jour de `users_stock.balance`.
+
+Fonctions BSC-USD de référence à mutualiser ou prendre comme modèle :
+- applyUserTopUp ;
+- processConfirmedUsdtPayment ;
+- processOneDepositBatch ;
+- processDepositBatchQueue ;
+- markPendingDepositBatchesDueTx ;
+- evaluateDepositCredit et findMaximumDepositCredit ;
+- verifyFinalizedTransfer et scanTreasury ;
+- persistUnknownTransfer ;
+- les fonctions de traitement événementiel immédiat, de clôture de session dès atteinte du minimum et d'expiration à 30 jours.
+
+L'endpoint `/app/user-last-stock` doit retourner les montants numériques en attente pour chaque token, et non uniquement des booléens. Il doit inclure, pour chaque dossier, le montant, le motif exact, la date d'expiration et le temps restant. Les montants BSC-USD et XTU restent séparés et sont sérialisés en chaînes décimales pour éviter toute perte de précision. Exemple de structure indicative :
+
+```json
+{
+  "pending_deposits": {
+    "bsc_usd": {
+      "total_pending_amount": "65.00000000",
+      "batches": [
+        {
+          "batch_id": "125",
+          "pending_amount": "65.00000000",
+          "reason": "maximum_user_balance",
+          "expires_at_ms": 1790000000000,
+          "remaining_ms": 1555200000
+        }
+      ]
+    },
+    "xtu": {
+      "total_pending_amount": "15.00000000",
+      "batches": [
+        {
+          "batch_id": "48",
+          "pending_amount": "15.00000000",
+          "reason": "minimum_not_reached",
+          "minimum_remaining": "5.00000000",
+          "expires_at_ms": 1790000000000,
+          "remaining_ms": 1555200000
+        }
+      ]
+    }
+  }
+}
+```
+
+Les champs booléens historiques `has_pending_deposit`/`has_pending_xtu_deposit` peuvent être conservés comme indicateurs dérivés si un client les utilise encore, mais ils ne remplacent jamais les montants et échéances détaillés.
+
+Les règles métier communes doivent être centralisées autant que possible dans des fonctions partagées. Le worker XTU ne doit conserver que les étapes propres au token : événements contractuels, décompte unique de common.xtu_wallets au retour confirmé, registre des XTU protégés dans le Hot Wallet, provision et rapprochement gas de consolidation, sélection FIFO de lots strictement égaux ou supérieurs à 100 XTU nets, affectation comptable des reliquats expirés et transfert Hot Wallet → Distribution Wallet.
+
+======================================================================
+13. TERMS ET PRIVACY
+======================================================================
+
+Les quatre documents doivent expliquer clairement :
+- BSC-USD et XTU sont deux tokens différents et ne peuvent pas être mélangés dans un même dépôt ;
+- chaque dépôt respecte individuellement le minimum 20 et le maximum de tranche 100 ;
+- lorsqu'un dossier dépasse 100, le crédit peut être partiel et le reliquat reste en attente jusqu'à ce que le solde de l'utilisateur permette son crédit, mais au maximum jusqu'à l'échéance fixe de 30 jours du dossier ;
+- aucun délai de 60 minutes n'est appliqué ; chaque transfert finalisé est évalué immédiatement ; chaque dossier expire exactement 30 jours (30 × 24 heures) après son premier transfert finalisé ; les transferts suivants ne repoussent pas cette échéance ;
+- OneX réévalue les reliquats à chaque mise à jour du solde et lors des reprises périodiques ; si le reliquat n'est pas crédité à l'échéance, il est irréversiblement affecté aux réserves communes, sans remboursement ni crédit ultérieur ;
+- si le minimum de 20 n'est pas atteint à l'échéance, la totalité du montant encore non crédité est également affectée aux réserves communes ;
+- après chaque transfert qui laisse un dossier en attente, OneX notifie sur Telegram le motif précis, le montant en attente, l'action utile (compléter le minimum ou libérer de la capacité par vente/retrait) et le temps restant avant l'affectation irréversible aux réserves communes ;
+- aucune promesse de crédit immédiat n'est faite pour les montants en attente de capacité ou de réserves ;
+- la limite hebdomadaire porte uniquement sur un achat financé par ONEX, une fois par période de sept jours, quel que soit le montant ;
+- le compteur est commun à BSC-USD et XTU ; les achats financés exclusivement par les vendeurs ne le consomment pas ;
+- les campagnes vendeurs sont activées volontairement et leur principal est immobilisé conformément aux règles vendeur ;
+- les paiements vendeurs sont accumulés FIFO et exécutés intégralement, sans paiement fractionné ;
+- le crédit XTU n'attend pas la consolidation interne de 100 XTU ;
+- les XTU reçus dans le Hot Wallet sont protégés et comptabilisés individuellement avant consolidation ;
+- la consolidation interne XTU est distincte et son gas réel est provisionné, réparti et rapproché ; elle s'effectue uniquement par lots d'au moins 100 XTU nets ;
+- le seuil de consolidation de 100 XTU reste obligatoire même après l'expiration de 30 jours ; un reliquat expiré inférieur à 100 XTU reste protégé et comptabilisé dans le Hot Wallet jusqu'à ce que le cumul permette un lot conforme ;
+- après expiration, le reliquat XTU est affecté à `common.total_units_price` à la parité comptable de 1 XTU = 1 BSC-USD ; `common.xtu_wallets` ne diminue qu'une seule fois lors du retour confirmé des XTU, sans second décrément à l'expiration ou à la consolidation ;
+- la commission XTU de 0,1 %, l'exemption exacte Hot Wallet → Distribution Wallet, la réserve XTU externalisée et la couverture BSC-USD ;
+- l'absence de conversion automatique XTU/BSC-USD ;
+- les remboursements sont réservés exclusivement aux transferts correspondant exactement au contrat officiel BSC-USD ou XTU sur BNB Smart Chain Mainnet (Chain ID 56), et provenant d'une adresse expéditrice non enregistrée dans OneX ;
+- ces deux conditions sont cumulatives ; une adresse inconnue ne rend jamais un token non accepté remboursable ;
+- une demande de remboursement ne peut être présentée que par l'expéditeur de l'adresse inconnue et reste soumise à une décision administrative explicite ;
+- les faux tokens, tokens d'imitation, autres contrats BEP-20 et transferts effectués sur d'autres réseaux sont ignorés, ne sont pas crédités et ne sont pas remboursables ;
+- l'utilisateur doit vérifier le réseau, le contrat exact du token et l'adresse officielle de réception OneX avant tout transfert ;
+- les registres, demandes, décisions et transactions de remboursement des inconnus sont séparés des bases de dépôts des utilisateurs connus ;
+- aucun utilisateur connu ne peut demander le remboursement d'un dépôt, d'un excédent ou d'un reliquat non crédité ; ces montants restent en attente au maximum 30 jours, puis le reliquat non crédité est irréversiblement affecté aux réserves communes ;
+- le seuil historique de 200 unités ne donne aucun droit au remboursement ;
+- le minimum de remboursement existant ne s'applique qu'aux remboursements approuvés de transferts inconnus ;
+- l'impossibilité d'annuler un paiement déjà acquis, réservé, signé ou en cours ;
+- la responsabilité de l'utilisateur concernant le montant, le token et l'adresse expéditrice qu'il utilise ;
+- les contrôles de gas, les frais réels et les délais dépendant de la blockchain ;
+- pendant le disbursement global, les nouveaux dépôts BSC-USD et XTU sont suspendus selon le même cutoff ; les transferts post-cutoff sont tracés mais ne créent pas de nouveau crédit ni d'obligation contraire à la photographie initiale ;
+- la photographie initiale du disbursement global est immuable et les obligations déjà acquises restent suivies dans leurs registres dédiés ;
+- les conditions de suspension communes pendant le disbursement global.
+
+La règle de remboursement exclusivement réservée aux transferts des deux contrats officiels BSC-USD/XTU provenant d'adresses expéditrices non enregistrées, l'exclusion absolue des faux tokens et des transferts hors BNB Smart Chain, ainsi que l'annulation définitive de tout droit au remboursement pour les utilisateurs connus, doivent être formulées sans ambiguïté dans les quatre documents. Les quatre documents doivent également avertir l'utilisateur de vérifier le réseau, le contrat exact du token et l'adresse officielle de réception OneX avant de poursuivre le transfert.
+
+======================================================================
+14. TESTS ET CRITÈRES D'ACCEPTATION
+======================================================================
+
+Dépôts communs :
+- les deux tokens utilisent exactement le minimum 20 et le plafond 100 ;
+- aucune limite hebdomadaire de montant entrant ;
+- une session ne contient qu'un seul token ;
+- aucune fenêtre de 60 minutes ni temporisation de collecte ; chaque transfert finalisé déclenche immédiatement une évaluation ;
+- le premier transfert finalisé fixe une échéance immuable à 30 jours ; les transferts ajoutés ne repoussent jamais cette échéance ;
+- tant que le cumul est inférieur à 20, les paiements du même utilisateur et du même token complètent le dossier ouvert ; dès 20 atteints, la collecte est clôturée et le crédit est évalué immédiatement ;
+- si le minimum n'est pas atteint au terme des 30 jours, tout le montant non crédité est affecté irréversiblement aux réserves communes ;
+- si le minimum est atteint mais qu'une partie reste non créditée, seul le reliquat non crédité est affecté irréversiblement aux réserves communes à l'échéance ;
+- après expiration, aucun solde utilisateur ultérieur ne peut réactiver le dossier ;
+- montant supérieur à 100 : crédit partiel jusqu'au plafond de tranche et reliquat conservé ;
+- reliquat réévalué dès chaque mise à jour du solde et par le worker périodique ;
+- notification Telegram après chaque transfert laissant un montant en attente, avec cause précise, action recommandée, montant en attente et délai restant ;
+- montant non crédité affecté aux réserves communes à l'échéance fixe de 30 jours, sans remboursement ;
+- FIFO des dossiers en attente ;
+- pas de double frais ou double crédit entre tranches ;
+- les limites s'appliquent identiquement que le financement soit ONEX ou vendeur.
+
+Financement hebdomadaire :
+- un achat ONEX consomme le droit même si le montant est faible ;
+- un deuxième achat ONEX est bloqué pendant sept jours ;
+- le compteur est commun BSC-USD/XTU ;
+- les achats exclusivement vendeurs ne consomment pas le droit ;
+- un achat mixte le consomme une seule fois ;
+- les tranches suivantes du même dossier ne le consomment pas à nouveau ;
+- le délai part du dernier achat réellement financé par ONEX.
+
+Crédit XTU et consolidation :
+- un dépôt XTU éligible peut être crédité avant que le Hot Wallet atteigne 100 XTU ;
+- la consolidation ne traite que les dépôts identifiés et finalisés ;
+- seuil de consolidation de 100 XTU net Hot Wallet ;
+- FIFO, aucune duplication, aucun balayage de l'offre initiale ;
+- provision gas et régularisation sur reçu réel ;
+- le gas réel est alloué exactement une fois ;
+- le crédit n'attend pas la consolidation ;
+- tous les XTU détenus au Hot Wallet sont protégés dans un registre de lots avant transfert ;
+- un reliquat XTU expiré est affecté à `common.total_units_price` et reste protégé au Hot Wallet jusqu'à consolidation ;
+- aucune consolidation inférieure à 100 XTU n'est permise, même après expiration ;
+- `common.xtu_wallets` n'est diminué qu'une seule fois au retour blockchain confirmé ; l'expiration et la consolidation ne créent pas de second décrément ;
+- consolidation ultérieure : déplacement de garde uniquement, sans double écriture de réserve.
+
+common.xtu_wallets :
+- le compteur augmente du net XTU externalisé après retrait confirmé ;
+- le retour XTU réduit le compteur du brut effectivement retourné ;
+- impossible de le rendre négatif ;
+- événement, contrat, reçu et commission doivent se rapprocher ;
+- incohérence : attente administrative, aucun décrément, aucun crédit, aucune consolidation ;
+- aucune écriture artificielle ni double traitement.
+
+Expiration et protection des XTU :
+- aucun paramètre, timer, condition ou requête ne maintient une fenêtre de 60 minutes ;
+- chaque transfert finalisé déclenche immédiatement une évaluation du dossier ;
+- l'échéance de 30 jours est fixée au premier transfert et n'est jamais repoussée par les transferts suivants ;
+- l'atteinte du minimum 20 ferme la collecte immédiatement et déclenche le traitement sans temporisation ;
+- à l'expiration, seule la partie non créditée est affectée aux réserves communes ; si le minimum n'a jamais été atteint, tout le cumul non crédité est affecté ;
+- une opération d'expiration rejouée n'augmente jamais `common.total_units_price` une deuxième fois ;
+- l'expiration générique et le worker XTU ne créent qu'une seule écriture `common.total_units_price` pour le même reliquat ;
+- chaque XTU reçu dans le Hot Wallet figure dans le registre de conservation avec sa provenance, son allocation et son statut ;
+- les XTU en attente ou expirés ne peuvent être utilisés par une autre opération ;
+- un lot de consolidation XTU de moins de 100 XTU n'est jamais envoyé, y compris après expiration ;
+- les montants XTU expirés inférieurs à 100 restent protégés et comptabilisés jusqu'à formation d'un lot FIFO d'au moins 100 XTU nets ;
+- la consolidation ne modifie pas une seconde fois `common.xtu_wallets` ni `common.total_units_price` ;
+- les écritures de retour XTU, d'expiration/réserve et de consolidation sont distinctes, traçables et idempotentes ;
+- Telegram reçoit après chaque transfert en attente un message qui indique le cas exact, le montant et le temps restant ;
+- `/app/user-last-stock` retourne les montants en attente et les échéances détaillées séparément pour BSC-USD et XTU ;
+- toute mise à jour du solde utilisateur réveille le traitement FIFO des dossiers encore dans leur période de 30 jours ;
+- un dossier expiré ne redevient jamais créditable.
+
+Paiement vendeur :
+- consommation des lots FIFO ;
+- aucune demande avant couverture intégrale de la dette ;
+- un seul paiement ouvert par vendeur ;
+- aucune fragmentation en paiements partiels ;
+- dette et réserves restent protégées jusqu'à confirmation/résolution ;
+- RPC incertain : rapprochement hash/nonce/reçu avant nouvelle soumission.
+
+Remboursements :
+- aucun utilisateur connu ne peut créer ou demander un remboursement pour un dépôt, un excédent ou un reliquat ;
+- les excédents de dépôts connus sont réévalués à chaque mise à jour du solde, mais expirent au terme fixe de 30 jours s'ils ne sont pas crédités ;
+- le seuil de 200 unités n'ouvre aucun droit au remboursement ;
+- un transfert n'est remboursable que si son contrat est exactement le contrat officiel BSC-USD ou XTU sur BNB Smart Chain Mainnet et si l'adresse expéditrice réelle n'est enregistrée dans aucun compte OneX ;
+- une adresse expéditrice inconnue associée à un faux token, à un autre contrat BEP-20 ou à un transfert sur un autre réseau ne crée aucun dossier remboursable ;
+- les faux tokens et transferts non pris en charge ne sont ni crédités ni remboursés ;
+- la demande est présentée par l'expéditeur de l'adresse inconnue et exige une décision administrative explicite ;
+- demandes, décisions et transactions éligibles sont stockées dans des registres dédiés, séparés des dépôts des comptes connus ;
+- un transfert officiel inconnu ne peut être qu'assigné à un compte ou remboursé, jamais les deux ;
+- le minimum de remboursement sortant existant reste appliqué aux remboursements approuvés des transferts officiels éligibles ;
+- aucun remboursement automatique ;
+- aucun remboursement ou annulation d'un montant déjà crédité, acquis, réservé ou en cours ;
+- destination et gas contrôlés ;
+- aucun doublon après résultat RPC incertain ;
+- les quatre documents terms/privacy décrivent la restriction et les exclusions de manière identique en français et en anglais ;
+- les quatre documents avertissent l'utilisateur de vérifier l'adresse de réception, le réseau BSC, le contrat exact du token et l'adresse expéditrice avant l'envoi.
+
+Disbursement global :
+- les dépôts BSC-USD et XTU sont suspendus au même cutoff ;
+- les transferts reçus après le cutoff sont tracés sans crédit ni nouvelle obligation ;
+- la photographie initiale reste immuable ;
+- les obligations acquises avant le cutoff restent suivies dans leurs registres dédiés ;
+- aucun dépôt XTU ne contourne la suspension BSC-USD ni le cutoff global.
+
+Documentation :
+- les quatre fichiers terms/privacy sont cohérents en français et anglais ;
+- aucun ancien endpoint recharge officiel ;
+- séparation BSC-USD/XTU clairement expliquée ;
+- règle de dépassement, de mise en attente et de remboursement sans ambiguïté.
+
+======================================================================
+15. CONFIRMATION DÉFINITIVE — POLITIQUE DE REMBOURSEMENT ET PRÉCAUTIONS D'ENVOI
+======================================================================
+
+La politique est définitivement arrêtée comme suit : le remboursement est
+annulé pour tout utilisateur disposant d'un compte OneX. Il ne concerne
+qu'un transfert du contrat officiel BSC-USD ou du contrat officiel XTU sur
+BNB Smart Chain Mainnet (Chain ID 56), lorsque l'adresse expéditrice réelle
+n'est enregistrée dans aucun compte OneX au moment de la réception.
+
+Les deux conditions sont cumulatives :
+- le contrat du token doit correspondre exactement à l'un des deux contrats
+  officiels BSC-USD ou XTU configurés par OneX sur BNB Smart Chain ;
+- l'adresse expéditrice réelle doit être inconnue/non enregistrée dans OneX
+  à la date de réception.
+
+En conséquence :
+- un utilisateur connu ne peut demander le remboursement d'aucun dépôt,
+  excédent ou reliquat, même si le montant reste longtemps en attente ;
+- le reliquat d'un dépôt connu attend au maximum jusqu'à l'échéance fixe de
+  30 jours du dossier ;
+- le système réévalue ce reliquat à chaque mise à jour du solde et lors des
+  reprises périodiques ; à l'échéance, le reliquat non crédité est
+  irréversiblement affecté aux réserves communes ;
+- aucune demande utilisateur, durée d'attente ou accumulation à 200 unités
+  ne peut transformer ce reliquat en remboursement ;
+- après 30 jours, la partie non créditée cesse définitivement d'être une
+  créance de dépôt utilisateur et devient un actif comptabilisé dans les
+  réserves communes ;
+- seul l'expéditeur d'un transfert du contrat officiel BSC-USD ou XTU,
+  provenant d'une adresse non enregistrée, peut présenter une demande de
+  remboursement ;
+- la demande de cet expéditeur est soumise à une décision administrative
+  explicite et n'entraîne jamais un remboursement automatique ;
+- les dossiers, bases de données, demandes, décisions et transactions de
+  remboursement restent séparés des dossiers ordinaires de dépôts connus ;
+- le minimum de remboursement actuellement configuré est conservé et
+  s'applique uniquement aux remboursements approuvés de ces transferts
+  officiels éligibles ;
+- aucun faux token, token d'imitation, token d'un autre contrat BEP-20,
+  token non pris en charge ou transfert effectué sur un autre réseau n'est
+  admissible au crédit ou au remboursement ; OneX ne garantit ni sa
+  détection, ni sa récupération, ni sa restitution ;
+- un transfert officiel inconnu ne peut être assigné à un compte ou
+  remboursé, jamais les deux pour le même montant ;
+- une transaction déjà acquise, réservée, signée ou en cours ne peut pas
+  être annulée par une demande de remboursement.
+
+Responsabilité de l'expéditeur : avant de signer une transaction, chaque
+utilisateur doit vérifier personnellement :
+- qu'il utilise BNB Smart Chain Mainnet (Chain ID 56) ;
+- que le token est bien le contrat officiel BSC-USD ou le contrat officiel
+  XTU indiqué par OneX, et non un token portant seulement un nom ou symbole
+  similaire ;
+- que l'adresse destinataire est exactement l'adresse officielle de
+  réception affichée ou communiquée par OneX ;
+- que le montant et l'adresse expéditrice sont corrects et conformes à son
+  compte OneX.
+
+OneX ne doit pas présenter les faux tokens, les tokens non pris en charge,
+les transferts sur d'autres réseaux ou les erreurs d'adresse de réception
+comme pouvant faire l'objet d'un remboursement. Les quatre documents
+terms_fr.html, terms_en.html, privacy_fr.html et privacy_en.html doivent
+exposer ces avertissements et cette politique de façon cohérente.
+
+Cette politique est une règle métier confirmée, et non un point à arbitrer.
+Elle doit être appliquée dans le backend, les routes, les schémas et
+registres SQL, les contrôles d'administration, les tests, les courriels et
+notifications, ainsi que dans les quatre documents légaux.
+
+
+======================================================================
+16. RÉVISION 4 — PRIORITÉ DES RÈGLES DE DÉPÔT ET DE CONSOLIDATION XTU
+======================================================================
+
+La présente révision remplace toute formulation antérieure contradictoire, notamment :
+- toute fenêtre de regroupement ou d'attente de 60 minutes ;
+- toute mention selon laquelle les reliquats de dépôts connus resteraient en attente sans échéance ;
+- toute exception permettant de consolider moins de 100 XTU au seul motif qu'un dossier a expiré ;
+- toute règle qui ferait dépendre le crédit utilisateur de la consolidation XTU ;
+- toute écriture qui décrémenterait `common.xtu_wallets` une deuxième fois à l'expiration ou à la consolidation.
+
+Ordre opérationnel impératif :
+1. détecter et finaliser le transfert sur la blockchain ;
+2. enregistrer immédiatement le dossier et ses données sources ;
+3. vérifier le seuil minimal de 20 et les conditions communes ;
+4. déclencher sans délai le crédit possible, par tranches maximales de 100 et selon la capacité/les réserves ;
+5. conserver le reliquat non crédité dans un registre protégé avec son échéance fixe de 30 jours ;
+6. réévaluer le reliquat à chaque modification du solde utilisateur et par reprise périodique ;
+7. à 30 jours, affecter de façon irréversible le reliquat non crédité aux réserves communes ;
+8. pour XTU, conserver tous les tokens non consolidés dans le registre de lots protégé ; ne lancer un transfert Hot Wallet → Distribution Wallet que lorsque le lot FIFO atteint au moins 100 XTU nets ;
+9. ne jamais forcer un transfert XTU inférieur à 100, même si le dossier correspondant a expiré ;
+10. ne comptabiliser qu'une seule fois le retour XTU dans `common.xtu_wallets`, une seule fois l'affectation du reliquat expiré dans `common.total_units_price`, et une seule fois chaque consolidation.
+
+Précision de comptabilité XTU : `common.xtu_wallets` mesure l'exposition XTU externalisée et non encore retournée. Le retour XTU finalisé et rapproché diminue ce compteur une seule fois, au moment du retour. L'expiration ultérieure reclassifie uniquement le reliquat non crédité dans `common.total_units_price`. La consolidation ultérieure déplace les tokens protégés du Hot Wallet vers le Distribution Wallet et n'effectue aucune nouvelle écriture sur ces deux champs communs. Si l'implémentation choisit de différer le décrément pour une catégorie technique particulière, elle doit néanmoins garantir un seul événement comptable de décrément et ne peut jamais le répéter à l'expiration ou à la consolidation.
+
+La valeur ajoutée à `common.total_units_price` au titre d'un reliquat XTU expiré est une valorisation comptable à la parité interne de 1 XTU = 1 BSC-USD. Elle ne signifie pas que des BSC-USD physiques ont été créés, reçus ou transférés. Les XTU concernés doivent rester identifiés, protégés et rapprochables jusqu'à leur consolidation conforme.
+
+FIN DE LA SPÉCIFICATION — RÉVISION 4

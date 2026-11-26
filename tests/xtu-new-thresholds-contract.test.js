@@ -57,15 +57,16 @@ test("personal-wallet XTU withdrawal has a 5 XTU gross minimum", () => {
   assert.match(androidGuide, /gross minimum of `5` XTU/);
 });
 
-test("BSC-USD deposits enforce the individual 100-unit ceiling and hold oversized transfers for support", () => {
+test("BSC-USD accepts transfers above 100 and caps each automatic credit tranche at 100", () => {
   const policy = read("deposit-policy.js");
   const routes = read("routes.js");
 
-  assert.match(policy, /amount\.isGreaterThan\(MAX_DEPOSIT_AMOUNT\)[\s\S]*?reason: "above_maximum"/);
-  assert.match(routes, /individualDepositAboveMaximum = amountValue\.isGreaterThan\(MAX_DEPOSIT_AMOUNT\)/);
-  assert.match(routes, /individualDepositAboveMaximum \? \["deposit_amount_above_maximum"\]/);
-  assert.match(routes, /JSON_CONTAINS\(reason_codes, JSON_QUOTE\('deposit_amount_above_maximum'\)\)=0/);
-  assert.match(routes, /Suggested action: contact OneX support by email or phone/);
+  assert.match(policy, /requiresMultipleTranches: amount\.isGreaterThan\(MAX_INITIAL_CREDIT_TRANCHE_AMOUNT\)/);
+  assert.doesNotMatch(policy, /reason: "above_maximum"/);
+  assert.doesNotMatch(routes, /individualDepositAboveMaximum/);
+  assert.match(routes, /BigNumber\.minimum\(remainingAmount, MAX_INITIAL_CREDIT_TRANCHE_AMOUNT\)/);
+  assert.match(routes, /remainingAfter\.isGreaterThan\(0\)/);
+  assert.match(routes, /expires_at_ms/);
 });
 
 test("weekly control counts one OneX-funded purchase, shared by BSC-USD and XTU, while seller campaigns bypass it", () => {
@@ -78,8 +79,9 @@ test("weekly control counts one OneX-funded purchase, shared by BSC-USD and XTU,
   const sellerAccounting = read("seller-accounting.js");
   const privacyEn = read("privacy_en.html");
 
-  assert.match(privacyEn, /one purchase funded from OneX system reserves per user per rolling seven days regardless of amount, as well as separate seller-campaign-funded credits that bypass this system-funding cooldown/);
-  assert.doesNotMatch(privacyEn, /including seller-campaign-funded credits that bypass this system-funding cooldown/);
+  assert.match(privacyEn, /one purchase[^.]*OneX system reserves[^.]*rolling seven days/i);
+  assert.match(privacyEn, /seller-campaign-funded credits[^.]*do not consume|credits funded exclusively from active seller campaigns[^.]*do not consume/i);
+  assert.doesNotMatch(privacyEn, /rolling seven-day incoming-amount ceiling/i);
   assert.match(policy, /SELECT id,record_date,record_time[\s\S]*?WHERE sender=\? AND receiver=\? AND type=2[\s\S]*?ORDER BY record_date DESC,record_time DESC,id DESC/);
   assert.doesNotMatch(policy, /SUM\(|amount\s*[<>]|gross_amount|xtu_amount|classifyRollingDepositReceipt|previousSevenDayGross|rollingSevenDayGross/);
   assert.match(routes, /const lastSystemPurchase = await getLastOneXSystemFundedPurchase\(tx, username, OneX\)/);

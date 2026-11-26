@@ -5,18 +5,20 @@ const { calculateGlobalUnitPrice, calculateDepositFundingAllocation } = require(
 
 const MAX_DEFAULT_STOCK = "300";
 const { DEPOSIT_MIN_AMOUNT, DEPOSIT_MAX_AMOUNT } = require("./deposit-limits");
-// Shared limits: 20 gross minimum and 100 gross maximum per deposit session for both BSC-USD and XTU.
+// Shared limits: 20 minimum per collecting dossier and 100 maximum per automatic credit tranche for both assets.
 const MIN_DEPOSIT_AMOUNT = new BigNumber(DEPOSIT_MIN_AMOUNT);
 const MAX_DEPOSIT_AMOUNT = new BigNumber(DEPOSIT_MAX_AMOUNT);
 // Keep the first automatically credited tranche distinct from the per-session deposit ceiling.
-const MAX_INITIAL_CREDIT_TRANCHE_AMOUNT = new BigNumber(
-  process.env.MAX_DEPOSIT_INITIAL_CREDIT_BSC_USD || "100",
-);
+const MAX_INITIAL_CREDIT_TRANCHE_AMOUNT = new BigNumber(DEPOSIT_MAX_AMOUNT);
+const DEPOSIT_PENDING_EXPIRATION_DAYS = Number(process.env.DEPOSIT_PENDING_EXPIRATION_DAYS || 30);
+if (DEPOSIT_PENDING_EXPIRATION_DAYS !== 30) {
+  throw new RangeError("DEPOSIT_PENDING_EXPIRATION_DAYS is fixed at 30 days by the deposit policy.");
+}
+const DEPOSIT_PENDING_EXPIRATION_MS = DEPOSIT_PENDING_EXPIRATION_DAYS * 24 * 60 * 60 * 1000;
 const SYSTEM_ADMIN_RESERVE_RATIO = new BigNumber(
   process.env.SYSTEM_ADMIN_RESERVE_RATIO || "0.10",
 );
 const SYSTEM_FUNDED_PURCHASE_COOLDOWN_DAYS = 7;
-const DEPOSIT_BATCH_WINDOW_MINUTES = 60;
 const DISBURSEMENT_COOLDOWN_DAYS = 30;
 const DISBURSEMENT_RESERVATION_MINUTES = 60;
 
@@ -31,7 +33,6 @@ if (
 }
 
 const SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS = SYSTEM_FUNDED_PURCHASE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
-const DEPOSIT_BATCH_WINDOW_MS = DEPOSIT_BATCH_WINDOW_MINUTES * 60 * 1000;
 const DISBURSEMENT_COOLDOWN_MS = DISBURSEMENT_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
 const DISBURSEMENT_RESERVATION_MS = DISBURSEMENT_RESERVATION_MINUTES * 60 * 1000;
 
@@ -40,18 +41,14 @@ function validateDepositAmount(amountValue) {
   if (!amount.isFinite() || !amount.isGreaterThan(0)) {
     return { allowed: false, reason: "invalid_amount" };
   }
-  if (amount.isLessThan(MIN_DEPOSIT_AMOUNT)) {
-    return { allowed: false, reason: "below_minimum" };
-  }
-  if (amount.isGreaterThan(MAX_DEPOSIT_AMOUNT)) {
-    return { allowed: false, reason: "above_maximum" };
-  }
   return {
     allowed: true,
     reason: null,
     amount,
+    minimumAmount: MIN_DEPOSIT_AMOUNT,
     initialCreditLimit: MAX_INITIAL_CREDIT_TRANCHE_AMOUNT,
-    exceedsInitialCreditLimit: amount.isGreaterThan(MAX_INITIAL_CREDIT_TRANCHE_AMOUNT),
+    requiresCollection: amount.isLessThan(MIN_DEPOSIT_AMOUNT),
+    requiresMultipleTranches: amount.isGreaterThan(MAX_INITIAL_CREDIT_TRANCHE_AMOUNT),
   };
 }
 
@@ -240,8 +237,8 @@ module.exports = {
   SYSTEM_ADMIN_RESERVE_RATIO,
   SYSTEM_FUNDED_PURCHASE_COOLDOWN_DAYS,
   SYSTEM_FUNDED_PURCHASE_COOLDOWN_MS,
-  DEPOSIT_BATCH_WINDOW_MINUTES,
-  DEPOSIT_BATCH_WINDOW_MS,
+  DEPOSIT_PENDING_EXPIRATION_DAYS,
+  DEPOSIT_PENDING_EXPIRATION_MS,
   DISBURSEMENT_COOLDOWN_DAYS,
   DISBURSEMENT_COOLDOWN_MS,
   DISBURSEMENT_RESERVATION_MINUTES,

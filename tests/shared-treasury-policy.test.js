@@ -106,8 +106,8 @@ test("Terms and Privacy describe the shared-treasury and fixed-wallet model in b
     assert.match(text, /treasury|trésorerie/i, `${name} must describe the shared treasury`);
     assert.match(text, /unknown|inconnu/i, `${name} must describe unmatched transfers`);
     assert.match(text, /from|expédit/i, `${name} must explain sender-address matching`);
-    assert.match(text, /block cursor|curseur de blocs/i, `${name} must describe durable scanner state`);
-    assert.match(text, /manual_review/i, `${name} must describe scanner reconciliation holds`);
+    assert.match(text, /block cursor|curseur de blocs|durable scanner state|curseur persistant/i, `${name} must describe durable scanner state`);
+    assert.match(text, /manual_review|examen manuel/i, `${name} must describe scanner reconciliation holds`);
   }
   assert.match(read("terms_fr.html"), /C = 3 × tfees × min\(1, 2 × V \/ P\)/);
   assert.match(read("terms_en.html"), /C = 3 × tfees × min\(1, 2 × V \/ P\)/);

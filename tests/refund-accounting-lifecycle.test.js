@@ -29,15 +29,12 @@ test("refund request and refund record have unique direct one-to-one links", () 
   assert.match(db, /UNIQUE KEY uq_user_refund_request_event_key\(event_key\)/);
 });
 
-test("administrative approval reserves the pending remainder without counting it as refunded", () => {
+test("known-account deposit refund endpoint is disabled under the confirmed policy", () => {
   const adminRoute = between(routes, 'router.post("/admin/deposit/refund"', '// Requeue an unsubmitted disbursement');
-  assert.match(adminRoute, /MAX_INITIAL_CREDIT_TRANCHE_AMOUNT\.multipliedBy\(3\)/);
-  assert.match(adminRoute, /reserved_refund_amount=reserved_refund_amount\+\?,remaining_amount=remaining_amount-\?/);
-  assert.doesNotMatch(adminRoute, /refunded_amount=refunded_amount\+/);
-  assert.match(adminRoute, /user_request_id/);
-  assert.match(adminRoute, /refund_id=\?/);
-  assert.match(adminRoute, /WHERE id=\? AND status='pending_admin' AND refund_id IS NULL/);
-  assert.match(adminRoute, /recordRefundRequestEventTx/);
+  assert.match(adminRoute, /status\(403\)/);
+  assert.match(adminRoute, /known_account_deposit_refund_disabled/);
+  assert.match(adminRoute, /Refunds are restricted to official BSC-USD or XTU transfers from sender addresses not registered/);
+  assert.doesNotMatch(adminRoute, /reserved_refund_amount=reserved_refund_amount\+/);
 });
 
 test("only a confirmed blockchain refund converts reserved amount into refunded amount", () => {
@@ -84,9 +81,10 @@ test("administrator user-info endpoint exists and is rate limited without exposi
 });
 
 for (const file of ["terms_fr.html", "terms_en.html"]) {
-  test(`${file} states the 300 BSC-USD exceptional remainder threshold and deactivation grounds`, () => {
+  test(`${file} states the 300 XTU individual valuation cap and deactivation grounds`, () => {
     const html = read(file);
-    assert.match(html, /300 BSC-USD/);
+    assert.match(html, /300 XTU/);
+    assert.doesNotMatch(html, /300 BSC-USD/);
     assert.match(html, /multiple accounts|plusieurs comptes/i);
     assert.match(html, /suspicious|suspect/i);
     assert.match(html, /non-compliance|non-respect/i);

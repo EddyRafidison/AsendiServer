@@ -39,6 +39,8 @@ const {
 } = require("./bsc-fee-accounting");
 const { getBnbUsdPrice } = require("./bsc-price-oracle");
 const { getConfiguredMaxBscTxFeeUsd, evaluateBscTxFee } = require("./bsc-transaction-policy");
+const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
+const { calculateXtuUnknownRefundQuote } = require("./xtu-unknown-refund-policy");
 const {
   calculateDepositFundingAllocation,
   calculateSellerOnlyDepositFundingAllocation,
@@ -222,19 +224,18 @@ async function notifyUserTx(tx, username, eventKey, subject, message) {
   }
 }
 
-async function createDepositBatchTx(tx, username, settings, blockTimestampMs, status = "collecting", reason = null, globalRunId = null) {
-  const timestamp = Number(blockTimestampMs);
-  const expiresAt = timestamp + settings.depositBatchWindowMs;
-  const initialDeadline = timestamp + settings.depositInitialGroupingTimeoutMs;
+async function createDepositBatchTx(tx, username, settings, finalizedAtMs, status = "collecting", reason = null, globalRunId = null) {
+  const timestamp = Number(finalizedAtMs);
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) throw new RangeError("Invalid finalized XTU deposit timestamp.");
+  const expiresAt = timestamp + settings.depositPendingExpirationMs;
   const pendingSince = status === "collecting" ? null : timestamp;
-  const retryAfterDelay = status === "pending_weekly" || status === "pending_minimum";
-  const releaseAt = retryAfterDelay ? timestamp + settings.depositPendingRetryMs : null;
+  const releaseAt = status === "pending_weekly" ? timestamp + settings.depositPendingRetryMs : null;
   const [result] = await tx.query(
     `INSERT INTO xtu_deposit_batches
      (username,hot_wallet_address,opened_at_ms,expires_at_ms,initial_group_deadline_ms,global_run_id,
       pending_since_ms,release_at_ms,status,reason_codes,tfees_rate_percent,created_at_ms,updated_at_ms)
      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [username, settings.mainWalletAddress, String(timestamp), String(expiresAt), String(initialDeadline), globalRunId,
+    [username, settings.mainWalletAddress, String(timestamp), String(expiresAt), String(expiresAt), globalRunId,
       pendingSince == null ? null : String(pendingSince), releaseAt == null ? null : String(releaseAt),
       status, reason ? JSON.stringify([reason]) : "[]", new BigNumber(tfees).toFixed(10), String(Date.now()), String(Date.now())],
   );
@@ -244,15 +245,24 @@ async function createDepositBatchTx(tx, username, settings, blockTimestampMs, st
 async function assignDepositEventTx(tx, event, settings) {
   const identity = eventIdentity(event.txHash, event.logIndex);
   const [existingEventRows] = await tx.query(
-    `SELECT id FROM xtu_deposit_transfer_events WHERE event_identity=? LIMIT 1 FOR UPDATE`, [identity],
+    `SELECT id,username,batch_id,status FROM xtu_deposit_transfer_events WHERE event_identity=? LIMIT 1 FOR UPDATE`, [identity],
   );
-  if (existingEventRows.length) return { status: "duplicate" };
+  const previouslyUnknownEvent = existingEventRows.length === 1 &&
+    existingEventRows[0].username == null && existingEventRows[0].batch_id == null &&
+    String(existingEventRows[0].status) === "pending_identity";
+  if (existingEventRows.length && !previouslyUnknownEvent) return { status: "duplicate" };
+
   const [authRows] = await tx.query(
     `SELECT username,email,account_active,wallet_address FROM auths
-     WHERE LOWER(wallet_address)=LOWER(?) LIMIT 1 FOR UPDATE`,
-    [event.sender],
+     WHERE LOWER(wallet_address)=LOWER(?) LIMIT 1 FOR UPDATE`, [event.sender],
   );
   if (!authRows.length) {
+    // Preserve the finalized event and create a separate XTU-only unknown-transfer record.
+    // Unknown XTU is excluded from user deposit batches and Hot Wallet consolidation lots.
+    const grossAmount = new BigNumber(event.gross.toString()).shiftedBy(-18);
+    const hotWalletAmount = new BigNumber(event.net.toString()).shiftedBy(-18);
+    const commissionAmount = new BigNumber(event.fee.toString()).shiftedBy(-18);
+    const now = String(Date.now());
     await tx.query(
       `INSERT IGNORE INTO xtu_deposit_transfer_events
        (username,batch_id,token_contract,from_address,hot_wallet_address,gross_amount,net_amount,commission_amount,
@@ -260,16 +270,40 @@ async function assignDepositEventTx(tx, event, settings) {
         block_timestamp_ms,event_identity,status,reason_codes,created_at_ms)
        VALUES(NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending_identity','["wallet_not_linked"]',?)`,
       [settings.tokenAddress, event.sender, settings.mainWalletAddress,
-        new BigNumber(event.gross.toString()).shiftedBy(-18).toFixed(18),
-        new BigNumber(event.net.toString()).shiftedBy(-18).toFixed(18),
-        new BigNumber(event.fee.toString()).shiftedBy(-18).toFixed(18),
+        grossAmount.toFixed(18), hotWalletAmount.toFixed(18), commissionAmount.toFixed(18),
         event.gross.toString(), event.net.toString(), event.fee.toString(), event.txHash,
-        String(event.logIndex), String(event.blockNumber), event.blockHash, String(event.blockTimestampMs), identity, String(Date.now())],
+        String(event.logIndex), String(event.blockNumber), event.blockHash,
+        String(event.blockTimestampMs), identity, now],
     );
-    return { status: "pending_identity" };
+    await tx.query(
+      `INSERT IGNORE INTO xtu_unknown_incoming_transfers
+       (chain_id,token_contract,from_address,hot_wallet_address,gross_amount,hot_wallet_received_amount,commission_amount,
+        gross_amount_raw,hot_wallet_received_raw,commission_amount_raw,tx_hash,log_index,block_number,block_hash,
+        block_timestamp_ms,finalized_at_ms,receipt_json,event_identity,previous_username,status,created_at_ms,updated_at_ms)
+       VALUES(56,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'pending_admin',?,?)`,
+      [settings.tokenAddress, event.sender, settings.mainWalletAddress, grossAmount.toFixed(18),
+        hotWalletAmount.toFixed(18), commissionAmount.toFixed(18), event.gross.toString(), event.net.toString(),
+        event.fee.toString(), event.txHash, String(event.logIndex), String(event.blockNumber), event.blockHash,
+        String(event.blockTimestampMs), String(event.finalizedAtMs || Date.now()), String(event.receiptJson || null), identity, now, now],
+    );
+    return { status: "pending_identity", unknownTransfer: true };
   }
+
+  await acquireDepositLocks(tx);
   const username = authRows[0].username;
   const eventTimestamp = Number(event.blockTimestampMs);
+  const finalizedAtMs = Number.isSafeInteger(Number(event.finalizedAtMs)) && Number(event.finalizedAtMs) > 0
+    ? Number(event.finalizedAtMs) : Date.now();
+  const grossAmount = new BigNumber(event.gross.toString()).shiftedBy(-18);
+  const hotWalletAmount = new BigNumber(event.net.toString()).shiftedBy(-18);
+  const commissionAmount = new BigNumber(event.fee.toString()).shiftedBy(-18);
+  if (!grossAmount.isFinite() || !grossAmount.isGreaterThan(0) ||
+      !hotWalletAmount.isFinite() || !hotWalletAmount.isGreaterThan(0) ||
+      !commissionAmount.isFinite() || commissionAmount.isNegative() ||
+      !hotWalletAmount.plus(commissionAmount).eq(grossAmount)) {
+    throw new Error("The finalized XTU deposit event has inconsistent gross, net and commission amounts.");
+  }
+
   const [globalRows] = await tx.query(
     `SELECT id,status,effective_at_ms FROM global_disbursement_runs
      WHERE status IN ('active','closed','manual_review','completed','resolved')
@@ -279,134 +313,158 @@ async function assignDepositEventTx(tx, event, settings) {
   const eventGlobalRunId = candidateGlobal && isGlobalDisbursementEffective(candidateGlobal.status) &&
     eventTimestamp >= Number(candidateGlobal.effective_at_ms || Number.MAX_SAFE_INTEGER)
     ? String(candidateGlobal.id) : null;
-  const incoming = new BigNumber(event.gross.toString()).shiftedBy(-18);
-  const [activeRows] = await tx.query(
-    `SELECT * FROM xtu_deposit_batches WHERE username=? AND status='collecting'
-     ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
+  const [controlRows] = await tx.query(
+    "SELECT is_suspended FROM deposit_service_control WHERE control_id=1 LIMIT 1 FOR UPDATE",
   );
-  let activeBatch = activeRows[0] || null;
-  if (activeBatch && String(activeBatch.global_run_id || "") !== String(eventGlobalRunId || "")) {
-    const priorGross = new BigNumber(activeBatch.gross_amount || "0");
-    const priorStatus = priorGross.gte(MIN_XTU_DEPOSIT) && priorGross.lte(MAX_XTU_DEPOSIT)
-      ? "ready" : (priorGross.gt(MAX_XTU_DEPOSIT) ? "pending_support" : "pending_minimum");
-    const priorReason = priorStatus === "pending_support"
-      ? JSON.stringify(["deposit_session_above_maximum"])
-      : (priorStatus === "pending_minimum" ? JSON.stringify(["minimum_not_reached"]) : "[]");
-    const [latestPriorEventRows] = await tx.query(
-      "SELECT MAX(CAST(block_timestamp_ms AS UNSIGNED)) AS latest_event_ms FROM xtu_deposit_transfer_events WHERE batch_id=?",
-      [String(activeBatch.id)],
+  const manuallySuspended = Number(controlRows[0]?.is_suspended || 0) === 1;
+  const accountInactive = Number(authRows[0].account_active) !== 1;
+  const globalCutoff = eventGlobalRunId != null;
+
+  const [activeRows] = await tx.query(
+    `SELECT * FROM xtu_deposit_batches
+     WHERE username=? AND status='collecting' AND CAST(expires_at_ms AS UNSIGNED)>?
+     ORDER BY opened_at_ms ASC,id ASC LIMIT 1 FOR UPDATE`, [username, String(finalizedAtMs)],
+  );
+  let batch = activeRows[0] || null;
+  if (batch && String(batch.global_run_id || "") !== String(eventGlobalRunId || "")) batch = null;
+
+  if (!batch) {
+    const [reopenRows] = await tx.query(
+      `SELECT * FROM xtu_deposit_batches
+       WHERE username=? AND status='pending_minimum' AND global_run_id <=> ?
+         AND CAST(expires_at_ms AS UNSIGNED)>?
+       ORDER BY opened_at_ms ASC,id ASC LIMIT 1 FOR UPDATE`,
+      [username, eventGlobalRunId, String(finalizedAtMs)],
     );
-    const latestPriorEvent = Number(latestPriorEventRows[0]?.latest_event_ms || activeBatch.opened_at_ms);
-    await tx.query(
-      `UPDATE xtu_deposit_batches SET status=?,pending_since_ms=?,release_at_ms=?,reason_codes=?,updated_at_ms=? WHERE id=? AND status='collecting'`,
-      [priorStatus, priorStatus === "ready" || priorStatus === "pending_support" ? null : String(Date.now()),
-        priorStatus === "ready" || priorStatus === "pending_support" ? null : String(latestPriorEvent + settings.depositPendingRetryMs),
-        priorReason, String(Date.now()), String(activeBatch.id)],
-    );
-    activeBatch = null;
-  }
-  if (activeBatch && eventTimestamp > Number(activeBatch.expires_at_ms)) {
-    const priorGross = new BigNumber(activeBatch.gross_amount || "0");
-    const priorStatus = priorGross.gte(MIN_XTU_DEPOSIT) && priorGross.lte(MAX_XTU_DEPOSIT)
-      ? "ready" : (priorGross.gt(MAX_XTU_DEPOSIT) ? "pending_support" : "pending_minimum");
-    const priorReason = priorStatus === "pending_support"
-      ? JSON.stringify(["deposit_session_above_maximum"])
-      : (priorStatus === "pending_minimum" ? JSON.stringify(["minimum_not_reached"]) : "[]");
-    const [latestPriorEventRows] = await tx.query(
-      "SELECT MAX(CAST(block_timestamp_ms AS UNSIGNED)) AS latest_event_ms FROM xtu_deposit_transfer_events WHERE batch_id=?",
-      [String(activeBatch.id)],
-    );
-    const latestPriorEvent = Number(latestPriorEventRows[0]?.latest_event_ms || activeBatch.opened_at_ms);
-    await tx.query(
-      `UPDATE xtu_deposit_batches SET status=?,pending_since_ms=?,release_at_ms=?,reason_codes=?,updated_at_ms=?
-       WHERE id=? AND status='collecting'`,
-      [priorStatus,
-        priorStatus === "ready" || priorStatus === "pending_support" ? null : String(Date.now()),
-        priorStatus === "ready" || priorStatus === "pending_support" ? null : String(latestPriorEvent + settings.depositPendingRetryMs),
-        priorReason, String(Date.now()), String(activeBatch.id)],
-    );
-    activeBatch = null;
+    batch = reopenRows[0] || null;
   }
 
-  const currentSessionAmount = new BigNumber(activeBatch?.gross_amount || "0");
-  const sessionDecision = classifyDepositSession({
-    incomingGross: incoming,
-    currentBatchGross: activeBatch ? currentSessionAmount : 0,
-  });
-  let batchId;
-  let eventStatus = "detected";
-  let reason = null;
+  let blockingReason = null;
+  if (globalCutoff) blockingReason = "received_after_global_disbursement_cutoff";
+  else if (manuallySuspended) blockingReason = "manual_deposit_suspended";
+  else if (accountInactive) blockingReason = "account_deactivated";
 
-  if (Number(authRows[0].account_active) !== 1) {
-    reason = "account_inactive";
-    batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
-    eventStatus = "pending_support";
-  } else if (!sessionDecision.allowed) {
-    reason = sessionDecision.reason;
-    batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
-    eventStatus = "pending_support";
-  } else if (activeBatch) {
-    batchId = String(activeBatch.id);
-  } else {
+  // A returned XTU reduces the externalized exposure exactly once when its
+  // finalized event is registered, never later at consolidation or expiry.
+  const common = await getLatestCommonTx(tx, true);
+  const outstandingXtu = new BigNumber(common.xtu_wallets || "0");
+  const counterConsistent = outstandingXtu.isFinite() && !outstandingXtu.isNegative() && outstandingXtu.gte(grossAmount);
+  if (!counterConsistent) blockingReason = "xtu_return_counter_insufficient_manual_review";
+
+  if (!batch) {
     const [lastRows] = await tx.query(
-      `SELECT * FROM xtu_deposit_batches WHERE username=? ORDER BY id DESC LIMIT 1 FOR UPDATE`, [username],
+      `SELECT * FROM xtu_deposit_batches WHERE username=? ORDER BY opened_at_ms DESC,id DESC LIMIT 1 FOR UPDATE`,
+      [username],
     );
     const lastBatch = lastRows[0] || null;
-    if (lastBatch && lastBatch.status === "pending_minimum" &&
-        String(lastBatch.global_run_id || "") === String(eventGlobalRunId || "") &&
-        eventTimestamp <= Number(lastBatch.initial_group_deadline_ms || 0)) {
-      const reopenedDecision = classifyDepositSession({ incomingGross: incoming, currentBatchGross: lastBatch.gross_amount || 0 });
-      if (!reopenedDecision.allowed) {
-        reason = reopenedDecision.reason;
-        batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
-        eventStatus = "pending_support";
-      } else {
-        await tx.query(
-          `UPDATE xtu_deposit_batches SET status='collecting',expires_at_ms=?,pending_since_ms=NULL,
-           release_at_ms=NULL,reason_codes='[]',updated_at_ms=? WHERE id=? AND status='pending_minimum'`,
-          [String(eventTimestamp + settings.depositBatchWindowMs), String(Date.now()), String(lastBatch.id)],
-        );
-        activeBatch = { ...lastBatch, status: "collecting", expires_at_ms: String(eventTimestamp + settings.depositBatchWindowMs) };
-        batchId = String(activeBatch.id);
-      }
-    } else if (lastBatch && !["credited", "rejected", "reversed"].includes(String(lastBatch.status))) {
-      reason = eventTimestamp > Number(lastBatch.initial_group_deadline_ms || 0)
-        ? "outside_initial_grouping_window" : "previous_batch_unresolved";
-      batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "pending_support", reason, eventGlobalRunId);
-      eventStatus = "pending_support";
-    } else {
-      batchId = await createDepositBatchTx(tx, username, settings, eventTimestamp, "collecting", null, eventGlobalRunId);
+    if (lastBatch && !["credited", "forfeited_to_common_reserve", "rejected", "reversed"].includes(String(lastBatch.status)) &&
+        String(lastBatch.status) !== "pending_minimum") {
+      // Never merge a later payment into an already eligible/blocked batch.
+      // It opens its own fixed 30-day batch and is kept in FIFO order.
     }
+    const initialStatus = counterConsistent
+      ? (blockingReason ? (blockingReason === "xtu_return_counter_insufficient_manual_review" ? "manual_review" :
+        blockingReason === "received_after_global_disbursement_cutoff" ? "pending_global" : "pending_support") : "collecting")
+      : "manual_review";
+    const batchId = await createDepositBatchTx(
+      tx, username, settings, finalizedAtMs, initialStatus,
+      blockingReason || null, eventGlobalRunId,
+    );
+    const [newRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [batchId]);
+    batch = newRows[0];
   }
 
-  const [insertResult] = await tx.query(
-    `INSERT IGNORE INTO xtu_deposit_transfer_events
-     (username,batch_id,token_contract,from_address,hot_wallet_address,gross_amount,net_amount,commission_amount,
-      gross_amount_raw,net_amount_raw,commission_amount_raw,tx_hash,log_index,block_number,block_hash,
-      block_timestamp_ms,event_identity,status,reason_codes,created_at_ms)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [username, batchId, settings.tokenAddress, event.sender, settings.mainWalletAddress,
-      incoming.toFixed(18), new BigNumber(event.net.toString()).shiftedBy(-18).toFixed(18),
-      new BigNumber(event.fee.toString()).shiftedBy(-18).toFixed(18), event.gross.toString(), event.net.toString(),
-      event.fee.toString(), event.txHash, String(event.logIndex), String(event.blockNumber), event.blockHash,
-      String(eventTimestamp), identity, eventStatus, reason ? JSON.stringify([reason]) : "[]", String(Date.now())],
-  );
-  if (Number(insertResult.affectedRows || 0) !== 1) return { status: "duplicate" };
+  const nextGross = new BigNumber(batch.gross_amount || "0").plus(grossAmount);
+  const nextHot = new BigNumber(batch.hot_wallet_received_amount || "0").plus(hotWalletAmount);
+  const nextCommission = new BigNumber(batch.commission_amount || "0").plus(commissionAmount);
+  let eventStatus = "detected";
+  let batchStatus = String(batch.status);
+  if (!counterConsistent) {
+    batchStatus = "manual_review";
+    eventStatus = "manual_review";
+  } else if (blockingReason === "received_after_global_disbursement_cutoff") {
+    batchStatus = "pending_global";
+    eventStatus = "pending_global";
+  } else if (blockingReason) {
+    batchStatus = "pending_support";
+    eventStatus = "pending_support";
+  } else {
+    batchStatus = nextGross.gte(MIN_XTU_DEPOSIT) ? "ready" : "collecting";
+    eventStatus = batchStatus;
+  }
+
+  const eventValues = [username, String(batch.id), settings.tokenAddress, event.sender, settings.mainWalletAddress,
+    grossAmount.toFixed(18), hotWalletAmount.toFixed(18), commissionAmount.toFixed(18), event.gross.toString(),
+    event.net.toString(), event.fee.toString(), event.txHash, String(event.logIndex), String(event.blockNumber),
+    event.blockHash, String(eventTimestamp), identity, eventStatus,
+    blockingReason ? JSON.stringify([blockingReason]) : "[]",
+    counterConsistent ? String(Date.now()) : null, String(Date.now())];
+  if (previouslyUnknownEvent) {
+    await tx.query(
+      `UPDATE xtu_deposit_transfer_events SET username=?,batch_id=?,token_contract=?,from_address=?,hot_wallet_address=?,
+       gross_amount=?,net_amount=?,commission_amount=?,gross_amount_raw=?,net_amount_raw=?,commission_amount_raw=?,
+       tx_hash=?,log_index=?,block_number=?,block_hash=?,block_timestamp_ms=?,status=?,reason_codes=?,
+       common_xtu_counter_decremented_at_ms=?,created_at_ms=? WHERE event_identity=? AND username IS NULL AND status='pending_identity'`,
+      [eventValues[0], eventValues[1], eventValues[2], eventValues[3], eventValues[4],
+        eventValues[5], eventValues[6], eventValues[7], eventValues[8], eventValues[9], eventValues[10],
+        eventValues[11], eventValues[12], eventValues[13], eventValues[14], eventValues[15],
+        eventValues[17], eventValues[18], eventValues[19], eventValues[20], identity],
+    );
+  } else {
+    const [insertResult] = await tx.query(
+      `INSERT IGNORE INTO xtu_deposit_transfer_events
+       (username,batch_id,token_contract,from_address,hot_wallet_address,gross_amount,net_amount,commission_amount,
+        gross_amount_raw,net_amount_raw,commission_amount_raw,tx_hash,log_index,block_number,block_hash,
+        block_timestamp_ms,event_identity,status,reason_codes,common_xtu_counter_decremented_at_ms,created_at_ms)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, eventValues,
+    );
+    if (Number(insertResult.affectedRows || 0) !== 1) return { status: "duplicate" };
+  }
+
+  if (counterConsistent) {
+    const nextOutstanding = outstandingXtu.minus(grossAmount);
+    const [date, time] = utcDateTime();
+    await insertCommonSnapshotTx(tx, common, { xtu_wallets: nextOutstanding.toFixed(30) }, date, time);
+  }
 
   await tx.query(
-    `UPDATE xtu_deposit_batches SET gross_amount=gross_amount+?,hot_wallet_received_amount=hot_wallet_received_amount+?,
-     commission_amount=commission_amount+?,remaining_amount=remaining_amount+?,transfer_count=transfer_count+1,updated_at_ms=?
-     WHERE id=?`,
-    [incoming.toFixed(18), new BigNumber(event.net.toString()).shiftedBy(-18).toFixed(18),
-      new BigNumber(event.fee.toString()).shiftedBy(-18).toFixed(18), incoming.toFixed(18), String(Date.now()), batchId],
+    `UPDATE xtu_deposit_batches
+     SET gross_amount=gross_amount+?,hot_wallet_received_amount=hot_wallet_received_amount+?,
+         commission_amount=commission_amount+?,returned_amount=returned_amount+?,remaining_amount=remaining_amount+?,transfer_count=transfer_count+1,
+         common_xtu_return_accounted_at_ms=CASE WHEN ? IS NULL THEN common_xtu_return_accounted_at_ms ELSE ? END,
+         status=?,pending_since_ms=CASE WHEN ?='collecting' THEN pending_since_ms ELSE COALESCE(pending_since_ms,?) END,
+         reason_codes=?,updated_at_ms=? WHERE id=?`,
+    [grossAmount.toFixed(18), hotWalletAmount.toFixed(18), commissionAmount.toFixed(18), grossAmount.toFixed(18), grossAmount.toFixed(18),
+      counterConsistent ? String(Date.now()) : null, counterConsistent ? String(Date.now()) : null,
+      batchStatus, batchStatus, String(Date.now()), blockingReason ? JSON.stringify([blockingReason]) : "[]",
+      String(Date.now()), String(batch.id)],
   );
-  if (reason) {
-    await notifyUserTx(
-      tx, username, `xtu-deposit:${batchId}:${reason}`, "OneX XTU deposit pending",
-      `Your XTU deposit has been detected and finalized, but it is pending because: ${reason}. Please contact OneX support by email or phone to review this deposit. Reference: ${event.txHash}.`,
-    );
+
+  await tx.query(
+    `INSERT IGNORE INTO xtu_hot_wallet_lots
+     (event_identity,batch_id,username,token_contract,chain_id,from_address,hot_wallet_address,tx_hash,log_index,
+      gross_amount,hot_wallet_received_amount,commission_amount,pending_user_amount,protected_hot_wallet_amount,
+      status,first_finalized_at_ms,created_at_ms,updated_at_ms)
+     VALUES(?,?,?,?,56,?,?,?,?,?,?,?,?,?,'protected',?,?,?)`,
+    [identity, String(batch.id), username, settings.tokenAddress, event.sender, settings.mainWalletAddress,
+      event.txHash, String(event.logIndex), grossAmount.toFixed(18), hotWalletAmount.toFixed(18),
+      commissionAmount.toFixed(18), hotWalletAmount.toFixed(18), hotWalletAmount.toFixed(18),
+      String(finalizedAtMs), String(finalizedAtMs), String(finalizedAtMs)],
+  );
+
+  if (blockingReason) {
+    const detail = blockingReason === "xtu_return_counter_insufficient_manual_review"
+      ? `The finalized XTU transfer is ${grossAmount.toFixed(8)} XTU, but common.xtu_wallets is only ${outstandingXtu.toFixed(8)} XTU. The amount is protected and requires administrative reconciliation; no credit, counter decrement or consolidation is allowed.`
+      : `The XTU transfer is finalized and recorded, but deposit processing is blocked: ${blockingReason}. It remains protected until the blocking condition is resolved or its fixed expiry is reached.`;
+    await notifyUserTx(tx, username, `xtu-deposit:${identity}:pending`, "OneX XTU deposit pending", detail);
+  } else {
+    const missing = BigNumber.maximum(0, MIN_XTU_DEPOSIT.minus(nextGross));
+    const statusMessage = batchStatus === "collecting"
+      ? `Your finalized XTU transfer has been recorded. Current batch total: ${nextGross.toFixed(8)} XTU. Another ${missing.toFixed(8)} XTU is required to reach the 20 XTU minimum. Fixed expiry: ${new Date(Number(batch.expires_at_ms)).toISOString()}. Any amount still uncredited at expiry is irrevocably reclassified to OneX common reserves and is not refundable.`
+      : `Your XTU batch has reached the 20 XTU minimum and is now being checked for immediate credit. Batch total: ${nextGross.toFixed(8)} XTU. The 100 XTU limit applies per credit tranche; any amount not credited remains pending until its fixed 30-day expiry, when it is irrevocably reclassified to common reserves.`;
+    await notifyUserTx(tx, username, `xtu-deposit:${identity}:received`, "OneX XTU deposit received", statusMessage);
   }
-  return { status: eventStatus, username, batchId };
+  return { status: eventStatus, username, batchId: String(batch.id), creditReady: batchStatus === "ready" };
 }
 
 async function scanIncomingEvents(pool, provider, settings) {
@@ -456,6 +514,8 @@ async function scanIncomingEvents(pool, provider, settings) {
         blockNumber: log.blockNumber,
         blockHash: log.blockHash,
         blockTimestampMs,
+        finalizedAtMs: Date.now(),
+        receiptJson: JSON.stringify(receipt),
       }, settings));
     }
     cursor = to;
@@ -535,7 +595,9 @@ async function assessBatchCapacityTx(tx, batch, gasUsdEstimate, settings) {
   const common = await getLatestCommonTx(tx, true);
   const globalRun = await getGlobalRunTx(tx, batch.global_run_id || null);
   const [priorCreditRows] = await tx.query(
-    `SELECT COALESCE(SUM(creditable_xtu),0) AS amount,COUNT(*) AS credit_count
+    `SELECT COALESCE(SUM(creditable_xtu),0) AS amount,
+            COALESCE(SUM(gross_returned_xtu),0) AS gross_processed,
+            COALESCE(SUM(CASE WHEN gas_fee_status='reconciled' THEN gas_actual_fee_xtu ELSE gas_fee_xtu END),0) AS gas_processed,COUNT(*) AS credit_count
      FROM xtu_deposit_credits WHERE batch_id=? FOR UPDATE`, [String(batch.id)],
   );
   const credit = calculateXtuDepositTranche({
@@ -545,6 +607,8 @@ async function assessBatchCapacityTx(tx, batch, gasUsdEstimate, settings) {
     globalDisbursementActive: Boolean(globalRun),
     globalUnitPrice: common.unit_price,
     creditedBeforeXtu: priorCreditRows[0]?.amount || "0",
+    grossCreditedBeforeXtu: priorCreditRows[0]?.gross_processed || "0",
+    gasCreditedBeforeXtu: priorCreditRows[0]?.gas_processed || "0",
     creditSequence: Number(batch.credit_sequence || 0),
     maximumInitialCreditXtu: settings.depositInitialCreditCap,
   });
@@ -571,49 +635,297 @@ async function assessBatchCapacityTx(tx, batch, gasUsdEstimate, settings) {
   return { allowed: true, credit, allocation, common, globalRun, currentBalance, nextBalance, userCapacity };
 }
 
-async function closeExpiredBatches(pool, settings) {
+async function ensureXtuBatchGasProvision(pool, batchId, runtime) {
+  const existingRows = await pool.queryAsync(
+    "SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1", [String(batchId)],
+  );
+  if (!existingRows.length) return null;
+  const existing = existingRows[0];
+  const existingProvision = new BigNumber(existing.gas_provisioned_usd || "0");
+  if (existingProvision.isGreaterThan(0)) return { feeUsd: existingProvision, feeBnb: new BigNumber(0), provisional: true };
+  if (["manual_review", "pending_global", "forfeited_to_common_reserve", "credited"].includes(String(existing.status))) return null;
+
+  const data = runtime.contract.interface.encodeFunctionData("transfer", [runtime.settings.distributionAddress, 1n]);
+  const bnbUsdPrice = await getBnbUsdPrice(runtime.provider, { forceRefresh: true });
+  const estimate = await estimateBscTokenTransfer({
+    provider: runtime.provider,
+    fromAddress: runtime.settings.mainWalletAddress,
+    tokenAddress: runtime.settings.tokenAddress,
+    data,
+    maximumGasLimit: runtime.settings.depositGasLimitCeiling,
+    bnbUsdPrice,
+  });
+  const bufferedGasLimit = (estimate.gasLimit * 120n + 99n) / 100n;
+  if (bufferedGasLimit > runtime.settings.depositGasLimitCeiling) {
+    throw new RangeError("The estimated XTU consolidation gas exceeds the configured gas-limit ceiling.");
+  }
+  const fee = require("./bsc-fee-accounting").calculateEstimatedGasFee(
+    bufferedGasLimit.toString(), estimate.gasPrice.toString(), bnbUsdPrice,
+  );
+  const decision = evaluateBscTxFee(fee.feeUsd, getConfiguredMaxBscTxFeeUsd());
+  if (!decision.allowed) {
+    const error = new Error("The estimated XTU consolidation gas exceeds BSC_MAX_TX_FEE_BSC_USD; the credit remains pending until the estimate is acceptable.");
+    error.code = "BSC_GAS_FEE_LIMIT_EXCEEDED";
+    throw error;
+  }
+
+  return withTransaction(pool, async (tx) => {
+    await acquireDepositLocks(tx);
+    const [batchRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(batchId)]);
+    if (!batchRows.length) return null;
+    const batch = batchRows[0];
+    const currentProvision = new BigNumber(batch.gas_provisioned_usd || "0");
+    if (currentProvision.isGreaterThan(0)) return { feeUsd: currentProvision, feeBnb: new BigNumber(0), provisional: true };
+    if (["manual_review", "pending_global", "forfeited_to_common_reserve", "credited"].includes(String(batch.status))) return null;
+
+    const [events] = await tx.query(
+      `SELECT event_identity,net_amount FROM xtu_deposit_transfer_events
+       WHERE batch_id=? AND status NOT IN ('rejected','reversed','manual_review')
+       ORDER BY block_timestamp_ms ASC,log_index ASC FOR UPDATE`, [String(batchId)],
+    );
+    if (!events.length) throw new Error("The XTU batch has no verified finalized source events for gas provision allocation.");
+    const allocationRows = allocateBatchGasByGross(
+      events.map((row) => ({ event_identity: String(row.event_identity), gross_amount: String(row.net_amount) })),
+      fee.feeUsd,
+      "event_identity",
+    );
+    const feeByEvent = new Map(allocationRows.map((entry) => [entry.key, entry.gasFee]));
+    for (const event of events) {
+      const allocated = feeByEvent.get(String(event.event_identity));
+      if (!allocated) throw new Error("The XTU provisional gas allocation is incomplete.");
+      await tx.query(
+        `UPDATE xtu_deposit_transfer_events SET allocated_gas_fee_usd=?,allocated_gas_fee_xtu=? WHERE event_identity=?`,
+        [allocated.toFixed(18), allocated.toFixed(18), String(event.event_identity)],
+      );
+      await tx.query(
+        `UPDATE xtu_hot_wallet_lots SET gas_provision_xtu=?,updated_at_ms=? WHERE event_identity=?`,
+        [allocated.toFixed(18), String(Date.now()), String(event.event_identity)],
+      );
+    }
+    await tx.query(
+      `UPDATE xtu_deposit_batches SET gas_provisioned_usd=?,gas_allocated_usd=?,gas_allocated_xtu=?,updated_at_ms=? WHERE id=?`,
+      [fee.feeUsd.toFixed(18), fee.feeUsd.toFixed(18), fee.feeUsd.toFixed(18), String(Date.now()), String(batchId)],
+    );
+    return { feeUsd: fee.feeUsd, feeBnb: fee.feeBnb, provisional: true };
+  });
+}
+
+async function expireOneXtuDepositBatch(pool, batchId, settings, now = Date.now()) {
+  return withTransaction(pool, async (tx) => {
+    await acquireDepositLocks(tx);
+    const [batchRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(batchId)]);
+    if (!batchRows.length) return { skipped: true };
+    const batch = batchRows[0];
+    if (["credited", "forfeited_to_common_reserve", "rejected", "reversed", "manual_review"].includes(String(batch.status))) {
+      return { skipped: true, status: batch.status };
+    }
+    const expiresAt = Number(batch.expires_at_ms || 0);
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0 || now < expiresAt) return { waiting: true };
+
+    const [controlRows] = await tx.query("SELECT is_suspended FROM deposit_service_control WHERE control_id=1 LIMIT 1 FOR UPDATE");
+    const [scannerRows] = await tx.query("SELECT health_status FROM xtu_deposit_scan_state WHERE singleton_id=1 LIMIT 1 FOR UPDATE");
+    const pauseReason = Number(controlRows[0]?.is_suspended || 0) === 1
+      ? "administrative_deposit_suspension"
+      : (String(scannerRows[0]?.health_status || "healthy") !== "healthy" ? "xtu_scanner_unavailable_or_reconciliation" : null);
+    if (pauseReason) {
+      if (batch.expiration_paused_at_ms == null) {
+        await tx.query(
+          `UPDATE xtu_deposit_batches SET expiration_paused_at_ms=?,expiration_pause_reason=?,updated_at_ms=? WHERE id=?`,
+          [String(now), pauseReason, String(now), String(batchId)],
+        );
+      }
+      return { paused: true, reason: pauseReason };
+    }
+    if (batch.expiration_paused_at_ms != null) {
+      const pausedAt = Number(batch.expiration_paused_at_ms);
+      if (!Number.isSafeInteger(pausedAt) || pausedAt > now) throw new Error("Invalid XTU deposit expiration pause timestamp.");
+      const extendedExpiry = expiresAt + (now - pausedAt);
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET expires_at_ms=?,initial_group_deadline_ms=?,expiration_paused_at_ms=NULL,
+         expiration_pause_reason=NULL,updated_at_ms=? WHERE id=?`,
+        [String(extendedExpiry), String(extendedExpiry), String(now), String(batchId)],
+      );
+      return { resumed: true, expiresAtMs: extendedExpiry };
+    }
+
+    const [eventRows] = await tx.query(
+      `SELECT event_identity,tx_hash,log_index,gross_amount,net_amount,commission_amount,status
+       FROM xtu_deposit_transfer_events WHERE batch_id=? ORDER BY block_number ASC,log_index ASC FOR UPDATE`,
+      [String(batchId)],
+    );
+    if (eventRows.length !== Number(batch.transfer_count || 0) || eventRows.some((row) => ["detected", "pending_reconciliation", "orphaned", "manual_review"].includes(String(row.status)))) {
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET status='manual_review',reason_codes=?,expiration_paused_at_ms=?,
+         expiration_pause_reason='xtu_deposit_event_reconciliation',updated_at_ms=? WHERE id=?`,
+        [JSON.stringify(["xtu_deposit_event_reconciliation_required"]), String(now), String(now), String(batchId)],
+      );
+      await notifyUserTx(tx, batch.username, `xtu-deposit:${batchId}:expiry-reconciliation`, "OneX XTU deposit requires reconciliation",
+        `Your XTU deposit reached its 30-day expiry, but its source events do not fully reconcile. No reserve reclassification or credit was performed. The expiry is paused while OneX reviews the blockchain records. Batch: ${batchId}.`);
+      return { held: true, reason: "event_reconciliation_mismatch" };
+    }
+
+    const [creditRows] = await tx.query(
+      `SELECT COALESCE(SUM(creditable_xtu),0) AS credited,
+              COALESCE(SUM(gross_returned_xtu),0) AS gross_processed,
+              COALESCE(SUM(CASE WHEN gas_fee_status='reconciled' THEN gas_actual_fee_xtu ELSE gas_fee_xtu END),0) AS gas_processed
+       FROM xtu_deposit_credits WHERE batch_id=? FOR UPDATE`,
+      [String(batchId)],
+    );
+    const gross = new BigNumber(batch.gross_amount || "0");
+    const grossProcessed = new BigNumber(creditRows[0]?.gross_processed || "0");
+    const credited = new BigNumber(creditRows[0]?.credited || "0");
+    const gasProcessed = new BigNumber(creditRows[0]?.gas_processed || "0");
+    const grossRemaining = BigNumber.maximum(0, gross.minus(grossProcessed).decimalPlaces(18, BigNumber.ROUND_DOWN));
+    const batchRemaining = new BigNumber(batch.remaining_amount || "0");
+    if (!gross.isFinite() || gross.isNegative() || grossProcessed.gt(gross) ||
+        !grossRemaining.eq(batchRemaining) || !gasProcessed.isFinite() || gasProcessed.isNegative()) {
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET status='manual_review',reason_codes=?,expiration_paused_at_ms=?,
+         expiration_pause_reason='xtu_credit_ledger_mismatch',updated_at_ms=? WHERE id=?`,
+        [JSON.stringify(["xtu_credit_ledger_mismatch_at_expiry"]), String(now), String(now), String(batchId)],
+      );
+      await notifyUserTx(tx, batch.username, `xtu-deposit:${batchId}:expiry-ledger-review`, "OneX XTU deposit requires accounting review",
+        `Your XTU deposit reached its expiry date, but its gross/credit ledger does not reconcile. No amount was reclassified or credited. OneX has paused the expiry for accounting review. Batch: ${batchId}.`);
+      return { held: true, reason: "credit_ledger_mismatch" };
+    }
+
+    if (grossRemaining.isZero()) {
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET remaining_amount=0,status='credited',forfeited_at_ms=?,updated_at_ms=? WHERE id=?`,
+        [String(now), String(now), String(batchId)],
+      );
+      return { completed: true, amount: "0" };
+    }
+
+    // No OneX deposit fee is deducted from the uncredited remainder. Only the
+    // remaining gas provision (or its already-known actual allocation) reduces
+    // the reserve value recognised at the 1:1 internal accounting parity.
+    const provisionTotal = new BigNumber(batch.gas_provisioned_usd || "0");
+    const actualTotal = new BigNumber(batch.gas_actual_usd || "0");
+    if (!provisionTotal.isFinite() || provisionTotal.isNegative() || !actualTotal.isFinite() || actualTotal.isNegative()) {
+      throw new Error("Invalid XTU gas provision or actual gas amount at expiry.");
+    }
+    const provisionRemaining = BigNumber.maximum(0, provisionTotal.minus(gasProcessed).decimalPlaces(18, BigNumber.ROUND_DOWN));
+    const actualKnown = actualTotal.isGreaterThan(0);
+    const actualRemaining = actualKnown ? actualTotal.minus(gasProcessed).decimalPlaces(18, BigNumber.ROUND_DOWN) : null;
+    if (actualKnown && actualRemaining.isNegative()) {
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET status='manual_review',reason_codes=?,expiration_paused_at_ms=?,
+         expiration_pause_reason='xtu_gas_reconciliation',updated_at_ms=? WHERE id=?`,
+        [JSON.stringify(["actual_consolidation_gas_below_previously_allocated_provision"]), String(now), String(now), String(batchId)],
+      );
+      await notifyUserTx(tx, batch.username, `xtu-deposit:${batchId}:gas-reconciliation`, "OneX XTU deposit gas reconciliation required",
+        `The actual XTU consolidation gas is lower than the provision already assigned to credited tranches. The difference requires reconciliation before the expired remainder can be reclassified. No additional debit or credit has been applied. Batch: ${batchId}.`);
+      return { held: true, reason: "gas_reconciliation_required" };
+    }
+    const gasForExpiredRemainder = actualKnown ? actualRemaining : provisionRemaining;
+    if (gasForExpiredRemainder.gt(grossRemaining)) {
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET status='manual_review',reason_codes=?,expiration_paused_at_ms=?,
+         expiration_pause_reason='xtu_gas_exceeds_remainder',updated_at_ms=? WHERE id=?`,
+        [JSON.stringify(["xtu_expiry_gas_exceeds_uncredited_gross"]), String(now), String(now), String(batchId)],
+      );
+      return { held: true, reason: "gas_exceeds_uncredited_gross" };
+    }
+    const expiredReserveValue = grossRemaining.minus(gasForExpiredRemainder).decimalPlaces(18, BigNumber.ROUND_DOWN);
+    if (!expiredReserveValue.isFinite() || expiredReserveValue.isNegative()) throw new Error("Invalid XTU expired reserve value.");
+
+    const common = await getLatestCommonTx(tx, true);
+    const sourceHashes = JSON.stringify(eventRows.map((row) => ({
+      event_identity: String(row.event_identity), tx_hash: String(row.tx_hash).toLowerCase(),
+      log_index: Number(row.log_index), gross_amount: String(row.gross_amount),
+      net_amount: String(row.net_amount), commission_amount: String(row.commission_amount),
+    })));
+    const eventKey = `deposit-expiry:XTU:${batchId}`;
+    const [insertResult] = await tx.query(
+      `INSERT IGNORE INTO deposit_expiration_events
+       (asset_code,batch_id,username,expired_amount,value_added_to_common,gas_provision_value,gas_actual_value,
+        gas_adjustment_value,gas_adjustment_applied_at_ms,global_unit_price,source_event_hashes_json,event_key,status,created_at_ms)
+       VALUES('XTU',?,?,?,?,?,?,?,?,?,?,?,'applied',?)`,
+      [String(batchId), batch.username, grossRemaining.toFixed(18), expiredReserveValue.toFixed(30),
+        provisionRemaining.toFixed(18), actualKnown ? actualRemaining.toFixed(18) : "0",
+        actualKnown ? provisionRemaining.minus(actualRemaining).toFixed(18) : "0",
+        actualKnown ? String(now) : null, String(common.unit_price), sourceHashes, eventKey, String(now)],
+    );
+    if (Number(insertResult.affectedRows || 0) === 1) {
+      if (expiredReserveValue.isGreaterThan(0)) {
+        const [date, time] = utcDateTime(now);
+        await insertCommonSnapshotTx(tx, common, {
+          total_units_price: new BigNumber(common.total_units_price).plus(expiredReserveValue).toFixed(30),
+        }, date, time);
+        const [snapshotRows] = await tx.query("SELECT id FROM common ORDER BY id DESC LIMIT 1 FOR UPDATE");
+        if (!snapshotRows.length) throw new Error("The common reserve snapshot was not persisted for XTU expiry.");
+        await tx.query("UPDATE deposit_expiration_events SET common_snapshot_id=? WHERE event_key=?", [String(snapshotRows[0].id), eventKey]);
+      }
+    }
+
+    await tx.query(
+      `UPDATE xtu_deposit_batches SET expired_common_reserve_amount=expired_common_reserve_amount+?,remaining_amount=0,
+       status='forfeited_to_common_reserve',reason_codes=NULL,forfeited_at_ms=?,updated_at_ms=?
+       WHERE id=? AND status<>'forfeited_to_common_reserve'`,
+      [expiredReserveValue.toFixed(18), String(now), String(now), String(batchId)],
+    );
+
+    const [lots] = await tx.query(
+      `SELECT * FROM xtu_hot_wallet_lots WHERE batch_id=?
+       ORDER BY first_finalized_at_ms ASC,tx_hash ASC,log_index ASC,id ASC FOR UPDATE`, [String(batchId)],
+    );
+    for (const lot of lots) {
+      const hotNet = new BigNumber(lot.hot_wallet_received_amount || "0");
+      const creditedNet = new BigNumber(lot.credited_amount || "0");
+      const expiredNet = BigNumber.maximum(0, hotNet.minus(creditedNet));
+      await tx.query(
+        `UPDATE xtu_hot_wallet_lots SET pending_user_amount=0,
+         expired_common_reserve_amount=?,status='common_reserve_owned',expired_at_ms=?,updated_at_ms=? WHERE id=?`,
+        [expiredNet.toFixed(18), String(now), String(now), String(lot.id)],
+      );
+    }
+    await tx.query(
+      `UPDATE xtu_deposit_transfer_events SET status='forfeited_to_common_reserve',reason_codes=NULL WHERE batch_id=?`,
+      [String(batchId)],
+    );
+    await notifyUserTx(tx, batch.username, `xtu-deposit:${batchId}:forfeited`, "OneX XTU deposit expired",
+      `${grossRemaining.toFixed(8)} gross XTU remained uncredited at the fixed 30-day expiry. The recognised common-reserve value is ${expiredReserveValue.toFixed(8)} XTU/BSC-USD equivalent after the applicable gas provision or actual gas allocation. No OneX deposit fee was charged on this uncredited remainder. The physical XTU remains protected in the Hot Wallet until an eligible FIFO consolidation lot reaches at least 100 XTU net. It cannot be refunded or credited later. Batch: ${batchId}.`);
+    return { forfeited: true, grossAmount: grossRemaining.toFixed(18), reserveValue: expiredReserveValue.toFixed(18) };
+  });
+}
+
+async function expireDueXtuDepositBatches(pool, settings, now = Date.now()) {
   const rows = await pool.queryAsync(
-    `SELECT id,username,gross_amount,opened_at_ms,expires_at_ms,initial_group_deadline_ms
-     FROM xtu_deposit_batches WHERE status='collecting' AND CAST(expires_at_ms AS UNSIGNED)<=?
-     ORDER BY id ASC LIMIT 20`, [String(Date.now())],
+    `SELECT id FROM xtu_deposit_batches WHERE remaining_amount>0
+       AND CAST(expires_at_ms AS UNSIGNED)<=?
+       AND status NOT IN ('credited','forfeited_to_common_reserve','rejected','reversed','manual_review')
+     ORDER BY CAST(expires_at_ms AS UNSIGNED) ASC,id ASC LIMIT 100`, [String(now)],
+  );
+  for (const row of rows) {
+    try { await expireOneXtuDepositBatch(pool, row.id, settings, now); }
+    catch (error) { console.error(`XTU deposit expiry failed for batch ${row.id}:`, error.message); }
+  }
+}
+
+async function notifyDueXtuDepositExpirations(pool, now = Date.now()) {
+  const rows = await pool.queryAsync(
+    `SELECT id,username,gross_amount,credited_amount,remaining_amount,expires_at_ms
+     FROM xtu_deposit_batches WHERE remaining_amount>0 AND expiration_warning_sent_at_ms IS NULL
+       AND CAST(expires_at_ms AS UNSIGNED)>? AND CAST(expires_at_ms AS UNSIGNED)<=?
+       AND status NOT IN ('credited','forfeited_to_common_reserve','rejected','reversed','manual_review')
+     ORDER BY expires_at_ms ASC,id ASC LIMIT 100`, [String(now), String(now + 24 * 60 * 60 * 1000)],
   );
   for (const row of rows) {
     await withTransaction(pool, async (tx) => {
-      const [batchRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(row.id)]);
-      if (!batchRows.length || batchRows[0].status !== "collecting") return;
-      const batch = batchRows[0];
-      const gross = new BigNumber(batch.gross_amount);
-      const now = Date.now();
-      if (gross.gte(MIN_XTU_DEPOSIT) && gross.lte(MAX_XTU_DEPOSIT)) {
-        await tx.query("UPDATE xtu_deposit_batches SET status='ready',reason_codes='[]',updated_at_ms=? WHERE id=?", [String(now), String(row.id)]);
-      } else if (gross.gt(MAX_XTU_DEPOSIT)) {
-        await tx.query(
-          `UPDATE xtu_deposit_batches SET status='pending_support',pending_since_ms=NULL,release_at_ms=NULL,
-           reason_codes='["deposit_session_above_maximum"]',updated_at_ms=? WHERE id=?`,
-          [String(now), String(row.id)],
-        );
-        await notifyUserTx(
-          tx, batch.username, `xtu-deposit:${row.id}:session-maximum`, "OneX XTU deposit requires support review",
-          `Your 60-minute XTU deposit session exceeds the 100 XTU maximum. It is held for manual support review and will not be automatically released after seven days. Batch: ${row.id}.`,
-        );
-      } else {
-        const [latestRows] = await tx.query(
-          "SELECT MAX(CAST(block_timestamp_ms AS UNSIGNED)) AS latest_event_ms FROM xtu_deposit_transfer_events WHERE batch_id=?",
-          [String(row.id)],
-        );
-        const releaseAt = Number(latestRows[0]?.latest_event_ms || row.opened_at_ms) + settings.depositPendingRetryMs;
-        await tx.query(
-          `UPDATE xtu_deposit_batches SET status='pending_minimum',pending_since_ms=?,release_at_ms=?,
-           reason_codes='["minimum_not_reached"]',updated_at_ms=? WHERE id=?`,
-          [String(now), String(releaseAt), String(now), String(row.id)],
-        );
-        await notifyUserTx(
-          tx, batch.username, `xtu-deposit:${row.id}:pending-minimum`, "OneX XTU deposit pending",
-          `Your XTU deposit session is below the 20 XTU minimum. It may be completed within the initial grouping period. Batch: ${row.id}.`,
-        );
-      }
+      const [locked] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(row.id)]);
+      if (!locked.length || locked[0].expiration_warning_sent_at_ms != null) return;
+      const batch = locked[0];
+      await notifyUserTx(tx, batch.username, `xtu-deposit:${batch.id}:expiry-warning`, "OneX XTU deposit expiry warning",
+        `Your XTU deposit batch ${batch.id} has ${new BigNumber(batch.remaining_amount || "0").toFixed(8)} XTU-equivalent still pending and expires at ${new Date(Number(batch.expires_at_ms)).toISOString()}. Any uncredited remainder will be irrevocably reclassified to OneX common reserves and cannot be refunded or credited later. Resolve the stated minimum, account-capacity or reserve condition before expiry.`);
+      await tx.query("UPDATE xtu_deposit_batches SET expiration_warning_sent_at_ms=?,updated_at_ms=? WHERE id=? AND expiration_warning_sent_at_ms IS NULL",
+        [String(now), String(now), String(row.id)]);
     });
   }
+}
+
+async function closeExpiredBatches(pool, settings) {
+  return expireDueXtuDepositBatches(pool, settings, Date.now());
 }
 
 async function setBatchPending(pool, batchId, status, reason) {
@@ -673,16 +985,35 @@ async function prepareConsolidation(pool, batches, runtime, mainSigner) {
     error.code = "BSC_GAS_FEE_LIMIT_EXCEEDED";
     throw error;
   }
-  const [tokenBalance, nativeBalance] = await Promise.all([
+  const [tokenBalance, nativeBalance, protectedDepositRows, protectedUnknownRows] = await Promise.all([
     runtime.contract.balanceOf(runtime.settings.mainWalletAddress),
     runtime.provider.getBalance(runtime.settings.mainWalletAddress),
+    pool.queryAsync(
+      `SELECT COALESCE(SUM(protected_hot_wallet_amount),0) AS amount
+       FROM xtu_hot_wallet_lots
+       WHERE status IN ('protected','consolidation_reserved','common_reserve_owned')`,
+    ),
+    pool.queryAsync(
+      `SELECT COALESCE(SUM(CASE WHEN status='refunded' THEN refund_residual_amount ELSE hot_wallet_received_amount END),0) AS amount
+       FROM xtu_unknown_incoming_transfers
+       WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded')`,
+    ),
   ]);
-  if (BigInt(tokenBalance) < rawAmount) throw new Error("The XTU Hot Wallet does not currently hold the exact identified deposit lot amount.");
+  const protectedHotWalletTotal = new BigNumber(protectedDepositRows[0]?.amount || "0")
+    .plus(protectedUnknownRows[0]?.amount || "0");
+  const actualHotWalletBalance = new BigNumber(tokenBalance.toString()).shiftedBy(-18);
+  if (!protectedHotWalletTotal.isFinite() || protectedHotWalletTotal.isNegative() ||
+      !actualHotWalletBalance.isFinite() || actualHotWalletBalance.lt(protectedHotWalletTotal) ||
+      BigInt(tokenBalance) < rawAmount) {
+    throw new Error("The XTU Hot Wallet does not cover every protected user deposit, expired common-reserve lot and unknown-transfer balance; consolidation is blocked pending reconciliation.");
+  }
   if (BigInt(nativeBalance) < BigInt(gasEstimate.feeBnb.shiftedBy(18).integerValue(BigNumber.ROUND_CEIL).toFixed(0))) {
     throw new Error("The XTU Hot Wallet does not have enough BNB for deposit consolidation gas.");
   }
 
-  const grossRows = batches.map((batch) => ({ id: String(batch.id), gross_amount: String(batch.gross_amount) }));
+  const grossRows = batches.map((batch) => ({
+    id: String(batch.id), gross_amount: String(batch.consolidation_available_amount ?? batch.hot_wallet_received_amount),
+  }));
   const estimatedUsdByBatch = new Map(allocateBatchGasByGross(grossRows, gasEstimate.feeUsd, "id").map((row) => [row.key, row.gasFee]));
   const estimatedBnbByBatch = new Map(allocateBatchGasByGross(grossRows, gasEstimate.feeBnb, "id").map((row) => [row.key, row.gasFee]));
   const nonce = await runtime.provider.getTransactionCount(runtime.settings.mainWalletAddress, "pending");
@@ -715,18 +1046,38 @@ async function prepareConsolidation(pool, batches, runtime, mainSigner) {
     let lockedReceived = new BigNumber(0);
     let lockedGross = new BigNumber(0);
     for (const locked of lockedBatches) {
-      if (!["ready", "pending_reserve", "pending_credit", "pending_weekly"].includes(String(locked.status))) return;
-      if (locked.release_at_ms != null && Number(locked.release_at_ms) > Date.now() &&
-          !["ready", "pending_weekly"].includes(String(locked.status))) return;
-      const gross = new BigNumber(locked.gross_amount);
-      const received = new BigNumber(locked.hot_wallet_received_amount);
-      if (!gross.isFinite() || gross.lt(MIN_XTU_DEPOSIT) || gross.gt(MAX_XTU_DEPOSIT) ||
-          !received.isFinite() || !received.isGreaterThan(0)) return;
-      lockedReceived = lockedReceived.plus(received);
+      if (["manual_review", "rejected", "reversed"].includes(String(locked.status))) return;
+      const gross = new BigNumber(locked.gross_amount || "0");
+      const received = new BigNumber(locked.hot_wallet_received_amount || "0");
+      const consolidated = new BigNumber(locked.hot_wallet_consolidated_amount || "0");
+      const reserved = new BigNumber(locked.consolidation_reserved_amount || "0");
+      const available = BigNumber.maximum(0, received.minus(consolidated).minus(reserved));
+      if (!gross.isFinite() || gross.isNegative() || !received.isFinite() || !received.isGreaterThan(0) ||
+          !available.isFinite() || !available.isGreaterThan(0)) return;
+      lockedReceived = lockedReceived.plus(available);
       lockedGross = lockedGross.plus(gross);
     }
-    if (!lockedReceived.eq(totalReceived) || !lockedGross.eq(totalGrossReturned) ||
-        lockedReceived.lt(runtime.settings.depositConsolidationMinBatchXtu)) return;
+    if (!lockedReceived.eq(totalReceived) || lockedReceived.lt(runtime.settings.depositConsolidationMinBatchXtu)) return;
+
+    const [protectedLotRows] = await tx.query(
+      `SELECT id,protected_hot_wallet_amount FROM xtu_hot_wallet_lots
+       WHERE status IN ('protected','consolidation_reserved','common_reserve_owned') FOR UPDATE`,
+    );
+    const [protectedUnknownRowsLocked] = await tx.query(
+      `SELECT id,status,hot_wallet_received_amount,refund_residual_amount FROM xtu_unknown_incoming_transfers
+       WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded')
+       FOR UPDATE`,
+    );
+    const protectedLotTotal = protectedLotRows.reduce((total, row) =>
+      total.plus(row.protected_hot_wallet_amount || "0"), new BigNumber(0));
+    const protectedUnknownTotal = protectedUnknownRowsLocked.reduce((total, row) =>
+      total.plus(row.status === 'refunded' ? (row.refund_residual_amount || "0") : (row.hot_wallet_received_amount || "0")), new BigNumber(0));
+    const lockedProtectedTotal = protectedLotTotal.plus(protectedUnknownTotal);
+    const freshHotWalletBalance = new BigNumber((await runtime.contract.balanceOf(runtime.settings.mainWalletAddress)).toString()).shiftedBy(-18);
+    if (!lockedProtectedTotal.isFinite() || lockedProtectedTotal.isNegative() ||
+        !freshHotWalletBalance.isFinite() || freshHotWalletBalance.lt(lockedProtectedTotal)) {
+      throw new Error("The XTU Hot Wallet balance no longer covers all locked protected deposit and unknown-transfer lots; no consolidation transaction was persisted.");
+    }
 
     await recordEstimatedBscFeeTx(tx, {
       txHash,
@@ -750,21 +1101,30 @@ async function prepareConsolidation(pool, batches, runtime, mainSigner) {
     const consolidationId = String(insertResult.insertId);
     for (const locked of lockedBatches) {
       const batchId = String(locked.id);
-      const received = new BigNumber(locked.hot_wallet_received_amount);
-      const gross = new BigNumber(locked.gross_amount);
+      const received = new BigNumber(locked.hot_wallet_received_amount || "0");
+      const consolidated = new BigNumber(locked.hot_wallet_consolidated_amount || "0");
+      const reserved = new BigNumber(locked.consolidation_reserved_amount || "0");
+      const available = BigNumber.maximum(0, received.minus(consolidated).minus(reserved));
+      const gross = new BigNumber(locked.gross_amount || "0");
+      if (!available.isGreaterThan(0)) throw new Error("The XTU deposit lot has no unreserved Hot Wallet balance.");
       await tx.query(
         `INSERT INTO xtu_deposit_consolidation_items
          (consolidation_id,batch_id,username,gross_returned_xtu,hot_wallet_received_xtu,contract_commission_xtu,
           estimated_gas_fee_bnb,estimated_gas_fee_usd,allocated_gas_fee_bnb,allocated_gas_fee_usd,
           allocated_gas_fee_xtu,status,created_at_ms,updated_at_ms)
          VALUES(?,?,?,?,?,?,?,?,?,?,?,'signed',?,?)`,
-        [consolidationId, batchId, locked.username, gross.toFixed(18), received.toFixed(18),
+        [consolidationId, batchId, locked.username, gross.toFixed(18), available.toFixed(18),
           new BigNumber(locked.commission_amount || "0").toFixed(18),
           estimatedBnbByBatch.get(batchId).toFixed(30), estimatedUsdByBatch.get(batchId).toFixed(30),
           "0", "0", "0", now, now],
       );
       await tx.query(
-        "UPDATE xtu_deposit_batches SET status='finalizing',updated_at_ms=? WHERE id=?",
+        `UPDATE xtu_deposit_batches SET consolidation_reserved_amount=consolidation_reserved_amount+?,updated_at_ms=? WHERE id=?`,
+        [available.toFixed(18), now, batchId],
+      );
+      await tx.query(
+        `UPDATE xtu_hot_wallet_lots SET consolidation_reserved_amount=protected_hot_wallet_amount,
+         status='consolidation_reserved',updated_at_ms=? WHERE batch_id=? AND consolidated_amount<hot_wallet_received_amount`,
         [now, batchId],
       );
     }
@@ -812,18 +1172,70 @@ async function parseConsolidationReceipt(runtime, receipt, row) {
   return { gross, net, fee };
 }
 
+async function allocateXtuGrossCreditToLotsTx(tx, batchId, trancheGrossAmount) {
+  let remainingGross = new BigNumber(trancheGrossAmount);
+  if (!remainingGross.isFinite() || !remainingGross.isGreaterThan(0)) {
+    throw new RangeError("The XTU credited gross tranche must be positive.");
+  }
+  const [lots] = await tx.query(
+    `SELECT * FROM xtu_hot_wallet_lots WHERE batch_id=?
+     ORDER BY first_finalized_at_ms ASC,tx_hash ASC,log_index ASC,id ASC FOR UPDATE`,
+    [String(batchId)],
+  );
+  if (!lots.length) throw new Error("The XTU credited tranche has no protected Hot Wallet source lots.");
+
+  for (const lot of lots) {
+    if (!remainingGross.isGreaterThan(0)) break;
+    const lotGross = new BigNumber(lot.gross_amount || "0");
+    const lotGrossCredited = new BigNumber(lot.gross_credited_amount || "0");
+    const lotHotNet = new BigNumber(lot.hot_wallet_received_amount || "0");
+    const lotNetCredited = new BigNumber(lot.credited_amount || "0");
+    const lotExpiredNet = new BigNumber(lot.expired_common_reserve_amount || "0");
+    const availableGross = BigNumber.maximum(0, lotGross.minus(lotGrossCredited));
+    const availableNet = BigNumber.maximum(0, lotHotNet.minus(lotNetCredited).minus(lotExpiredNet));
+    if (!availableGross.isGreaterThan(0)) continue;
+    if (!lotGross.isGreaterThan(0) || !lotHotNet.isFinite()) {
+      throw new Error("An XTU Hot Wallet lot contains invalid gross/net amounts.");
+    }
+    const grossPart = BigNumber.minimum(remainingGross, availableGross);
+    const netPart = grossPart.eq(availableGross)
+      ? availableNet
+      : BigNumber.minimum(availableNet, lotHotNet.multipliedBy(grossPart).dividedBy(lotGross)
+        .decimalPlaces(18, BigNumber.ROUND_DOWN));
+    await tx.query(
+      `UPDATE xtu_hot_wallet_lots
+       SET gross_credited_amount=gross_credited_amount+?,credited_amount=credited_amount+?,
+           pending_user_amount=GREATEST(0,pending_user_amount-?),updated_at_ms=?
+       WHERE id=?`,
+      [grossPart.toFixed(18), netPart.toFixed(18), netPart.toFixed(18), String(Date.now()), String(lot.id)],
+    );
+    remainingGross = remainingGross.minus(grossPart);
+  }
+  if (remainingGross.gt("0.000000000000000001")) {
+    throw new Error(`XTU Hot Wallet lot ledger is missing ${remainingGross.toFixed(18)} gross XTU for the credited tranche.`);
+  }
+}
+
 async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actualGas, settings) {
   const [batchRows] = await tx.query("SELECT * FROM xtu_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(batch.id)]);
-  if (!batchRows.length || ["credited", "manual_review"].includes(batchRows[0].status)) return;
+  if (!batchRows.length || ["credited", "forfeited_to_common_reserve", "manual_review"].includes(batchRows[0].status)) return;
   const currentBatch = batchRows[0];
-  if (! ["consolidated_pending_credit", "pending_reserve", "pending_credit", "pending_weekly"].includes(currentBatch.status)) {
+  if (!["ready", "pending_reserve", "pending_credit", "pending_weekly", "pending_support"].includes(currentBatch.status)) {
     throw new Error(`XTU deposit batch ${currentBatch.id} is not in a creditable state.`);
+  }
+  const [depositControlRows] = await tx.query(
+    "SELECT is_suspended FROM deposit_service_control WHERE control_id=1 LIMIT 1 FOR UPDATE",
+  );
+  if (Number(depositControlRows[0]?.is_suspended || 0) === 1) {
+    throw new Error("The deposit service is administratively suspended.");
   }
   const globalRun = await getGlobalRunTx(tx, currentBatch.global_run_id || null);
   const common = await getLatestCommonTx(tx, true);
-  const grossReturned = new BigNumber(currentBatch.returned_amount || currentBatch.gross_amount || "0");
+  const grossReturned = new BigNumber(currentBatch.gross_amount || currentBatch.returned_amount || "0");
   const [priorCreditRows] = await tx.query(
-    `SELECT COALESCE(SUM(creditable_xtu),0) AS amount,COUNT(*) AS credit_count
+    `SELECT COALESCE(SUM(creditable_xtu),0) AS amount,
+            COALESCE(SUM(gross_returned_xtu),0) AS gross_processed,
+            COALESCE(SUM(CASE WHEN gas_fee_status='reconciled' THEN gas_actual_fee_xtu ELSE gas_fee_xtu END),0) AS gas_processed,COUNT(*) AS credit_count
      FROM xtu_deposit_credits WHERE batch_id=? FOR UPDATE`, [String(currentBatch.id)],
   );
   const priorCredited = new BigNumber(priorCreditRows[0]?.amount || "0");
@@ -838,12 +1250,14 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
     globalDisbursementActive: Boolean(globalRun),
     globalUnitPrice: common.unit_price,
     creditedBeforeXtu: priorCredited,
+    grossCreditedBeforeXtu: priorCreditRows[0]?.gross_processed || "0",
+    gasCreditedBeforeXtu: priorCreditRows[0]?.gas_processed || "0",
     creditSequence,
     maximumInitialCreditXtu: settings.depositInitialCreditCap,
   });
-  const firstTranche = creditSequence === 0;
-  const depositFeeForThisTranche = firstTranche ? credit.depositFeeXtu : new BigNumber(0);
-  const gasFeeForThisTranche = firstTranche ? credit.actualGasFeeXtu : new BigNumber(0);
+  const depositFeeForThisTranche = credit.depositFeeXtu;
+  const gasFeeForThisTranche = credit.actualGasFeeXtu;
+  const grossForThisTranche = credit.trancheGrossXtu;
 
   const [stockRows] = await tx.query("SELECT balance FROM users_stock WHERE username=? LIMIT 1 FOR UPDATE", [currentBatch.username]);
   const [authRows] = await tx.query("SELECT email,wallet_address,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE", [currentBatch.username]);
@@ -892,10 +1306,10 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
     commission_amount: String(event.commission_amount),
   })));
   const sourceTransactionHash = String(sourceEventRows[0].tx_hash || "").toLowerCase();
-  const consolidationTxHash = String(consolidation.tx_hash).toLowerCase();
+  const consolidationTxHash = consolidation?.tx_hash ? String(consolidation.tx_hash).toLowerCase() : null;
   if (!/^0x[0-9a-f]{64}$/.test(sourceTransactionHash) ||
-      !/^0x[0-9a-f]{64}$/.test(consolidationTxHash)) {
-    throw new Error("The XTU source deposit or consolidation transaction hash is invalid for the credit audit.");
+      (consolidationTxHash != null && !/^0x[0-9a-f]{64}$/.test(consolidationTxHash))) {
+    throw new Error("The XTU source deposit or optional consolidation transaction hash is invalid for the credit audit.");
   }
   const [date, time] = utcDateTime();
   const creditedSequence = creditSequence + 1;
@@ -916,18 +1330,22 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
   );
   const [creditInsert] = await tx.query(
     `INSERT INTO xtu_deposit_credits
-     (batch_id,username,credit_sequence,gross_returned_xtu,deposit_fee_xtu,gas_fee_xtu,creditable_xtu,
+     (batch_id,username,credit_sequence,gross_returned_xtu,deposit_fee_xtu,gas_fee_xtu,gas_fee_status,gas_actual_fee_xtu,creditable_xtu,
       credited_initial_asset,global_unit_price,reference,global_run_id,source_event_hashes_json,
       consolidation_tx_hash,status,created_at_ms)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'credited',?)`,
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'credited',?)`,
     [String(currentBatch.id), currentBatch.username, creditedSequence,
-      firstTranche ? grossReturned.toFixed(18) : "0",
+      grossForThisTranche.toFixed(18),
       depositFeeForThisTranche.toFixed(18), gasFeeForThisTranche.toFixed(18),
+      actualGas.provisional ? "provisional" : "reconciled",
+      actualGas.provisional ? "0" : gasFeeForThisTranche.toFixed(18),
       credit.creditedInitialAsset.isFinite() ? credit.initialCreditXtu.toFixed(18) : "0",
       credit.creditedInitialAsset.toFixed(30), common.unit_price, reference,
       globalRun ? String(globalRun.id) : null, sourceEventHashesJson, consolidationTxHash, String(Date.now())], 
   );
   if (Number(creditInsert.affectedRows || 0) !== 1) throw new Error("XTU deposit credit audit row was not inserted.");
+
+  await allocateXtuGrossCreditToLotsTx(tx, currentBatch.id, grossForThisTranche);
 
   await tx.query(
     `UPDATE users_stock SET balance=?,record_date=?,record_time=? WHERE username=?`,
@@ -944,9 +1362,9 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
     : new BigNumber(0);
   const systemFeeBasis = totalFeeBasis.minus(sellerFeeBasis);
   const sellerGasCost = credit.creditedInitialAsset.isGreaterThan(0)
-    ? actualGas.feeUsd.multipliedBy(sellerBasis).dividedBy(credit.creditedInitialAsset)
+    ? gasFeeForThisTranche.multipliedBy(sellerBasis).dividedBy(credit.creditedInitialAsset)
     : new BigNumber(0);
-  const systemGasCost = actualGas.feeUsd.minus(sellerGasCost);
+  const systemGasCost = gasFeeForThisTranche.minus(sellerGasCost);
   if (sellerBasis.isGreaterThan(0)) {
     await tx.query(
       `INSERT INTO activities
@@ -986,7 +1404,7 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'reserved',?,?)`,
       [String(globalRun.id), currentBatch.username, String(currentBatch.id), creditedSequence,
         sourceTransactionHash, sourceEventHashesJson, consolidationTxHash,
-        firstTranche ? grossReturned.toFixed(18) : "0",
+        grossForThisTranche.toFixed(18),
         depositFeeForThisTranche.toFixed(18), gasFeeForThisTranche.toFixed(18), common.unit_price,
         credit.creditedInitialAsset.toFixed(30), netPayout.toFixed(18), netPayout.toFixed(18),
         String(Date.now()), String(Date.now())], 
@@ -1004,14 +1422,16 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
   }
 
   const nextCredited = priorCredited.plus(credit.initialCreditXtu);
-  const remainingCredit = credit.deferredCreditXtu;
+  const grossProcessedAfter = new BigNumber(priorCreditRows[0]?.gross_processed || "0").plus(grossForThisTranche);
+  const remainingCredit = grossReturned.minus(grossProcessedAfter).decimalPlaces(18, BigNumber.ROUND_DOWN);
+  const totalDepositFeeAfter = new BigNumber(currentBatch.deposit_fee_amount || "0").plus(depositFeeForThisTranche);
   const now = Date.now();
   const nextStatus = remainingCredit.isGreaterThan(0) ? "pending_credit" : "credited";
   await tx.query(
-    `UPDATE xtu_deposit_batches SET credited_amount=?,remaining_amount=?,credit_sequence=?,deposit_fee_amount=?,
+    `UPDATE xtu_deposit_batches SET credited_amount=?,gross_credited_amount=?,remaining_amount=?,credit_sequence=?,deposit_fee_amount=?,
      gas_allocated_usd=?,gas_allocated_xtu=?,global_run_id=?,status=?,pending_since_ms=?,release_at_ms=?,
      reason_codes=?,updated_at_ms=? WHERE id=?`,
-    [nextCredited.toFixed(18), remainingCredit.toFixed(18), creditedSequence, credit.depositFeeXtu.toFixed(18),
+    [nextCredited.toFixed(18), grossProcessedAfter.toFixed(18), remainingCredit.toFixed(18), creditedSequence, totalDepositFeeAfter.toFixed(18),
       actualGas.feeUsd.toFixed(18), actualGas.feeUsd.toFixed(18), globalRun ? String(globalRun.id) : null,
       nextStatus, remainingCredit.isGreaterThan(0) ? String(now) : null,
       remainingCredit.isGreaterThan(0) ? String(now + DEPOSIT_PENDING_RETRY_MS) : null,
@@ -1022,15 +1442,15 @@ async function creditConsolidatedBatchTx(tx, batch, consolidation, receipt, actu
     tx, currentBatch.username, `xtu-deposit:${currentBatch.id}:credit:${creditedSequence}`, "OneX XTU deposit credit updated",
     [
       `Your XTU deposit credit tranche ${creditedSequence} has been confirmed.`,
-      `Gross XTU returned: ${grossReturned.toFixed(8)} XTU`,
-      `OneX deposit fee for the whole deposit: ${credit.depositFeeXtu.toFixed(8)} XTU`,
-      `Actual BSC gas for the whole deposit: ${actualGas.feeUsd.toFixed(8)} BSC-USD / XTU equivalent`,
+      `Gross XTU processed in this tranche: ${grossForThisTranche.toFixed(8)} XTU`,
+      `OneX deposit fee for this credited tranche: ${depositFeeForThisTranche.toFixed(8)} XTU`,
+      `${actualGas.provisional ? "Provisioned" : "Actual"} consolidation gas allocated to this tranche: ${gasFeeForThisTranche.toFixed(8)} BSC-USD / XTU equivalent`,
       `Global unit price: ${new BigNumber(common.unit_price).toFixed(12)}`,
       `Initial assets credited in this tranche: ${credit.creditedInitialAsset.toFixed(12)}`,
-      `Creditable XTU remaining for a later tranche: ${remainingCredit.toFixed(8)}`,
+      `Gross XTU remaining for a later credit tranche: ${remainingCredit.toFixed(8)}`,
       `Reference: ${reference}`,
       settlement ? `Global XTU-only settlement reference: ${settlement.ledgerId}` : "",
-      remainingCredit.isGreaterThan(0) ? `The remaining credit remains pending and is rechecked automatically; eligible seller-campaign reserves may fund it before the seven-day OneX system-funding cooldown expires.` : "The XTU deposit batch is fully credited.",
+      remainingCredit.isGreaterThan(0) ? `The remaining gross XTU remains pending and is rechecked automatically. No OneX deposit fee has been charged on that uncredited remainder; it remains subject to the original 30-day expiry.` : "The XTU deposit batch is fully credited.",
     ].filter(Boolean).join("\n"),
   );
 }
@@ -1065,45 +1485,18 @@ async function finalizeConsolidation(pool, row, receipt, runtime) {
       bnbUsdPrice,
     });
 
-    const totalGrossReturned = items.reduce(
-      (sum, item) => sum.plus(item.gross_returned_xtu), new BigNumber(0),
-    );
-    const common = await getLatestCommonTx(tx, true);
-    const nextOutstanding = new BigNumber(common.xtu_wallets || "0").minus(totalGrossReturned);
-    if (!totalGrossReturned.isFinite() || !totalGrossReturned.isGreaterThan(0) ||
-        !nextOutstanding.isFinite() || nextOutstanding.isNegative()) {
-      const reason = "The returned gross XTU exceeds the outstanding externalized counter; manual reconciliation is required and no negative balance was written.";
-      await tx.query(
-        `UPDATE xtu_deposit_consolidations SET status='manual_review',block_number=?,receipt_json=?,
-         actual_gas_fee_bnb=?,actual_gas_fee_usd=?,confirmed_at_ms=?,last_error=?,updated_at_ms=? WHERE id=?`,
-        [String(receipt.blockNumber), JSON.stringify(receipt), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(30),
-          String(Date.now()), reason, String(Date.now()), String(current.id)],
-      );
-      await tx.query(
-        `UPDATE xtu_deposit_consolidation_items SET status='manual_review',updated_at_ms=? WHERE consolidation_id=?`,
-        [String(Date.now()), String(current.id)],
-      );
-      for (const batch of batchRows) {
-        await tx.query(
-          `UPDATE xtu_deposit_batches SET status='manual_review',returned_amount=?,reason_codes=?,updated_at_ms=? WHERE id=?`,
-          [String(batch.gross_amount), JSON.stringify(["returned_xtu_exceeds_common_xtu_wallets_manual_reconciliation"]), String(Date.now()), String(batch.id)],
-        );
-        await notifyUserTx(
-          tx, batch.username, `xtu-deposit:${batch.id}:manual-reconcile`, "OneX XTU deposit requires reconciliation",
-          `Your XTU was returned to the OneX Distribution Wallet, but the outstanding externalized XTU ledger is insufficient to reconcile the gross returned amount. No negative accounting balance was created and no initial assets were credited automatically. Please contact OneX support. Batch: ${batch.id}.`,
-        );
-      }
-      return;
-    }
-
     const eventRows = (await tx.query(
-      `SELECT event_identity,batch_id,gross_amount FROM xtu_deposit_transfer_events
-       WHERE batch_id IN (${placeholders}) AND status NOT IN ('rejected','reversed')
+      `SELECT event_identity,batch_id,gross_amount,net_amount FROM xtu_deposit_transfer_events
+       WHERE batch_id IN (${placeholders}) AND status NOT IN ('rejected','reversed','manual_review')
        ORDER BY event_identity ASC FOR UPDATE`, batchIds,
     ))[0];
-    if (!eventRows.length) throw new Error("The XTU consolidation lot has no finalized source deposit events.");
-    const gasUsdByEvent = new Map(allocateBatchGasByGross(eventRows, actualGas.feeUsd).map((entry) => [entry.key, entry.gasFee]));
-    const gasBnbByEvent = new Map(allocateBatchGasByGross(eventRows, actualGas.feeBnb).map((entry) => [entry.key, entry.gasFee]));
+    if (!eventRows.length) throw new Error("The XTU consolidation lot has no verified source deposit events.");
+    const gasUsdByEvent = new Map(allocateBatchGasByGross(
+      eventRows.map((entry) => ({ ...entry, gross_amount: String(entry.net_amount) })), actualGas.feeUsd,
+    ).map((entry) => [entry.key, entry.gasFee]));
+    const gasBnbByEvent = new Map(allocateBatchGasByGross(
+      eventRows.map((entry) => ({ ...entry, gross_amount: String(entry.net_amount) })), actualGas.feeBnb,
+    ).map((entry) => [entry.key, entry.gasFee]));
     const gasByBatch = new Map(batchIds.map((id) => [id, { usd: new BigNumber(0), bnb: new BigNumber(0) }]));
     for (const event of eventRows) {
       const key = String(event.event_identity);
@@ -1115,14 +1508,20 @@ async function finalizeConsolidation(pool, row, receipt, runtime) {
       bucket.usd = bucket.usd.plus(gasUsd);
       bucket.bnb = bucket.bnb.plus(gasBnb);
       await tx.query(
-        `UPDATE xtu_deposit_transfer_events SET status='returned',allocated_gas_fee_usd=?,allocated_gas_fee_xtu=?
-         WHERE event_identity=?`,
+        `UPDATE xtu_deposit_transfer_events SET allocated_gas_fee_usd=?,allocated_gas_fee_xtu=?,
+         status=IF(status='forfeited_to_common_reserve',status,'consolidated') WHERE event_identity=?`,
         [gasUsd.toFixed(18), gasUsd.toFixed(18), key],
+      );
+      await tx.query(
+        `UPDATE xtu_hot_wallet_lots SET gas_actual_xtu=?,consolidated_amount=hot_wallet_received_amount,
+         protected_hot_wallet_amount=0,consolidation_reserved_amount=0,
+         status=IF(expired_common_reserve_amount>0,'consolidated_common_reserve','consolidated'),
+         consolidated_at_ms=?,updated_at_ms=? WHERE event_identity=?`,
+        [gasUsd.toFixed(18), String(Date.now()), String(Date.now()), key],
       );
     }
 
     const [date, time] = utcDateTime();
-    await insertCommonSnapshotTx(tx, common, { xtu_wallets: nextOutstanding.toFixed(30) }, date, time);
     await tx.query(
       `UPDATE xtu_deposit_consolidations SET status='confirmed',block_number=?,receipt_json=?,
        actual_gas_fee_bnb=?,actual_gas_fee_usd=?,confirmed_at_ms=?,updated_at_ms=? WHERE id=?`,
@@ -1135,6 +1534,12 @@ async function finalizeConsolidation(pool, row, receipt, runtime) {
       const batch = batchRows.find((entry) => String(entry.id) === batchId);
       const allocation = gasByBatch.get(batchId);
       if (!batch || !allocation) throw new Error("An XTU consolidation item is not linked to its expected batch or gas allocation.");
+      const consolidatedAmount = new BigNumber(item.hot_wallet_received_xtu);
+      const previousConsolidated = new BigNumber(batch.hot_wallet_consolidated_amount || "0");
+      const previousReserved = new BigNumber(batch.consolidation_reserved_amount || "0");
+      if (!consolidatedAmount.isGreaterThan(0) || previousReserved.lt(consolidatedAmount)) {
+        throw new Error("The XTU protected Hot Wallet lot reservation does not match the confirmed consolidation.");
+      }
       await tx.query(
         `UPDATE xtu_deposit_consolidation_items SET status='confirmed',allocated_gas_fee_bnb=?,
          allocated_gas_fee_usd=?,allocated_gas_fee_xtu=?,updated_at_ms=?
@@ -1142,47 +1547,132 @@ async function finalizeConsolidation(pool, row, receipt, runtime) {
         [allocation.bnb.toFixed(18), allocation.usd.toFixed(18), allocation.usd.toFixed(18),
           String(Date.now()), String(current.id), batchId],
       );
-      await tx.query(
-        `UPDATE xtu_deposit_batches SET status='consolidated_pending_credit',returned_amount=?,
-         gas_allocated_usd=?,gas_allocated_xtu=?,updated_at_ms=? WHERE id=?`,
-        [new BigNumber(item.gross_returned_xtu).toFixed(18), allocation.usd.toFixed(18), allocation.usd.toFixed(18),
-          String(Date.now()), batchId],
-      );
 
-      await tx.query("SAVEPOINT xtu_credit_attempt");
-      try {
-        await creditConsolidatedBatchTx(
-          tx,
-          { ...batch, returned_amount: String(item.gross_returned_xtu), status: "consolidated_pending_credit" },
-          current,
-          receipt,
-          { feeBnb: allocation.bnb, feeUsd: allocation.usd },
-          runtime.settings,
-        );
-        await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
-      } catch (error) {
-        await tx.query("ROLLBACK TO SAVEPOINT xtu_credit_attempt");
-        await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
-        const now = Date.now();
-        const systemFundingCooldown = error.code === "XTU_SYSTEM_FUNDING_COOLDOWN";
-        const pendingStatus = systemFundingCooldown ? "pending_weekly" : "pending_reserve";
-        const pendingReason = systemFundingCooldown ? "system_funding_cooldown" : String(error.message || error).slice(0, 250);
-        const releaseAt = systemFundingCooldown && Number.isSafeInteger(Number(error.releaseAtMs))
-          ? Number(error.releaseAtMs)
-          : now + DEPOSIT_PENDING_RETRY_MS;
+      const [creditRows] = await tx.query(
+        `SELECT id,credit_sequence,gross_returned_xtu,gas_fee_xtu,gas_fee_status,gas_actual_fee_xtu,
+                COALESCE(SUM(creditable_xtu) OVER (),0) AS credited
+         FROM xtu_deposit_credits WHERE batch_id=? ORDER BY credit_sequence ASC FOR UPDATE`,
+        [batchId],
+      );
+      const credited = new BigNumber(creditRows[0]?.credited || "0");
+      const gross = new BigNumber(batch.gross_amount || "0");
+      const [lotTotalsRows] = await tx.query(
+        `SELECT COALESCE(SUM(hot_wallet_received_amount),0) AS hot_net,
+                COALESCE(SUM(credited_amount),0) AS credited_hot_net,
+                COALESCE(SUM(expired_common_reserve_amount),0) AS expired_hot_net
+         FROM xtu_hot_wallet_lots WHERE batch_id=? FOR UPDATE`, [batchId],
+      );
+      const hotNetTotal = new BigNumber(lotTotalsRows[0]?.hot_net || "0");
+      const creditedHotNet = new BigNumber(lotTotalsRows[0]?.credited_hot_net || "0");
+      const expiredHotNet = new BigNumber(lotTotalsRows[0]?.expired_hot_net || "0");
+      if (!hotNetTotal.isGreaterThan(0) || creditedHotNet.plus(expiredHotNet).gt(hotNetTotal)) {
+        throw new Error(`XTU protected Hot Wallet lot totals do not reconcile for batch ${batchId}.`);
+      }
+      const actualGasCredited = allocation.usd.multipliedBy(creditedHotNet).dividedBy(hotNetTotal)
+        .decimalPlaces(18, BigNumber.ROUND_DOWN);
+      let gasAssignedToCredits = new BigNumber(0);
+      const grossCreditTotal = creditRows.reduce((sum, row) => sum.plus(row.gross_returned_xtu || 0), new BigNumber(0));
+      for (let creditIndex = 0; creditIndex < creditRows.length; creditIndex += 1) {
+        const creditRow = creditRows[creditIndex];
+        const rowGross = new BigNumber(creditRow.gross_returned_xtu || "0");
+        const rowGas = creditIndex === creditRows.length - 1
+          ? actualGasCredited.minus(gasAssignedToCredits)
+          : (grossCreditTotal.isGreaterThan(0)
+            ? actualGasCredited.multipliedBy(rowGross).dividedBy(grossCreditTotal).decimalPlaces(18, BigNumber.ROUND_DOWN)
+            : new BigNumber(0));
+        gasAssignedToCredits = gasAssignedToCredits.plus(rowGas);
         await tx.query(
-          `UPDATE xtu_deposit_batches SET status=?,reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),
-           release_at_ms=?,updated_at_ms=? WHERE id=?`,
-          [pendingStatus, JSON.stringify([pendingReason]), String(now), String(releaseAt), String(now), batchId],
-        );
-        await notifyUserTx(
-          tx, batch.username, `xtu-deposit:${batchId}:${systemFundingCooldown ? "weekly-system-funding" : "pending-reserve"}`,
-          "OneX XTU deposit pending",
-          systemFundingCooldown
-            ? `Your XTU deposit has been returned to OneX and reconciled, but the weekly OneX-funded purchase has already been used. An active eligible seller campaign may fund this credit earlier; the worker will recheck seller reserves. Otherwise OneX system-reserve funding becomes available after the seven-day period. Batch: ${batchId}.`
-            : `Your XTU transfer has returned to OneX and the externalized XTU counter and coverage ledger have been reconciled. The initial-asset credit is pending a reserve or account check and will be reassessed automatically. Please contact OneX support if needed. Batch: ${batchId}.`,
+          `UPDATE xtu_deposit_credits SET gas_fee_status='reconciled',gas_actual_fee_xtu=? WHERE id=?`,
+          [rowGas.toFixed(18), String(creditRow.id)],
         );
       }
+
+      const alreadyExpired = String(batch.status) === "forfeited_to_common_reserve";
+      let expirationGasManualReview = false;
+      if (alreadyExpired) {
+        const actualGasExpired = allocation.usd.minus(actualGasCredited).decimalPlaces(18, BigNumber.ROUND_DOWN);
+        const [expirationRows] = await tx.query(
+          `SELECT * FROM deposit_expiration_events
+           WHERE asset_code='XTU' AND batch_id=? LIMIT 1 FOR UPDATE`, [batchId],
+        );
+        if (expirationRows.length) {
+          const expiration = expirationRows[0];
+          const provisionForExpired = new BigNumber(expiration.gas_provision_value || "0");
+          const adjustment = provisionForExpired.minus(actualGasExpired).decimalPlaces(18, BigNumber.ROUND_DOWN);
+          const correctedReserveValue = new BigNumber(expiration.expired_amount || "0")
+            .minus(actualGasExpired).decimalPlaces(18, BigNumber.ROUND_DOWN);
+          if (correctedReserveValue.isNegative()) {
+            throw new Error(`Actual XTU consolidation gas exceeds the expired gross reserve for batch ${batchId}.`);
+          }
+          if (!adjustment.isZero()) {
+            const commonForAdjustment = await getLatestCommonTx(tx, true);
+            const adjustedTotal = new BigNumber(commonForAdjustment.total_units_price).plus(adjustment);
+            if (adjustedTotal.isNegative()) {
+              expirationGasManualReview = true;
+              await tx.query(
+                `UPDATE deposit_expiration_events SET gas_actual_value=?,gas_adjustment_value=?,
+                 gas_covered_by_onex=?,status='manual_review' WHERE id=?`,
+                [actualGasExpired.toFixed(18), adjustment.toFixed(18), BigNumber.maximum(0, actualGasExpired.minus(provisionForExpired)).toFixed(18), String(expiration.id)],
+              );
+              await tx.query(
+                `UPDATE xtu_deposit_batches SET status='manual_review',reason_codes=?,updated_at_ms=? WHERE id=?`,
+                [JSON.stringify(["xtu_expired_gas_adjustment_would_make_common_reserve_negative"]), String(Date.now()), batchId],
+              );
+            } else {
+              const [date, time] = utcDateTime();
+              await insertCommonSnapshotTx(tx, commonForAdjustment, {
+                total_units_price: adjustedTotal.toFixed(30),
+              }, date, time);
+              const [snapshotRows] = await tx.query("SELECT id FROM common ORDER BY id DESC LIMIT 1 FOR UPDATE");
+              if (!snapshotRows.length) throw new Error("The XTU expiry gas adjustment snapshot was not persisted.");
+              await tx.query(
+                `UPDATE deposit_expiration_events SET value_added_to_common=?,gas_actual_value=?,
+                 gas_adjustment_value=?,gas_covered_by_onex=?,gas_adjustment_applied_at_ms=?,
+                 common_snapshot_id=?,status='gas_reconciled' WHERE id=?`,
+                [correctedReserveValue.toFixed(30), actualGasExpired.toFixed(18), adjustment.toFixed(18),
+                  BigNumber.maximum(0, actualGasExpired.minus(provisionForExpired)).toFixed(18),
+                  String(Date.now()), String(snapshotRows[0].id), String(expiration.id)],
+              );
+              await tx.query(
+                `UPDATE xtu_deposit_batches SET expired_common_reserve_amount=?,updated_at_ms=? WHERE id=?`,
+                [correctedReserveValue.toFixed(18), String(Date.now()), batchId],
+              );
+            }
+          } else {
+            await tx.query(
+              `UPDATE deposit_expiration_events SET value_added_to_common=?,gas_actual_value=?,
+               gas_adjustment_value='0',gas_adjustment_applied_at_ms=?,status='gas_reconciled' WHERE id=?`,
+              [correctedReserveValue.toFixed(30), actualGasExpired.toFixed(18), String(Date.now()), String(expiration.id)],
+            );
+            await tx.query(
+              `UPDATE xtu_deposit_batches SET expired_common_reserve_amount=?,updated_at_ms=? WHERE id=?`,
+              [correctedReserveValue.toFixed(18), String(Date.now()), batchId],
+            );
+          }
+        }
+      }
+      const globalRun = await getGlobalRunTx(tx, batch.global_run_id || null);
+      const feeRate = calculateDepositFeeRate(batch.tfees_rate_percent ?? tfees, Boolean(globalRun));
+      const depositFee = globalRun ? new BigNumber(0) : gross.multipliedBy(feeRate).dividedBy(100).decimalPlaces(18, BigNumber.ROUND_DOWN);
+      const creditableAtActualGas = BigNumber.maximum(0, gross.minus(depositFee).minus(allocation.usd).decimalPlaces(18, BigNumber.ROUND_DOWN));
+      const newlyAvailable = BigNumber.maximum(0, creditableAtActualGas.minus(credited).decimalPlaces(18, BigNumber.ROUND_DOWN));
+      const nextStatus = expirationGasManualReview ? "manual_review"
+        : alreadyExpired ? "forfeited_to_common_reserve"
+          : newlyAvailable.isGreaterThan(0) ? "pending_credit" : (credited.isGreaterThan(0) ? "credited" : String(batch.status));
+      await tx.query(
+        `UPDATE xtu_deposit_batches SET hot_wallet_consolidated_amount=?,
+         consolidation_reserved_amount=consolidation_reserved_amount-?,gas_actual_usd=?,
+         gas_allocated_usd=?,gas_allocated_xtu=?,remaining_amount=?,status=?,
+         release_at_ms=IF(?='pending_credit',?,release_at_ms),updated_at_ms=? WHERE id=?`,
+        [previousConsolidated.plus(consolidatedAmount).toFixed(18), consolidatedAmount.toFixed(18),
+          allocation.usd.toFixed(18), allocation.usd.toFixed(18), allocation.usd.toFixed(18),
+          alreadyExpired ? "0" : newlyAvailable.toFixed(18), nextStatus, nextStatus, String(Date.now()),
+          String(Date.now()), batchId],
+      );
+      // Each credited tranche now has its own actual gas share. Keep gas_fee_xtu
+      // unchanged as the original provision used for the credit calculation.
+      // The consolidation is a custody transfer only. It must not change
+      // common.xtu_wallets or common.total_units_price a second time.
     }
   });
 }
@@ -1308,6 +1798,29 @@ async function filterEligibleConsolidationBatches(pool, candidates, settings) {
 }
 
 async function processOneReadyBatch(pool, runtime, mainSigner) {
+  // User-credit decisions are database/accounting operations and remain independent
+  // of a refund or consolidation occupying the XTU Hot Wallet signer.
+  const pendingMainWalletRefunds = await pool.queryAsync(
+    `SELECT id FROM xtu_unknown_refunds WHERE status IN ('signed','submitted','manual_review') LIMIT 1`,
+  );
+
+  // Credit processing is deliberately independent from Hot Wallet custody
+  // consolidation. An eligible deposit can be credited while its tokens are
+  // still protected in the Hot Wallet awaiting the 100-XTU FIFO threshold.
+  const retryRows = await pool.queryAsync(
+    `SELECT id FROM xtu_deposit_batches
+     WHERE status IN ('ready','pending_reserve','pending_credit','pending_weekly','pending_support')
+       AND remaining_amount>0
+       AND (status IN ('ready','pending_weekly') OR release_at_ms IS NULL OR CAST(release_at_ms AS UNSIGNED)<=?)
+     ORDER BY opened_at_ms ASC,id ASC LIMIT 1`, [String(Date.now())],
+  );
+  if (retryRows.length) {
+    await retryCredit(pool, retryRows[0].id, runtime);
+  }
+
+  // A signed/submitted/manual-review refund must not block the database-only
+  // credit path above, but it must prevent any additional Hot Wallet spend.
+  if (pendingMainWalletRefunds.length) return;
   const pendingConsolidations = await pool.queryAsync(
     `SELECT * FROM xtu_deposit_consolidations WHERE status IN ('signed','submitted')
      ORDER BY id ASC LIMIT 1`,
@@ -1316,84 +1829,102 @@ async function processOneReadyBatch(pool, runtime, mainSigner) {
     await reconcileConsolidation(pool, pendingConsolidations[0], runtime);
     return;
   }
-
-  const retryRows = await pool.queryAsync(
-    `SELECT b.id FROM xtu_deposit_batches b
-     JOIN xtu_deposit_consolidation_items i ON i.batch_id=b.id
-     JOIN xtu_deposit_consolidations c ON c.id=i.consolidation_id
-     WHERE b.status IN ('pending_reserve','pending_credit','pending_weekly') AND c.status='confirmed'
-       AND (b.status='pending_weekly' OR b.release_at_ms IS NULL OR CAST(b.release_at_ms AS UNSIGNED)<=?)
-     ORDER BY b.id ASC LIMIT 1`, [String(Date.now())],
+  const manualReviewConsolidations = await pool.queryAsync(
+    `SELECT id FROM xtu_deposit_consolidations WHERE status='manual_review' LIMIT 1`,
   );
-  if (retryRows.length) {
-    await retryCredit(pool, retryRows[0].id, runtime.settings);
-    return;
-  }
+  if (manualReviewConsolidations.length) return;
+
+  // Consolidation is a custody-only FIFO process. It considers every
+  // finalized, protected Hot Wallet lot, including lots whose user credit has
+  // already completed or whose uncredited remainder was reclassified at 30d.
+  const fifoBlockers = await pool.queryAsync(
+    `SELECT id,status FROM xtu_deposit_batches
+     WHERE status IN ('collecting','pending_minimum','pending_global','manual_review')
+       AND CAST(hot_wallet_received_amount AS DECIMAL(36,18)) >
+           CAST(hot_wallet_consolidated_amount AS DECIMAL(36,18)) + CAST(consolidation_reserved_amount AS DECIMAL(36,18))
+     ORDER BY opened_at_ms ASC,id ASC LIMIT 1`,
+  );
+  if (fifoBlockers.length) return;
 
   const candidates = await pool.queryAsync(
     `SELECT b.* FROM xtu_deposit_batches b
-     WHERE b.status IN ('ready','pending_reserve','pending_credit','pending_weekly')
-       AND (b.status IN ('ready','pending_weekly') OR b.release_at_ms IS NULL OR CAST(b.release_at_ms AS UNSIGNED)<=?)
-       AND NOT EXISTS (
-         SELECT 1 FROM xtu_deposit_consolidation_items i WHERE i.batch_id=b.id
-       )
-     ORDER BY b.id ASC LIMIT 200`, [String(Date.now())],
+     WHERE b.status IN ('ready','pending_reserve','pending_credit',
+                        'pending_weekly','pending_support','pending_global','credited','forfeited_to_common_reserve')
+       AND (CAST(b.hot_wallet_received_amount AS DECIMAL(36,18)) >
+            CAST(b.hot_wallet_consolidated_amount AS DECIMAL(36,18)) +
+            CAST(b.consolidation_reserved_amount AS DECIMAL(36,18)))
+       AND NOT EXISTS (SELECT 1 FROM xtu_deposit_consolidation_items i WHERE i.batch_id=b.id)
+     ORDER BY b.opened_at_ms ASC,b.id ASC LIMIT 500`,
   );
   if (!candidates.length) return;
-
-  const eligible = await filterEligibleConsolidationBatches(pool, candidates, runtime.settings);
-  const selected = selectXtuConsolidationBatches(
-    eligible,
-    runtime.settings.depositConsolidationMinBatchXtu,
-  );
+  const selected = selectXtuConsolidationBatches(candidates, runtime.settings.depositConsolidationMinBatchXtu);
   if (!selected) return;
-
   try {
     await prepareConsolidation(pool, selected.batches, runtime, mainSigner);
   } catch (error) {
+    // A failed estimate/fee check does not affect the user-credit state or
+    // release the protected tokens; the same FIFO lot is retried later.
     for (const batch of selected.batches) {
-      await setBatchPending(pool, batch.id, "pending_reserve", error.message || "xtu_consolidation_preparation_failed");
+      await setBatchPending(pool, batch.id, batch.status, `consolidation_pending:${String(error.message || error).slice(0, 180)}`);
     }
   }
 }
 
-async function retryCredit(pool, batchId, settings) {
+async function retryCredit(pool, batchId, runtime) {
+  const expiryRows = await pool.queryAsync(
+    "SELECT expires_at_ms,status FROM xtu_deposit_batches WHERE id=? LIMIT 1", [String(batchId)],
+  );
+  if (!expiryRows.length || ["forfeited_to_common_reserve", "manual_review", "credited"].includes(String(expiryRows[0].status))) return;
+  const expiresAt = Number(expiryRows[0].expires_at_ms || 0);
+  if (expiresAt > 0 && Date.now() >= expiresAt) {
+    await expireOneXtuDepositBatch(pool, batchId, runtime.settings, Date.now());
+    return;
+  }
+  let provision;
+  try {
+    provision = await ensureXtuBatchGasProvision(pool, batchId, runtime);
+  } catch (error) {
+    await setBatchPending(pool, batchId, "pending_reserve", error.message || "xtu_gas_provision_unavailable");
+    return;
+  }
+  if (!provision) return;
   const rows = await pool.queryAsync(
-    `SELECT b.*,i.allocated_gas_fee_bnb AS batch_gas_fee_bnb,
-            i.allocated_gas_fee_usd AS batch_gas_fee_usd,
-            c.receipt_json,c.tx_hash
-     FROM xtu_deposit_batches b
-     JOIN xtu_deposit_consolidation_items i ON i.batch_id=b.id
-     JOIN xtu_deposit_consolidations c ON c.id=i.consolidation_id
-     WHERE b.id=? AND b.status IN ('pending_reserve','pending_credit','pending_weekly') AND c.status='confirmed' LIMIT 1`, [String(batchId)],
+    `SELECT * FROM xtu_deposit_batches WHERE id=?
+     AND status IN ('ready','pending_reserve','pending_credit','pending_weekly','pending_support') LIMIT 1`,
+    [String(batchId)],
   );
   if (!rows.length) return;
   const row = rows[0];
-  const receipt = JSON.parse(row.receipt_json || "{}");
-  const gas = {
-    feeBnb: new BigNumber(row.batch_gas_fee_bnb || "0"),
-    feeUsd: new BigNumber(row.batch_gas_fee_usd || "0"),
-  };
+  const actualUsd = new BigNumber(row.gas_actual_usd || "0");
+  const gasUsd = actualUsd.isGreaterThan(0) ? actualUsd : new BigNumber(row.gas_provisioned_usd || provision.feeUsd);
+  const gas = { feeBnb: provision.feeBnb || new BigNumber(0), feeUsd: gasUsd, provisional: !actualUsd.isGreaterThan(0) };
   await withTransaction(pool, async (tx) => {
     await acquireDepositLocks(tx);
     await tx.query("SAVEPOINT xtu_credit_attempt");
     try {
-      await creditConsolidatedBatchTx(tx, row, { tx_hash: row.tx_hash }, receipt, gas, settings);
+      await creditConsolidatedBatchTx(tx, row, null, null, gas, runtime.settings);
       await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
     } catch (error) {
       await tx.query("ROLLBACK TO SAVEPOINT xtu_credit_attempt");
       await tx.query("RELEASE SAVEPOINT xtu_credit_attempt");
       const now = Date.now();
       const systemFundingCooldown = error.code === "XTU_SYSTEM_FUNDING_COOLDOWN";
-      const pendingStatus = systemFundingCooldown ? "pending_weekly" : "pending_reserve";
-      const pendingReason = systemFundingCooldown ? "system_funding_cooldown" : String(error.message || error).slice(0, 250);
+      const pendingStatus = systemFundingCooldown ? "pending_weekly"
+        : (String(error.message || "").includes("maximum_user_balance") || String(error.message || "").includes("capacity")
+          ? "pending_credit" : "pending_reserve");
+      const pendingReason = systemFundingCooldown ? "system_funding_cooldown" :
+        (pendingStatus === "pending_credit" ? "maximum_user_balance" : String(error.message || error).slice(0, 250));
       const releaseAt = systemFundingCooldown && Number.isSafeInteger(Number(error.releaseAtMs))
-        ? Number(error.releaseAtMs)
-        : now + DEPOSIT_PENDING_RETRY_MS;
+        ? Number(error.releaseAtMs) : now + DEPOSIT_PENDING_RETRY_MS;
       await tx.query(
-        "UPDATE xtu_deposit_batches SET status=?,reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),release_at_ms=?,updated_at_ms=? WHERE id=? AND status IN ('pending_reserve','pending_credit','pending_weekly')",
+        `UPDATE xtu_deposit_batches SET status=?,reason_codes=?,pending_since_ms=COALESCE(pending_since_ms,?),
+         release_at_ms=?,updated_at_ms=? WHERE id=? AND status IN ('ready','pending_reserve','pending_credit','pending_weekly','pending_support')`,
         [pendingStatus, JSON.stringify([pendingReason]), String(now), String(releaseAt), String(now), String(batchId)],
       );
+      await notifyUserTx(tx, row.username, `xtu-deposit:${batchId}:${pendingReason}`, "OneX XTU deposit pending",
+        systemFundingCooldown
+          ? `Your XTU deposit is eligible but the weekly OneX-funded purchase allowance is already used. Seller-campaign reserves may fund it earlier; otherwise OneX funding can be reconsidered after the seven-day period. The deposit remains subject to its fixed 30-day expiry. Batch: ${batchId}.`
+          : `Your XTU deposit remains pending because: ${pendingReason}. Release capacity by selling/transferring/withdrawing eligible assets or wait for eligible reserves. The remaining amount expires on ${new Date(Number(row.expires_at_ms)).toISOString()} and will then be irreversibly reclassified to common reserves. Batch: ${batchId}.`);
     }
   });
 }
@@ -1616,10 +2147,530 @@ async function processEmailOutbox(pool) {
   }
 }
 
+async function appendXtuUnknownRefundEventTx(tx, requestId, refundId, eventType, oldStatus, newStatus, reason, options = {}) {
+  const now = String(Date.now());
+  await tx.query(
+    `INSERT IGNORE INTO xtu_unknown_refund_events
+     (unknown_transfer_id,request_id,refund_id,event_key,event_type,actor_type,actor_reference,old_status,new_status,reason,tx_hash,
+      gross_amount,fee_amount,net_amount,created_at_ms)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [options.transferId == null ? null : String(options.transferId), requestId == null ? null : String(requestId), refundId == null ? null : String(refundId),
+      String(options.eventKey || `xtu-unknown-refund:${requestId}:${eventType}:${options.suffix || "v1"}`),
+      eventType, options.actorType || "system", options.actorReference || null,
+      oldStatus || null, newStatus || null, reason || null, options.txHash || null,
+      String(options.grossAmount || "0"), String(options.feeAmount || "0"), String(options.netAmount || "0"), now],
+  );
+}
+
+async function assignUnknownXtuTransferToAccount(pool, transferId, username) {
+  const settings = getXtuSettings();
+  return withTransaction(pool, async (tx) => {
+    await acquireDepositLocks(tx);
+    const [unknownRows] = await tx.query(
+      `SELECT * FROM xtu_unknown_incoming_transfers WHERE id=? AND status IN ('pending_admin','refund_failed') LIMIT 1 FOR UPDATE`,
+      [String(transferId)],
+    );
+    if (!unknownRows.length) return { status: "not_available" };
+    const unknown = unknownRows[0];
+    const [authRows] = await tx.query(
+      `SELECT username,wallet_address FROM auths WHERE username=? LIMIT 1 FOR UPDATE`, [String(username)],
+    );
+    if (!authRows.length || String(authRows[0].wallet_address || "").toLowerCase() !== String(unknown.from_address).toLowerCase()) {
+      return { status: "sender_account_mismatch" };
+    }
+    const [requestRows] = await tx.query(
+      `SELECT id,status FROM xtu_unknown_refund_requests WHERE unknown_transfer_id=? LIMIT 1 FOR UPDATE`,
+      [String(unknown.id)],
+    );
+    if (requestRows.length && ["approved", "refund_signed", "refund_submitted", "manual_review", "completed"].includes(String(requestRows[0].status))) {
+      return { status: "refund_already_resolved" };
+    }
+    const [activeRefundRows] = await tx.query(
+      `SELECT id,status FROM xtu_unknown_refunds WHERE unknown_transfer_id=? LIMIT 1 FOR UPDATE`,
+      [String(unknown.id)],
+    );
+    if (activeRefundRows.length && !["failed", "cancelled"].includes(String(activeRefundRows[0].status))) {
+      return { status: "refund_already_resolved_or_in_progress" };
+    }
+    const event = {
+      sender: unknown.from_address,
+      gross: BigInt(String(unknown.gross_amount_raw)),
+      net: BigInt(String(unknown.hot_wallet_received_raw)),
+      fee: BigInt(String(unknown.commission_amount_raw)),
+      txHash: unknown.tx_hash,
+      logIndex: Number(unknown.log_index),
+      blockNumber: String(unknown.block_number),
+      blockHash: unknown.block_hash,
+      blockTimestampMs: Number(unknown.block_timestamp_ms),
+      finalizedAtMs: Number(unknown.finalized_at_ms || unknown.created_at_ms),
+    };
+    const assigned = await assignDepositEventTx(tx, event, settings);
+    if (["duplicate", "pending_identity"].includes(String(assigned.status))) {
+      throw new Error("The unknown XTU transfer could not be safely re-assigned to the normal deposit ledger.");
+    }
+    const now = String(Date.now());
+    await tx.query(
+      `UPDATE xtu_unknown_incoming_transfers
+       SET status='assigned',decision_action='assign',decision_reason=?,decided_by='configured_admin',
+           decided_at_ms=?,assigned_username=?,updated_at_ms=? WHERE id=? AND status IN ('pending_admin','refund_failed')`,
+      [`Assigned to the account whose registered BSC wallet exactly matches the original sender.`, now, String(username), now, String(unknown.id)],
+    );
+    if (requestRows.length) {
+      await tx.query(
+        `UPDATE xtu_unknown_refund_requests SET status='assigned',admin_reason=?,resolved_at_ms=?,updated_at_ms=?
+         WHERE id=? AND status IN ('challenge_pending','pending_admin','failed')`,
+        ["The transfer was assigned to its matching registered OneX account.", now, now, String(requestRows[0].id)],
+      );
+      await appendXtuUnknownRefundEventTx(tx, requestRows[0].id, null, "assigned", "pending_admin", "assigned",
+        "The transfer was assigned to the matching registered wallet.", { actorType: "admin", actorReference: String(username), transferId: unknown.id });
+    }
+    return { status: "assigned", username: String(username), deposit: assigned };
+  });
+}
+
+async function verifyUnknownXtuSource(pool, transfer, runtime) {
+  const [canonicalBlock, receipt] = await Promise.all([
+    runtime.provider.getBlock(Number(transfer.block_number)),
+    runtime.provider.getTransactionReceipt(transfer.tx_hash),
+  ]);
+  if (!canonicalBlock || String(canonicalBlock.hash).toLowerCase() !== String(transfer.block_hash).toLowerCase() ||
+      !receipt || Number(receipt.status) !== 1 || Number(receipt.blockNumber) !== Number(transfer.block_number) ||
+      String(receipt.blockHash).toLowerCase() !== String(transfer.block_hash).toLowerCase()) {
+    throw new Error("The original unknown XTU deposit is not canonical and final; administrative refund signing is blocked.");
+  }
+  const parsed = (receipt.logs || []).find((log) => Number(log.index) === Number(transfer.log_index) &&
+    String(log.address || "").toLowerCase() === String(runtime.settings.tokenAddress).toLowerCase());
+  if (!parsed) throw new Error("The original unknown XTU transfer log is missing from its source receipt.");
+  const feeEvent = XTU_INTERFACE.parseLog(parsed);
+  if (!feeEvent || feeEvent.name !== "TransferWithFee" ||
+      getAddress(String(feeEvent.args.from)) !== getAddress(String(transfer.from_address)) ||
+      getAddress(String(feeEvent.args.to)) !== runtime.settings.mainWalletAddress ||
+      BigInt(feeEvent.args.grossAmount).toString() !== String(transfer.gross_amount_raw) ||
+      BigInt(feeEvent.args.netAmount).toString() !== String(transfer.hot_wallet_received_raw) ||
+      BigInt(feeEvent.args.feeAmount).toString() !== String(transfer.commission_amount_raw) || Boolean(feeEvent.args.feeExempt)) {
+    throw new Error("The original unknown XTU transfer event no longer matches the audited incoming amounts.");
+  }
+  const latestBlock = await runtime.provider.getBlockNumber();
+  if (latestBlock - Number(transfer.block_number) + 1 < runtime.settings.minConfirmations) {
+    throw new Error("The original unknown XTU transfer has not reached the configured confirmation depth.");
+  }
+  return receipt;
+}
+
+async function markUnknownXtuRefundDeferred(pool, transferId, reason) {
+  await pool.queryAsync(
+    `UPDATE xtu_unknown_incoming_transfers SET decision_reason=?,updated_at_ms=?
+     WHERE id=? AND status='refund_approved'`,
+    [String(reason || "Refund is deferred.").slice(0, 990), String(Date.now()), String(transferId)],
+  );
+}
+
+async function createAndSignUnknownXtuRefund(pool, transfer, request, runtime, mainSigner) {
+  await verifyUnknownXtuSource(pool, transfer, runtime);
+  const baseAmount = new BigNumber(String(transfer.hot_wallet_received_amount));
+  const baseRaw = BigInt(String(transfer.hot_wallet_received_raw));
+  if (!baseAmount.isFinite() || !baseAmount.isGreaterThan(0) || baseRaw <= 0n) {
+    throw new Error("The XTU unknown-transfer Hot Wallet receipt is not a positive refundable base.");
+  }
+
+  const estimatedCallRaw = baseRaw;
+  const estimatedData = runtime.contract.interface.encodeFunctionData("transfer", [transfer.from_address, estimatedCallRaw]);
+  const bnbUsdPrice = await getBnbUsdPrice(runtime.provider, { forceRefresh: true });
+  const estimate = await estimateBscTokenTransfer({
+    provider: runtime.provider,
+    fromAddress: runtime.settings.mainWalletAddress,
+    tokenAddress: runtime.settings.tokenAddress,
+    data: estimatedData,
+    maximumGasLimit: runtime.settings.depositGasLimitCeiling,
+    bnbUsdPrice,
+  });
+  const gasLimit = (estimate.gasLimit * 120n + 99n) / 100n;
+  if (gasLimit > runtime.settings.depositGasLimitCeiling) throw new Error("XTU unknown-refund gas limit exceeds the configured XTU deposit gas ceiling.");
+  const gasQuote = require("./bsc-fee-accounting").calculateEstimatedGasFee(gasLimit.toString(), estimate.gasPrice.toString(), bnbUsdPrice);
+  const gasDecision = evaluateBscTxFee(gasQuote.feeUsd, getConfiguredMaxBscTxFeeUsd());
+  if (!gasDecision.allowed) {
+    await markUnknownXtuRefundDeferred(pool, transfer.id,
+      `Estimated XTU refund gas ${gasQuote.feeUsd.toFixed(8)} BSC-USD exceeds the 0.4 BSC-USD outgoing transaction ceiling.`);
+    return false;
+  }
+  let quote;
+  try {
+    quote = calculateXtuUnknownRefundQuote({
+      hotWalletReceivedAmount: baseAmount.toFixed(18),
+      estimatedGasFeeBscUsd: gasQuote.feeUsd.toFixed(18),
+      minimumRefundNet: MINIMUM_REFUND_NET_BSC_USD.toFixed(18),
+    });
+  } catch (error) {
+    await markUnknownXtuRefundDeferred(pool, transfer.id, error.message || "XTU refund minimum or gas check failed.");
+    return false;
+  }
+
+  const [tokenBalance, nativeBalance] = await Promise.all([
+    runtime.contract.balanceOf(runtime.settings.mainWalletAddress),
+    runtime.provider.getBalance(runtime.settings.mainWalletAddress),
+  ]);
+  const protectedDepositRows = await pool.queryAsync(
+    `SELECT COALESCE(SUM(protected_hot_wallet_amount),0) AS amount
+     FROM xtu_hot_wallet_lots WHERE status IN ('protected','consolidation_reserved','common_reserve_owned')`,
+  );
+  const protectedUnknownRows = await pool.queryAsync(
+    `SELECT COALESCE(SUM(CASE WHEN status='refunded' THEN refund_residual_amount ELSE hot_wallet_received_amount END),0) AS amount
+     FROM xtu_unknown_incoming_transfers
+     WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded')`,
+  );
+  const protectedTotal = new BigNumber(protectedDepositRows[0]?.amount || "0")
+    .plus(protectedUnknownRows[0]?.amount || "0");
+  const hotBalance = new BigNumber(tokenBalance.toString()).shiftedBy(-18);
+  if (!hotBalance.isFinite() || hotBalance.lt(protectedTotal)) {
+    throw new Error("The XTU Hot Wallet balance does not cover all protected deposit lots and unknown-transfer balances; refund signing is blocked.");
+  }
+  const requiredBnb = gasQuote.feeBnb.shiftedBy(18).integerValue(BigNumber.ROUND_CEIL);
+  if (BigInt(nativeBalance) < BigInt(requiredBnb.toFixed(0))) {
+    throw new Error("The XTU Hot Wallet does not have enough BNB for the approved unknown-transfer refund gas.");
+  }
+
+  const data = runtime.contract.interface.encodeFunctionData("transfer", [transfer.from_address, BigInt(quote.amountRaw)]);
+  const eventId = String(transfer.id);
+  let signedRowId = null;
+  let signedHash = null;
+  let rawTx = null;
+  await withTransaction(pool, async (tx) => {
+    await acquireDepositLocks(tx);
+    const [transferRows] = await tx.query(
+      `SELECT * FROM xtu_unknown_incoming_transfers WHERE id=? AND status='refund_approved' LIMIT 1 FOR UPDATE`, [eventId],
+    );
+    const [requestRows] = await tx.query(
+      `SELECT * FROM xtu_unknown_refund_requests WHERE id=? AND unknown_transfer_id=? AND status='approved' LIMIT 1 FOR UPDATE`,
+      [String(request.id), eventId],
+    );
+    if (!transferRows.length || !requestRows.length) return;
+    const [activeConsolidations] = await tx.query(
+      `SELECT id FROM xtu_deposit_consolidations WHERE status IN ('signed','submitted','manual_review') LIMIT 1 FOR UPDATE`,
+    );
+    const [activeRefunds] = await tx.query(
+      `SELECT id FROM xtu_unknown_refunds WHERE status IN ('signed','submitted','manual_review') LIMIT 1 FOR UPDATE`,
+    );
+    if (activeConsolidations.length || activeRefunds.length) return;
+    const [existingRefundRows] = await tx.query(
+      `SELECT * FROM xtu_unknown_refunds WHERE unknown_transfer_id=? LIMIT 1 FOR UPDATE`, [eventId],
+    );
+    if (existingRefundRows.length && !["failed", "cancelled"].includes(String(existingRefundRows[0].status))) return;
+
+    const nonce = await runtime.provider.getTransactionCount(runtime.settings.mainWalletAddress, "pending");
+    rawTx = await mainSigner.signTransaction({
+      to: runtime.settings.tokenAddress,
+      data,
+      value: 0n,
+      chainId: CHAIN_ID,
+      nonce,
+      gasLimit,
+      gasPrice: estimate.gasPrice,
+    });
+    signedHash = keccak256(rawTx).toLowerCase();
+    const now = String(Date.now());
+    await recordEstimatedBscFeeTx(tx, {
+      txHash: signedHash,
+      operation: "xtu_unknown_refund",
+      gasLimit: gasLimit.toString(),
+      gasPriceWei: estimate.gasPrice.toString(),
+      bnbUsdPrice,
+    });
+    const reference = `XTU-UNK-REF-${eventId}-${Date.now()}`.slice(0, 64);
+    if (existingRefundRows.length) {
+      signedRowId = String(existingRefundRows[0].id);
+      await tx.query(
+        `UPDATE xtu_unknown_refunds SET request_id=?,payout_address=?,base_received_amount=?,gas_equivalent_xtu=?,
+         gross_transfer_amount=?,contract_fee_amount=?,net_amount=?,amount_raw=?,estimated_fee_bnb=?,estimated_fee_usd=?,
+         actual_fee_bnb=NULL,actual_fee_usd=NULL,bnb_usd_price=?,gas_limit=?,gas_price_wei=?,reference=?,status='signed',
+         raw_tx=?,tx_hash=?,nonce=?,block_number=NULL,receipt_json=NULL,last_error=NULL,created_at_ms=?,updated_at_ms=?,
+         confirmed_at_ms=NULL,failed_at_ms=NULL WHERE id=? AND status IN ('failed','cancelled')`,
+        [String(request.id), transfer.from_address, baseAmount.toFixed(18), quote.gasEquivalentXtu.toFixed(18),
+          quote.grossTransferAmount.toFixed(18), quote.contractFeeAmount.toFixed(18), quote.netAmount.toFixed(18),
+          quote.amountRaw, gasQuote.feeBnb.toFixed(30), gasQuote.feeUsd.toFixed(30), bnbUsdPrice.toFixed(18),
+          gasLimit.toString(), estimate.gasPrice.toString(), reference, rawTx, signedHash, String(nonce), now, now, signedRowId],
+      );
+    } else {
+      const [insertResult] = await tx.query(
+        `INSERT INTO xtu_unknown_refunds
+         (unknown_transfer_id,request_id,payout_address,base_received_amount,gas_equivalent_xtu,gross_transfer_amount,
+          contract_fee_amount,net_amount,amount_raw,estimated_fee_bnb,estimated_fee_usd,bnb_usd_price,gas_limit,
+          gas_price_wei,reference,status,raw_tx,tx_hash,nonce,created_at_ms,updated_at_ms)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'signed',?,?,?,?,?)`,
+        [eventId, String(request.id), transfer.from_address, baseAmount.toFixed(18), quote.gasEquivalentXtu.toFixed(18),
+          quote.grossTransferAmount.toFixed(18), quote.contractFeeAmount.toFixed(18), quote.netAmount.toFixed(18),
+          quote.amountRaw, gasQuote.feeBnb.toFixed(30), gasQuote.feeUsd.toFixed(30), bnbUsdPrice.toFixed(18),
+          gasLimit.toString(), estimate.gasPrice.toString(), `XTU-UNK-REF-${eventId}-${Date.now()}`.slice(0, 64),
+          rawTx, signedHash, String(nonce), now, now],
+      );
+      signedRowId = String(insertResult.insertId);
+    }
+    await tx.query(
+      `UPDATE xtu_unknown_incoming_transfers SET status='refund_signed',refund_id=?,updated_at_ms=?
+       WHERE id=? AND status='refund_approved'`, [signedRowId, now, eventId],
+    );
+    await tx.query(
+      `UPDATE xtu_unknown_refund_requests SET status='refund_signed',refund_id=?,updated_at_ms=?
+       WHERE id=? AND status='approved'`, [signedRowId, now, String(request.id)],
+    );
+    await tx.query(
+      `UPDATE xtu_deposit_transfer_events SET status='refund_signed'
+       WHERE tx_hash=? AND log_index=? AND username IS NULL AND status='pending_identity'`,
+      [String(transfer.tx_hash), String(transfer.log_index)],
+    );
+    await appendXtuUnknownRefundEventTx(tx, request.id, signedRowId, "signed", "approved", "refund_signed",
+      "The refund was signed from the XTU Hot Wallet using the net amount originally received, less estimated gas equivalent and the 0.1% contract fee.", {
+        eventKey: `xtu-unknown-refund:${request.id}:signed:${signedHash}`,
+        actorReference: mainSigner.address, txHash: signedHash, transferId: eventId,
+        grossAmount: quote.grossTransferAmount.toFixed(18), feeAmount: quote.contractFeeAmount.toFixed(18), netAmount: quote.netAmount.toFixed(18),
+      });
+  });
+  if (!signedRowId || !rawTx || !signedHash) return false;
+  try {
+    const sent = await runtime.provider.broadcastTransaction(rawTx);
+    if (String(sent.hash).toLowerCase() !== signedHash) throw new Error("The RPC returned a different hash for the signed XTU refund.");
+    await pool.queryAsync(
+      `UPDATE xtu_unknown_refunds SET status='submitted',updated_at_ms=? WHERE id=? AND status='signed'`,
+      [String(Date.now()), signedRowId],
+    );
+    await pool.queryAsync(
+      `UPDATE xtu_unknown_incoming_transfers SET status='refund_submitted',updated_at_ms=? WHERE id=? AND refund_id=? AND status='refund_signed'`,
+      [String(Date.now()), eventId, signedRowId],
+    );
+    await pool.queryAsync(
+      `UPDATE xtu_deposit_transfer_events SET status='refund_submitted' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+      [String(transfer.tx_hash), String(transfer.log_index)],
+    );
+  } catch (error) {
+    await pool.queryAsync(
+      `UPDATE xtu_unknown_refunds SET last_error=?,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')`,
+      [String(error.message || error).slice(0, 990), String(Date.now()), signedRowId],
+    );
+  }
+  return true;
+}
+
+function parseUnknownXtuRefundReceipt(receipt, row, runtime) {
+  const expectedGross = BigInt(String(row.amount_raw));
+  let transferWithFee = null;
+  let recipientTransferAmount = null;
+  let collectorFeeAmount = null;
+  for (const log of receipt.logs || []) {
+    if (String(log.address || "").toLowerCase() !== runtime.settings.tokenAddress.toLowerCase()) continue;
+    try {
+      const parsed = XTU_INTERFACE.parseLog(log);
+      if (parsed?.name === "TransferWithFee" &&
+          getAddress(String(parsed.args.from)) === runtime.settings.mainWalletAddress &&
+          getAddress(String(parsed.args.to)) === getAddress(String(row.payout_address))) {
+        transferWithFee = parsed;
+      } else if (parsed?.name === "Transfer" &&
+          getAddress(String(parsed.args.from)) === runtime.settings.mainWalletAddress &&
+          getAddress(String(parsed.args.to)) === getAddress(String(row.payout_address)) &&
+          BigInt(parsed.args.value) > 0n) {
+        recipientTransferAmount = BigInt(parsed.args.value);
+      } else if (parsed?.name === "Transfer" &&
+          getAddress(String(parsed.args.from)) === runtime.settings.mainWalletAddress &&
+          getAddress(String(parsed.args.to)) === runtime.settings.distributionAddress &&
+          BigInt(parsed.args.value) > 0n) {
+        collectorFeeAmount = BigInt(parsed.args.value);
+      }
+    } catch {}
+  }
+  if (!transferWithFee) return { valid: false, reason: "The refund receipt is missing the expected XTU TransferWithFee event." };
+  const gross = BigInt(transferWithFee.args.grossAmount);
+  const net = BigInt(transferWithFee.args.netAmount);
+  const fee = BigInt(transferWithFee.args.feeAmount);
+  const expectedFee = (gross * 10n) / 10_000n;
+  if (gross !== expectedGross || fee !== expectedFee || net + fee !== gross ||
+      Boolean(transferWithFee.args.feeExempt) || recipientTransferAmount !== net || collectorFeeAmount !== fee) {
+    return { valid: false, reason: "The confirmed XTU refund receipt does not match the persisted gross/net/0.1% fee quote." };
+  }
+  if (net.toString() !== BigInt(String(row.net_amount).includes(".") ? new BigNumber(row.net_amount).shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0) : row.net_amount).toString()) {
+    return { valid: false, reason: "The refund receipt net amount differs from the persisted beneficiary amount." };
+  }
+  return { valid: true, gross, net, fee };
+}
+
+async function reconcileUnknownXtuRefund(pool, row, runtime) {
+  const [transaction, receipt] = await Promise.all([
+    runtime.provider.getTransaction(row.tx_hash),
+    runtime.provider.getTransactionReceipt(row.tx_hash),
+  ]);
+  if (!receipt) {
+    if (transaction) {
+      await pool.queryAsync("UPDATE xtu_unknown_refunds SET status='submitted',updated_at_ms=? WHERE id=? AND status='signed'", [String(Date.now()), String(row.id)]);
+      await pool.queryAsync("UPDATE xtu_unknown_incoming_transfers SET status='refund_submitted',updated_at_ms=? WHERE id=? AND refund_id=?", [String(Date.now()), String(row.unknown_transfer_id), String(row.id)]);
+      await pool.queryAsync(
+        `UPDATE xtu_deposit_transfer_events SET status='refund_submitted' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+        [String(row.source_tx_hash), String(row.source_log_index)],
+      );
+      return;
+    }
+    const latestNonce = await runtime.provider.getTransactionCount(runtime.settings.mainWalletAddress, "latest");
+    if (latestNonce > Number(row.nonce)) {
+      await withTransaction(pool, async (tx) => {
+        const now = String(Date.now());
+        await tx.query("UPDATE xtu_unknown_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?", [
+          "The Hot Wallet nonce advanced but the signed XTU refund is not visible by its persisted hash. Automatic resubmission is blocked.", now, String(row.id),
+        ]);
+        await tx.query("UPDATE xtu_unknown_incoming_transfers SET status='refund_manual_review',updated_at_ms=? WHERE id=?", [now, String(row.unknown_transfer_id)]);
+        await tx.query("UPDATE xtu_unknown_refund_requests SET status='manual_review',updated_at_ms=? WHERE id=?", [now, String(row.request_id)]);
+        await tx.query(
+          `UPDATE xtu_deposit_transfer_events SET status='refund_manual_review' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+          [String(row.source_tx_hash), String(row.source_log_index)],
+        );
+        await appendXtuUnknownRefundEventTx(tx, row.request_id, row.id, "manual_review", row.status, "manual_review",
+          "The main-wallet nonce advanced without a visible refund hash. Manual reconciliation is required.", { eventKey: `xtu-unknown-refund:${row.id}:nonce-mismatch` , txHash: row.tx_hash, transferId: row.unknown_transfer_id });
+      });
+      return;
+    }
+    try {
+      const sent = await runtime.provider.broadcastTransaction(row.raw_tx);
+      if (String(sent.hash).toLowerCase() !== String(row.tx_hash).toLowerCase()) throw new Error("The RPC returned a different hash for the persisted refund transaction.");
+      await pool.queryAsync("UPDATE xtu_unknown_refunds SET status='submitted',updated_at_ms=? WHERE id=? AND status='signed'", [String(Date.now()), String(row.id)]);
+      await pool.queryAsync("UPDATE xtu_unknown_incoming_transfers SET status='refund_submitted',updated_at_ms=? WHERE id=? AND refund_id=?", [String(Date.now()), String(row.unknown_transfer_id), String(row.id)]);
+      await pool.queryAsync(
+        `UPDATE xtu_deposit_transfer_events SET status='refund_submitted' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+        [String(row.source_tx_hash), String(row.source_log_index)],
+      );
+    } catch (error) {
+      await pool.queryAsync("UPDATE xtu_unknown_refunds SET last_error=?,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')", [String(error.message || error).slice(0, 990), String(Date.now()), String(row.id)]);
+    }
+    return;
+  }
+  const latestBlock = await runtime.provider.getBlockNumber();
+  if (latestBlock - Number(receipt.blockNumber) + 1 < runtime.settings.minConfirmations) return;
+  const canonicalBlock = await runtime.provider.getBlock(Number(receipt.blockNumber));
+  if (!canonicalBlock || String(canonicalBlock.hash).toLowerCase() !== String(receipt.blockHash).toLowerCase()) {
+    await pool.queryAsync("UPDATE xtu_unknown_refunds SET status='manual_review',last_error=?,updated_at_ms=? WHERE id=?", [
+      "The XTU refund receipt block is not canonical; the refund amount remains protected pending administrative reconciliation.", String(Date.now()), String(row.id),
+    ]);
+    await pool.queryAsync("UPDATE xtu_unknown_incoming_transfers SET status='refund_manual_review',updated_at_ms=? WHERE id=?", [String(Date.now()), String(row.unknown_transfer_id)]);
+    await pool.queryAsync(
+      `UPDATE xtu_deposit_transfer_events SET status='refund_manual_review' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+      [String(row.source_tx_hash), String(row.source_log_index)],
+    );
+    return;
+  }
+  const bnbUsdPrice = await getBnbUsdPrice(runtime.provider, { forceRefresh: true });
+  const actualGas = calculateActualGasFee(receipt, bnbUsdPrice);
+  await withTransaction(pool, async (tx) => {
+    const [refundRows] = await tx.query(
+      `SELECT rf.*,u.tx_hash AS source_tx_hash,u.log_index AS source_log_index
+       FROM xtu_unknown_refunds rf
+       INNER JOIN xtu_unknown_incoming_transfers u ON u.id=rf.unknown_transfer_id
+       WHERE rf.id=? LIMIT 1 FOR UPDATE`, [String(row.id)],
+    );
+    if (!refundRows.length || refundRows[0].status === "confirmed") return;
+    const current = refundRows[0];
+    await recordActualBscFeeTx(tx, { txHash: current.tx_hash, operation: "xtu_unknown_refund", receipt, bnbUsdPrice });
+    const now = String(Date.now());
+    if (Number(receipt.status) !== 1) {
+      await tx.query("UPDATE xtu_unknown_refunds SET status='failed',block_number=?,actual_fee_bnb=?,actual_fee_usd=?,receipt_json=?,last_error=?,failed_at_ms=?,updated_at_ms=? WHERE id=?", [
+        String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(18), JSON.stringify(receipt),
+        "The XTU refund transaction reverted. The original Hot Wallet amount remains held and may be reviewed for a new administrative decision.", now, now, String(row.id),
+      ]);
+      await tx.query("UPDATE xtu_unknown_incoming_transfers SET status='refund_failed',decision_reason=?,updated_at_ms=? WHERE id=?", [
+        "The approved refund transaction reverted; no XTU refund was completed.", now, String(current.unknown_transfer_id),
+      ]);
+      await tx.query(
+        `UPDATE xtu_deposit_transfer_events SET status='refund_failed' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+        [String(current.source_tx_hash), String(current.source_log_index)],
+      );
+      await tx.query("UPDATE xtu_unknown_refund_requests SET status='failed',updated_at_ms=? WHERE id=?", [now, String(current.request_id)]);
+      await appendXtuUnknownRefundEventTx(tx, current.request_id, current.id, "failed", current.status, "failed",
+        "The refund transaction reverted on BNB Smart Chain; no token amount was transferred.", {
+          eventKey: `xtu-unknown-refund:${current.id}:failed:${current.tx_hash}`,
+          txHash: current.tx_hash, grossAmount: current.gross_transfer_amount,
+          feeAmount: current.contract_fee_amount, netAmount: current.net_amount, transferId: current.unknown_transfer_id,
+        });
+      return;
+    }
+    const actualTransfer = parseUnknownXtuRefundReceipt(receipt, current, runtime);
+    if (!actualTransfer.valid) {
+      await tx.query("UPDATE xtu_unknown_refunds SET status='manual_review',block_number=?,actual_fee_bnb=?,actual_fee_usd=?,receipt_json=?,last_error=?,updated_at_ms=? WHERE id=?", [
+        String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(18), JSON.stringify(receipt), actualTransfer.reason, now, String(row.id),
+      ]);
+      await tx.query("UPDATE xtu_unknown_incoming_transfers SET status='refund_manual_review',updated_at_ms=? WHERE id=?", [now, String(current.unknown_transfer_id)]);
+      await tx.query("UPDATE xtu_unknown_refund_requests SET status='manual_review',updated_at_ms=? WHERE id=?", [now, String(current.request_id)]);
+      await tx.query(
+        `UPDATE xtu_deposit_transfer_events SET status='refund_manual_review' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+        [String(current.source_tx_hash), String(current.source_log_index)],
+      );
+      await appendXtuUnknownRefundEventTx(tx, current.request_id, current.id, "manual_review", current.status, "manual_review",
+        actualTransfer.reason, { eventKey: `xtu-unknown-refund:${current.id}:receipt-review:${current.tx_hash}`, txHash: current.tx_hash, transferId: current.unknown_transfer_id });
+      return;
+    }
+    const gasAdjustment = new BigNumber(current.gas_equivalent_xtu).minus(actualGas.feeUsd);
+    await tx.query(
+      `UPDATE xtu_unknown_refunds SET status='confirmed',block_number=?,actual_fee_bnb=?,actual_fee_usd=?,bnb_usd_price=?,
+       gas_adjustment_xtu=?,receipt_json=?,confirmed_at_ms=?,updated_at_ms=?,last_error=? WHERE id=?`,
+      [String(receipt.blockNumber), actualGas.feeBnb.toFixed(30), actualGas.feeUsd.toFixed(18), bnbUsdPrice.toFixed(18),
+        gasAdjustment.toFixed(18), JSON.stringify(receipt), now, now,
+        `Gas estimate reconciliation (estimated XTU equivalent minus actual BSC-USD gas): ${gasAdjustment.toFixed(18)} XTU. Any estimate shortfall is covered by OneX; any excess estimate remains included in the initial refund quote.`, String(row.id)],
+    );
+    const refundResidual = new BigNumber(current.base_received_amount).minus(current.gross_transfer_amount);
+    if (!refundResidual.isFinite() || refundResidual.isNegative()) {
+      throw new Error("The confirmed XTU refund residual is inconsistent with the original Hot Wallet receipt.");
+    }
+    const refundResidualRaw = BigInt(refundResidual.shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0));
+    await tx.query(
+      `UPDATE xtu_unknown_incoming_transfers SET status='refunded',refund_residual_amount=?,refund_residual_raw=?,updated_at_ms=?
+       WHERE id=? AND status IN ('refund_signed','refund_submitted','refund_manual_review')`,
+      [refundResidual.toFixed(18), refundResidualRaw.toString(), now, String(current.unknown_transfer_id)],
+    );
+    await tx.query("UPDATE xtu_unknown_refund_requests SET status='completed',completed_at_ms=?,updated_at_ms=? WHERE id=?", [now, now, String(current.request_id)]);
+    await tx.query(
+      `UPDATE xtu_deposit_transfer_events SET status='refunded' WHERE tx_hash=? AND log_index=? AND username IS NULL`,
+      [String(current.source_tx_hash), String(current.source_log_index)],
+    );
+    await appendXtuUnknownRefundEventTx(tx, current.request_id, current.id, "confirmed", current.status, "confirmed",
+      "The XTU refund was confirmed. The beneficiary received the net amount after the 0.1% contract commission; BNB gas was paid by the Hot Wallet and recorded separately.", {
+        eventKey: `xtu-unknown-refund:${current.id}:confirmed:${current.tx_hash}`,
+        txHash: current.tx_hash, grossAmount: actualTransfer.gross.toString(), feeAmount: actualTransfer.fee.toString(), netAmount: actualTransfer.net.toString(),
+        transferId: current.unknown_transfer_id,
+      });
+  });
+}
+
+async function processOneUnknownXtuRefund(pool, runtime, mainSigner) {
+  const [activeRows] = await pool.queryAsync(
+    `SELECT rf.*,u.tx_hash AS source_tx_hash,u.log_index AS source_log_index
+     FROM xtu_unknown_refunds rf
+     INNER JOIN xtu_unknown_incoming_transfers u ON u.id=rf.unknown_transfer_id
+     WHERE rf.status IN ('signed','submitted','manual_review') ORDER BY rf.id ASC LIMIT 1`,
+  );
+  if (activeRows.length) {
+    if (["signed", "submitted"].includes(String(activeRows[0].status))) {
+      await reconcileUnknownXtuRefund(pool, activeRows[0], runtime);
+    }
+    return true;
+  }
+  const [approvedRows] = await pool.queryAsync(
+    `SELECT u.*,r.id AS request_id,r.status AS request_status
+     FROM xtu_unknown_incoming_transfers u
+     INNER JOIN xtu_unknown_refund_requests r ON r.unknown_transfer_id=u.id
+     WHERE u.status='refund_approved' AND r.status='approved'
+     ORDER BY u.block_timestamp_ms ASC,u.id ASC LIMIT 1`,
+  );
+  if (!approvedRows.length) return false;
+  const [pendingConsolidations] = await pool.queryAsync(
+    `SELECT id FROM xtu_deposit_consolidations WHERE status IN ('signed','submitted','manual_review') LIMIT 1`,
+  );
+  if (pendingConsolidations.length) return true;
+  try {
+    return await createAndSignUnknownXtuRefund(pool, approvedRows[0], { id: approvedRows[0].request_id }, runtime, mainSigner);
+  } catch (error) {
+    await markUnknownXtuRefundDeferred(pool, approvedRows[0].id, error.message || "XTU unknown refund is waiting for reconciliation.");
+    return false;
+  }
+}
+
 async function processOne(pool, context) {
   const { runtime, provider, mainSigner } = context;
   await scanIncomingEvents(pool, provider, runtime.settings);
   await closeExpiredBatches(pool, runtime.settings);
+  await notifyDueXtuDepositExpirations(pool, Date.now());
+  await processOneUnknownXtuRefund(pool, runtime, mainSigner);
   await processOneReadyBatch(pool, runtime, mainSigner);
   await processSettlementPayout(pool, runtime);
   await processEmailOutbox(pool);
@@ -1695,6 +2746,9 @@ module.exports = {
   closeExpiredBatches,
   processOne,
   processSettlementPayout,
+  assignUnknownXtuTransferToAccount,
+  processOneUnknownXtuRefund,
+  parseUnknownXtuRefundReceipt,
 };
 
 if (require.main === module) {

@@ -5,7 +5,8 @@ const assert = require("node:assert/strict");
 const {
   MIN_DEPOSIT_AMOUNT,
   MAX_DEPOSIT_AMOUNT,
-  DEPOSIT_BATCH_WINDOW_MINUTES,
+  DEPOSIT_PENDING_EXPIRATION_DAYS,
+  DEPOSIT_PENDING_EXPIRATION_MS,
   validateDepositAmount,
   getLastOneXSystemFundedPurchase,
   assessOneXSystemFundingCooldown,
@@ -13,19 +14,24 @@ const {
   calculateMinimumDepositCapacity,
 } = require("../deposit-policy");
 
-test("automatic deposit receipt bounds are fixed at 20 and 100 BSC-USD, with a separate 100 BSC-USD first-credit tranche", () => {
+test("shared deposit thresholds are 20 minimum, 100 per automatic credit tranche and a fixed 30-day expiry", () => {
   assert.equal(MIN_DEPOSIT_AMOUNT.toFixed(), "20");
   assert.equal(MAX_DEPOSIT_AMOUNT.toFixed(), "100");
-  assert.equal(DEPOSIT_BATCH_WINDOW_MINUTES, 60);
+  assert.equal(DEPOSIT_PENDING_EXPIRATION_DAYS, 30);
+  assert.equal(DEPOSIT_PENDING_EXPIRATION_MS, 30 * 24 * 60 * 60 * 1000);
 });
 
-test("the 20-100 gross limits apply to each 60-minute deposit session, independently of weekly funding source", () => {
+test("every positive transfer is recorded; minimum collection and maximum credit tranche are separate", () => {
+  const belowMinimum = validateDepositAmount("19.999999999999999999");
+  assert.equal(belowMinimum.allowed, true);
+  assert.equal(belowMinimum.requiresCollection, true);
+  assert.equal(belowMinimum.requiresMultipleTranches, false);
   assert.equal(validateDepositAmount("20").allowed, true);
   assert.equal(validateDepositAmount("100").allowed, true);
-  assert.equal(validateDepositAmount("19.999999999999999999").reason, "below_minimum");
-  const oversized = validateDepositAmount("100.000000000000000001");
-  assert.equal(oversized.allowed, false);
-  assert.equal(oversized.reason, "above_maximum");
+  const oversized = validateDepositAmount("150");
+  assert.equal(oversized.allowed, true);
+  assert.equal(oversized.requiresCollection, false);
+  assert.equal(oversized.requiresMultipleTranches, true);
 });
 
 test("the weekly limit counts one OneX-funded purchase regardless of amount", async () => {

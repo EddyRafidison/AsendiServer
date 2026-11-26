@@ -95,9 +95,10 @@ function getXtuSettings() {
   if (!rpcUrl) throw new Error("BSC_RPC_URL (outgoing BSC RPC) is required for XTU operations.");
   const depositMinAmount = DEPOSIT_MIN_AMOUNT;
   const depositMaxAmount = DEPOSIT_MAX_AMOUNT;
-  const depositInitialCreditCap = new BigNumber(process.env.XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU || "100");
-  if (!depositInitialCreditCap.isFinite() || !depositInitialCreditCap.isGreaterThan(0) || depositInitialCreditCap.gt(depositMaxAmount)) {
-    throw new RangeError("XTU_DEPOSIT_MAX_INITIAL_CREDIT_XTU must be positive and cannot exceed the shared DEPOSIT_MAX_AMOUNT.");
+  const depositInitialCreditCap = new BigNumber(depositMaxAmount);
+  const depositPendingExpirationDays = Number(process.env.DEPOSIT_PENDING_EXPIRATION_DAYS || 30);
+  if (depositPendingExpirationDays !== 30) {
+    throw new RangeError("DEPOSIT_PENDING_EXPIRATION_DAYS is fixed at 30 days for both BSC-USD and XTU.");
   }
   const depositConsolidationMinBatch = new BigNumber(process.env.XTU_DEPOSIT_CONSOLIDATION_MIN_BATCH_XTU || "100");
   if (!depositConsolidationMinBatch.isFinite() || depositConsolidationMinBatch.lt("100") || depositConsolidationMinBatch.decimalPlaces() > 18) {
@@ -122,9 +123,9 @@ function getXtuSettings() {
     depositInitialCreditCap: depositInitialCreditCap.toFixed(18),
     depositConsolidationMinBatchXtu: depositConsolidationMinBatch.toFixed(18),
     depositGasLimitCeiling: BigInt(readBoundedInteger("XTU_DEPOSIT_GAS_LIMIT", 250000, 50000, 1000000)),
-    depositBatchWindowMs: readBoundedInteger("XTU_DEPOSIT_BATCH_WINDOW_MS", 3600000, 3600000, 3600000),
-    depositInitialGroupingTimeoutMs: readBoundedInteger("XTU_DEPOSIT_INITIAL_GROUPING_TIMEOUT_DAYS", 30, 1, 30) * 24 * 60 * 60 * 1000,
-    depositPendingRetryMs: readBoundedInteger("XTU_DEPOSIT_PENDING_RETRY_DAYS", 7, 7, 7) * 24 * 60 * 60 * 1000,
+    depositPendingExpirationDays,
+    depositPendingExpirationMs: depositPendingExpirationDays * 24 * 60 * 60 * 1000,
+    depositPendingRetryMs: 30_000,
     depositWorkerEnabled: String(process.env.XTU_DEPOSIT_WORKER_ENABLED || "false").toLowerCase() === "true",
     incomingStartBlock: String(process.env.XTU_INCOMING_START_BLOCK || "").trim(),
     incomingRpcUrl: String(process.env.XTU_INCOMING_RPC_URL || process.env.BSC_INCOMING_RPC_URL || process.env.BSC_RPC_URL || "").trim(),

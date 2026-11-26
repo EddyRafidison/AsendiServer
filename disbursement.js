@@ -1637,6 +1637,9 @@ async function finalizeRefund(db, refundId, receipt) {
       [refundId],
     );
     if (!preRows.length) throw new Error(`Refund ${refundId} does not exist.`);
+    if (preRows[0].batch_id != null || preRows[0].unknown_transfer_id == null || preRows[0].user_request_id != null) {
+      throw new Error("Only an approved official-token transfer from an unregistered sender address can be refunded.");
+    }
     const batchId = preRows[0].batch_id;
     const unknownTransferId = preRows[0].unknown_transfer_id;
     const userRequestId = preRows[0].user_request_id;
@@ -1685,6 +1688,13 @@ async function finalizeRefund(db, refundId, receipt) {
         "UPDATE admin_payment_resolutions SET action='refund_manual_review',tx_hash=?,reason=? WHERE refund_id=? AND action IN ('refund_queued','refund_signed','refund_submitted')",
         [refund.tx_hash, reviewReason, refundId],
       );
+      if (unknownTransferId != null) {
+        await tx.query(
+          `UPDATE bsc_unknown_refund_requests SET status='manual_review',admin_reason=?,updated_at_ms=?
+           WHERE unknown_transfer_id=? AND status IN ('approved','refund_signed','submitted')`,
+          [reviewReason, String(Date.now()), String(unknownTransferId)],
+        );
+      }
       await transitionUserRefundRequestTx(tx, refund, {
         newStatus: "manual_review", eventType: "source_reconciliation_required", reason: reviewReason,
         txHash: refund.tx_hash, feeAmount: String(refund.fee_amount || "0"), netAmount: String(refund.amount || "0"),
@@ -1737,6 +1747,11 @@ async function finalizeRefund(db, refundId, receipt) {
         `UPDATE admin_payment_resolutions SET action='refund_confirmed',tx_hash=?
          WHERE unknown_transfer_id=? AND (refund_id=? OR refund_id IS NULL) AND action IN ('unknown_refund_queued','refund_queued')`,
         [refund.tx_hash, unknownTransferId, refundId],
+      );
+      await tx.query(
+        `UPDATE bsc_unknown_refund_requests SET status='completed',refund_id=?,completed_at_ms=?,updated_at_ms=?
+         WHERE unknown_transfer_id=? AND status IN ('approved','refund_signed','submitted')`,
+        [String(refundId), now, now, String(unknownTransferId)],
       );
     }
     await transitionUserRefundRequestTx(tx, refund, {
@@ -1808,6 +1823,9 @@ async function markRefundManualReview(db, job, reason) {
 }
 
 async function processOneRefundJob(db, job, activeRuntime) {
+  if (job.batch_id != null || job.unknown_transfer_id == null || job.user_request_id != null) {
+    throw new Error("Known-account deposit refunds are disabled; only registered-token transfers from unregistered sender addresses are eligible.");
+  }
   if (job.user_request_id != null && ["signed", "submitted"].includes(String(job.status))) {
     await withTransaction(db, async (tx) => {
       const [refundRows] = await tx.query(
@@ -1928,6 +1946,13 @@ async function processOneRefundJob(db, job, activeRuntime) {
           [finalEstimate.feeUsd.toFixed(18), finalPayoutAmount.toFixed(18), transactionHash, job.unknown_transfer_id],
         );
       }
+      if (job.unknown_transfer_id != null) {
+        await tx.query(
+          `UPDATE bsc_unknown_refund_requests SET status='refund_signed',refund_id=?,updated_at_ms=?
+           WHERE unknown_transfer_id=? AND status='approved'`,
+          [String(job.id), String(Date.now()), String(job.unknown_transfer_id)],
+        );
+      }
       await queueTelegramMessageTx(tx, job.username, `refund:${job.id}:gas_accepted`, [
         "OneX Refund Update",
         "The estimated BSC network fee is within the permitted limit. Your refund transaction has been signed and queued for blockchain submission.",
@@ -1968,6 +1993,13 @@ async function processOneRefundJob(db, job, activeRuntime) {
       "UPDATE users_usdt_refunds SET status='submitted',last_error=NULL,updated_at_ms=? WHERE id=? AND status IN ('signed','submitted')",
       [submittedAt, job.id],
     );
+    if (job.unknown_transfer_id != null) {
+      await db.queryAsync(
+        `UPDATE bsc_unknown_refund_requests SET status='submitted',updated_at_ms=?
+         WHERE unknown_transfer_id=? AND status IN ('approved','refund_signed','submitted')`,
+        [submittedAt, String(job.unknown_transfer_id)],
+      );
+    }
     if (Number(submittedUpdate.affectedRows || 0) > 0 && job.user_request_id != null) {
       await withTransaction(db, async (tx) => {
         await tx.query(
@@ -2045,6 +2077,11 @@ async function processOneRefundJob(db, job, activeRuntime) {
            WHERE unknown_transfer_id=? AND (refund_id=? OR refund_id IS NULL) AND action IN ('unknown_refund_queued','refund_queued')`,
           [job.tx_hash, refund.unknown_transfer_id, job.id],
         );
+        await tx.query(
+          `UPDATE bsc_unknown_refund_requests SET status='failed',admin_reason='The finalized refund transaction reverted; administrative reconciliation is required.',
+             updated_at_ms=? WHERE unknown_transfer_id=? AND status IN ('approved','refund_signed','submitted')`,
+          [now, String(refund.unknown_transfer_id)],
+        );
       }
       await transitionUserRefundRequestTx(tx, refund, {
         newStatus: "failed", eventType: "blockchain_reverted",
@@ -2101,6 +2138,11 @@ async function processOneRefundJob(db, job, activeRuntime) {
            WHERE unknown_transfer_id=? AND action='unknown_refund_queued'`,
           [job.unknown_transfer_id],
         );
+        await tx.query(
+          `UPDATE bsc_unknown_refund_requests SET status='manual_review',admin_reason='The refund receipt did not match the expected BSC-USD transfer.',
+             updated_at_ms=? WHERE unknown_transfer_id=? AND status IN ('approved','refund_signed','submitted')`,
+          [now, String(job.unknown_transfer_id)],
+        );
       }
       await transitionUserRefundRequestTx(tx, refund || job, {
         newStatus: "manual_review", eventType: "unexpected_transfer_event",
@@ -2124,6 +2166,7 @@ async function processRefundQueue(db, activeRuntime) {
   const jobs = await db.queryAsync(
     `SELECT * FROM users_usdt_refunds
      WHERE status IN ('queued','signed','submitted')
+       AND batch_id IS NULL AND unknown_transfer_id IS NOT NULL AND user_request_id IS NULL
      ORDER BY id ASC LIMIT 10`,
   );
   for (const job of jobs) {

@@ -33,7 +33,11 @@ test("user-last-stock is the only app endpoint that returns the shared treasury 
   assert.doesNotMatch(stockRoute, /getOrCreateUserDepositAddress/);
   assert.match(stockRoute, /deposit_addr:\s*depositAddress/);
   assert.match(stockRoute, /has_pending_deposit:\s*hasPendingDeposit/);
-  assert.match(stockRoute, /SELECT 1 AS pending[\s\S]*remaining_amount>0/);
+  assert.match(stockRoute, /SELECT id,total_amount,credited_amount,remaining_amount,status[\s\S]*remaining_amount>0/);
+  assert.match(stockRoute, /SELECT id,gross_amount,credited_amount,remaining_amount,status[\s\S]*remaining_amount>0/);
+  assert.match(stockRoute, /pending_deposits:/);
+  assert.match(stockRoute, /earliest_expiry_at_ms|expires_at_ms/);
+  assert.match(stockRoute, /remaining_ms/);
   assert.match(stockRoute, /getVisibleDepositAddress/);
   assert.doesNotMatch(depositRoute, /getOrCreateUserDepositAddress/);
   assert.doesNotMatch(depositRoute, /deposit_addr/);
@@ -77,7 +81,7 @@ test("shared deposit receipt limits are 20-100 for BSC-USD and XTU with no legac
   assert.match(depositPolicySource, /DEPOSIT_MIN_AMOUNT, DEPOSIT_MAX_AMOUNT/);
   assert.match(depositLimitsSource, /DEPOSIT_MIN_AMOUNT \|\| "20"/);
   assert.match(depositLimitsSource, /DEPOSIT_MAX_AMOUNT \|\| "100"/);
-  assert.match(routesSource, /minimum_not_reached: "The 60-minute session total has not reached the 20 BSC-USD minimum\."/);
+  assert.match(routesSource, /minimum_not_reached: "The cumulative amount received in this asset has not yet reached the minimum of 20\."/);
   assert.match(routesSource, /consolidation_minimum_batch_xtu: state\.consolidationMinBatchXtu/);
   assert.match(xtuEnvExample, /XTU_DEPOSIT_CONSOLIDATION_MIN_BATCH_XTU=100/);
   assert.doesNotMatch(xtuEnvExample, /XTU_DEPOSIT_(?:MIN|MAX)_AMOUNT=/);

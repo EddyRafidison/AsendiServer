@@ -101,18 +101,21 @@ test("batch gas allocation is deterministic and reconciles to the exact gas rece
   assert.equal(total.toFixed(18), "0.123456789012345678");
 });
 
-test("XTU applies the shared 20-100 gross limits to each 60-minute session, not to a rolling-week amount", () => {
+test("XTU uses event-driven collection: 20 minimum and 100 per credit tranche, without a time window", () => {
   assert.equal(MIN_XTU_DEPOSIT.toFixed(), "20");
   assert.equal(MAX_XTU_DEPOSIT.toFixed(), "100");
   assert.equal(classifyDepositSession({ incomingGross: "20" }).status, "eligible");
   assert.equal(classifyDepositSession({ incomingGross: "30", currentBatchGross: "70" }).status, "eligible");
-  assert.equal(classifyDepositSession({ incomingGross: "19.999999999999999999" }).status, "collecting");
-  const oversizedTransfer = classifyDepositSession({ incomingGross: "100.000000000000000001" });
-  assert.equal(oversizedTransfer.status, "pending_support");
-  assert.equal(oversizedTransfer.reason, "deposit_amount_above_maximum");
+  const belowMinimum = classifyDepositSession({ incomingGross: "19.999999999999999999" });
+  assert.equal(belowMinimum.status, "collecting");
+  assert.equal(belowMinimum.allowed, true);
+  const oversizedTransfer = classifyDepositSession({ incomingGross: "150" });
+  assert.equal(oversizedTransfer.status, "eligible");
+  assert.equal(oversizedTransfer.requiresMultipleCreditTranches, true);
+  assert.equal(oversizedTransfer.creditTrancheLimit.toFixed(), "100");
   const oversizedSession = classifyDepositSession({ incomingGross: "40", currentBatchGross: "70" });
-  assert.equal(oversizedSession.status, "pending_support");
-  assert.equal(oversizedSession.reason, "deposit_session_above_maximum");
+  assert.equal(oversizedSession.status, "eligible");
+  assert.equal(oversizedSession.requiresMultipleCreditTranches, true);
 });
 
 test("XTU consolidation waits until identified Hot Wallet receipts reach 100 XTU", () => {

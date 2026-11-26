@@ -19,7 +19,7 @@ const {
   MAX_DEPOSIT_AMOUNT,
   MAX_DEFAULT_STOCK,
   SYSTEM_ADMIN_RESERVE_RATIO,
-  DEPOSIT_BATCH_WINDOW_MS,
+  DEPOSIT_PENDING_EXPIRATION_MS,
   getSystemFundingCooldownReleaseAt,
   recordDateTimeToUtcMs,
 } = require("../deposit-policy");
@@ -31,7 +31,7 @@ test("current OneX business limits are centralized", () => {
   assert.equal(fixed(MAX_DEPOSIT_AMOUNT), "100");
   assert.equal(MAX_DEFAULT_STOCK, "300");
   assert.equal(fixed(SYSTEM_ADMIN_RESERVE_RATIO), "0.1");
-  assert.equal(DEPOSIT_BATCH_WINDOW_MS, 60 * 60 * 1000);
+  assert.equal(DEPOSIT_PENDING_EXPIRATION_MS, 30 * 24 * 60 * 60 * 1000);
   assert.equal(DISBURSEMENT_COOLDOWN_MS, 30 * 24 * 60 * 60 * 1000);
 });
 

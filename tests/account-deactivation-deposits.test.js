@@ -35,9 +35,9 @@ test("deactivation immediately holds all outstanding deposit balances with accou
 test("new incoming transfers for an already deactivated account are held with the explicit reason", () => {
   const payment = blockBetween(routes, "async function processConfirmedUsdtPayment", "async function updateBatchEventStatus");
   assert.match(payment, /const accountDeactivated = Number\(account\.account_active\) !== 1/);
-  assert.match(payment, /initialReasons\.push\("account_deactivated"\)/);
-  assert.match(payment, /const nextStatus = \(accountDeactivated \|\| accountUnavailable \|\| manualDepositSuspended \|\| initialGroupingExpired\)/);
-  assert.match(payment, /initialStatus === "collecting" \? null : String\(now\)/);
+  assert.match(payment, /initialReasons = \["account_deactivated"\]/);
+  assert.match(payment, /else if \(accountDeactivated\)/);
+  assert.match(payment, /initialReasons = \["account_deactivated"\]/);
 });
 
 test("normal deposit polling excludes account-deactivated holds", () => {
@@ -53,15 +53,15 @@ test("top-up credit path distinguishes an administratively deactivated account",
   assert.match(batch, /creditResult\?\.error === "account deactivated"/);
   assert.match(batch, /reasons = \["account_deactivated"\]/);
   assert.match(batch, /retryAt = null/);
-  assert.match(batch, /batch\.status !== "collecting" && Number\.isSafeInteger\(sessionExpiresAt\) && sessionExpiresAt > now/);
-  assert.match(batch, /deposit_session_window_open/);
+  assert.match(batch, /expiresAt > 0 && now >= expiresAt/);
 });
 
 test("reactivation removes only the deactivation reason and immediately wakes eligible batches", () => {
   const release = blockBetween(routes, "async function releaseDeactivatedDepositBatches", "function wakeDepositBatchesImmediately");
   assert.match(release, /JSON_CONTAINS\(reason_codes, JSON_QUOTE\('account_deactivated'\)\)=1/);
   assert.match(release, /filter\(\(reason\) => reason !== "account_deactivated"\)/);
-  assert.match(release, /Math\.max\(now,/);
+  assert.match(release, /next_attempt_at_ms=NULL/);
+  assert.match(release, /accountReactivated: true/);
   assert.match(release, /accountReactivated: true/);
   const wake = blockBetween(routes, "function wakeDepositBatchesImmediately", "async function changeAccountAccess");
   assert.match(wake, /processOneDepositBatch\(batchId\)/);
@@ -74,7 +74,7 @@ test("reactivation removes only the deactivation reason and immediately wakes el
 
 test("Telegram messages explain account deactivation and reactivation processing", () => {
   assert.match(routes, /account_deactivated: "The account has been administratively deactivated/);
-  assert.match(routes, /Account access has been restored\. OneX has immediately requeued/);
+  assert.match(routes, /Your account access has been restored\. OneX has immediately re-evaluated this pending deposit/);
 });
 
 test("Terms and Privacy describe deposit holds on deactivation and automatic wake-up", () => {
