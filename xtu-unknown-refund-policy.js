@@ -3,7 +3,7 @@
 const BigNumber = require("bignumber.js");
 
 const XTU_DECIMALS = 18;
-const XTU_TRANSFER_FEE_BPS = 10;
+const XTU_TRANSFER_FEE_BPS = 0;
 const XTU_SCALE = new BigNumber(10).pow(XTU_DECIMALS);
 
 function amount(value, name, allowZero = false) {
@@ -27,7 +27,7 @@ function toRaw(value) {
 /**
  * The refundable base is the exact net XTU amount initially received by the
  * Hot Wallet. The estimated BNB gas cost is deducted at the internal 1:1
- * accounting parity before applying the contract's 0.1% outbound fee.
+ * accounting parity. The XTU token contract has no outbound transfer fee.
  * Actual BNB gas is reconciled from the receipt after confirmation.
  */
 function calculateXtuUnknownRefundQuote({

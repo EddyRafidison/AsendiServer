@@ -8,14 +8,14 @@ const {
   formatTokenRaw,
 } = require("../xtu-withdrawal-policy");
 
-test("XTU withdrawal quote deducts gas first and the contract applies 0.1% exactly once", () => {
+test("XTU withdrawal quote deducts gas once and applies no contract commission", () => {
   const quote = calculateXtuWithdrawalQuote("100", "0.10");
   assert.equal(quote.grossAmount.toFixed(18), "100.000000000000000000");
   assert.equal(quote.estimatedGasFeeXtu.toFixed(18), "0.100000000000000000");
   assert.equal(quote.contractTransferAmount.toFixed(18), "99.900000000000000000");
-  assert.equal(quote.contractFeeAmount.toFixed(18), "0.099900000000000000");
-  assert.equal(quote.netAmount.toFixed(18), "99.800100000000000000");
-  assert.equal(quote.estimatedCombinedFees.toFixed(18), "0.199900000000000000");
+  assert.equal(quote.contractFeeAmount.toFixed(18), "0.000000000000000000");
+  assert.equal(quote.netAmount.toFixed(18), "99.900000000000000000");
+  assert.equal(quote.estimatedCombinedFees.toFixed(18), "0.100000000000000000");
 });
 
 test("XTU withdrawal amount validation enforces a gross minimum of five tokens and 18 decimals", () => {

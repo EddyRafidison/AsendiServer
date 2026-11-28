@@ -7,12 +7,6 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
-const routes = read("routes.js");
-const worker = read("xtu-deposit-worker.js");
-const schema = read("db.js");
-const limiter = read("http-rate-limiter.js");
-const policy = read("xtu-unknown-refund-policy.js");
-
 function between(source, start, end) {
   const a = source.indexOf(start);
   assert.notEqual(a, -1, `Missing start marker ${start}`);
@@ -21,66 +15,51 @@ function between(source, start, end) {
   return source.slice(a, b);
 }
 
-test("XTU unknown transfers have isolated incoming, request, refund and audit ledgers", () => {
-  for (const table of ["xtu_unknown_incoming_transfers", "xtu_unknown_refund_requests", "xtu_unknown_refunds", "xtu_unknown_refund_events"]) {
+const routes = read("routes.js");
+const worker = read("xtu-deposit-worker.js");
+const schema = read("db.js");
+const policy = read("xtu-unknown-refund-policy.js");
+const refundWorker = read("automatic-refund-worker.js");
+
+ test("XTU unknown official transfers use the common automatic-refund register", () => {
+  for (const table of ["automatic_refund_groups", "automatic_refund_group_events", "automatic_refund_payouts"]) {
     assert.match(schema, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`));
   }
-  assert.match(schema, /uq_xtu_unknown_event_identity/);
-  assert.match(schema, /uq_xtu_unknown_refund_request_transfer/);
-  assert.match(schema, /uq_xtu_unknown_refund_transfer/);
-  assert.match(schema, /uq_xtu_unknown_refund_tx_hash/);
-  assert.match(schema, /uq_xtu_unknown_refund_event_key/);
+  assert.match(worker, /registerAutomaticRefundEventTx/);
+  assert.match(worker, /category: "A"/);
+  assert.match(worker, /sourceTable: "xtu_unknown_incoming_transfers"/);
+  assert.match(worker, /automatic_refund_pending/);
 });
 
-test("public refund request requires source-address proof and fixes payout to the original sender", () => {
+test("legacy XTU challenge and request endpoints return HTTP 410", () => {
   const challenge = between(routes, 'router.post("/public/xtu/unknown-transfers/refund-challenge"', 'router.post("/public/xtu/unknown-transfers/refund-request"');
   const request = between(routes, 'router.post("/public/xtu/unknown-transfers/refund-request"', 'router.post("/admin/xtu/unknown-transfers/list"');
-  assert.match(challenge, /Signing this message proves control of the original sender address/);
-  assert.match(request, /verifyMessage/);
-  assert.match(request, /isValidSignature/);
-  assert.match(request, /proof_verified_at_ms/);
-  assert.match(request, /sender_address/);
-  assert.doesNotMatch(request, /payout_address|destination_address/);
-  assert.match(limiter, /POST \/public\/xtu\/unknown-transfers\/refund-challenge/);
-  assert.match(limiter, /POST \/public\/xtu\/unknown-transfers\/refund-request/);
+  assert.match(challenge, /status\(410\)/);
+  assert.match(request, /status\(410\)/);
+  assert.doesNotMatch(challenge + request, /verifyMessage|isValidSignature|proof_verified_at_ms/);
 });
 
-test("admin can approve an unknown XTU refund only after proof-verified sender request", () => {
-  const resolve = between(routes, 'router.post("/admin/xtu/unknown-transfers/resolve"', 'router.post("/admin/xtu/unknown-refunds/list"');
-  assert.match(resolve, /proof_verified_at_ms/);
-  assert.match(resolve, /status='refund_approved'/);
-  assert.match(resolve, /status='approved'/);
-  assert.match(resolve, /status\(403\)|incorrect admin credentials/);
-  assert.match(resolve, /assign|refund|retain/);
+test("XTU fee policy and deployed-runtime checks require zero contract commission", () => {
+  assert.match(policy, /BPS\s*=\s*0/);
+  assert.match(read("xtu-deposit-policy.js"), /XTU_TRANSFER_FEE_BPS\s*=\s*0n/);
+  assert.match(read("xtu-withdrawal-policy.js"), /XTU_TRANSFER_FEE_BPS\s*=\s*0n/);
+  assert.match(refundWorker, /TRANSFER_FEE_BPS\(\)\) !== 0n/);
+  assert.match(read("xtu-withdrawal-chain.js"), /TRANSFER_FEE_BPS/);
 });
 
-test("XTU refund uses Hot Wallet net receipt, gas-equivalent deduction and 0.1 percent contract fee", () => {
-  assert.match(policy, /hotWalletReceivedAmount/);
-  assert.match(policy, /estimatedGasFeeBscUsd/);
-  assert.match(policy, /BPS = 10/);
-  assert.match(worker, /baseAmount = new BigNumber\(String\(transfer\.hot_wallet_received_amount\)\)/);
-  assert.match(worker, /hotWalletReceivedAmount: baseAmount\.toFixed\(18\)/);
-  assert.match(worker, /MINIMUM_REFUND_NET_BSC_USD/);
-  assert.match(worker, /parseUnknownXtuRefundReceipt/);
-  assert.match(worker, /actual_fee_bnb/);
-  assert.match(worker, /actual_fee_usd/);
-  assert.match(worker, /getXtuMainSigner/);
-  assert.match(worker, /encodeFunctionData\("transfer", \[transfer\.from_address/);
-  assert.match(worker, /payout_address/);
-});
-
-test("refunds never use unprotected initial XTU supply or overlap with consolidation", () => {
-  assert.match(worker, /common_reserve_owned/);
-  assert.match(worker, /protectedHotWalletTotal/);
+test("XTU Hot Wallet custody lots and unknown automatic-refund amounts are protected from consolidation", () => {
+  assert.match(worker, /getUnbackedAutomaticRefundXtuAmount/);
+  assert.match(worker, /automatic_refund_pending/);
   assert.match(worker, /lockedProtectedTotal/);
-  assert.match(worker, /activeConsolidations/);
-  assert.match(worker, /activeRefunds/);
-  assert.match(worker, /status IN \('signed','submitted','manual_review'\)/);
+  assert.match(worker, /protected_hot_wallet_amount/);
+  assert.match(refundWorker, /protectedAmount/);
 });
 
-test("admin listing never exposes signed raw transaction payloads", () => {
-  const list = between(routes, 'router.post("/admin/xtu/unknown-refunds/list"', 'router.post("/admin/bsc/unknown-transfers/list"');
-  assert.match(list, /SELECT rf\.id/);
-  assert.doesNotMatch(list, /SELECT rf\.\*/);
-  assert.doesNotMatch(list, /rf\.raw_tx/);
+test("automatic XTU refund payouts use the same source address, exact token and persisted signed transaction", () => {
+  assert.match(refundWorker, /payoutAddress\.toLowerCase\(\) !== String\(group\.sender_address\)/);
+  assert.match(refundWorker, /from_wallet_address/);
+  assert.match(refundWorker, /raw_tx/);
+  assert.match(refundWorker, /tx_hash/);
+  assert.match(refundWorker, /nonce/);
+  assert.match(refundWorker, /broadcastTransaction\(payout\.raw_tx\)/);
 });

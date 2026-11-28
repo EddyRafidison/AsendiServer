@@ -154,8 +154,8 @@ async function getXtuRuntime({ requireSigner = true } = {}) {
   const expectedSupply = 100_000_000_000n * (10n ** 18n);
   if (BigInt(supply) !== expectedSupply) throw new Error("The XTU contract total supply does not match the fixed 100-billion XTU supply.");
   if (getAddress(String(collector)) !== settings.distributionAddress ||
-      getAddress(String(initialWallet)) !== settings.mainWalletAddress || BigInt(feeBps) !== 10n) {
-    throw new Error("The XTU contract Hot Wallet, fee collector or mandatory 0.1% fee does not match the configured wallet roles.");
+      getAddress(String(initialWallet)) !== settings.mainWalletAddress || BigInt(feeBps) !== 0n) {
+    throw new Error("The XTU contract Hot Wallet, fee collector or zero-fee transfer setting does not match the configured wallet roles.");
   }
 
   let signer = null;

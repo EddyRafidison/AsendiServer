@@ -1,44 +1,45 @@
+"use strict";
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-
 const root = path.resolve(__dirname, "..");
 const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
 
-test("BSC unknown sender refund requests use a dedicated fresh schema", () => {
-  const db = read("db.js");
-  assert.match(db, /CREATE TABLE IF NOT EXISTS bsc_unknown_refund_requests/);
-  assert.match(db, /uq_bsc_unknown_refund_request_transfer/);
-  assert.match(db, /CREATE TABLE IF NOT EXISTS bsc_unknown_refund_request_events/);
-});
+function between(source, start, end) {
+  const a = source.indexOf(start);
+  assert.notEqual(a, -1, `Missing start marker ${start}`);
+  const b = source.indexOf(end, a + start.length);
+  assert.notEqual(b, -1, `Missing end marker ${end}`);
+  return source.slice(a, b);
+}
 
-test("BSC unknown refund challenge is bound to the original chain event and sender", () => {
+test("legacy BSC-USD public refund challenge and request endpoints are permanently retired", () => {
   const routes = read("routes.js");
-  assert.match(routes, /\/public\/bsc\/unknown-transfers\/refund-challenge/);
-  assert.match(routes, /FROM bsc_unknown_incoming_transfers[\s\S]*?tx_hash=\? AND log_index=\? AND LOWER\(from_address\)=LOWER\(\?\)/);
-  assert.match(routes, /BSC-USD unknown-transfer refund request/);
-  assert.match(routes, /Signing proves control of the original sender address|proves control of the original sender address/);
+  const challenge = between(routes, 'router.post("/public/bsc/unknown-transfers/refund-challenge"', 'router.post("/public/bsc/unknown-transfers/refund-request"');
+  const request = between(routes, 'router.post("/public/bsc/unknown-transfers/refund-request"', 'router.post("/admin/bsc/unknown-transfers/list"');
+  assert.match(challenge, /status\(410\)/);
+  assert.match(request, /status\(410\)/);
+  assert.match(challenge + request, /automatic refund|automatically/i);
 });
 
-test("BSC unknown refund request requires EIP-191 or EIP-1271 sender proof", () => {
+test("official unknown BSC-USD events are registered automatically as category A", () => {
   const routes = read("routes.js");
-  assert.match(routes, /verifyMessage\(String\(request\.challenge_message\), signature\)/);
-  assert.match(routes, /isValidSignature/);
-  assert.match(routes, /proof_verified_at_ms=.*status='pending_admin'/);
+  const payment = between(routes, "async function processConfirmedUsdtPayment", "async function updateBatchEventStatus");
+  assert.match(payment, /registerAutomaticRefundEventTx/);
+  assert.match(payment, /category: "A"/);
+  assert.match(payment, /automatic_refund_pending/);
+  assert.match(payment, /ensureWalletFinancialLockTx/);
 });
 
-test("administrator cannot queue a BSC unknown refund without proof-verified sender request", () => {
-  const routes = read("routes.js");
-  assert.match(routes, /bsc_unknown_refund_requests[\s\S]*?status='pending_admin'[\s\S]*?proof_verified_at_ms IS NOT NULL/);
-  assert.match(routes, /sender_request_and_address_proof_required/);
-});
-
-test("BSC unknown refund request lifecycle is rate limited and reconciled", () => {
-  const limiter = read("http-rate-limiter.js");
-  const disbursement = read("disbursement.js");
-  assert.match(limiter, /POST \/public\/bsc\/unknown-transfers\/refund-challenge/);
-  assert.match(limiter, /POST \/public\/bsc\/unknown-transfers\/refund-request/);
-  assert.match(disbursement, /UPDATE bsc_unknown_refund_requests SET status='completed'/);
-  assert.match(disbursement, /UPDATE bsc_unknown_refund_requests SET status='manual_review'/);
+test("the shared automatic-refund worker persists and reconciles a single signed transaction", () => {
+  const worker = read("automatic-refund-worker.js");
+  assert.match(worker, /AUTOMATIC_REFUNDS_ENABLED/);
+  assert.match(worker, /raw_tx/);
+  assert.match(worker, /tx_hash/);
+  assert.match(worker, /nonce/);
+  assert.match(worker, /broadcastTransaction\(payout\.raw_tx\)/);
+  assert.match(worker, /markAutomaticRefundManualReviewTx/);
+  assert.doesNotMatch(worker, /signTransaction\([^\n]*replacement/i);
 });

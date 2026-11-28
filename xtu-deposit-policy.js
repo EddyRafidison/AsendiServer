@@ -7,7 +7,7 @@ BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP })
 
 const XTU_DECIMALS = 18;
 const XTU_SCALE = 10n ** 18n;
-const XTU_TRANSFER_FEE_BPS = 10n;
+const XTU_TRANSFER_FEE_BPS = 0n;
 const BPS_DENOMINATOR = 10_000n;
 const MIN_XTU_DEPOSIT = new BigNumber(DEPOSIT_MIN_AMOUNT);
 const MAX_XTU_DEPOSIT = new BigNumber(DEPOSIT_MAX_AMOUNT);
@@ -256,17 +256,11 @@ function classifyDepositSession({ incomingGross, currentBatchGross = 0 }) {
   };
 }
 
-/** Find the smallest gross raw amount whose Solidity 0.1% fee leaves exact net raw. */
+/** XTU contract transfers are fee-free: gross and net are identical. */
 function grossForExactNetRaw(netRawValue) {
   const targetNet = BigInt(netRawValue);
   if (targetNet <= 0n) throw new RangeError("Settlement net XTU amount must be positive.");
-  let gross = (targetNet * BPS_DENOMINATOR + (BPS_DENOMINATOR - XTU_TRANSFER_FEE_BPS) - 1n) /
-    (BPS_DENOMINATOR - XTU_TRANSFER_FEE_BPS);
-  const netFor = (value) => value - (value * XTU_TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
-  while (netFor(gross) < targetNet) gross += 1n;
-  while (gross > 1n && netFor(gross - 1n) >= targetNet) gross -= 1n;
-  const fee = (gross * XTU_TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
-  return { grossRaw: gross, feeRaw: fee, netRaw: netFor(gross) };
+  return { grossRaw: targetNet, feeRaw: 0n, netRaw: targetNet };
 }
 
 function calculateXtuSettlementQuote(netAmount) {

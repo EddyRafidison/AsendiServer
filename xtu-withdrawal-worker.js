@@ -169,11 +169,19 @@ async function signQueuedWithdrawal(pool, row, runtime) {
       `SELECT COALESCE(SUM(net_amount),0) AS amount FROM xtu_withdrawals
        WHERE status IN ('queued','signed','submitted','manual_review')`,
     );
+    const [automaticRefundRows] = await tx.query(
+      `SELECT COALESCE(SUM(net_amount),0) AS amount FROM automatic_refund_payouts
+       WHERE from_wallet_address=? AND token_contract=?
+         AND status IN ('queued','signed','submitted','manual_review')`,
+      [String(runtime.settings.distributionAddress).toLowerCase(), String(runtime.settings.tokenAddress).toLowerCase()],
+    );
     const distributionBalance = new BigNumber((await runtime.contract.balanceOf(runtime.settings.distributionAddress)).toString()).shiftedBy(-18);
     const reservedSettlement = new BigNumber(settlementRows[0]?.amount || "0");
     const allPendingWithdrawals = new BigNumber(withdrawalRows[0]?.amount || "0");
-    if (!distributionBalance.isFinite() || distributionBalance.lt(reservedSettlement.plus(allPendingWithdrawals))) {
-      throw new Error("The XTU Distribution Wallet balance does not cover all queued withdrawals and protected global XTU settlement amounts.");
+    const automaticRefundReservations = new BigNumber(automaticRefundRows[0]?.amount || "0");
+    const totalProtected = reservedSettlement.plus(allPendingWithdrawals).plus(automaticRefundReservations);
+    if (!distributionBalance.isFinite() || !totalProtected.isFinite() || distributionBalance.lt(totalProtected)) {
+      throw new Error("The XTU Distribution Wallet balance does not cover queued withdrawals, automatic refunds and protected global XTU settlement amounts.");
     }
     await recordEstimatedBscFeeTx(tx, {
       txHash,
@@ -312,11 +320,11 @@ function parseXtuTransferEvents(runtime, receipt, row) {
   const netRaw = BigInt(transferWithFee.args.netAmount);
   const feeRaw = BigInt(transferWithFee.args.feeAmount);
   const expectedGross = BigInt(String(row.amount_raw));
-  const expectedFee = (expectedGross * 10n) / 10000n;
+  const expectedFee = 0n;
   const expectedNet = expectedGross - expectedFee;
   if (Boolean(transferWithFee.args.feeExempt) || grossRaw !== expectedGross ||
       feeRaw !== expectedFee || netRaw !== expectedNet || !netTransferFound || unexpectedSelfFeeTransfer) {
-    return { valid: false, reason: "Finalized XTU transfer gross, net, 0.1% fee or distributor-origin event semantics do not match the reserved withdrawal quote." };
+    return { valid: false, reason: "Finalized XTU transfer gross, net, zero-fee contract setting or distributor-origin event semantics do not match the reserved withdrawal quote." };
   }
   return { valid: true, netRaw, feeRaw };
 }
@@ -535,7 +543,7 @@ async function finalizeSuccessfulWithdrawal(pool, row, receipt, events, runtime)
       [
         "OneX XTU Withdrawal Confirmed",
         `Net amount sent: ${actualNetAmount.toFixed(8)} XTU`,
-        `Contract fee (0.1%): ${actualContractFee.toFixed(8)} XTU`,
+        `Contract transfer commission: ${actualContractFee.toFixed(8)} XTU`,
         `BSC network fee: ${actualGas.feeUsd.toFixed(8)} XTU equivalent`,
         `Destination: ${current.payout_address}`,
         `Transaction: ${current.tx_hash}`,

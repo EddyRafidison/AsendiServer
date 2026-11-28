@@ -135,9 +135,10 @@ test("XTU consolidation waits until identified Hot Wallet receipts reach 100 XTU
   assert.throws(() => selectXtuConsolidationBatches([], "99"), /cannot be below 100 XTU/);
 });
 
-test("XTU settlement gross-up accounts for contract 0.1% fee and preserves exact net", () => {
+test("XTU settlement transfers the exact net amount with no contract commission", () => {
   const quote = calculateXtuSettlementQuote("99.8001");
   assert.equal(quote.requestedNet.toFixed(18), "99.800100000000000000");
   assert.equal(quote.actualNetAmount.toFixed(18), "99.800100000000000000");
-  assert.equal(quote.grossAmount.minus(quote.contractFeeAmount).toFixed(18), "99.800100000000000000");
+  assert.equal(quote.grossAmount.toFixed(18), "99.800100000000000000");
+  assert.equal(quote.contractFeeAmount.toFixed(18), "0.000000000000000000");
 });

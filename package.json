@@ -26,7 +26,8 @@
     "xtu-withdrawals": "node xtu-withdrawal-worker.js",
     "xtu-deposits": "node xtu-deposit-worker.js",
     "compile:xtu": "node scripts/compile-xtu.js",
-    "deploy:xtu": "node scripts/deploy-xtu.js"
+    "deploy:xtu": "node scripts/deploy-xtu.js",
+    "automatic-refunds": "node automatic-refund-worker.js"
   },
   "keywords": [],
   "author": "Eddy Rafidison",

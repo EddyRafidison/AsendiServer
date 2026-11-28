@@ -714,6 +714,7 @@ async function persistUnknownTransfer(db, event) {
     "SELECT username FROM bsc_wallet_address_registry WHERE wallet_address_lower=? LIMIT 1",
     [event.fromAddress.toLowerCase()],
   );
+  const identity = createBscEventIdentity(event.txHash, event.logIndex, event.blockHash);
   await db.queryAsync(
     `INSERT IGNORE INTO bsc_unknown_incoming_transfers
      (token_contract,from_address,to_address,amount,amount_raw,tx_hash,log_index,block_number,block_hash,
@@ -731,11 +732,16 @@ async function persistUnknownTransfer(db, event) {
       event.blockHash,
       String(event.blockTimestampMs),
       registryRows[0]?.username || null,
-      createBscEventIdentity(event.txHash, event.logIndex, event.blockHash),
+      identity,
       String(Date.now()),
       String(Date.now()),
     ],
   );
+  const rows = await db.queryAsync(
+    `SELECT id,status FROM bsc_unknown_incoming_transfers WHERE event_identity=? LIMIT 1`, [identity],
+  );
+  if (!rows.length) throw new Error("The finalized unknown BSC-USD transfer could not be persisted.");
+  return { id: String(rows[0].id), status: String(rows[0].status) };
 }
 
 async function scanTreasury(db, safeBlock) {
@@ -810,7 +816,11 @@ async function scanTreasury(db, safeBlock) {
       [event.fromAddress.toLowerCase()],
     );
     if (!accountRows.length) {
-      await persistUnknownTransfer(db, event);
+      const unknownSource = await persistUnknownTransfer(db, event);
+      const handled = await transferHandler({ ...event, unknownTransferId: unknownSource.id });
+      if (handled?.unknown) {
+        throw new Error("An official BSC-USD transfer from an unregistered address was not assigned to the automatic refund registry.");
+      }
       processed += 1;
       continue;
     }

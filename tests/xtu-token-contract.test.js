@@ -6,7 +6,7 @@ const ganache = require("ganache");
 const { BrowserProvider, ContractFactory, parseUnits } = require("ethers");
 const { compileOneXToken } = require("../scripts/compile-xtu");
 
-test("OneXToken assigns fixed supply to the Hot Wallet and exempts only Hot Wallet -> Distribution Wallet", async () => {
+test("OneXToken preserves fixed supply and transfers the full amount without contract commission", async () => {
   const chain = ganache.provider({
     chain: { chainId: 56, hardfork: "shanghai" },
     wallet: { totalAccounts: 5, defaultBalance: 1000 },
@@ -35,70 +35,55 @@ test("OneXToken assigns fixed supply to the Hot Wallet and exempts only Hot Wall
     assert.equal(await token.balanceOf(distributionAddress), 0n);
     assert.equal(await token.initialWallet(), hotAddress);
     assert.equal(await token.feeCollector(), distributionAddress);
-    assert.equal(await token.TRANSFER_FEE_BPS(), 10n);
+    assert.equal(await token.TRANSFER_FEE_BPS(), 0n);
     assert.equal(artifact.abi.some((item) => item.type === "function" && item.name === "mint"), false);
 
-    // Exact internal consolidation pair is exempt and transfers the full amount.
-    const hotToDistribution = await token.transfer(distributionAddress, parseUnits("10", 18));
-    const hotToDistributionReceipt = await hotToDistribution.wait();
-    assert.equal(await token.balanceOf(distributionAddress), parseUnits("10", 18));
-    const exemptEvent = hotToDistributionReceipt.logs
-      .map((log) => { try { return token.interface.parseLog(log); } catch { return null; } })
-      .find((event) => event?.name === "TransferWithFee");
-    assert.equal(exemptEvent.args.grossAmount, parseUnits("10", 18));
-    assert.equal(exemptEvent.args.netAmount, parseUnits("10", 18));
-    assert.equal(exemptEvent.args.feeAmount, 0n);
-    assert.equal(exemptEvent.args.feeExempt, true);
+    const assertZeroFeeAudit = (receipt, from, to, amount) => {
+      const events = receipt.logs.map((log) => { try { return token.interface.parseLog(log); } catch { return null; } }).filter(Boolean);
+      const audit = events.find((event) => event.name === "TransferWithFee");
+      assert.ok(audit, "TransferWithFee audit event is present");
+      assert.equal(audit.args.from, from);
+      assert.equal(audit.args.to, to);
+      assert.equal(audit.args.grossAmount, amount);
+      assert.equal(audit.args.netAmount, amount);
+      assert.equal(audit.args.feeAmount, 0n);
+      assert.equal(audit.args.feeExempt, false);
+      assert.equal(events.some((event) => event.name === "FeeCollected"), false);
+    };
 
-    // Hot Wallet -> a personal wallet is not exempt.
-    const hotToAlice = await token.transfer(aliceAddress, parseUnits("10", 18));
-    const hotToAliceReceipt = await hotToAlice.wait();
-    assert.equal(await token.balanceOf(aliceAddress), parseUnits("9.99", 18));
-    assert.equal(await token.balanceOf(distributionAddress), parseUnits("10.01", 18));
-    const hotFee = hotToAliceReceipt.logs
-      .map((log) => { try { return token.interface.parseLog(log); } catch { return null; } })
-      .find((event) => event?.name === "FeeCollected");
-    assert.equal(hotFee.args.amount, parseUnits("0.01", 18));
+    const hotToDistributionAmount = parseUnits("10", 18);
+    const hotToDistribution = await token.transfer(distributionAddress, hotToDistributionAmount);
+    assertZeroFeeAudit(await hotToDistribution.wait(), hotAddress, distributionAddress, hotToDistributionAmount);
+    assert.equal(await token.balanceOf(distributionAddress), hotToDistributionAmount);
 
-    // User -> user is charged through transfer.
-    const beforeUserTransfer = await token.balanceOf(distributionAddress);
-    const userTx = await token.connect(alice).transfer(bobAddress, parseUnits("1", 18));
-    const userReceipt = await userTx.wait();
-    assert.equal(await token.balanceOf(bobAddress), parseUnits("0.999", 18));
-    assert.equal(await token.balanceOf(distributionAddress), beforeUserTransfer + parseUnits("0.001", 18));
-    const userFee = userReceipt.logs
-      .map((log) => { try { return token.interface.parseLog(log); } catch { return null; } })
-      .find((event) => event?.name === "FeeCollected");
-    assert.equal(userFee.args.amount, parseUnits("0.001", 18));
+    const hotToAliceAmount = parseUnits("10", 18);
+    const hotToAlice = await token.transfer(aliceAddress, hotToAliceAmount);
+    assertZeroFeeAudit(await hotToAlice.wait(), hotAddress, aliceAddress, hotToAliceAmount);
+    assert.equal(await token.balanceOf(aliceAddress), hotToAliceAmount);
+    assert.equal(await token.balanceOf(distributionAddress), hotToDistributionAmount);
 
-    // transferFrom has the same fee behavior.
-    await (await token.connect(alice).approve(await spender.getAddress(), parseUnits("2", 18))).wait();
-    const beforeTransferFrom = await token.balanceOf(distributionAddress);
-    await (await token.connect(spender).transferFrom(aliceAddress, bobAddress, parseUnits("2", 18))).wait();
-    assert.equal(await token.balanceOf(bobAddress), parseUnits("2.997", 18));
-    assert.equal(await token.balanceOf(distributionAddress), beforeTransferFrom + parseUnits("0.002", 18));
+    const userTransferAmount = parseUnits("1", 18);
+    const userTx = await token.connect(alice).transfer(bobAddress, userTransferAmount);
+    assertZeroFeeAudit(await userTx.wait(), aliceAddress, bobAddress, userTransferAmount);
+    assert.equal(await token.balanceOf(bobAddress), userTransferAmount);
+
+    const transferFromAmount = parseUnits("2", 18);
+    await (await token.connect(alice).approve(await spender.getAddress(), transferFromAmount)).wait();
+    const transferFrom = await token.connect(spender).transferFrom(aliceAddress, bobAddress, transferFromAmount);
+    assertZeroFeeAudit(await transferFrom.wait(), aliceAddress, bobAddress, transferFromAmount);
+    assert.equal(await token.balanceOf(bobAddress), userTransferAmount + transferFromAmount);
     assert.equal(await token.allowance(aliceAddress, await spender.getAddress()), 0n);
 
-    // Distribution Wallet retains its fee in-place; there is no self Transfer.
-    const distributionBefore = await token.balanceOf(distributionAddress);
-    const aliceBefore = await token.balanceOf(aliceAddress);
-    const distributionTx = await token.connect(distribution).transfer(aliceAddress, parseUnits("1", 18));
-    const distributionReceipt = await distributionTx.wait();
-    assert.equal(await token.balanceOf(aliceAddress), aliceBefore + parseUnits("0.999", 18));
-    assert.equal(await token.balanceOf(distributionAddress), distributionBefore - parseUnits("0.999", 18));
-    const distributionFeeEvent = distributionReceipt.logs
-      .map((log) => { try { return token.interface.parseLog(log); } catch { return null; } })
-      .find((event) => event?.name === "TransferWithFee");
-    assert.equal(distributionFeeEvent.args.feeAmount, parseUnits("0.001", 18));
-    assert.equal(distributionFeeEvent.args.feeExempt, false);
-    assert.equal(distributionReceipt.logs.filter((log) => {
-      try { return token.interface.parseLog(log)?.name === "FeeCollected"; } catch { return false; }
-    }).length, 0);
+    const distributionToAliceAmount = parseUnits("1", 18);
+    const distributionTx = await token.connect(distribution).transfer(aliceAddress, distributionToAliceAmount);
+    assertZeroFeeAudit(await distributionTx.wait(), distributionAddress, aliceAddress, distributionToAliceAmount);
+    assert.equal(await token.balanceOf(aliceAddress), hotToAliceAmount + distributionToAliceAmount);
+    assert.equal(await token.balanceOf(distributionAddress), hotToDistributionAmount - distributionToAliceAmount);
 
-    // Reverse direction and other senders to the Distribution Wallet are not exempt.
-    const beforeReverse = await token.balanceOf(distributionAddress);
-    await (await token.connect(alice).transfer(distributionAddress, parseUnits("1", 18))).wait();
-    assert.equal(await token.balanceOf(distributionAddress), beforeReverse + parseUnits("1", 18));
+    const aliceToDistributionAmount = parseUnits("1", 18);
+    const reverseTx = await token.connect(alice).transfer(distributionAddress, aliceToDistributionAmount);
+    assertZeroFeeAudit(await reverseTx.wait(), aliceAddress, distributionAddress, aliceToDistributionAmount);
+    assert.equal(await token.balanceOf(distributionAddress), hotToDistributionAmount);
   } finally {
     await chain.disconnect();
   }

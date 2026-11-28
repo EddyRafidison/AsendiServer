@@ -4,13 +4,11 @@ pragma solidity ^0.8.24;
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 /// @title OneX Token (XTU)
-/// @notice Fixed-supply BEP-20-compatible token with a mandatory 0.1% external-transfer fee.
-/// @dev The initial supply belongs to the Hot Wallet. Only Hot Wallet -> Distribution Wallet is exempt.
+/// @notice Fixed-supply BEP-20-compatible token with no contract-level transfer commission.
+/// @dev The initial supply belongs to the Hot Wallet. TransferWithFee is retained as a zero-fee audit event for scanner compatibility.
 contract OneXToken is ERC20 {
     uint256 public constant MAX_SUPPLY = 100_000_000_000 * 10 ** 18;
-    uint256 public constant TRANSFER_FEE_BPS = 10;
-    uint256 private constant BPS_DENOMINATOR = 10_000;
-
+    uint256 public constant TRANSFER_FEE_BPS = 0;
     address public immutable initialWallet;
     address public immutable feeCollector;
 
@@ -38,30 +36,11 @@ contract OneXToken is ERC20 {
     }
 
     function _update(address from, address to, uint256 value) internal override {
-        // Mint and burn are not externally initiated token transfers.
-        if (from == address(0) || to == address(0)) {
-            super._update(from, to, value);
-            return;
+        super._update(from, to, value);
+        // No fee is charged or redirected for any transfer. The legacy-shaped
+        // event remains solely to make gross/net/fee reconciliation explicit.
+        if (from != address(0) && to != address(0)) {
+            emit TransferWithFee(from, to, value, value, 0, false);
         }
-
-        // The only exemption is the exact internal consolidation pair.
-        bool feeExempt = from == initialWallet && to == feeCollector;
-        uint256 fee = feeExempt || value == 0
-            ? 0
-            : (value * TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
-        uint256 netAmount = value - fee;
-
-        super._update(from, to, netAmount);
-
-        if (fee > 0) {
-            // If Distribution Wallet sends, its commission remains in its own balance.
-            // No self-transfer is emitted or executed in that case.
-            if (from != feeCollector) {
-                super._update(from, feeCollector, fee);
-                emit FeeCollected(from, feeCollector, fee);
-            }
-        }
-
-        emit TransferWithFee(from, to, value, netAmount, fee, feeExempt);
     }
 }

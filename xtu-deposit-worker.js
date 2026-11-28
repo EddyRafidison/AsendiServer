@@ -42,6 +42,11 @@ const { getConfiguredMaxBscTxFeeUsd, evaluateBscTxFee } = require("./bsc-transac
 const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
 const { calculateXtuUnknownRefundQuote } = require("./xtu-unknown-refund-policy");
 const {
+  ensureWalletFinancialLockTx,
+  registerAutomaticRefundEventTx,
+  markAutomaticRefundManualReviewTx,
+} = require("./automatic-refund-service");
+const {
   calculateDepositFundingAllocation,
   calculateSellerOnlyDepositFundingAllocation,
   calculateRemainingAdministrativeBacking,
@@ -110,6 +115,26 @@ function safeAddress(value) {
   try { return getAddress(String(value)); } catch { return null; }
 }
 
+async function getUnbackedAutomaticRefundXtuAmount(queryable, excludeGroupId = null) {
+  const exclusion = excludeGroupId == null ? "" : "AND e.group_id<>?";
+  const params = excludeGroupId == null ? [] : [String(excludeGroupId)];
+  const sql = `SELECT COALESCE(SUM(e.gross_amount-e.refunded_amount),0) AS amount
+    FROM automatic_refund_group_events e
+    JOIN automatic_refund_groups g ON g.id=e.group_id
+    JOIN xtu_deposit_transfer_events s ON s.id=e.source_id
+    WHERE g.asset_code='XTU' AND e.source_table='xtu_deposit_transfer_events'
+      AND e.status NOT IN ('refunded','resolved','cancelled')
+      AND e.gross_amount>e.refunded_amount
+      AND NOT EXISTS (SELECT 1 FROM xtu_hot_wallet_lots l WHERE l.event_identity=s.event_identity)
+      ${exclusion}`;
+  if (typeof queryable.queryAsync === "function") {
+    const rows = await queryable.queryAsync(sql, params);
+    return String(rows[0]?.amount || "0");
+  }
+  const [rows] = await queryable.query(sql, params);
+  return String(rows[0]?.amount || "0");
+}
+
 function eventIdentity(txHash, logIndex) {
   return keccak256(toUtf8Bytes(`${String(txHash).toLowerCase()}:${Number(logIndex)}`)).slice(2);
 }
@@ -148,12 +173,12 @@ function verifyDepositReceipt(receipt, eventLog, settings, parsed) {
   const net = BigInt(parsed.args.netAmount);
   const fee = BigInt(parsed.args.feeAmount);
   const feeExempt = Boolean(parsed.args.feeExempt);
-  const expectedFee = (gross * 10n) / 10_000n;
+  const expectedFee = 0n;
   if (receiver !== settings.mainWalletAddress || sender === settings.distributionAddress || feeExempt) {
     throw new Error("The XTU transfer is not an external deposit into the configured Hot Wallet.");
   }
   if (gross <= 0n || fee !== expectedFee || net + fee !== gross) {
-    throw new Error("The XTU TransferWithFee event has inconsistent gross, net or 0.1% commission values.");
+    throw new Error("The XTU TransferWithFee event has inconsistent gross, net or zero-commission values.");
   }
   let hotTransfer = false;
   let distributionFee = fee === 0n;
@@ -244,6 +269,8 @@ async function createDepositBatchTx(tx, username, settings, finalizedAtMs, statu
 
 async function assignDepositEventTx(tx, event, settings) {
   const identity = eventIdentity(event.txHash, event.logIndex);
+  await acquireDepositLocks(tx);
+  await ensureWalletFinancialLockTx(tx, event.sender, Date.now());
   const [existingEventRows] = await tx.query(
     `SELECT id,username,batch_id,status FROM xtu_deposit_transfer_events WHERE event_identity=? LIMIT 1 FOR UPDATE`, [identity],
   );
@@ -257,18 +284,19 @@ async function assignDepositEventTx(tx, event, settings) {
      WHERE LOWER(wallet_address)=LOWER(?) LIMIT 1 FOR UPDATE`, [event.sender],
   );
   if (!authRows.length) {
-    // Preserve the finalized event and create a separate XTU-only unknown-transfer record.
-    // Unknown XTU is excluded from user deposit batches and Hot Wallet consolidation lots.
+    // Unknown official XTU goes directly to the shared automatic-refund registry.
+    // The refundable principal is the amount actually received by the Hot Wallet.
     const grossAmount = new BigNumber(event.gross.toString()).shiftedBy(-18);
     const hotWalletAmount = new BigNumber(event.net.toString()).shiftedBy(-18);
     const commissionAmount = new BigNumber(event.fee.toString()).shiftedBy(-18);
-    const now = String(Date.now());
+    const nowMs = Number(event.finalizedAtMs || Date.now());
+    const now = String(nowMs);
     await tx.query(
       `INSERT IGNORE INTO xtu_deposit_transfer_events
        (username,batch_id,token_contract,from_address,hot_wallet_address,gross_amount,net_amount,commission_amount,
         gross_amount_raw,net_amount_raw,commission_amount_raw,tx_hash,log_index,block_number,block_hash,
         block_timestamp_ms,event_identity,status,reason_codes,created_at_ms)
-       VALUES(NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending_identity','["wallet_not_linked"]',?)`,
+       VALUES(NULL,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'automatic_refund_pending','["wallet_not_linked"]',?)`,
       [settings.tokenAddress, event.sender, settings.mainWalletAddress,
         grossAmount.toFixed(18), hotWalletAmount.toFixed(18), commissionAmount.toFixed(18),
         event.gross.toString(), event.net.toString(), event.fee.toString(), event.txHash,
@@ -280,16 +308,43 @@ async function assignDepositEventTx(tx, event, settings) {
        (chain_id,token_contract,from_address,hot_wallet_address,gross_amount,hot_wallet_received_amount,commission_amount,
         gross_amount_raw,hot_wallet_received_raw,commission_amount_raw,tx_hash,log_index,block_number,block_hash,
         block_timestamp_ms,finalized_at_ms,receipt_json,event_identity,previous_username,status,created_at_ms,updated_at_ms)
-       VALUES(56,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'pending_admin',?,?)`,
+       VALUES(56,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'automatic_refund_pending',?,?)`,
       [settings.tokenAddress, event.sender, settings.mainWalletAddress, grossAmount.toFixed(18),
         hotWalletAmount.toFixed(18), commissionAmount.toFixed(18), event.gross.toString(), event.net.toString(),
         event.fee.toString(), event.txHash, String(event.logIndex), String(event.blockNumber), event.blockHash,
-        String(event.blockTimestampMs), String(event.finalizedAtMs || Date.now()), String(event.receiptJson || null), identity, now, now],
+        String(event.blockTimestampMs), String(nowMs), String(event.receiptJson || null), identity, now, now],
     );
-    return { status: "pending_identity", unknownTransfer: true };
+    const [sourceRows] = await tx.query(
+      `SELECT id FROM xtu_unknown_incoming_transfers WHERE event_identity=? LIMIT 1 FOR UPDATE`, [identity],
+    );
+    if (!sourceRows.length) throw new Error("The finalized unknown XTU transfer could not be persisted.");
+    const registered = await registerAutomaticRefundEventTx(tx, {
+      chainId: 56,
+      tokenContract: settings.tokenAddress,
+      assetCode: "XTU",
+      senderAddress: event.sender,
+      payoutAddress: event.sender,
+      sourceTable: "xtu_unknown_incoming_transfers",
+      sourceId: String(sourceRows[0].id),
+      sourceKind: "xtu_unknown",
+      eventIdentity: identity,
+      txHash: event.txHash,
+      logIndex: Number(event.logIndex),
+      blockNumber: String(event.blockNumber),
+      blockHash: event.blockHash,
+      grossAmount: hotWalletAmount.toFixed(18),
+      finalizedAtMs: nowMs,
+      category: "A",
+      reasonCode: "official_unknown_sender",
+      nowMs,
+    });
+    await tx.query(
+      `UPDATE xtu_unknown_incoming_transfers SET status='automatic_refund_pending',updated_at_ms=?
+       WHERE id=? AND status IN ('pending_admin','automatic_refund_pending')`, [now, String(sourceRows[0].id)],
+    );
+    return { status: "automatic_refund_pending", category: "A", groupId: registered.groupId, duplicate: Boolean(registered.duplicate) };
   }
 
-  await acquireDepositLocks(tx);
   const username = authRows[0].username;
   const eventTimestamp = Number(event.blockTimestampMs);
   const finalizedAtMs = Number.isSafeInteger(Number(event.finalizedAtMs)) && Number(event.finalizedAtMs) > 0
@@ -350,6 +405,73 @@ async function assignDepositEventTx(tx, event, settings) {
   const outstandingXtu = new BigNumber(common.xtu_wallets || "0");
   const counterConsistent = outstandingXtu.isFinite() && !outstandingXtu.isNegative() && outstandingXtu.gte(grossAmount);
   if (!counterConsistent) blockingReason = "xtu_return_counter_insufficient_manual_review";
+
+  if (accountInactive) {
+    const [inserted] = await tx.query(
+      `INSERT IGNORE INTO xtu_deposit_transfer_events
+       (username,batch_id,token_contract,from_address,hot_wallet_address,gross_amount,net_amount,commission_amount,
+        gross_amount_raw,net_amount_raw,commission_amount_raw,tx_hash,log_index,block_number,block_hash,
+        block_timestamp_ms,event_identity,status,reason_codes,common_xtu_counter_decremented_at_ms,created_at_ms)
+       VALUES(?,NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'automatic_refund_pending','["account_deactivated"]',NULL,?)`,
+      [username, settings.tokenAddress, event.sender, settings.mainWalletAddress, grossAmount.toFixed(18),
+        hotWalletAmount.toFixed(18), commissionAmount.toFixed(18), event.gross.toString(), event.net.toString(),
+        event.fee.toString(), event.txHash, String(event.logIndex), String(event.blockNumber), event.blockHash,
+        String(eventTimestamp), identity, String(finalizedAtMs)],
+    );
+    let sourceId = null;
+    if (Number(inserted.affectedRows || 0) === 1) sourceId = String(inserted.insertId);
+    else {
+      const [existingSourceRows] = await tx.query(
+        `SELECT id,status FROM xtu_deposit_transfer_events WHERE event_identity=? LIMIT 1 FOR UPDATE`, [identity],
+      );
+      if (!existingSourceRows.length || String(existingSourceRows[0].status) !== "automatic_refund_pending") return { status: "duplicate_or_conflict" };
+      sourceId = String(existingSourceRows[0].id);
+    }
+    const registered = await registerAutomaticRefundEventTx(tx, {
+      chainId: 56,
+      tokenContract: settings.tokenAddress,
+      assetCode: "XTU",
+      senderAddress: event.sender,
+      payoutAddress: event.sender,
+      sourceTable: "xtu_deposit_transfer_events",
+      sourceId,
+      sourceKind: "xtu_registered",
+      eventIdentity: identity,
+      txHash: event.txHash,
+      logIndex: Number(event.logIndex),
+      blockNumber: String(event.blockNumber),
+      blockHash: event.blockHash,
+      grossAmount: hotWalletAmount.toFixed(18),
+      finalizedAtMs,
+      category: "C",
+      username,
+      reasonCode: "account_deactivated",
+      nowMs: finalizedAtMs,
+    });
+    if (counterConsistent) {
+      const [date, time] = utcDateTime();
+      await insertCommonSnapshotTx(tx, common, { xtu_wallets: outstandingXtu.minus(grossAmount).toFixed(30) }, date, time);
+      await tx.query(
+        `UPDATE xtu_deposit_transfer_events SET common_xtu_counter_decremented_at_ms=? WHERE id=? AND common_xtu_counter_decremented_at_ms IS NULL`,
+        [String(finalizedAtMs), sourceId],
+      );
+    } else {
+      const [groupRows] = await tx.query(
+        `SELECT id FROM automatic_refund_groups WHERE id=? LIMIT 1 FOR UPDATE`, [registered.groupId],
+      );
+      if (groupRows.length) {
+        await tx.query(
+          `UPDATE automatic_refund_group_events SET status='manual_review',reason_code='xtu_return_counter_insufficient'
+           WHERE source_table='xtu_deposit_transfer_events' AND source_id=?`, [sourceId],
+        );
+        await tx.query(
+          `UPDATE automatic_refund_groups SET status='manual_review',manual_review_reason='The XTU externalized-return counter is insufficient for this finalized source transfer.'
+           WHERE id=?`, [registered.groupId],
+        );
+      }
+    }
+    return { status: counterConsistent ? "automatic_refund_pending" : "manual_review", category: "C", groupId: registered.groupId };
+  }
 
   if (!batch) {
     const [lastRows] = await tx.query(
@@ -985,7 +1107,7 @@ async function prepareConsolidation(pool, batches, runtime, mainSigner) {
     error.code = "BSC_GAS_FEE_LIMIT_EXCEEDED";
     throw error;
   }
-  const [tokenBalance, nativeBalance, protectedDepositRows, protectedUnknownRows] = await Promise.all([
+  const [tokenBalance, nativeBalance, protectedDepositRows, protectedUnknownRows, unbackedAutomaticRefundAmount] = await Promise.all([
     runtime.contract.balanceOf(runtime.settings.mainWalletAddress),
     runtime.provider.getBalance(runtime.settings.mainWalletAddress),
     pool.queryAsync(
@@ -996,11 +1118,13 @@ async function prepareConsolidation(pool, batches, runtime, mainSigner) {
     pool.queryAsync(
       `SELECT COALESCE(SUM(CASE WHEN status='refunded' THEN refund_residual_amount ELSE hot_wallet_received_amount END),0) AS amount
        FROM xtu_unknown_incoming_transfers
-       WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded')`,
+       WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded','automatic_refund_pending')`,
     ),
+    getUnbackedAutomaticRefundXtuAmount(pool),
   ]);
   const protectedHotWalletTotal = new BigNumber(protectedDepositRows[0]?.amount || "0")
-    .plus(protectedUnknownRows[0]?.amount || "0");
+    .plus(protectedUnknownRows[0]?.amount || "0")
+    .plus(unbackedAutomaticRefundAmount);
   const actualHotWalletBalance = new BigNumber(tokenBalance.toString()).shiftedBy(-18);
   if (!protectedHotWalletTotal.isFinite() || protectedHotWalletTotal.isNegative() ||
       !actualHotWalletBalance.isFinite() || actualHotWalletBalance.lt(protectedHotWalletTotal) ||
@@ -1065,14 +1189,15 @@ async function prepareConsolidation(pool, batches, runtime, mainSigner) {
     );
     const [protectedUnknownRowsLocked] = await tx.query(
       `SELECT id,status,hot_wallet_received_amount,refund_residual_amount FROM xtu_unknown_incoming_transfers
-       WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded')
+       WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded','automatic_refund_pending')
        FOR UPDATE`,
     );
+    const unbackedAutomaticRefundAmount = await getUnbackedAutomaticRefundXtuAmount(tx);
     const protectedLotTotal = protectedLotRows.reduce((total, row) =>
       total.plus(row.protected_hot_wallet_amount || "0"), new BigNumber(0));
     const protectedUnknownTotal = protectedUnknownRowsLocked.reduce((total, row) =>
       total.plus(row.status === 'refunded' ? (row.refund_residual_amount || "0") : (row.hot_wallet_received_amount || "0")), new BigNumber(0));
-    const lockedProtectedTotal = protectedLotTotal.plus(protectedUnknownTotal);
+    const lockedProtectedTotal = protectedLotTotal.plus(protectedUnknownTotal).plus(unbackedAutomaticRefundAmount);
     const freshHotWalletBalance = new BigNumber((await runtime.contract.balanceOf(runtime.settings.mainWalletAddress)).toString()).shiftedBy(-18);
     if (!lockedProtectedTotal.isFinite() || lockedProtectedTotal.isNegative() ||
         !freshHotWalletBalance.isFinite() || freshHotWalletBalance.lt(lockedProtectedTotal)) {
@@ -1166,7 +1291,7 @@ async function parseConsolidationReceipt(runtime, receipt, row) {
   const gross = BigInt(matching.args.grossAmount);
   const net = BigInt(matching.args.netAmount);
   const fee = BigInt(matching.args.feeAmount);
-  if (!Boolean(matching.args.feeExempt) || fee !== 0n || net !== gross || gross !== BigInt(String(row.amount_raw))) {
+  if (Boolean(matching.args.feeExempt) || fee !== 0n || net !== gross || gross !== BigInt(String(row.amount_raw))) {
     throw new Error("The Hot Wallet to Distribution Wallet consolidation did not use the exact zero-commission exemption.");
   }
   return { gross, net, fee };
@@ -2087,8 +2212,8 @@ async function finalizeSettlementPayout(pool, row, receipt, runtime) {
       foundExempt = Boolean(parsed.args.feeExempt);
     }
   }
-  const expectedFeeRaw = (expectedGrossRaw * 10n) / 10_000n;
-  if (foundNet !== expectedNetRaw || foundGross !== expectedGrossRaw || foundFee !== expectedFeeRaw || foundExempt !== false) throw new Error("The XTU global settlement receipt does not match the exact gross/net entitlement and 0.1% contract fee.");
+  const expectedFeeRaw = 0n;
+  if (foundNet !== expectedNetRaw || foundGross !== expectedGrossRaw || foundFee !== expectedFeeRaw || foundExempt !== false) throw new Error("The XTU global settlement receipt does not match the exact gross/net entitlement and zero contract fee.");
   await withTransaction(pool, async (tx) => {
     const [lockRows] = await tx.query("SELECT lock_name FROM system_locks WHERE lock_name='onex_xtu_wallet_spend' FOR UPDATE");
     if (!lockRows.length) throw new Error("The XTU wallet-spend lock is missing.");
@@ -2316,10 +2441,12 @@ async function createAndSignUnknownXtuRefund(pool, transfer, request, runtime, m
   const protectedUnknownRows = await pool.queryAsync(
     `SELECT COALESCE(SUM(CASE WHEN status='refunded' THEN refund_residual_amount ELSE hot_wallet_received_amount END),0) AS amount
      FROM xtu_unknown_incoming_transfers
-     WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded')`,
+     WHERE status IN ('pending_admin','refund_approved','refund_queued','refund_signed','refund_submitted','refund_manual_review','refund_failed','retained_uncredited','refunded','automatic_refund_pending')`,
   );
+  const unbackedAutomaticRefundAmount = await getUnbackedAutomaticRefundXtuAmount(pool);
   const protectedTotal = new BigNumber(protectedDepositRows[0]?.amount || "0")
-    .plus(protectedUnknownRows[0]?.amount || "0");
+    .plus(protectedUnknownRows[0]?.amount || "0")
+    .plus(unbackedAutomaticRefundAmount);
   const hotBalance = new BigNumber(tokenBalance.toString()).shiftedBy(-18);
   if (!hotBalance.isFinite() || hotBalance.lt(protectedTotal)) {
     throw new Error("The XTU Hot Wallet balance does not cover all protected deposit lots and unknown-transfer balances; refund signing is blocked.");
@@ -2418,7 +2545,7 @@ async function createAndSignUnknownXtuRefund(pool, transfer, request, runtime, m
       [String(transfer.tx_hash), String(transfer.log_index)],
     );
     await appendXtuUnknownRefundEventTx(tx, request.id, signedRowId, "signed", "approved", "refund_signed",
-      "The refund was signed from the XTU Hot Wallet using the net amount originally received, less estimated gas equivalent and the 0.1% contract fee.", {
+      "The refund was signed from the XTU Hot Wallet using the net amount originally received, less estimated gas equivalent and the zero contract fee.", {
         eventKey: `xtu-unknown-refund:${request.id}:signed:${signedHash}`,
         actorReference: mainSigner.address, txHash: signedHash, transferId: eventId,
         grossAmount: quote.grossTransferAmount.toFixed(18), feeAmount: quote.contractFeeAmount.toFixed(18), netAmount: quote.netAmount.toFixed(18),
@@ -2479,10 +2606,10 @@ function parseUnknownXtuRefundReceipt(receipt, row, runtime) {
   const gross = BigInt(transferWithFee.args.grossAmount);
   const net = BigInt(transferWithFee.args.netAmount);
   const fee = BigInt(transferWithFee.args.feeAmount);
-  const expectedFee = (gross * 10n) / 10_000n;
+  const expectedFee = 0n;
   if (gross !== expectedGross || fee !== expectedFee || net + fee !== gross ||
       Boolean(transferWithFee.args.feeExempt) || recipientTransferAmount !== net || collectorFeeAmount !== fee) {
-    return { valid: false, reason: "The confirmed XTU refund receipt does not match the persisted gross/net/0.1% fee quote." };
+    return { valid: false, reason: "The confirmed XTU refund receipt does not match the persisted gross/net/zero-fee quote." };
   }
   if (net.toString() !== BigInt(String(row.net_amount).includes(".") ? new BigNumber(row.net_amount).shiftedBy(18).integerValue(BigNumber.ROUND_DOWN).toFixed(0) : row.net_amount).toString()) {
     return { valid: false, reason: "The refund receipt net amount differs from the persisted beneficiary amount." };
@@ -2624,7 +2751,7 @@ async function reconcileUnknownXtuRefund(pool, row, runtime) {
       [String(current.source_tx_hash), String(current.source_log_index)],
     );
     await appendXtuUnknownRefundEventTx(tx, current.request_id, current.id, "confirmed", current.status, "confirmed",
-      "The XTU refund was confirmed. The beneficiary received the net amount after the 0.1% contract commission; BNB gas was paid by the Hot Wallet and recorded separately.", {
+      "The XTU refund was confirmed. The beneficiary received the net amount after a contract transfer commission; BNB gas was paid by the Hot Wallet and recorded separately.", {
         eventKey: `xtu-unknown-refund:${current.id}:confirmed:${current.tx_hash}`,
         txHash: current.tx_hash, grossAmount: actualTransfer.gross.toString(), feeAmount: actualTransfer.fee.toString(), netAmount: actualTransfer.net.toString(),
         transferId: current.unknown_transfer_id,
@@ -2665,12 +2792,207 @@ async function processOneUnknownXtuRefund(pool, runtime, mainSigner) {
   }
 }
 
+
+/**
+ * Atomically converts every uncredited portion of an already-open XTU batch
+ * belonging to a newly disabled account into Category C refund events.
+ * Previously credited portions remain untouched. The source lot ledger is the
+ * authority for event-level FIFO allocation; inconsistent batches are held.
+ */
+async function routeOutstandingXtuBatchesToAutomaticRefund(pool, username) {
+  const U = String(username || "").trim();
+  if (!U) throw new TypeError("A username is required to route XTU deposits after deactivation.");
+  return withTransaction(pool, async (tx) => {
+    await acquireDepositLocks(tx);
+    const [accountRows] = await tx.query(
+      `SELECT username,wallet_address,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE`, [U],
+    );
+    if (!accountRows.length || Number(accountRows[0].account_active) !== 0) {
+      throw new Error("The account must be inactive before its existing XTU deposits can be routed to Category C.");
+    }
+    const sender = String(accountRows[0].wallet_address || "").toLowerCase();
+    await ensureWalletFinancialLockTx(tx, sender, Date.now());
+    const [batches] = await tx.query(
+      `SELECT * FROM xtu_deposit_batches
+       WHERE username=? AND CAST(remaining_amount AS DECIMAL(36,18))>0
+         AND status IN ('collecting','pending_minimum','ready','pending_reserve','pending_credit',
+                        'pending_weekly','pending_support','pending_global')
+       ORDER BY opened_at_ms ASC,id ASC FOR UPDATE`, [U],
+    );
+    const now = Date.now();
+    let queuedCount = 0;
+    let queuedAmount = new BigNumber(0);
+    const queuedBatchIds = [];
+
+    for (const batch of batches) {
+      const batchId = String(batch.id);
+      try {
+        const [sourceRows] = await tx.query(
+          `SELECT * FROM xtu_deposit_transfer_events
+           WHERE batch_id=? ORDER BY block_number ASC,log_index ASC FOR UPDATE`, [batchId],
+        );
+        if (!sourceRows.length || sourceRows.length !== Number(batch.transfer_count || 0)) {
+          throw new Error("XTU source-event count does not match the batch transfer count.");
+        }
+        const [consolidationRows] = await tx.query(
+          `SELECT i.status,c.status AS consolidation_status
+           FROM xtu_deposit_consolidation_items i
+           INNER JOIN xtu_deposit_consolidations c ON c.id=i.consolidation_id
+           WHERE i.batch_id=? AND (i.status IN ('queued','signed','submitted','manual_review')
+             OR c.status IN ('queued','signed','submitted','manual_review'))
+           LIMIT 1 FOR UPDATE`, [batchId],
+        );
+        if (consolidationRows.length) {
+          throw new Error("An XTU consolidation for this batch is still queued, signed, submitted or under manual review.");
+        }
+        const [lotRows] = await tx.query(
+          `SELECT * FROM xtu_hot_wallet_lots WHERE batch_id=?
+           ORDER BY first_finalized_at_ms ASC,tx_hash ASC,log_index ASC,id ASC FOR UPDATE`, [batchId],
+        );
+        const lotsByIdentity = new Map(lotRows.map((lot) => [String(lot.event_identity).toLowerCase(), lot]));
+        let grossRemaining = new BigNumber(0);
+        let netRemaining = new BigNumber(0);
+        const refundableSlices = [];
+        for (const event of sourceRows) {
+          const lot = lotsByIdentity.get(String(event.event_identity).toLowerCase());
+          if (!lot) throw new Error(`The protected XTU source lot for event ${event.event_identity} is missing.`);
+          if (["common_reserve_owned", "consolidated_common_reserve"].includes(String(lot.status))) {
+            throw new Error("An XTU source lot has already been reclassified to common reserves and cannot be refunded automatically.");
+          }
+          if (new BigNumber(lot.consolidation_reserved_amount || "0").gt(0)) {
+            throw new Error("An XTU source lot still has an active consolidation reservation.");
+          }
+          const originalGross = new BigNumber(lot.gross_amount || event.gross_amount || "0");
+          const creditedGross = new BigNumber(lot.gross_credited_amount || "0");
+          const receivedNet = new BigNumber(lot.hot_wallet_received_amount || event.net_amount || "0");
+          const creditedNet = new BigNumber(lot.credited_amount || "0");
+          const reserveOwnedNet = new BigNumber(lot.expired_common_reserve_amount || "0");
+          if (!originalGross.isFinite() || !originalGross.isGreaterThan(0) ||
+              !creditedGross.isFinite() || creditedGross.isNegative() || creditedGross.gt(originalGross) ||
+              !receivedNet.isFinite() || receivedNet.isNegative() || !creditedNet.isFinite() || creditedNet.isNegative() ||
+              !reserveOwnedNet.isFinite() || reserveOwnedNet.isNegative()) {
+            throw new Error("An XTU source lot has invalid gross/net/credited amounts.");
+          }
+          const uncreditedGross = BigNumber.maximum(0, originalGross.minus(creditedGross)).decimalPlaces(18, BigNumber.ROUND_DOWN);
+          const uncreditedNet = BigNumber.maximum(0, receivedNet.minus(creditedNet).minus(reserveOwnedNet)).decimalPlaces(18, BigNumber.ROUND_DOWN);
+          if (uncreditedGross.isZero()) continue;
+          if (uncreditedNet.isZero()) throw new Error("An XTU source event has uncredited gross principal but no corresponding received token balance.");
+          if (!/^[0-9a-f]{64}$/i.test(String(event.event_identity)) ||
+              !/^0x[0-9a-f]{64}$/i.test(String(event.tx_hash)) ||
+              !/^0x[0-9a-f]{64}$/i.test(String(event.block_hash))) {
+            throw new Error("An XTU source event is missing immutable blockchain identity evidence.");
+          }
+          grossRemaining = grossRemaining.plus(uncreditedGross);
+          netRemaining = netRemaining.plus(uncreditedNet);
+          refundableSlices.push({ event, lot, uncreditedGross, uncreditedNet });
+        }
+        const storedRemaining = new BigNumber(batch.remaining_amount || "0");
+        if (!storedRemaining.isFinite() || storedRemaining.isNegative() || !grossRemaining.eq(storedRemaining)) {
+          throw new Error("XTU lot-level uncredited gross does not reconcile with the deposit batch remaining_amount.");
+        }
+        if (grossRemaining.isZero()) {
+          await tx.query(
+            `UPDATE xtu_deposit_batches SET remaining_amount=0,status='credited',updated_at_ms=? WHERE id=?`,
+            [String(now), batchId],
+          );
+          continue;
+        }
+
+        for (const slice of refundableSlices) {
+          const event = slice.event;
+          const registered = await registerAutomaticRefundEventTx(tx, {
+            chainId: 56,
+            tokenContract: String(event.token_contract || batch.token_contract || settingsTokenFallback()).toLowerCase(),
+            assetCode: "XTU",
+            senderAddress: sender,
+            payoutAddress: sender,
+            sourceTable: "xtu_deposit_transfer_events",
+            sourceId: String(event.id),
+            sourceKind: "xtu_deactivated_batch",
+            eventIdentity: String(event.event_identity),
+            txHash: String(event.tx_hash),
+            logIndex: Number(event.log_index),
+            blockNumber: String(event.block_number),
+            blockHash: String(event.block_hash),
+            grossAmount: slice.uncreditedNet.toFixed(18),
+            finalizedAtMs: Number(event.created_at_ms) > 0 ? Number(event.created_at_ms) : now,
+            category: "C",
+            username: U,
+            reasonCode: "account_deactivated",
+            nowMs: now,
+          });
+          if (registered.status === "manual_review") throw new Error("An existing XTU refund source is already marked for manual review.");
+          await tx.query(
+            `UPDATE xtu_deposit_transfer_events SET status='automatic_refund_pending',reason_codes=? WHERE id=?`,
+            [JSON.stringify(["account_deactivated"]), String(event.id)],
+          );
+          await tx.query(
+            `UPDATE xtu_hot_wallet_lots SET pending_user_amount=0,protected_hot_wallet_amount=?,
+             status='refund_queued',updated_at_ms=? WHERE id=?`,
+            [slice.uncreditedNet.toFixed(18), String(now), String(slice.lot.id)],
+          );
+        }
+        await tx.query(
+          `UPDATE xtu_deposit_batches SET remaining_amount=0,status='refund_queued',reason_codes=?,
+           pending_since_ms=NULL,release_at_ms=NULL,updated_at_ms=? WHERE id=? AND remaining_amount=?`,
+          [JSON.stringify(["account_deactivated"]), String(now), batchId, storedRemaining.toFixed(18)],
+        );
+        queuedCount += refundableSlices.length;
+        queuedAmount = queuedAmount.plus(netRemaining);
+        queuedBatchIds.push(batchId);
+        await notifyUserTx(
+          tx, U, `xtu-deposit:${batchId}:automatic-refund-category-c`, "OneX XTU deposit routed to automatic refund",
+          `Your uncredited XTU deposit balance of ${netRemaining.toFixed(8)} XTU has been transferred to the automatic refund register because the account is deactivated. Already credited amounts are unchanged. Refunds are grouped by token and source address; the net minimum is 1 XTU and amounts below it are retained without an expiry. Batch: ${batchId}.`,
+        );
+      } catch (error) {
+        await tx.query(
+          `UPDATE xtu_deposit_batches SET status='manual_review',reason_codes=?,updated_at_ms=? WHERE id=?`,
+          [JSON.stringify(["account_deactivation_refund_reconciliation"]), String(now), batchId],
+        );
+        await tx.query(
+          `UPDATE xtu_deposit_transfer_events SET status='manual_review',reason_codes=? WHERE batch_id=?
+           AND status NOT IN ('credited','refund_confirmed','refunded')`,
+          [JSON.stringify(["account_deactivation_refund_reconciliation"]), batchId],
+        );
+        console.error(`Deactivated account XTU batch ${batchId} requires refund reconciliation:`, error.message);
+      }
+    }
+    return { count: queuedBatchIds.length, events: queuedCount, batchIds: queuedBatchIds, queuedAmount: queuedAmount.toFixed(18) };
+  });
+}
+
+function settingsTokenFallback() {
+  return String(process.env.XTU_TOKEN_CONTRACT_ADDRESS || "").trim();
+}
+
+async function reconcileDeactivatedXtuDepositBatches(pool) {
+  const rows = await pool.queryAsync(
+    `SELECT DISTINCT b.username
+     FROM xtu_deposit_batches b
+     INNER JOIN auths a ON a.username=b.username
+     WHERE a.account_active=0 AND CAST(b.remaining_amount AS DECIMAL(36,18))>0
+       AND b.status IN ('collecting','pending_minimum','ready','pending_reserve','pending_credit',
+                        'pending_weekly','pending_support','pending_global')
+     ORDER BY b.username ASC LIMIT 100`,
+  );
+  for (const row of rows) {
+    try {
+      await routeOutstandingXtuBatchesToAutomaticRefund(pool, row.username);
+    } catch (error) {
+      console.error(`Deactivated XTU account ${row.username} still requires refund routing:`, error.message);
+    }
+  }
+}
+
 async function processOne(pool, context) {
   const { runtime, provider, mainSigner } = context;
   await scanIncomingEvents(pool, provider, runtime.settings);
+  await reconcileDeactivatedXtuDepositBatches(pool);
   await closeExpiredBatches(pool, runtime.settings);
   await notifyDueXtuDepositExpirations(pool, Date.now());
-  await processOneUnknownXtuRefund(pool, runtime, mainSigner);
+  // Legacy unknown-transfer request/signature/admin-approval refunds are intentionally
+  // not executed. Those events are now assigned by assignDepositEventTx to the
+  // shared automatic-refund registry and wait for its idempotent payout worker.
   await processOneReadyBatch(pool, runtime, mainSigner);
   await processSettlementPayout(pool, runtime);
   await processEmailOutbox(pool);
@@ -2749,6 +3071,7 @@ module.exports = {
   assignUnknownXtuTransferToAccount,
   processOneUnknownXtuRefund,
   parseUnknownXtuRefundReceipt,
+  routeOutstandingXtuBatchesToAutomaticRefund,
 };
 
 if (require.main === module) {

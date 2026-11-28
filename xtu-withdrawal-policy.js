@@ -7,7 +7,7 @@ BigNumber.config({ DECIMAL_PLACES: 36, ROUNDING_MODE: BigNumber.ROUND_HALF_UP })
 const XTU_DECIMALS = 18;
 const XTU_SCALE = 10n ** BigInt(XTU_DECIMALS);
 const MIN_XTU_WITHDRAWAL = new BigNumber("5");
-const XTU_TRANSFER_FEE_BPS = 10n;
+const XTU_TRANSFER_FEE_BPS = 0n;
 const BPS_DENOMINATOR = 10000n;
 
 function positiveAmount(value, fieldName) {
@@ -47,8 +47,8 @@ function calculateXtuWithdrawalQuote(grossAmountValue, estimatedGasFeeUsdValue) 
   if (gasRawInteger >= grossRaw) throw new RangeError("The estimated gas fee consumes the requested withdrawal amount.");
 
   const contractTransferRaw = grossRaw - gasRawInteger;
-  const contractFeeRaw = (contractTransferRaw * XTU_TRANSFER_FEE_BPS) / BPS_DENOMINATOR;
-  const netRaw = contractTransferRaw - contractFeeRaw;
+  const contractFeeRaw = 0n;
+  const netRaw = contractTransferRaw;
   if (netRaw <= 0n) throw new RangeError("The net XTU withdrawal must be positive.");
 
   const gasXtu = new BigNumber(gasRawInteger.toString()).dividedBy(XTU_SCALE.toString());

@@ -19,7 +19,7 @@ Required JSON body:
 
 `amount` must be a decimal string with at most 18 decimal places and a gross minimum of `5` XTU. Do not send `to`, `destination`, a wallet address, a private key or a recovery seed. The server uses the fixed `auths.wallet_address` recorded at signup. The route requires the normal device-bound request signature headers documented in `README.md` and the current Android device-authentication protocol.
 
-The service is available only when both `XTU_WITHDRAWAL_WORKER_ENABLED=true` and the admin-controlled XTU withdrawal gate is open. The request is accepted with HTTP 202 while the worker processes it. The response includes the unique `reference`, gross amount, estimated BNB gas cost and XTU equivalent, estimated 0.1% contract fee, estimated net amount and registered destination address. These values are estimates until the transaction is finalized.
+The service is available only when both `XTU_WITHDRAWAL_WORKER_ENABLED=true` and the admin-controlled XTU withdrawal gate is open. The request is accepted with HTTP 202 while the worker processes it. The response includes the unique `reference`, gross amount, estimated BNB gas cost and XTU equivalent, estimated net amount and registered destination address. The XTU contract transfer commission is 0%; do not display a token commission. These values are estimates until the transaction is finalized.
 
 ### Request status
 
@@ -38,21 +38,20 @@ The user can query only their own request. Status values include `queued`, `sign
 
 ## Fees and displayed amounts
 
-The request amount is gross. The server subtracts the estimated BNB gas cost converted into XTU using the Chainlink BNB/USD feed. The contract then charges 0.1% on the remaining token transfer amount. The contract fee is retained in the XTU distribution wallet. The final user-received amount is the on-chain `Transfer` amount to the registered wallet, not the gross request.
+The request amount is gross. The server subtracts the estimated BNB gas cost converted into XTU using the Chainlink BNB/USD feed. The XTU contract transfers the resulting amount without a token commission (0% transfer fee). The final user-received amount is the on-chain `Transfer` amount to the registered wallet, not the gross request.
 
 The app should label the values separately:
 
 - Gross XTU requested.
 - Estimated BNB network fee and its XTU equivalent.
-- Estimated contract fee (0.1%).
 - Estimated net XTU to be received.
-- Actual BNB gas cost, actual contract fee and actual net XTU after confirmation.
+- Actual BNB gas cost and actual net XTU after confirmation.
 
-The normal internal P2P `tfees` must not be applied to this endpoint. The XTU contract fee is applied by the smart contract, not by backend pre-deduction.
+The normal internal P2P `tfees` must not be applied to this endpoint. The XTU token contract does not charge an outbound transfer commission; only the applicable estimated/actual network gas cost is deducted and reconciled.
 
 ## Transaction history
 
-A confirmed externalization creates an `activities` row with `type=5`, `sender=USERNAME` and `receiver=USERNAME-WALLET`. The history endpoint `/app/transactions-history` returns `amount_xtu` as the actual net externalized XTU and `fees_xtu` as the combined actual gas-equivalent plus contract fee. It also returns the internal initial-asset fields and the saved individual `unit_price`. The `activities.fees` column for type 5 is not `tfees`; it represents the combined fee equivalent in initial-asset units so the existing history conversion remains consistent.
+A confirmed externalization creates an `activities` row with `type=5`, `sender=USERNAME` and `receiver=USERNAME-WALLET`. The history endpoint `/app/transactions-history` returns `amount_xtu` as the actual net externalized XTU and `fees_xtu` as the actual gas-equivalent cost only. It also returns the internal initial-asset fields and the saved individual `unit_price`. The `activities.fees` column for type 5 is not `tfees`; it represents the combined fee equivalent in initial-asset units so the existing history conversion remains consistent.
 
 **Client integration note:** the server archive includes the device-authentication helper but not the complete Android application or its activity-type display map. Server-side activity values `1`–`4` are already used for P2P, purchase/deposit, sale and welcome bonus; `5` is the first unused value in the inspected backend. Confirm the Android client maps `type=5` to “XTU wallet withdrawal” before enabling this history item in a released app.
 

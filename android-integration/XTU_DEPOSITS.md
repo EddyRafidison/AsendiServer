@@ -15,7 +15,7 @@ Endpoint: `POST /app/deposit`
 }
 ```
 
-The successful response identifies BNB Smart Chain Mainnet (chain ID 56), the XTU token contract, the OneX Hot Wallet destination, the registered sender wallet, 20-100 gross session limits, the one-per-seven-day OneX system-funded purchase rule (regardless of amount), seller-campaign funding availability and the separate first-credit-tranche cap, contract fee, OneX deposit fee and gas treatment. The app must display the exact destination and fee policy returned by the server. Users must send from the BSC address registered on their OneX account. The app must never request a wallet private key or recovery phrase.
+The successful response identifies BNB Smart Chain Mainnet (chain ID 56), the XTU token contract, the OneX Hot Wallet destination, the registered sender wallet, 20-100 gross session limits, the one-per-seven-day OneX system-funded purchase rule (regardless of amount), seller-campaign funding availability and the separate first-credit-tranche cap, 0% contract transfer fee, OneX deposit fee and gas treatment. The app must display the exact destination and fee policy returned by the server. Users must send from the BSC address registered on their OneX account. The app must never request a wallet private key or recovery phrase.
 
 ## Availability
 
@@ -35,11 +35,11 @@ Endpoint: `POST /app/deposit/status`
 }
 ```
 
-The response distinguishes gross XTU detected, net amount received by the Hot Wallet, contract commission, gross XTU returned to the system, credited XTU, gas allocated in BSC-USD/XTU equivalent, OneX deposit fee, batch status, hold reasons, source transfer hashes/log indexes and the Hot Wallet-to-Distribution-Wallet consolidation transaction. Keep each blockchain transaction reference as a separate audit item. The Android client must not treat a detected but unfinalized transfer as a completed deposit.
+The response distinguishes gross XTU detected, net amount received by the Hot Wallet, zero contract commission (gross = net), gross XTU returned to the system, credited XTU, gas allocated in BSC-USD/XTU equivalent, OneX deposit fee, batch status, hold reasons, source transfer hashes/log indexes and the Hot Wallet-to-Distribution-Wallet consolidation transaction. Keep each blockchain transaction reference as a separate audit item. The Android client must not treat a detected but unfinalized transfer as a completed deposit.
 
 ## Financial rules shown in the app
 
-- The XTU contract applies a 0.1% commission to external transfers. The only commission exemption is the exact Hot Wallet → Distribution Wallet transfer; the app should not imply that sending to the Hot Wallet is fee-free.
+- The XTU contract applies a 0% token transfer commission. Incoming and outgoing transfer events must reconcile gross amount = net amount and fee amount = 0; the app must not display a contract commission.
 - Incoming XTU is consolidated only after finality and only for identified deposit amounts. All identified XTU receipts, including amounts already reclassified to common reserves after 30-day expiry, remain protected and accounted for in the Hot Wallet custody register. They are consolidated FIFO only when the aggregate eligible net amount actually received by the Hot Wallet reaches at least 100 XTU. Expiry never forces a transfer below 100 XTU. The lot may contain multiple users’ batches, with gas allocated deterministically and auditable per source batch. The Hot Wallet's initial 100-billion-token supply and other non-deposit allocations are never swept. A custody consolidation must not change `common.xtu_wallets` or `common.total_units_price` a second time.
 - Outside global disbursement, the OneX XTU deposit fee is 75% of the normal `tfees` rate. From the effective global-disbursement cutoff, both BSC-USD and XTU deposits are suspended under the same rule; post-cutoff transfers are recorded for control but do not create new deposit credits or obligations.
 - Actual BNB gas is always imputed to XTU deposits that are processed before the cutoff. The estimated gas ceiling of 0.4 BSC-USD is a refusal/deferral threshold, not a fixed fee.
@@ -50,8 +50,8 @@ The response distinguishes gross XTU detected, net amount received by the Hot Wa
 The API is the authoritative source for current availability and fees. Do not display or calculate any 60-minute deposit window. Show the per-dossier 30-day expiry and the pending amount/reason returned by the API.
 
 
-## Unknown XTU sender transfers (support/admin workflow)
+## Unknown and deactivated XTU source transfers
 
-An official XTU transfer from an unregistered sender is not automatically credited. The original sender may submit a refund review request through `POST /public/xtu/unknown-transfers/refund-challenge`, sign the returned challenge with the source wallet (EIP-191 for EOAs or EIP-1271 for contract wallets), and submit the signature to `POST /public/xtu/unknown-transfers/refund-request`. The destination is bound to the original `from` address and cannot be replaced. The request is not a refund promise: explicit administrator approval is required.
+An official XTU transfer from an unregistered sender is registered as automatic refund category A after finality. No user refund request, EIP-191/EIP-1271 challenge or prior administrator approval is required. The public legacy endpoints `POST /public/xtu/unknown-transfers/refund-challenge` and `POST /public/xtu/unknown-transfers/refund-request` return HTTP 410 and must not be used by the app.
 
-The administration reviews the event through `POST /admin/xtu/unknown-transfers/list` and resolves it through `POST /admin/xtu/unknown-transfers/resolve` (`assign`, `refund` or `retain`). The refund history is exposed through `POST /admin/xtu/unknown-refunds/list`. The XTU refund base is the net amount originally received by the Hot Wallet; estimated BNB gas equivalent is deducted first, then the XTU contract applies its 0.1% outbound commission. Actual gas is reconciled from the receipt. These transfers remain separate from known-user deposits, `common.xtu_wallets` and ordinary XTU consolidation lots.
+If the sender belongs to a deactivated OneX account, uncredited XTU and each new official incoming transfer are routed to automatic refund category C; no XTU free balance is credited. The same-token refund is sent to the original sender address. A 1% off-chain retention is calculated per source event, estimated gas is deducted once per grouped payout, and the net minimum is 1 XTU. Each event must be finalized and pass its individual 30-minute hold. Amounts below the net minimum remain in custody indefinitely; they are not redirected to common reserves because of ordinary deposit expiry. The XTU contract charges 0% transfer commission. Genuine reconciliation anomalies may remain in `manual_review` and block signup until formally resolved with an audit record.

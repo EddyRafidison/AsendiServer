@@ -107,10 +107,11 @@ async function queryRows(queryable, sql, params = []) {
 }
 
 async function getHotWalletReserveAmounts(queryable) {
-  const [depositRows, unknownRows, sellerRows, otherRefundRows, sweepRows, commonRows] = await Promise.all([
+  const [depositRows, unknownRows, sellerRows, otherRefundRows, automaticRefundRows, sweepRows, commonRows] = await Promise.all([
     queryRows(queryable,
       `SELECT COALESCE(SUM(remaining_amount),0) AS pending_amount,
-              COALESCE(SUM(reserved_refund_amount),0) AS refund_reserved_amount
+              COALESCE(SUM(CASE WHEN status NOT IN ('refund_queued','refunded')
+                                THEN reserved_refund_amount ELSE 0 END),0) AS refund_reserved_amount
        FROM users_usdt_deposit_batches
        WHERE remaining_amount>0 OR reserved_refund_amount>0`),
     queryRows(queryable,
@@ -125,6 +126,13 @@ async function getHotWalletReserveAmounts(queryable) {
        FROM users_usdt_refunds
        WHERE batch_id IS NULL AND unknown_transfer_id IS NULL
          AND status IN ('queued','signed','submitted','manual_review')`),
+    queryRows(queryable,
+      `SELECT COALESCE(SUM(e.gross_amount-e.refunded_amount),0) AS amount
+       FROM automatic_refund_group_events e
+       JOIN automatic_refund_groups g ON g.id=e.group_id
+       WHERE g.asset_code='BSC-USD'
+         AND e.status NOT IN ('refunded','resolved','cancelled')
+         AND e.gross_amount>e.refunded_amount`),
     queryRows(queryable,
       `SELECT COALESCE(SUM(amount),0) AS amount
        FROM bsc_treasury_sweeps
@@ -144,7 +152,8 @@ async function getHotWalletReserveAmounts(queryable) {
     reservedDepositRefundAmount: depositRows[0]?.refund_reserved_amount || "0",
     unresolvedUnknownIncomingAmount: unknownRows[0]?.amount || "0",
     pendingSellerPayoutAmount: sellerReserve.toFixed(TOKEN_DECIMALS),
-    otherPendingRefundAmount: otherRefundRows[0]?.amount || "0",
+    otherPendingRefundAmount: new BigNumber(otherRefundRows[0]?.amount || "0")
+      .plus(automaticRefundRows[0]?.amount || "0").toFixed(TOKEN_DECIMALS),
     pendingColdWalletSweepAmount: sweepRows[0]?.amount || "0",
     xtuExternalizedCoverageAmount: commonRows[0]?.xtu_wallets || "0",
     xtuInFlightCoverageAmount: commonRows[0]?.xtu_wallets_reserved || "0",

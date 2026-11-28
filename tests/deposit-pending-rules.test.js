@@ -47,13 +47,19 @@ test("the pending API returns separate decimal amounts and individual expiration
   assert.match(endpoint, /reason_codes: reasons/);
 });
 
-test("BSC-USD expiry reclassifies only the remaining gross amount to common reserves once", () => {
+test("BSC-USD unqualified expiry routes every uncredited finalized source event to category D or C without touching common reserves", () => {
   const expiry = blockBetween(routes, "async function expireOneUsdtDepositBatch", "async function expireDueUsdtDepositBatches");
-  assert.match(expiry, /INSERT IGNORE INTO deposit_expiration_events/);
-  assert.match(expiry, /total_units_price: new BigNumber\(common\.total_units_price\)\.plus\(valueAdded\)/);
-  assert.match(expiry, /status='forfeited_to_common_reserve'/);
-  assert.match(expiry, /remaining_amount=0/);
-  assert.match(expiry, /deposit-expiry:BSC-USD:/);
+  const transfer = blockBetween(routes, "async function transferBscBatchRemainderToAutomaticRefundTx", "async function getBscExpiryScannerCatchupBoundary");
+  assert.match(expiry, /getBscExpiryScannerCatchupBoundary/);
+  assert.match(expiry, /totalGross\.gte\(MIN_DEPOSIT_AMOUNT\)/);
+  assert.match(expiry, /const category = wasActiveAtExpiry \? "D" : "C"/);
+  assert.match(expiry, /transferBscBatchRemainderToAutomaticRefundTx/);
+  assert.match(transfer, /getUncreditedBscBatchEventSlicesTx/);
+  assert.match(transfer, /registerAutomaticRefundEventTx/);
+  assert.match(transfer, /grossAmount: event\.uncreditedAmount\.toFixed\(18\)/);
+  assert.match(transfer, /status='refund_queued'/);
+  assert.doesNotMatch(expiry, /INSERT IGNORE INTO deposit_expiration_events/);
+  assert.doesNotMatch(expiry, /total_units_price|backed_units|inactive_init_asset/);
 });
 
 test("XTU credit is independent of custody consolidation and consolidation remains at least 100 net", () => {
@@ -87,23 +93,24 @@ test("XTU consolidation gas receipt reconciles each credit tranche and expired c
   assert.match(finalize, /The consolidation is a custody transfer only/);
 });
 
-test("known-account deposit refunds are disabled and the payout worker is restricted to unknown transfers", () => {
-  const userRoute = blockBetween(routes, 'router.post("/app/deposit/refund-request"', '// The BSC wallet is fixed at signup');
-  const adminRoute = blockBetween(routes, 'router.post("/admin/deposit/refund"', '// Requeue an unsubmitted disbursement');
-  assert.match(userRoute, /status\(403\)/);
-  assert.match(userRoute, /known_account_deposits_are_not_refundable/);
-  assert.match(adminRoute, /status\(403\)/);
+test("legacy public refund requests are retired and normal refund payouts use the shared automatic register", () => {
+  const userRoute = blockBetween(routes, 'router.post("/app/deposit/refund-request"', 'router.post("/app/set-payout-address"');
+  assert.match(userRoute, /status\(410\)/);
+  assert.match(userRoute, /automatic refund|automatically/i);
+  assert.match(routes, /registerAutomaticRefundEventTx/);
+  assert.match(routes, /automatic_refund_pending/);
   assert.match(disbursement, /batch_id IS NULL AND unknown_transfer_id IS NOT NULL AND user_request_id IS NULL/);
 });
 
 for (const file of ["terms_fr.html", "terms_en.html", "privacy_fr.html", "privacy_en.html"]) {
-  test(`${file} states the Revision 4 30-day rule and strict XTU consolidation threshold`, () => {
+  test(`${file} describes the 30-day BSC-USD deposit boundary and current automatic-refund policy`, () => {
     const html = read(file);
     assert.match(html, /30-day|30 days|30 jours|30 × 24 heures/i);
-    assert.match(html, /100 (?:net )?XTU|100 XTU/);
-    assert.match(html, /common reserve|réserves communes|réserve commune/i);
     assert.match(html, /BSC-USD/);
     assert.match(html, /XTU/);
+    assert.match(html, /1%|1 %|one percent|un pour cent/i);
+    assert.match(html, /1 (?:BSC-USD|XTU)|one unit|une unité/i);
+    assert.match(html, /automatic refund|remboursement automatique/i);
     assert.doesNotMatch(html, /(?:per|after|during) (?:a )?60-minute collection|session de 60 minutes|session of 60 minutes/i);
   });
 }

@@ -108,6 +108,11 @@ const {
 const { getHotWalletTreasurySnapshot } = require("./treasury-liquidity");
 const { getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
 const { MINIMUM_REFUND_NET_BSC_USD } = require("./refund-policy");
+const {
+  ensureWalletFinancialLockTx,
+  registerAutomaticRefundEventTx,
+  getOutstandingRefundObligationsTx,
+} = require("./automatic-refund-service");
 getConfiguredMaxBscTxFeeUsd();
 const { createTelegramBotLinkTx, queueTelegramMessageTx } = require("./telegram");
 const {
@@ -671,6 +676,39 @@ async function getBscAddressProofProvider() {
     }
   }
   throw lastError || new Error("No HTTPS BSC RPC endpoint is configured for sender-address proof.");
+}
+
+async function captureLiveSignupFinalizedReferenceBlock() {
+  const bscProvider = await getBscAddressProofProvider();
+  let xtuProvider = null;
+  try {
+    const xtuSettings = getXtuSettings();
+    if (!xtuSettings.incomingRpcUrl) throw new Error("The XTU incoming RPC is not configured for signup synchronization.");
+    xtuProvider = new JsonRpcProvider(xtuSettings.incomingRpcUrl, { name: "bnb-smart-chain", chainId: 56 });
+    const [bscNetwork, xtuNetwork] = await Promise.all([bscProvider.getNetwork(), xtuProvider.getNetwork()]);
+    if (Number(bscNetwork.chainId) !== 56 || Number(xtuNetwork.chainId) !== 56) {
+      throw new Error("Both signup synchronization RPCs must be connected to BNB Smart Chain Mainnet.");
+    }
+    const [bscLatest, xtuLatest] = await Promise.all([bscProvider.getBlockNumber(), xtuProvider.getBlockNumber()]);
+    const bscConfirmations = Math.max(1, Math.min(200, Number(process.env.USDT_MIN_CONFIRMATIONS || 15)));
+    const xtuConfirmations = Number(xtuSettings.minConfirmations || 15);
+    const bscFinalized = Math.max(0, bscLatest - bscConfirmations + 1);
+    const xtuFinalized = Math.max(0, xtuLatest - xtuConfirmations + 1);
+    const referenceBlock = Math.min(bscFinalized, xtuFinalized);
+    if (!Number.isSafeInteger(referenceBlock) || referenceBlock <= 0) {
+      throw new Error("A common finalized BSC reference block could not be captured.");
+    }
+    const [bscBlock, xtuBlock] = await Promise.all([
+      bscProvider.getBlock(referenceBlock), xtuProvider.getBlock(referenceBlock),
+    ]);
+    if (!bscBlock || !xtuBlock || String(bscBlock.hash).toLowerCase() !== String(xtuBlock.hash).toLowerCase()) {
+      throw new Error("The BSC and XTU RPCs disagree on the common finalized reference block hash.");
+    }
+    return BigInt(referenceBlock);
+  } finally {
+    try { await bscProvider.destroy(); } catch {}
+    try { if (xtuProvider) await xtuProvider.destroy(); } catch {}
+  }
 }
 const { registerXtuWithdrawalRoutes } = require("./xtu-withdrawal-routes");
 registerXtuWithdrawalRoutes(router, {
@@ -1610,10 +1648,11 @@ async function queueDepositBatchStatusTx(
   if (details.expiresAtMs) {
     lines.push(`Deposit expiry (UTC): ${formatTelegramUtc(expiry)}.`);
     lines.push(`Time remaining: ${Math.ceil((remainingMs || 0) / 86400000)} day(s).`);
-    lines.push(`IMPORTANT: any amount still uncredited at this fixed 30-day deadline is irrevocably reclassified to OneX common reserves. Known-account deposits are not refundable.`);
+    lines.push(`IMPORTANT: if this BSC-USD purchase batch has not reached 20 BSC-USD gross within at most five transfers by the 30-day deadline, only its still-uncredited source amounts are routed to the automatic Category D refund register. A 1% retention is applied per source transfer and estimated gas is deducted once per grouped payout. Net refunds below 1 BSC-USD are retained without a time limit; they are not moved to common reserves.`);
   }
   if (status === "credited") lines.push("The eligible amount has been credited to your initial-asset balance.");
-  if (status === "forfeited_to_common_reserve") lines.push("The remaining uncredited amount has been irrevocably reclassified to OneX common reserves. It is no longer available for user credit or refund.");
+  if (status === "refund_queued") lines.push("The uncredited BSC-USD source amounts have been transferred to the automatic refund register. The same-token refund is sent to the original source address when the grouped net amount reaches at least 1 BSC-USD after the 1% per-transfer retention and one estimated gas deduction.");
+  if (status === "forfeited_to_common_reserve") lines.push("This legacy batch was previously reconciled to common reserves. New MAJ6 Category D expirations are not allocated to common reserves.");
   lines.push("The 20-unit minimum and 100-unit maximum apply to each credit tranche. BSC-USD and XTU are separate deposit records and are never combined.");
   await queueTelegramMessageTx(tx, username, eventKey, lines.join("\n"));
 }
@@ -1633,17 +1672,116 @@ async function processConfirmedUsdtPayment(event) {
       "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
     );
     if (!commonLockRows.length) throw new Error("The common-state lock row has not been initialized");
+    const senderAddressLower = String(event.fromAddress || "").trim().toLowerCase();
+    await ensureWalletFinancialLockTx(tx, senderAddressLower, Date.now());
     const [authRows] = await tx.query(
       `SELECT username,wallet_address,created_at_ms,last_login_at_ms,account_active
        FROM auths WHERE LOWER(wallet_address)=? LIMIT 1 FOR UPDATE`,
       [String(event.fromAddress || "").toLowerCase()],
     );
-    if (!authRows.length) return { unknown: true };
+    if (!authRows.length) {
+      if (!event.unknownTransferId) return { unknown: true };
+      const [unknownRows] = await tx.query(
+        `SELECT * FROM bsc_unknown_incoming_transfers WHERE id=? LIMIT 1 FOR UPDATE`,
+        [String(event.unknownTransferId)],
+      );
+      if (!unknownRows.length) return { unknown: true, reason: "unknown_source_missing" };
+      const source = unknownRows[0];
+      const registeredAtMs = Number(source.block_timestamp_ms || 0);
+      const group = await registerAutomaticRefundEventTx(tx, {
+        chainId: 56,
+        tokenContract: source.token_contract,
+        assetCode: "BSC-USD",
+        senderAddress: source.from_address,
+        payoutAddress: source.from_address,
+        sourceTable: "bsc_unknown_incoming_transfers",
+        sourceId: String(source.id),
+        sourceKind: "bsc_usd_unknown",
+        eventIdentity: String(source.event_identity),
+        txHash: String(source.tx_hash),
+        logIndex: Number(source.log_index),
+        blockNumber: String(source.block_number),
+        blockHash: String(source.block_hash),
+        grossAmount: String(source.amount),
+        finalizedAtMs: Date.now(),
+        category: "A",
+        reasonCode: "official_unknown_sender",
+        nowMs: Date.now(),
+      });
+      await tx.query(
+        `UPDATE bsc_unknown_incoming_transfers
+         SET status='automatic_refund_pending',decision_action='automatic_refund',
+             decision_reason='Official BSC-USD transfer from an unregistered wallet; automatic refund category A.',
+             updated_at_ms=? WHERE id=? AND status IN ('pending_admin','refund_failed','automatic_refund_pending')`,
+        [String(Date.now()), String(source.id)],
+      );
+      return { automaticRefund: true, category: "A", groupId: group.groupId, duplicate: Boolean(group.duplicate) };
+    }
 
     const account = authRows[0];
     const username = account.username;
     const eventTimestampMs = Number(event.blockTimestampMs);
     const finalizedAtMs = Date.now();
+    const [registryRows] = await tx.query(
+      `SELECT registered_at_block FROM bsc_wallet_address_registry
+       WHERE wallet_address_lower=? LIMIT 1 FOR UPDATE`, [String(event.fromAddress).toLowerCase()],
+    );
+    const registrationBoundary = registryRows.length ? BigInt(String(registryRows[0].registered_at_block || "0")) : null;
+    const eventBlock = BigInt(String(event.blockNumber));
+    const [globalRows] = await tx.query(
+      `SELECT id,status,effective_at_ms,request_deadline_at_ms,extension_deadline_at_ms
+       FROM global_disbursement_runs
+       WHERE status IN ('announced','active','closed','manual_review','completed','resolved')
+       ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+    );
+    const refundGlobalRun = globalRows[0] || null;
+    const globalStart = Number(refundGlobalRun?.effective_at_ms || 0);
+    const globalEnd = Number(refundGlobalRun?.extension_deadline_at_ms || refundGlobalRun?.request_deadline_at_ms || 0);
+    const inGlobalRefundPeriod = Boolean(refundGlobalRun && globalStart > 0 && globalEnd >= globalStart &&
+      eventTimestampMs >= globalStart && eventTimestampMs <= globalEnd);
+    const accountInactiveForRefund = Number(account.account_active) !== 1;
+    const preRegistrationBoundary = registrationBoundary != null && registrationBoundary > 0n && eventBlock <= registrationBoundary;
+    if (inGlobalRefundPeriod || accountInactiveForRefund || preRegistrationBoundary) {
+      const eventIdentityForRefund = createBscEventIdentity(event.txHash, event.logIndex, event.blockHash);
+      const [sourceInsert] = await tx.query(
+        `INSERT IGNORE INTO users_usdt_transfer_events
+         (username,batch_id,treasury_address,from_address,amount,amount_raw,tx_hash,log_index,
+          block_number,block_hash,block_timestamp_ms,status,reason_codes,event_identity,created_at_ms)
+         VALUES(?,NULL,?,?,?,?,?,?,?,?,?,'automatic_refund_pending',?,?,?)`,
+        [String(account.username), event.treasuryAddress, event.fromAddress, amountValue.toFixed(18), event.amountRaw,
+          event.txHash, event.logIndex, event.blockNumber, event.blockHash, String(eventTimestampMs),
+          safeJson([inGlobalRefundPeriod ? "global_disbursement_refund" : accountInactiveForRefund ? "account_deactivated_refund" : "pre_registration_refund"]),
+          eventIdentityForRefund, String(finalizedAtMs)],
+      );
+      if (Number(sourceInsert.affectedRows || 0) !== 1) return { duplicate: true };
+      const category = inGlobalRefundPeriod ? "B" : (preRegistrationBoundary ? "A" : (accountInactiveForRefund ? "C" : "A"));
+      const [sourceRows] = await tx.query(
+        `SELECT id FROM users_usdt_transfer_events WHERE event_identity=? LIMIT 1 FOR UPDATE`, [eventIdentityForRefund],
+      );
+      if (!sourceRows.length) throw new Error("Unable to retrieve the persisted BSC-USD refund source event.");
+      const registered = await registerAutomaticRefundEventTx(tx, {
+        chainId: 56,
+        tokenContract: process.env.USDT_BEP20_CONTRACT || "0x55d398326f99059fF775485246999027B3197955",
+        assetCode: "BSC-USD",
+        senderAddress: event.fromAddress,
+        payoutAddress: event.fromAddress,
+        sourceTable: "users_usdt_transfer_events",
+        sourceId: String(sourceRows[0].id),
+        sourceKind: "bsc_usd_registered",
+        eventIdentity: eventIdentityForRefund,
+        txHash: event.txHash,
+        logIndex: Number(event.logIndex),
+        blockNumber: String(event.blockNumber),
+        blockHash: event.blockHash,
+        grossAmount: amountValue.toFixed(18),
+        finalizedAtMs,
+        category,
+        username: account.username,
+        reasonCode: category === "B" ? "global_disbursement_period" : category === "C" ? "account_deactivated" : "pre_registration_boundary",
+        nowMs: finalizedAtMs,
+      });
+      return { automaticRefund: true, category, username, groupId: registered.groupId, duplicate: Boolean(registered.duplicate) };
+    }
     if (!event.unknownTransferId) {
       const createdAtMs = Number(account.created_at_ms);
       if (!Number.isSafeInteger(createdAtMs) || createdAtMs <= 0 ||
@@ -1705,10 +1843,10 @@ async function processConfirmedUsdtPayment(event) {
         `SELECT * FROM users_usdt_deposit_batches
          WHERE username=? AND status='collecting' AND CAST(expires_at_ms AS UNSIGNED)>?
          ORDER BY opened_at_ms ASC,id ASC LIMIT 1 FOR UPDATE`,
-        [username, String(finalizedAtMs)],
+        [username, String(eventTimestampMs)],
       );
       batch = activeBatchRows[0] || null;
-      if (batch && new BigNumber(batch.total_amount || "0").gte(MIN_DEPOSIT_AMOUNT)) batch = null;
+      if (batch && (new BigNumber(batch.total_amount || "0").gte(MIN_DEPOSIT_AMOUNT) || Number(batch.transfer_count || 0) >= 5)) batch = null;
     }
 
     let initialReasons = [];
@@ -1728,7 +1866,7 @@ async function processConfirmedUsdtPayment(event) {
     }
 
     if (!batch) {
-      const openedAt = finalizedAtMs;
+      const openedAt = eventTimestampMs;
       const expiresAt = openedAt + DEPOSIT_PENDING_EXPIRATION_MS;
       const firstStatus = blockedStatus || (amountValue.gte(MIN_DEPOSIT_AMOUNT) ? "ready" : "collecting");
       const firstReasons = blockedStatus ? initialReasons : (amountValue.lt(MIN_DEPOSIT_AMOUNT) ? ["minimum_not_reached"] : []);
@@ -1851,7 +1989,8 @@ async function processOneDepositBatch(batchId) {
     const batch = batchRows[0];
     const now = Date.now();
     const expiresAt = Number(batch.expires_at_ms || 0);
-    if (expiresAt > 0 && now >= expiresAt) {
+    if (expiresAt > 0 && now >= expiresAt &&
+        new BigNumber(batch.total_amount || "0").lt(MIN_DEPOSIT_AMOUNT)) {
       return { waiting: true, reason: "expiry_due", expiresAtMs: expiresAt };
     }
 
@@ -2163,23 +2302,189 @@ function startDepositBatchWorker() {
   schedule(0);
 }
 
+async function getUncreditedBscBatchEventSlicesTx(tx, batch) {
+  const [eventRows] = await tx.query(
+    `SELECT id,event_identity,tx_hash,log_index,amount,status,from_address,block_number,block_hash,block_timestamp_ms,created_at_ms
+     FROM users_usdt_transfer_events WHERE batch_id=? ORDER BY block_number ASC,log_index ASC,id ASC FOR UPDATE`,
+    [String(batch.id)],
+  );
+  const [creditRows] = await tx.query(
+    `SELECT gross_amount FROM users_usdt_deposit_credits WHERE batch_id=? ORDER BY credit_sequence ASC,id ASC FOR UPDATE`,
+    [String(batch.id)],
+  );
+  let creditRemaining = creditRows.reduce((sum, row) => sum.plus(row.gross_amount || "0"), new BigNumber(0));
+  if (!creditRemaining.isFinite() || creditRemaining.isNegative()) throw new Error("The BSC-USD batch credit ledger is invalid.");
+  const slices = [];
+  let totalUncredited = new BigNumber(0);
+  for (const event of eventRows) {
+    const sourceAmount = new BigNumber(event.amount || "0");
+    if (!sourceAmount.isFinite() || !sourceAmount.isGreaterThan(0)) throw new Error("A BSC-USD source event has an invalid amount.");
+    const creditedFromEvent = BigNumber.minimum(sourceAmount, creditRemaining);
+    creditRemaining = BigNumber.maximum(0, creditRemaining.minus(creditedFromEvent));
+    const uncredited = sourceAmount.minus(creditedFromEvent);
+    if (uncredited.isGreaterThan(0)) {
+      slices.push({ ...event, uncreditedAmount: uncredited });
+      totalUncredited = totalUncredited.plus(uncredited);
+    }
+  }
+  const expectedRemaining = new BigNumber(batch.remaining_amount || "0");
+  if (!expectedRemaining.isFinite() || expectedRemaining.isNegative() ||
+      creditRemaining.isGreaterThan(0) || !totalUncredited.eq(expectedRemaining)) {
+    throw new Error("The BSC-USD source-event FIFO allocation does not reconcile with the batch remaining amount.");
+  }
+  return { eventRows, slices, totalUncredited };
+}
+
+async function transferBscBatchRemainderToAutomaticRefundTx(tx, batch, category, nowMs, reasonCode) {
+  const senderAddress = String(batch.sender_address || batch.from_address || "").toLowerCase();
+  const [authRows] = await tx.query(
+    `SELECT username,wallet_address,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE`, [String(batch.username)],
+  );
+  if (!authRows.length || String(authRows[0].wallet_address || "").toLowerCase() !== senderAddress) {
+    throw new Error("The BSC-USD refund source wallet does not match the account wallet.");
+  }
+  const { slices, totalUncredited } = await getUncreditedBscBatchEventSlicesTx(tx, batch);
+  if (totalUncredited.isZero()) return { queued: false, amount: "0" };
+  const [scannerIdentityRows] = await tx.query(
+    `SELECT token_contract FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1 FOR UPDATE`,
+  );
+  const sourceContract = String(scannerIdentityRows[0]?.token_contract || process.env.USDT_BEP20_CONTRACT ||
+    "0x55d398326f99059fF775485246999027B3197955").toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(sourceContract)) throw new Error("The official BSC-USD scanner token contract is unavailable.");
+  const now = Number(nowMs);
+  await ensureWalletFinancialLockTx(tx, senderAddress, now);
+  let registeredCount = 0;
+  for (const event of slices) {
+    if (!/^[0-9a-f]{64}$/i.test(String(event.event_identity)) ||
+        !/^0x[0-9a-f]{64}$/i.test(String(event.tx_hash)) ||
+        !/^0x[0-9a-f]{64}$/i.test(String(event.block_hash))) {
+      throw new Error("A BSC-USD refund source event is missing its immutable chain identity.");
+    }
+    const registered = await registerAutomaticRefundEventTx(tx, {
+      chainId: 56,
+      tokenContract: sourceContract,
+      assetCode: "BSC-USD",
+      senderAddress,
+      payoutAddress: senderAddress,
+      sourceTable: "users_usdt_transfer_events",
+      sourceId: String(event.id),
+      sourceKind: "bsc_usd_batch",
+      eventIdentity: String(event.event_identity),
+      txHash: String(event.tx_hash),
+      logIndex: Number(event.log_index),
+      blockNumber: String(event.block_number),
+      blockHash: String(event.block_hash),
+      grossAmount: event.uncreditedAmount.toFixed(18),
+      finalizedAtMs: Number(event.created_at_ms) > 0 ? Number(event.created_at_ms) : now,
+      category,
+      username: batch.username,
+      reasonCode,
+      nowMs: now,
+    });
+    if (!registered.duplicate) registeredCount += 1;
+    await tx.query(
+      `UPDATE users_usdt_transfer_events SET status='automatic_refund_pending',reason_codes=? WHERE id=?
+       AND status NOT IN ('credited','refund_confirmed','refunded','ignored')`,
+      [safeJson([reasonCode]), String(event.id)],
+    );
+  }
+  await tx.query(
+    `UPDATE users_usdt_deposit_batches SET reserved_refund_amount=reserved_refund_amount+?,
+     remaining_amount=0,status='refund_queued',reason_codes=?,next_attempt_at_ms=NULL,
+     expiration_paused_at_ms=NULL,expiration_pause_reason=NULL,forfeited_at_ms=?,updated_at_ms=?
+     WHERE id=? AND remaining_amount=? AND status NOT IN ('refund_queued','refunded')`,
+    [totalUncredited.toFixed(18), safeJson([reasonCode]), String(now), String(now), String(batch.id), totalUncredited.toFixed(18)],
+  );
+  return { queued: true, amount: totalUncredited.toFixed(18), events: registeredCount, category };
+}
+
+
+async function getBscExpiryScannerCatchupBoundary(expiresAtMs) {
+  const [scannerRows] = await db.queryAsync(
+    `SELECT scan_start_block,last_scanned_block,last_finalized_block,health_status
+     FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1`,
+  );
+  if (!scannerRows.length) return { ready: false, reason: "bsc_scanner_state_missing" };
+  const state = scannerRows[0];
+  if (String(state.health_status || "") === "manual_review") {
+    return { ready: true, boundaryBlock: "0", scannerManualReview: true };
+  }
+  if (String(state.health_status || "") !== "healthy") {
+    return { ready: false, reason: `bsc_scanner_${String(state.health_status || "unavailable")}` };
+  }
+  const scanStart = Number(state.scan_start_block || 0);
+  if (!Number.isSafeInteger(scanStart) || scanStart < 0 || state.last_scanned_block == null || state.last_finalized_block == null) {
+    return { ready: false, reason: "bsc_scanner_cursor_unavailable" };
+  }
+  const provider = await getBscAddressProofProvider();
+  try {
+    const latest = await provider.getBlockNumber();
+    const confirmations = Math.max(1, Math.min(200, Number(process.env.USDT_MIN_CONFIRMATIONS || 15)));
+    const finalizedNumber = Math.max(0, latest - confirmations + 1);
+    if (finalizedNumber < scanStart) return { ready: false, reason: "finalized_boundary_before_scan_start" };
+    const finalizedBlock = await provider.getBlock(finalizedNumber);
+    const deadlineSeconds = Math.floor(Number(expiresAtMs) / 1000);
+    if (!finalizedBlock || Number(finalizedBlock.timestamp) < deadlineSeconds) {
+      return { ready: false, reason: "expiry_boundary_not_finalized" };
+    }
+
+    let low = scanStart;
+    let high = finalizedNumber;
+    let boundary = scanStart - 1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const block = await provider.getBlock(mid);
+      if (!block) throw new Error(`BSC block ${mid} is unavailable while locating the BSC-USD deposit expiry boundary.`);
+      if (Number(block.timestamp) <= deadlineSeconds) {
+        boundary = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    if (boundary < scanStart) return { ready: true, boundaryBlock: String(boundary), noSourceBlockBeforeDeadline: true };
+    const scanned = BigInt(String(state.last_scanned_block));
+    const scannedFinalized = BigInt(String(state.last_finalized_block));
+    const required = BigInt(String(boundary));
+    if (scanned < required || scannedFinalized < required) {
+      return { ready: false, reason: "bsc_scanner_catching_up", boundaryBlock: String(boundary), lastScannedBlock: String(scanned), lastFinalizedBlock: String(scannedFinalized) };
+    }
+    return { ready: true, boundaryBlock: String(boundary) };
+  } finally {
+    try { await provider.destroy(); } catch {}
+  }
+}
+
 async function expireOneUsdtDepositBatch(batchId, now = Date.now()) {
+  const [expiryRows] = await db.queryAsync("SELECT expires_at_ms,status FROM users_usdt_deposit_batches WHERE id=? LIMIT 1", [String(batchId)]);
+  if (!expiryRows.length) return { skipped: true };
+  if (["refund_queued", "refunded", "credited", "rejected", "forfeited_to_common_reserve"].includes(String(expiryRows[0].status))) {
+    return { skipped: true, status: String(expiryRows[0].status) };
+  }
+  if (Number(expiryRows[0].expires_at_ms || 0) > now) return { waiting: true };
+  const catchup = await getBscExpiryScannerCatchupBoundary(Number(expiryRows[0].expires_at_ms));
+  if (!catchup.ready) return { waitingForScannerCatchup: true, reason: catchup.reason, boundaryBlock: catchup.boundaryBlock || null };
   return withTransaction(async (tx) => {
     const [lockRows] = await tx.query("SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE");
     if (!lockRows.length) throw new Error("The common-state lock row has not been initialized");
     const [batchRows] = await tx.query("SELECT * FROM users_usdt_deposit_batches WHERE id=? LIMIT 1 FOR UPDATE", [String(batchId)]);
     if (!batchRows.length) return { skipped: true };
     const batch = batchRows[0];
-    if (["credited", "forfeited_to_common_reserve", "refunded", "rejected"].includes(String(batch.status))) {
+    if (["credited", "forfeited_to_common_reserve", "refunded", "refund_queued", "rejected"].includes(String(batch.status))) {
       return { skipped: true, status: batch.status };
     }
     const expiresAt = Number(batch.expires_at_ms || 0);
     if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0 || now < expiresAt) return { waiting: true };
 
     const [controlRows] = await tx.query("SELECT is_suspended FROM deposit_service_control WHERE control_id=1 LIMIT 1 FOR UPDATE");
-    const [scannerRows] = await tx.query("SELECT health_status FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1 FOR UPDATE");
-    const systemHold = Number(controlRows[0]?.is_suspended || 0) === 1 ||
-      String(scannerRows[0]?.health_status || "healthy") === "manual_review";
+    const [scannerRows] = await tx.query(
+      "SELECT health_status,last_scanned_block,last_finalized_block FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1 FOR UPDATE",
+    );
+    const scannerUnavailable = !scannerRows.length || String(scannerRows[0]?.health_status || "") !== "healthy" ||
+      scannerRows[0]?.last_scanned_block == null || scannerRows[0]?.last_finalized_block == null ||
+      BigInt(String(scannerRows[0]?.last_scanned_block || "0")) < BigInt(String(catchup.boundaryBlock)) ||
+      BigInt(String(scannerRows[0]?.last_finalized_block || "0")) < BigInt(String(catchup.boundaryBlock));
+    const systemHold = Number(controlRows[0]?.is_suspended || 0) === 1 || scannerUnavailable;
     if (systemHold) {
       if (batch.expiration_paused_at_ms == null) {
         await tx.query(
@@ -2202,8 +2507,8 @@ async function expireOneUsdtDepositBatch(batchId, now = Date.now()) {
     }
 
     const [eventRows] = await tx.query(
-      `SELECT event_identity,tx_hash,log_index,amount,status FROM users_usdt_transfer_events
-       WHERE batch_id=? ORDER BY block_number ASC,log_index ASC FOR UPDATE`, [String(batchId)],
+      `SELECT id,event_identity,tx_hash,log_index,amount,status,from_address,block_number,block_hash,block_timestamp_ms
+       FROM users_usdt_transfer_events WHERE batch_id=? ORDER BY block_number ASC,log_index ASC FOR UPDATE`, [String(batchId)],
     );
     if (eventRows.length !== Number(batch.transfer_count || 0) || eventRows.some((row) => ["detected", "pending_reconciliation", "orphaned"].includes(String(row.status)))) {
       await tx.query(
@@ -2217,49 +2522,74 @@ async function expireOneUsdtDepositBatch(batchId, now = Date.now()) {
       return { held: true, reason: "event_reconciliation_mismatch" };
     }
 
+    const totalGross = new BigNumber(batch.total_amount || "0");
+    if (!totalGross.isFinite() || totalGross.isNegative()) throw new Error("Invalid BSC-USD deposit gross amount at expiry");
+    const uncreditedAtExpiry = new BigNumber(batch.remaining_amount || "0");
+    if (!uncreditedAtExpiry.isFinite() || uncreditedAtExpiry.isNegative()) throw new Error("Invalid BSC-USD deposit remainder at expiry");
+    if (uncreditedAtExpiry.isZero()) {
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches SET status='credited',forfeited_at_ms=?,updated_at_ms=? WHERE id=?`,
+        [String(now), String(now), String(batchId)],
+      );
+      return { completed: true, amount: "0" };
+    }
+    if (Number(batch.transfer_count || 0) > 5) {
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches SET status='manual_review',reason_codes=?,expiration_paused_at_ms=?,
+         expiration_pause_reason='deposit_event_cap_exceeded',updated_at_ms=? WHERE id=?`,
+        [safeJson(["deposit_event_cap_exceeded_at_expiry"]), String(now), String(now), String(batchId)],
+      );
+      return { held: true, reason: "deposit_event_cap_exceeded" };
+    }
+    if (totalGross.gte(MIN_DEPOSIT_AMOUNT)) {
+      // A qualified batch remains a normal purchase even when funding/credit is delayed.
+      return { skipped: true, reason: "qualified_purchase_remains_normal" };
+    }
+    const [accountRows] = await tx.query(
+      `SELECT wallet_address,account_active,account_deactivated_at_ms FROM auths WHERE username=? LIMIT 1 FOR UPDATE`, [String(batch.username)],
+    );
+    if (!accountRows.length) {
+      await tx.query(
+        `UPDATE users_usdt_deposit_batches SET status='manual_review',reason_codes=?,updated_at_ms=? WHERE id=?`,
+        [safeJson(["deposit_account_missing_at_expiry"]), String(now), String(batchId)],
+      );
+      return { held: true, reason: "account_missing" };
+    }
+    const senderAddress = String(accountRows[0].wallet_address || "").toLowerCase();
+    await ensureWalletFinancialLockTx(tx, senderAddress, now);
+    const [globalRows] = await tx.query(
+      `SELECT status,effective_at_ms,request_deadline_at_ms,extension_deadline_at_ms
+       FROM global_disbursement_runs
+       WHERE status IN ('announced','active','closed','manual_review','completed','resolved')
+       ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+    );
+    const globalRun = globalRows[0] || null;
+    const globalStart = Number(globalRun?.effective_at_ms || 0);
+    const globalEnd = Number(globalRun?.extension_deadline_at_ms || globalRun?.request_deadline_at_ms || 0);
+    const deactivatedAt = accountRows[0].account_deactivated_at_ms == null
+      ? null : Number(accountRows[0].account_deactivated_at_ms);
+    // A deactivation strictly after the immutable batch deadline cannot turn
+    // an already-expired active-account batch from D into C merely because
+    // the expiry worker is catching up later.
+    const wasActiveAtExpiry = Number(accountRows[0].account_active) === 1 ||
+      (Number.isSafeInteger(deactivatedAt) && deactivatedAt > expiresAt);
+    const category = wasActiveAtExpiry ? "D" : "C";
+    const reasonCode = category === "B" ? "global_disbursement_period" :
+      category === "C" ? "account_deactivated" : "deposit_expired_without_minimum";
     const remaining = new BigNumber(batch.remaining_amount || "0");
     if (!remaining.isFinite() || remaining.isNegative()) throw new Error("Invalid BSC-USD deposit remainder at expiry");
-    if (remaining.isZero()) {
-      await tx.query("UPDATE users_usdt_deposit_batches SET status='credited',forfeited_at_ms=?,updated_at_ms=? WHERE id=?", [String(now), String(now), String(batchId)]);
-      return { completed: true };
+    const transferred = await transferBscBatchRemainderToAutomaticRefundTx(tx, {
+      ...batch, sender_address: senderAddress,
+    }, category, now, reasonCode);
+    if (transferred.queued) {
+      await queueDepositBatchStatusTx(tx, batch.username, batchId, "refund_queued", [reasonCode], null, {
+        asset: "BSC-USD", sessionTotal: String(batch.total_amount),
+        creditedAmount: String(batch.credited_amount || "0"),
+        remainingAmount: transferred.amount, refundCategory: category,
+      });
     }
-    const common = await getLatestCommonTx(tx, true);
-    const valueAdded = remaining;
-    const eventKey = `deposit-expiry:BSC-USD:${batchId}`;
-    const sourceHashes = JSON.stringify(eventRows.map((row) => ({
-      event_identity: String(row.event_identity), tx_hash: String(row.tx_hash).toLowerCase(),
-      log_index: Number(row.log_index), amount: String(row.amount),
-    })));
-    const [insertResult] = await tx.query(
-      `INSERT IGNORE INTO deposit_expiration_events
-       (asset_code,batch_id,username,expired_amount,value_added_to_common,gas_provision_value,gas_actual_value,
-        global_unit_price,source_event_hashes_json,event_key,status,created_at_ms)
-       VALUES('BSC-USD',?,?,?,?,0,0,?,?,?,'applied',?)`,
-      [String(batchId), batch.username, remaining.toFixed(18), valueAdded.toFixed(30), String(common.unit_price), sourceHashes, eventKey, String(now)],
-    );
-    if (Number(insertResult.affectedRows || 0) === 1) {
-      const [date, time] = formatUtcRecordDateTime(now);
-      await insertCommonSnapshotTx(tx, common, {
-        total_units_price: new BigNumber(common.total_units_price).plus(valueAdded).toFixed(30),
-      }, date, time);
-      const [snapshotRows] = await tx.query("SELECT id FROM common ORDER BY id DESC LIMIT 1 FOR UPDATE");
-      if (!snapshotRows.length) throw new Error("The common reserve snapshot was not persisted for BSC-USD expiry.");
-      await tx.query("UPDATE deposit_expiration_events SET common_snapshot_id=? WHERE event_key=?", [String(snapshotRows[0].id), eventKey]);
-    }
-    await tx.query(
-      `UPDATE users_usdt_deposit_batches SET expired_amount=?,remaining_amount=0,status='forfeited_to_common_reserve',
-       reason_codes=NULL,next_attempt_at_ms=NULL,forfeited_at_ms=?,updated_at_ms=? WHERE id=? AND status<>'forfeited_to_common_reserve'`,
-      [remaining.toFixed(18), String(now), String(now), String(batchId)],
-    );
-    await tx.query(
-      `UPDATE users_usdt_transfer_events SET status='forfeited_to_common_reserve',reason_codes=NULL WHERE batch_id=?`,
-      [String(batchId)],
-    );
-    await queueDepositBatchStatusTx(tx, batch.username, batchId, "forfeited_to_common_reserve", [], null, {
-      asset: "BSC-USD", sessionTotal: String(batch.total_amount),
-      creditedAmount: String(batch.credited_amount), remainingAmount: remaining.toFixed(18), expiresAtMs: expiresAt,
-    });
-    return { forfeited: true, amount: remaining.toFixed(18) };
+    return { automaticRefund: true, category, amount: transferred.amount, events: transferred.events };
+    
   });
 }
 
@@ -2267,7 +2597,7 @@ async function expireDueUsdtDepositBatches(now = Date.now()) {
   const rows = await db.queryAsync(
     `SELECT id FROM users_usdt_deposit_batches
      WHERE remaining_amount>0 AND CAST(expires_at_ms AS UNSIGNED)<=?
-       AND status NOT IN ('credited','forfeited_to_common_reserve','refunded','rejected')
+       AND status NOT IN ('credited','forfeited_to_common_reserve','refunded','refund_queued','rejected')
      ORDER BY CAST(expires_at_ms AS UNSIGNED) ASC,id ASC LIMIT 100`, [String(now)],
   );
   for (const row of rows) {
@@ -2293,14 +2623,34 @@ async function notifyDueUsdtDepositExpirations(now = Date.now()) {
       const remaining = new BigNumber(batch.remaining_amount || "0");
       await queueTelegramMessageTx(tx, batch.username, `deposit:expiry-warning:${batch.id}`,
         "OneX deposit expiry warning",
-        `Your BSC-USD deposit batch ${batch.id} has ${remaining.toFixed(8)} BSC-USD still pending and expires at ${formatTelegramUtc(batch.expires_at_ms)}. If it is not credited before this fixed deadline, the uncredited remainder will be irrevocably reclassified to OneX common reserves and will not be refunded. Resolve the stated pending condition before expiry.`);
+        `Your BSC-USD deposit batch ${batch.id} has ${remaining.toFixed(8)} BSC-USD still pending and expires at ${formatTelegramUtc(batch.expires_at_ms)}. If the batch has not reached 20 BSC-USD gross within at most five finalized transfers by that deadline, only its still-uncredited source amounts will enter the automatic Category D refund process. A 1% retention applies to each source transfer; estimated gas is deducted once per grouped payout. A net refund below 1 BSC-USD remains held without a time limit and is not allocated to common reserves.`);
       await tx.query("UPDATE users_usdt_deposit_batches SET expiration_warning_sent_at_ms=?,updated_at_ms=? WHERE id=? AND expiration_warning_sent_at_ms IS NULL", [String(now), String(now), String(row.id)]);
     });
   }
 }
 
+async function reconcileDeactivatedBscDepositBatches() {
+  const rows = await db.queryAsync(
+    `SELECT DISTINCT b.username
+     FROM users_usdt_deposit_batches b
+     INNER JOIN auths a ON a.username=b.username
+     WHERE a.account_active=0 AND b.remaining_amount>0
+       AND b.status IN ('collecting','batched','ready','finalizing','pending_minimum',
+                        'pending_credit','pending_weekly','pending_reserve','pending_support','pending_global')
+     ORDER BY b.username ASC LIMIT 100`,
+  );
+  for (const row of rows) {
+    try {
+      await holdOutstandingDepositBatchesForDeactivatedAccount(row.username);
+    } catch (error) {
+      console.error(`Deactivated BSC-USD account ${row.username} still requires refund routing:`, error.message);
+    }
+  }
+}
+
 async function processDepositBatchQueue() {
   const now = Date.now();
+  await reconcileDeactivatedBscDepositBatches();
   await expireDueUsdtDepositBatches(now);
   await notifyDueUsdtDepositExpirations(now);
   const rows = await db.queryAsync(
@@ -2738,6 +3088,52 @@ router.post("/app/signup", async (req, res) => {
           throw emailConflict;
         }
         const walletLower = WalletAddress.toLowerCase();
+        await ensureWalletFinancialLockTx(connection, walletLower, Date.now());
+
+        // Signup is fail-closed until both finalized scanners have covered a
+        // common reference block. This prevents a finalized but not-yet-indexed
+        // transfer from being silently treated as a new-account deposit.
+        const [bscScanRows] = await connection.query(
+          `SELECT last_scanned_block,last_finalized_block,health_status
+           FROM bsc_incoming_scan_state WHERE singleton_id=1 LIMIT 1 FOR UPDATE`,
+        );
+        const [xtuScanRows] = await connection.query(
+          `SELECT last_scanned_block,last_finalized_block,health_status
+           FROM xtu_deposit_scan_state WHERE singleton_id=1 LIMIT 1 FOR UPDATE`,
+        );
+        if (!bscScanRows.length || !xtuScanRows.length ||
+            String(bscScanRows[0].health_status) !== "healthy" || String(xtuScanRows[0].health_status) !== "healthy") {
+          const scanUnavailable = new Error("Wallet refund synchronization is unavailable.");
+          scanUnavailable.code = "ONEX_REFUND_CHECK_UNAVAILABLE";
+          throw scanUnavailable;
+        }
+        let registeredAtBlock;
+        try {
+          registeredAtBlock = await captureLiveSignupFinalizedReferenceBlock();
+        } catch (referenceError) {
+          const scanUnavailable = new Error(`A live finalized signup reference block is unavailable: ${referenceError.message}`);
+          scanUnavailable.code = "ONEX_REFUND_CHECK_UNAVAILABLE";
+          throw scanUnavailable;
+        }
+        const referenceReached = registeredAtBlock > 0n &&
+          BigInt(String(bscScanRows[0].last_scanned_block || "0")) >= registeredAtBlock &&
+          BigInt(String(bscScanRows[0].last_finalized_block || "0")) >= registeredAtBlock &&
+          BigInt(String(xtuScanRows[0].last_scanned_block || "0")) >= registeredAtBlock &&
+          BigInt(String(xtuScanRows[0].last_finalized_block || "0")) >= registeredAtBlock;
+        if (!referenceReached) {
+          const scanLag = new Error("Wallet refund scanners have not reached the live common finalized reference block.");
+          scanLag.code = "ONEX_REFUND_CHECK_UNAVAILABLE";
+          throw scanLag;
+        }
+
+        const obligations = await getOutstandingRefundObligationsTx(connection, walletLower, Date.now());
+        if (obligations.hasPending) {
+          const refundPending = new Error("The submitted wallet address has an outstanding automatic refund.");
+          refundPending.code = "ONEX_REFUND_PENDING";
+          refundPending.details = obligations;
+          throw refundPending;
+        }
+
         const [walletRows] = await connection.query(
           "SELECT username FROM bsc_wallet_address_registry WHERE wallet_address_lower=? LIMIT 1 FOR UPDATE",
           [walletLower],
@@ -2772,9 +3168,9 @@ router.post("/app/signup", async (req, res) => {
 
         const createdAtMs = String(Date.now());
         await connection.query(
-          `INSERT INTO bsc_wallet_address_registry(wallet_address_lower,wallet_address,username,registered_at_ms)
-           VALUES(?,?,?,?)`,
-          [WalletAddress.toLowerCase(), WalletAddress, U, createdAtMs],
+          `INSERT INTO bsc_wallet_address_registry(wallet_address_lower,wallet_address,username,registered_at_ms,registered_at_block)
+           VALUES(?,?,?,?,?)`,
+          [WalletAddress.toLowerCase(), WalletAddress, U, createdAtMs, registeredAtBlock.toString()],
         );
         await connection.query(
           `INSERT INTO auths(
@@ -2805,6 +3201,20 @@ router.post("/app/signup", async (req, res) => {
           }
         }
 
+        if (insertError.code === "ONEX_REFUND_PENDING") {
+          return res.status(423).send({
+            auth: "refund_pending",
+            message: "Signup is temporarily blocked because this wallet address has an outstanding automatic refund. Complete the required minimum or wait until the refund is fully completed, as indicated below.",
+            pending_totals_by_asset: insertError.details?.pending_totals_by_asset || [],
+            pending_refunds: insertError.details?.pending_refunds || [],
+          });
+        }
+        if (insertError.code === "ONEX_REFUND_CHECK_UNAVAILABLE") {
+          return res.status(503).send({
+            auth: "refund_check_unavailable",
+            message: "We cannot verify outstanding refunds for this wallet right now. Please try again later.",
+          });
+        }
         if (insertError.code === "ONEX_EMAIL_ALREADY_REGISTERED") {
           return res.status(409).send({ msg: "email already registered" });
         }
@@ -2870,6 +3280,20 @@ router.post("/app/signup", async (req, res) => {
     });
   } catch (e) {
     console.error("Signup failed:", e);
+    if (!res.headersSent && e?.code === "ONEX_REFUND_PENDING") {
+      return res.status(423).send({
+        auth: "refund_pending",
+        message: "Signup is temporarily blocked because this wallet address has an outstanding automatic refund. Complete the required minimum or wait until the refund is fully completed, as indicated below.",
+        pending_totals_by_asset: e.details?.pending_totals_by_asset || [],
+        pending_refunds: e.details?.pending_refunds || [],
+      });
+    }
+    if (!res.headersSent && e?.code === "ONEX_REFUND_CHECK_UNAVAILABLE") {
+      return res.status(503).send({
+        auth: "refund_check_unavailable",
+        message: "We cannot verify outstanding refunds for this wallet right now. Please try again later.",
+      });
+    }
     if (!res.headersSent) res.send({ msg: "failed" });
   }
 });
@@ -3311,7 +3735,7 @@ router.post("/app/user-last-stock", async (req, res) => {
       `SELECT id,total_amount,credited_amount,remaining_amount,status,reason_codes,expires_at_ms
        FROM users_usdt_deposit_batches
        WHERE username=? AND remaining_amount>0
-         AND status NOT IN ('credited','forfeited_to_common_reserve','refunded','rejected')
+         AND status NOT IN ('credited','forfeited_to_common_reserve','refunded','refund_queued','rejected')
        ORDER BY opened_at_ms ASC,id ASC`, [U],
     );
     const xtuDepositState = await getXtuDepositPublicState(U);
@@ -3816,14 +4240,10 @@ router.post("/app/deposit/status", async (req, res) => {
 
 // Known-account deposit balances and expired remainders are never refundable.
 // The only refund workflow is the separate administrative workflow for official-token transfers from unregistered sender addresses.
-router.post("/app/deposit/refund-request", async (_req, res) => {
-  return res.status(403).send({
-    transf: "refund_not_available",
-    reason: "known_account_deposits_are_not_refundable",
-  });
-});
-
-// The BSC wallet is fixed at signup and is used for deposits and all outgoing payments.
+router.post("/app/deposit/refund-request", async (_req, res) => res.status(410).send({
+  transf: "automatic_refund_only",
+  message: "Eligible official-token transfers are processed automatically. A user refund request is not required or accepted.",
+}));
 router.post("/app/set-payout-address", async (req, res) => {
   const { user, pswd, tkn } = req.body || {};
   const U = normalizeUsername(user);
@@ -4943,190 +5363,14 @@ router.post("/admin/bsc/incoming-scanner/reconcile", async (req, res) => {
 
 // Public challenge endpoint for a finalized official XTU transfer sent from an unregistered address.
 // The refund destination is never supplied by the requester: it is bound to the source transaction's `from` address.
-router.post("/public/xtu/unknown-transfers/refund-challenge", async (req, res) => {
-  const txHash = String(req.body?.tx_hash || "").trim().toLowerCase();
-  const logIndex = Number(req.body?.log_index);
-  const senderInput = String(req.body?.sender_address || "").trim();
-  const contactEmail = String(req.body?.contact_email || "").trim().toLowerCase();
-  const reason = String(req.body?.reason || "").trim();
-  if (!/^0x[0-9a-f]{64}$/.test(txHash) || !Number.isInteger(logIndex) || logIndex < 0 || logIndex > 0xffffffff ||
-      !isEvmAddress(senderInput) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail) || contactEmail.length > 254 ||
-      reason.length < 5 || reason.length > 1000) {
-    return res.status(400).send({ refund: "invalid_request" });
-  }
-
-  let senderAddress;
-  try { senderAddress = checksumEvmAddress(senderInput); }
-  catch { return res.status(400).send({ refund: "invalid_sender_address" }); }
-
-  try {
-    const transfers = await db.queryAsync(
-      `SELECT * FROM xtu_unknown_incoming_transfers
-       WHERE chain_id=56 AND tx_hash=? AND log_index=? AND LOWER(from_address)=LOWER(?) LIMIT 1`,
-      [txHash, logIndex, senderAddress],
-    );
-    if (!transfers.length) return res.status(404).send({ refund: "eligible_transfer_not_found" });
-    const transfer = transfers[0];
-    if (!["pending_admin", "refund_failed"].includes(String(transfer.status))) {
-      return res.status(409).send({ refund: "transfer_not_requestable", status: transfer.status });
-    }
-
-    const existingRows = await db.queryAsync(
-      `SELECT * FROM xtu_unknown_refund_requests WHERE unknown_transfer_id=? LIMIT 1`, [String(transfer.id)],
-    );
-    const now = Date.now();
-    if (existingRows.length) {
-      const existing = existingRows[0];
-      if (["pending_admin", "approved", "refund_signed", "completed", "assigned", "manual_review"].includes(String(existing.status))) {
-        return res.status(409).send({ refund: "request_already_exists", status: existing.status });
-      }
-      if (String(existing.status) === "challenge_pending" && Number(existing.challenge_expires_at_ms) > now) {
-        return res.send({
-          refund: "challenge_pending",
-          request_reference: existing.request_reference,
-          challenge_message: existing.challenge_message,
-          challenge_expires_at_ms: String(existing.challenge_expires_at_ms),
-        });
-      }
-    }
-
-    const requestReference = createFinancialReference("XTUUNK");
-    const nonce = crypto.randomBytes(24).toString("hex");
-    const expiresAt = now + 15 * 60 * 1000;
-    const challengeMessage = [
-      "OneX XTU unknown-transfer refund request",
-      `Request: ${requestReference}`,
-      "Network: BNB Smart Chain Mainnet (Chain ID 56)",
-      `Transaction: ${txHash}`,
-      `Log index: ${logIndex}`,
-      `Sender: ${senderAddress}`,
-      `Nonce: ${nonce}`,
-      `Expires at: ${new Date(expiresAt).toISOString()}`,
-      "Signing this message proves control of the original sender address; it does not authorize or guarantee a refund.",
-    ].join("\n");
-
-    await withTransaction(async (tx) => {
-      const [lockedTransfers] = await tx.query(
-        `SELECT id,status,from_address FROM xtu_unknown_incoming_transfers
-         WHERE id=? AND chain_id=56 LIMIT 1 FOR UPDATE`, [String(transfer.id)],
-      );
-      if (!lockedTransfers.length || !["pending_admin", "refund_failed"].includes(String(lockedTransfers[0].status)) ||
-          String(lockedTransfers[0].from_address).toLowerCase() !== senderAddress.toLowerCase()) {
-        throw new Error("The XTU unknown transfer changed while the refund challenge was being created.");
-      }
-      const [lockedRequests] = await tx.query(
-        `SELECT * FROM xtu_unknown_refund_requests WHERE unknown_transfer_id=? LIMIT 1 FOR UPDATE`, [String(transfer.id)],
-      );
-      if (lockedRequests.length) {
-        await tx.query(
-          `UPDATE xtu_unknown_refund_requests
-           SET request_reference=?,sender_address=?,contact_email=?,requester_reason=?,challenge_message=?,
-               challenge_expires_at_ms=?,signature_hash=NULL,proof_verified_at_ms=NULL,status='challenge_pending',
-               admin_username=NULL,admin_reason=NULL,refund_id=NULL,updated_at_ms=?,approved_at_ms=NULL,
-               resolved_at_ms=NULL,completed_at_ms=NULL WHERE id=?`,
-          [requestReference, senderAddress, contactEmail, reason, challengeMessage, String(expiresAt), String(now), String(lockedRequests[0].id)],
-        );
-      } else {
-        await tx.query(
-          `INSERT INTO xtu_unknown_refund_requests
-           (request_reference,unknown_transfer_id,sender_address,contact_email,requester_reason,challenge_message,
-            challenge_expires_at_ms,status,created_at_ms,updated_at_ms)
-           VALUES(?,?,?,?,?,?,?,'challenge_pending',?,?)`,
-          [requestReference, String(transfer.id), senderAddress, contactEmail, reason, challengeMessage, String(expiresAt), String(now), String(now)],
-        );
-      }
-    });
-    return res.send({
-      refund: "challenge_created",
-      request_reference: requestReference,
-      challenge_message: challengeMessage,
-      challenge_expires_at_ms: String(expiresAt),
-    });
-  } catch (error) {
-    console.error("XTU unknown-transfer refund challenge failed:", error.message);
-    return res.status(409).send({ refund: "challenge_failed" });
-  }
-});
-
-// The sender signs the exact challenge above. The recovered signer must equal the original transaction sender.
-router.post("/public/xtu/unknown-transfers/refund-request", async (req, res) => {
-  const requestReference = String(req.body?.request_reference || "").trim();
-  const signature = String(req.body?.signature || "").trim();
-  if (!/^[A-Za-z0-9]{20,64}$/.test(requestReference) || !/^0x(?:[0-9a-f]{2}){1,4096}$/i.test(signature)) {
-    return res.status(400).send({ refund: "invalid_request" });
-  }
-  try {
-    const rows = await db.queryAsync(
-      `SELECT r.*,u.from_address,u.tx_hash,u.log_index,u.status AS transfer_status,u.chain_id
-       FROM xtu_unknown_refund_requests r
-       INNER JOIN xtu_unknown_incoming_transfers u ON u.id=r.unknown_transfer_id
-       WHERE r.request_reference=? LIMIT 1`, [requestReference],
-    );
-    if (!rows.length) return res.status(404).send({ refund: "request_not_found" });
-    const request = rows[0];
-    if (String(request.status) !== "challenge_pending" || Number(request.challenge_expires_at_ms) <= Date.now() ||
-        Number(request.chain_id) !== 56 || !["pending_admin", "refund_failed"].includes(String(request.transfer_status))) {
-      return res.status(409).send({ refund: "challenge_expired_or_not_requestable" });
-    }
-    const senderAddress = checksumEvmAddress(String(request.from_address));
-    let senderProofValid = false;
-    try {
-      const recovered = verifyMessage(String(request.challenge_message), signature);
-      senderProofValid = recovered.toLowerCase() === senderAddress.toLowerCase();
-    } catch {}
-    if (!senderProofValid) {
-      // Contract wallets can prove control through ERC-1271 instead of EIP-191.
-      const xtuRuntime = await getXtuRuntime({ requireSigner: false });
-      const senderCode = await xtuRuntime.provider.getCode(senderAddress);
-      if (senderCode && senderCode !== "0x") {
-        try {
-          const digest = hashMessage(String(request.challenge_message));
-          const callData = EIP1271_INTERFACE.encodeFunctionData("isValidSignature", [digest, signature]);
-          const result = await xtuRuntime.provider.call({ to: senderAddress, data: callData });
-          const [magicValue] = EIP1271_INTERFACE.decodeFunctionResult("isValidSignature", result);
-          senderProofValid = String(magicValue).toLowerCase() === EIP1271_MAGIC_VALUE;
-        } catch {}
-      }
-    }
-    if (!senderProofValid || senderAddress.toLowerCase() !== String(request.sender_address).toLowerCase()) {
-      return res.status(403).send({ refund: "signature_sender_mismatch" });
-    }
-    const signatureHash = crypto.createHash("sha256").update(signature).digest("hex");
-    await withTransaction(async (tx) => {
-      const [lockedRequests] = await tx.query(
-        `SELECT * FROM xtu_unknown_refund_requests WHERE id=? LIMIT 1 FOR UPDATE`, [String(request.id)],
-      );
-      const [lockedTransfers] = await tx.query(
-        `SELECT * FROM xtu_unknown_incoming_transfers WHERE id=? LIMIT 1 FOR UPDATE`, [String(request.unknown_transfer_id)],
-      );
-      if (!lockedRequests.length || !lockedTransfers.length || lockedRequests[0].status !== "challenge_pending" ||
-          Number(lockedRequests[0].challenge_expires_at_ms) <= Date.now() ||
-          !["pending_admin", "refund_failed"].includes(String(lockedTransfers[0].status))) {
-        throw new Error("The refund request has already changed or its challenge has expired.");
-      }
-      const now = String(Date.now());
-      await tx.query(
-        `UPDATE xtu_unknown_refund_requests
-         SET signature_hash=?,proof_verified_at_ms=?,status='pending_admin',challenge_expires_at_ms=NULL,updated_at_ms=?
-         WHERE id=? AND status='challenge_pending'`,
-        [signatureHash, now, now, String(request.id)],
-      );
-      await tx.query(
-        `INSERT IGNORE INTO xtu_unknown_refund_events
-         (unknown_transfer_id,request_id,refund_id,event_key,event_type,actor_type,actor_reference,old_status,new_status,reason,tx_hash,
-          gross_amount,fee_amount,net_amount,created_at_ms)
-         VALUES(?,?,NULL,?,'request_submitted','sender',?,'challenge_pending','pending_admin',?,?,0,0,0,?)`,
-        [String(request.unknown_transfer_id), String(request.id), `xtu-unknown-refund:${request.id}:request-submitted:${signatureHash.slice(0,16)}`,
-          String(request.from_address), "The original sender address signed the refund challenge.", String(request.tx_hash), now],
-      );
-    });
-    return res.send({ refund: "submitted_for_administrative_review", request_reference: requestReference });
-  } catch (error) {
-    console.error("XTU unknown-transfer refund request failed:", error.message);
-    return res.status(409).send({ refund: "request_rejected" });
-  }
-});
-
+router.post("/public/xtu/unknown-transfers/refund-challenge", async (_req, res) => res.status(410).send({
+  refund: "automatic_refund_only",
+  message: "Eligible official XTU transfers are processed automatically. Sender signatures and refund requests are not required.",
+}));
+router.post("/public/xtu/unknown-transfers/refund-request", async (_req, res) => res.status(410).send({
+  refund: "automatic_refund_only",
+  message: "Eligible official XTU transfers are processed automatically. Sender signatures and refund requests are not required.",
+}));
 router.post("/admin/xtu/unknown-transfers/list", async (req, res) => {
   const { pswd, pin, limit } = req.body || {};
   if (pswd !== decrypt(admin_pswd, DB_CONFIG.password) || pin !== decrypt(admin_pin, DB_CONFIG.password)) {
@@ -5301,170 +5545,14 @@ router.post("/admin/xtu/unknown-refunds/list", async (req, res) => {
 
 // Public challenge for a finalized official BSC-USD transfer from an unregistered sender.
 // The refund destination is bound to the original transaction's from address.
-router.post("/public/bsc/unknown-transfers/refund-challenge", async (req, res) => {
-  const txHash = String(req.body?.tx_hash || "").trim().toLowerCase();
-  const logIndex = Number(req.body?.log_index);
-  const senderInput = String(req.body?.sender_address || "").trim();
-  const contactEmail = String(req.body?.contact_email || "").trim().toLowerCase();
-  const reason = String(req.body?.reason || "").trim();
-  if (!/^0x[0-9a-f]{64}$/.test(txHash) || !Number.isInteger(logIndex) || logIndex < 0 || logIndex > 0xffffffff ||
-      !isEvmAddress(senderInput) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail) || contactEmail.length > 254 ||
-      reason.length < 5 || reason.length > 1000) {
-    return res.status(400).send({ refund: "invalid_request" });
-  }
-  let senderAddress;
-  try { senderAddress = checksumEvmAddress(senderInput); }
-  catch { return res.status(400).send({ refund: "invalid_sender_address" }); }
-
-  try {
-    const rows = await db.queryAsync(
-      `SELECT * FROM bsc_unknown_incoming_transfers
-       WHERE tx_hash=? AND log_index=? AND LOWER(from_address)=LOWER(?) LIMIT 1`,
-      [txHash, logIndex, senderAddress],
-    );
-    if (!rows.length) return res.status(404).send({ refund: "eligible_transfer_not_found" });
-    const transfer = rows[0];
-    const bscConfig = getPaymentPublicConfig();
-    if (!bscConfig.enabled || String(transfer.token_contract || "").toLowerCase() !== String(bscConfig.tokenContract || "").toLowerCase() ||
-        !["pending_admin", "refund_failed"].includes(String(transfer.status))) {
-      return res.status(409).send({ refund: "transfer_not_requestable" });
-    }
-    const existingRows = await db.queryAsync(
-      `SELECT * FROM bsc_unknown_refund_requests WHERE unknown_transfer_id=? LIMIT 1`, [String(transfer.id)],
-    );
-    const now = Date.now();
-    if (existingRows.length) {
-      const existing = existingRows[0];
-      if (["pending_admin", "approved", "refund_signed", "submitted", "completed", "assigned", "retained", "manual_review"].includes(String(existing.status))) {
-        return res.status(409).send({ refund: "request_already_exists", status: existing.status });
-      }
-      if (String(existing.status) === "challenge_pending" && Number(existing.challenge_expires_at_ms) > now) {
-        return res.send({ refund: "challenge_pending", request_reference: existing.request_reference,
-          challenge_message: existing.challenge_message, challenge_expires_at_ms: String(existing.challenge_expires_at_ms) });
-      }
-    }
-    const requestReference = createFinancialReference("BSCUNK");
-    const nonce = crypto.randomBytes(24).toString("hex");
-    const expiresAt = now + 15 * 60 * 1000;
-    const challengeMessage = [
-      "OneX BSC-USD unknown-transfer refund request",
-      `Request: ${requestReference}`,
-      "Network: BNB Smart Chain Mainnet (Chain ID 56)",
-      `Transaction: ${txHash}`,
-      `Log index: ${logIndex}`,
-      `Sender: ${senderAddress}`,
-      `Nonce: ${nonce}`,
-      `Expires at: ${new Date(expiresAt).toISOString()}`,
-      "Signing proves control of the original sender address; it does not authorize or guarantee a refund.",
-    ].join("\n");
-    await withTransaction(async (tx) => {
-      const [lockedTransfers] = await tx.query(
-        `SELECT id,status,from_address FROM bsc_unknown_incoming_transfers WHERE id=? LIMIT 1 FOR UPDATE`, [String(transfer.id)],
-      );
-      if (!lockedTransfers.length || !["pending_admin", "refund_failed"].includes(String(lockedTransfers[0].status)) ||
-          String(lockedTransfers[0].from_address).toLowerCase() !== senderAddress.toLowerCase()) {
-        throw new Error("The BSC unknown transfer changed while the challenge was being created.");
-      }
-      const [lockedRequests] = await tx.query(
-        `SELECT * FROM bsc_unknown_refund_requests WHERE unknown_transfer_id=? LIMIT 1 FOR UPDATE`, [String(transfer.id)],
-      );
-      if (lockedRequests.length) {
-        await tx.query(
-          `UPDATE bsc_unknown_refund_requests SET request_reference=?,sender_address=?,contact_email=?,requester_reason=?,
-             challenge_message=?,challenge_expires_at_ms=?,signature_hash=NULL,proof_verified_at_ms=NULL,status='challenge_pending',
-             admin_username=NULL,admin_reason=NULL,refund_id=NULL,updated_at_ms=?,approved_at_ms=NULL,resolved_at_ms=NULL,completed_at_ms=NULL
-           WHERE id=?`,
-          [requestReference, senderAddress, contactEmail, reason, challengeMessage, String(expiresAt), String(now), String(lockedRequests[0].id)],
-        );
-      } else {
-        await tx.query(
-          `INSERT INTO bsc_unknown_refund_requests
-           (request_reference,unknown_transfer_id,sender_address,contact_email,requester_reason,challenge_message,
-            challenge_expires_at_ms,status,created_at_ms,updated_at_ms)
-           VALUES(?,?,?,?,?,?,?,'challenge_pending',?,?)`,
-          [requestReference, String(transfer.id), senderAddress, contactEmail, reason, challengeMessage, String(expiresAt), String(now), String(now)],
-        );
-      }
-    });
-    return res.send({ refund: "challenge_created", request_reference: requestReference,
-      challenge_message: challengeMessage, challenge_expires_at_ms: String(expiresAt) });
-  } catch (error) {
-    console.error("BSC-USD unknown-transfer refund challenge failed:", error.message);
-    return res.status(409).send({ refund: "challenge_failed" });
-  }
-});
-
-router.post("/public/bsc/unknown-transfers/refund-request", async (req, res) => {
-  const requestReference = String(req.body?.request_reference || "").trim();
-  const signature = String(req.body?.signature || "").trim();
-  if (!/^[A-Za-z0-9]{20,64}$/.test(requestReference) || !/^0x(?:[0-9a-f]{2}){1,4096}$/i.test(signature)) {
-    return res.status(400).send({ refund: "invalid_request" });
-  }
-  try {
-    const rows = await db.queryAsync(
-      `SELECT r.*,u.from_address,u.tx_hash,u.log_index,u.status AS transfer_status,u.token_contract
-       FROM bsc_unknown_refund_requests r INNER JOIN bsc_unknown_incoming_transfers u ON u.id=r.unknown_transfer_id
-       WHERE r.request_reference=? LIMIT 1`, [requestReference],
-    );
-    if (!rows.length) return res.status(404).send({ refund: "request_not_found" });
-    const request = rows[0];
-    const publicConfig = getPaymentPublicConfig();
-    if (String(request.status) !== "challenge_pending" || Number(request.challenge_expires_at_ms) <= Date.now() ||
-        !["pending_admin", "refund_failed"].includes(String(request.transfer_status)) ||
-        String(request.token_contract).toLowerCase() !== String(publicConfig.tokenContract || "").toLowerCase()) {
-      return res.status(409).send({ refund: "challenge_expired_or_not_requestable" });
-    }
-    const senderAddress = checksumEvmAddress(String(request.from_address));
-    let senderProofValid = false;
-    try {
-      senderProofValid = verifyMessage(String(request.challenge_message), signature).toLowerCase() === senderAddress.toLowerCase();
-    } catch {}
-    if (!senderProofValid) {
-      const provider = await getBscAddressProofProvider();
-      const code = await provider.getCode(senderAddress);
-      if (code && code !== "0x") {
-        try {
-          const digest = hashMessage(String(request.challenge_message));
-          const data = EIP1271_INTERFACE.encodeFunctionData("isValidSignature", [digest, signature]);
-          const result = await provider.call({ to: senderAddress, data });
-          const [magicValue] = EIP1271_INTERFACE.decodeFunctionResult("isValidSignature", result);
-          senderProofValid = String(magicValue).toLowerCase() === EIP1271_MAGIC_VALUE;
-        } catch {}
-      }
-    }
-    if (!senderProofValid || senderAddress.toLowerCase() !== String(request.sender_address).toLowerCase()) {
-      return res.status(403).send({ refund: "signature_sender_mismatch" });
-    }
-    const signatureHash = crypto.createHash("sha256").update(signature).digest("hex");
-    await withTransaction(async (tx) => {
-      const [lockedRequests] = await tx.query(`SELECT * FROM bsc_unknown_refund_requests WHERE id=? LIMIT 1 FOR UPDATE`, [String(request.id)]);
-      const [lockedTransfers] = await tx.query(`SELECT * FROM bsc_unknown_incoming_transfers WHERE id=? LIMIT 1 FOR UPDATE`, [String(request.unknown_transfer_id)]);
-      if (!lockedRequests.length || !lockedTransfers.length || lockedRequests[0].status !== "challenge_pending" ||
-          Number(lockedRequests[0].challenge_expires_at_ms) <= Date.now() ||
-          !["pending_admin", "refund_failed"].includes(String(lockedTransfers[0].status))) {
-        throw new Error("The BSC refund request changed or its challenge expired.");
-      }
-      const now = String(Date.now());
-      await tx.query(
-        `UPDATE bsc_unknown_refund_requests SET signature_hash=?,proof_verified_at_ms=?,status='pending_admin',
-           challenge_expires_at_ms=NULL,updated_at_ms=? WHERE id=? AND status='challenge_pending'`,
-        [signatureHash, now, now, String(request.id)],
-      );
-      await tx.query(
-        `INSERT IGNORE INTO bsc_unknown_refund_request_events
-         (request_id,event_key,event_type,actor_type,actor_reference,old_status,new_status,reason,tx_hash,created_at_ms)
-         VALUES(?,?,'request_submitted','sender',?,'challenge_pending','pending_admin',?,?,?)`,
-        [String(request.id), `bsc-unknown-refund:${request.id}:request-submitted:${signatureHash.slice(0,16)}`,
-          senderAddress, "Original sender address proved control by signing the refund challenge.", String(request.tx_hash), now],
-      );
-    });
-    return res.send({ refund: "submitted_for_administrative_review", request_reference: requestReference });
-  } catch (error) {
-    console.error("BSC-USD unknown-transfer refund request failed:", error.message);
-    return res.status(409).send({ refund: "request_rejected" });
-  }
-});
-
+router.post("/public/bsc/unknown-transfers/refund-challenge", async (_req, res) => res.status(410).send({
+  refund: "automatic_refund_only",
+  message: "Eligible official BSC-USD transfers are processed automatically. Sender signatures and refund requests are not required.",
+}));
+router.post("/public/bsc/unknown-transfers/refund-request", async (_req, res) => res.status(410).send({
+  refund: "automatic_refund_only",
+  message: "Eligible official BSC-USD transfers are processed automatically. Sender signatures and refund requests are not required.",
+}));
 router.post("/admin/bsc/unknown-transfers/list", async (req, res) => {
   const { pswd, pin, limit } = req.body || {};
   if (
@@ -6910,6 +6998,18 @@ function parseDepositBatchReasons(raw) {
 
 async function holdOutstandingDepositBatchesForDeactivatedAccount(username) {
   return withTransaction(async (tx) => {
+    const [commonLockRows] = await tx.query(
+      `SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE`,
+    );
+    if (!commonLockRows.length) throw new Error("The common-state lock row has not been initialized");
+    const [accountRows] = await tx.query(
+      `SELECT username,wallet_address,account_active FROM auths WHERE username=? LIMIT 1 FOR UPDATE`, [username],
+    );
+    if (!accountRows.length || Number(accountRows[0].account_active) !== 0) {
+      throw new Error("The account must be confirmed deactivated before routing its deposits to automatic refunds.");
+    }
+    const wallet = String(accountRows[0].wallet_address || "").toLowerCase();
+    await ensureWalletFinancialLockTx(tx, wallet, Date.now());
     const [batchRows] = await tx.query(
       `SELECT * FROM users_usdt_deposit_batches
        WHERE username=? AND remaining_amount>0
@@ -6920,35 +7020,33 @@ async function holdOutstandingDepositBatchesForDeactivatedAccount(username) {
     );
     const now = Date.now();
     const batchIds = [];
+    let queuedAmount = new BigNumber(0);
     for (const batch of batchRows) {
-      const reasons = parseDepositBatchReasons(batch.reason_codes)
-        .filter((reason) => reason !== "account_unavailable");
-      if (!reasons.includes("account_deactivated")) reasons.push("account_deactivated");
-      const reasonJson = safeJson(reasons);
-      await tx.query(
-        `UPDATE users_usdt_deposit_batches
-         SET status='pending_support',pending_since_ms=COALESCE(pending_since_ms,?),
-             next_attempt_at_ms=NULL,reason_codes=?,updated_at_ms=?
-         WHERE id=? AND remaining_amount>0`,
-        [String(now), reasonJson, String(now), String(batch.id)],
-      );
-      await updateBatchEventStatus(tx, batch.id, "pending_support", reasons);
-      await queueDepositBatchStatusTx(
-        tx,
-        username,
-        batch.id,
-        "pending_support",
-        reasons,
-        null,
-        {
-          sessionTotal: String(batch.total_amount || "0"),
-          creditedAmount: String(batch.credited_amount || "0"),
-          remainingAmount: String(batch.remaining_amount || "0"),
-        },
-      );
-      batchIds.push(String(batch.id));
+      try {
+        const result = await transferBscBatchRemainderToAutomaticRefundTx(
+          tx, { ...batch, sender_address: wallet }, "C", now, "account_deactivated",
+        );
+        if (result.queued) {
+          queuedAmount = queuedAmount.plus(result.amount);
+          batchIds.push(String(batch.id));
+          await queueDepositBatchStatusTx(tx, username, batch.id, "refund_queued", ["account_deactivated"], null, {
+            asset: "BSC-USD", sessionTotal: String(batch.total_amount || "0"),
+            creditedAmount: String(batch.credited_amount || "0"), remainingAmount: result.amount,
+            refundCategory: "C",
+          });
+        }
+      } catch (error) {
+        await tx.query(
+          `UPDATE users_usdt_deposit_batches SET status='manual_review',reason_codes=?,
+           expiration_paused_at_ms=?,expiration_pause_reason='account_deactivation_refund_reconciliation',updated_at_ms=?
+           WHERE id=?`,
+          [safeJson(["account_deactivation_refund_reconciliation"]), String(now), String(now), String(batch.id)],
+        );
+        await updateBatchEventStatus(tx, batch.id, "manual_review", ["account_deactivation_refund_reconciliation"]);
+        console.error(`Deactivated account deposit batch ${batch.id} requires refund reconciliation:`, error.message);
+      }
     }
-    return { count: batchIds.length, batchIds };
+    return { count: batchIds.length, batchIds, queuedAmount: queuedAmount.toFixed(18) };
   });
 }
 
@@ -7087,7 +7185,14 @@ async function changeAccountAccess(req, res, action) {
 
     if (action === "deactivated" && ["deactivated", "already deactivated"].includes(result.account)) {
       const holdResult = await holdOutstandingDepositBatchesForDeactivatedAccount(U);
-      result = { ...result, deposit_batches_held: holdResult.count };
+      const { routeOutstandingXtuBatchesToAutomaticRefund } = require("./xtu-deposit-worker");
+      const xtuHoldResult = await routeOutstandingXtuBatchesToAutomaticRefund(db, U);
+      result = {
+        ...result,
+        deposit_batches_held: holdResult.count,
+        xtu_batches_refund_queued: xtuHoldResult.count,
+        xtu_refund_events_queued: xtuHoldResult.events,
+      };
     }
 
     if (action === "activated" && ["activated", "already active"].includes(result.account)) {
