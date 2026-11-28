@@ -1,0 +1,1084 @@
+ONEXSERVER — MISE À JOUR COMPLÉMENTAIRE DE LA SPÉCIFICATION CONSOLIDÉE
+BSC-USD, XTU LIBRES ET DISBURSEMENTS
+
+RÉVISION 5 — MAJ6 CONSOLIDÉE — MISE À JOUR 3
+Date : 28 novembre 2026
+Objet : uniformisation de l'éligibilité des remboursements automatiques, conservation sans limite de durée des petits remboursements, blocage des inscriptions avec remboursement en attente, gestion administrative des réserves (dépenses, recouvrements et dons) et transfert au remboursement automatique des dépôts BSC-USD actifs non qualifiés à l'expiration de 30 jours.
+
+STATUT
+Décisions métier confirmées par l'utilisateur. Le présent document constitue la troisième mise à jour de MAJ6 consolidée du 28 novembre 2026. Il complète la Révision 5 — MAJ5 du 27 novembre 2026 et remplace les formulations antérieures de MAJ6 relatives au délai de revue de 30 jours des petits remboursements, à la réaffectation de remboursements vers un dépôt lors d'une inscription et à l'affectation aux réserves communes des reliquats de dossiers d'achat BSC-USD actifs non qualifiés après 30 jours. Désormais, ces derniers reliquats sont transférés au remboursement automatique selon les mêmes règles que les autres remboursements. Les règles de MAJ5 qui ne sont pas expressément modifiées restent applicables. En cas de contradiction, cette version prévaut.
+
+======================================================================
+0. PORTÉE ET PRIORITÉ DE MAJ6
+======================================================================
+
+MAJ6 apporte une règle commune à tous les remboursements automatiques OneX : chaque remboursement, qu'il concerne un transfert unique ou un groupe de transferts, doit satisfaire le même minimum net d'éligibilité après retenue de remboursement et estimation du gas.
+
+Le minimum ne peut pas être contourné en traitant individuellement plusieurs petits transferts. Un transfert dont le net remboursable reste inférieur à une unité du token source est conservé et peut être agrégé avec d'autres transferts compatibles du même expéditeur et du même token exact. Aucun transfert sortant inférieur au minimum n'est signé ou diffusé.
+
+Lorsqu'un compte est désactivé, le serveur active pour ce compte le routage de remboursement automatique. Ce routage couvre :
+- tous les montants de dépôts connus qui n'ont pas encore été crédités à la date de désactivation ;
+- tous les montants de tentatives de dépôt disqualifiées et non créditées ;
+- chaque nouveau transfert officiel BSC-USD ou XTU reçu ultérieurement depuis l'adresse enregistrée liée au compte désactivé.
+
+À chaque nouveau transfert finalisé, ainsi que lors des reprises périodiques du worker, le serveur réévalue le transfert reçu et l'ensemble des montants de remboursement encore en attente ayant la même adresse source et le même contrat/token. Si le montant net agrégé atteint le minimum, le remboursement correspondant est automatiquement préparé, sans demande utilisateur ni approbation administrative préalable, sous réserve des contrôles de sécurité, de finalité, de gas, de liquidité et d'idempotence.
+
+Le minimum est exprimé dans le token source :
+- BSC-USD : au moins 1 BSC-USD net ;
+- XTU : au moins 1 XTU net.
+
+La parité comptable interne 1 XTU = 1 BSC-USD ne permet jamais de regrouper ou de convertir des remboursements entre ces deux tokens.
+
+Les dispositions de MAJ5 qui restent applicables comprennent notamment la finalité blockchain, le délai minimal de 30 minutes par événement, la retenue de remboursement de 1 %, le plafond de gas de 0,4 BSC-USD, le retour dans le même token vers l'adresse source, la conservation des petits remboursements sans limite de durée jusqu'à leur règlement, les contrôles d'idempotence et la séparation des registres.
+
+La présente mise à jour modifie également expressément la règle de la section 3.2 de MAJ5 qui affectait auparavant aux réserves communes le reliquat d'un dossier d'achat BSC-USD actif lorsque le minimum de qualification n'était pas atteint avant l'expiration de 30 jours. Ce reliquat rejoint désormais le circuit de remboursement automatique, sous la catégorie D définie ci-dessous.
+
+Sections de MAJ5 concernées : 0, 3.2, 9.1, 9.3 à 9.8, 17.6, 17.8 et 17.9. Les autres dispositions restent inchangées.
+
+======================================================================
+1. COMPARAISON AVEC L'IMPLÉMENTATION DE ONEXSERVER RÉVISION 4
+======================================================================
+
+La comparaison ci-dessous porte sur le contenu réel de l'archive OneXServer-Revision4.zip, notamment les fichiers JavaScript, le schéma db.js, les tests et le document de spécification Révision 4 inclus dans l'archive. Il s'agit d'une inspection statique des fichiers ; aucun test, déploiement ou traitement blockchain n'est déclaré comme exécuté.
+
+1.1. Dépôts BSC-USD d'un compte désactivé
+
+État constaté dans la Révision 4 :
+- routes.js, fonction processConfirmedUsdtPayment : un transfert reçu depuis un compte dont account_active n'est pas égal à 1 est classé avec le motif account_deactivated et son dépôt est placé en pending_support ;
+- routes.js, fonction holdOutstandingDepositBatchesForDeactivatedAccount : les batches ayant encore un remaining_amount positif sont déplacés vers pending_support, leur prochaine tentative est annulée et leurs événements sont mis à jour ;
+- routes.js, fonction releaseDeactivatedDepositBatches : la réactivation retire le motif account_deactivated et permet de réveiller immédiatement le traitement du dépôt ;
+- tests/account-deactivation-deposits.test.js : les tests présents vérifient précisément cette mise en attente, puis la reprise après réactivation ;
+- disbursement.js, fonction processOneRefundJob : le worker refuse explicitement les remboursements liés à un batch connu (batch_id non nul). Il n'existe donc pas, dans cette version, de remboursement automatique des dépôts connus désactivés.
+
+Décision MAJ5/MAJ6 :
+Le mécanisme pending_support suivi d'une reprise après réactivation ne doit plus être le mécanisme de traitement financier des montants non crédités d'un compte désactivé. Ces montants passent dans le circuit de remboursement automatique. La réactivation ultérieure ne les réintroduit pas dans le circuit de dépôt.
+
+1.2. Dépôts XTU d'un compte désactivé
+
+État constaté dans la Révision 4 :
+- xtu-deposit-worker.js, fonction assignDepositEventTx : lorsque account_active n'est pas égal à 1, le motif account_deactivated bloque le crédit et le batch passe en pending_support ;
+- le crédit final vérifie de nouveau account_active et refuse un compte désactivé ;
+- les notifications et le worker de dépôt mentionnent l'expiration fixe de 30 jours et l'affectation irréversible du montant non crédité aux réserves communes ;
+- le chemin observé ne transfère pas automatiquement ces sommes au remboursement.
+
+Décision MAJ5/MAJ6 :
+Pour un compte désactivé, aucun XTU libre n'est crédité. Le montant non crédité rejoint le registre de remboursement automatique, avec application du minimum net commun et de l'agrégation par expéditeur/token. Il demeure conservé sans limite de durée jusqu'à son remboursement ou une résolution administrative explicite et auditée. Il ne peut pas être affecté aux réserves communes en raison de l'expiration ordinaire d'un dépôt.
+
+1.3. Transferts officiels provenant d'adresses inconnues
+
+État constaté dans la Révision 4 :
+- le remboursement BSC-USD d'un transfert inconnu passe par une demande, une preuve de contrôle de l'adresse source et une résolution administrative ;
+- le remboursement XTU inconnu passe également par une demande avec challenge et signature EIP-191/EIP-1271, puis par une approbation administrative ;
+- les workers de remboursement attendent un transfert ou une demande approuvée avant de signer ;
+- le workflow BSC-USD refuse les remboursements de batches de comptes connus ;
+- les registres inconnus et les tables de demande/résolution sont conçus autour d'un transfert inconnu individuel, et non d'un groupe multi-événements.
+
+Décision MAJ5/MAJ6 :
+Pour les transferts officiels admissibles au remboursement automatique, aucune demande, signature de l'expéditeur ou approbation administrative préalable n'est exigée lorsque le remboursement est envoyé vers l'adresse from vérifiée. Les anomalies de rapprochement ou de sécurité restent soumises à manual_review.
+
+1.4. Ancien minimum de remboursement et anciennes retenues
+
+État constaté dans la Révision 4 :
+- refund-policy.js dérive le minimum BSC-USD du minimum de paiement sortant, égal à deux fois le plafond maximal de gas ; avec un plafond de 0,4 BSC-USD, le résultat est 0,8 BSC-USD net ;
+- les tests refund-minimum-policy.test.js vérifient cette relation ;
+- les tests XTU unknown refund utilisent également un minimum net de 0,8 XTU ;
+- xtu-unknown-refund-policy.js et ses tests reflètent l'ancien mécanisme de frais de contrat XTU de 0,1 %.
+
+Décision MAJ5/MAJ6 :
+L'ancien minimum dérivé de deux fois le plafond de gas est définitivement supprimé pour tous les remboursements automatiques. Il n'existe plus de seuil opérationnel de 0,8 BSC-USD ou 0,8 XTU. Le minimum net fixe est de 1 unité du token source. La valeur 0,8 n'est conservée ici qu'à titre d'explication historique du code Révision 4 et ne doit figurer dans aucune constante, configuration, branche de décision ou assertion de test active du moteur de remboursement. Le plafond de gas de 0,4 BSC-USD reste un contrôle de signature séparé et ne sert plus à calculer le minimum. L'ancienne retenue/commission contractuelle XTU de 0,1 % ne doit pas être réintroduite : le contrat XTU de la Révision 5 est sans commission de token. La retenue de remboursement hors chaîne de 1 % définie en MAJ5 reste applicable.
+
+1.5. Conséquence architecturale
+
+Les tables et fonctions de remboursement de la Révision 4 ne peuvent pas être reprises sans adaptation : les parcours existants sont principalement liés à un transfert inconnu individuel et, dans plusieurs cas, à une demande signée et approuvée. MAJ6 nécessite un registre de groupes de remboursement et un registre de rattachement de chaque événement source à un groupe. Les événements sources restent immuables et auditables.
+
+1.6. Expiration d'un dossier d'achat BSC-USD actif non qualifié
+
+La règle MAJ5 qui affectait le reliquat d'un dossier d'achat BSC-USD aux réserves communes après 30 jours sans qualification est remplacée par la catégorie D de remboursement automatique. L'implémentation doit donc supprimer toute affectation automatique à common.total_units_price ou aux réserves communes déclenchée uniquement par cette expiration. Les montants déjà crédités ne sont jamais repris ; seuls les montants source reçus et encore non crédités rejoignent le remboursement.
+
+Références de code Révision 4 examinées (numéros de lignes dans les fichiers de l'archive) :
+- routes.js:1623-1765 : processConfirmedUsdtPayment ; le contrôle account_active et le classement en pending_support sont visibles aux lignes 1697-1725 ;
+- routes.js:6909-6950 : holdOutstandingDepositBatchesForDeactivatedAccount ; routes.js:6953-6995 : releaseDeactivatedDepositBatches ; routes.js:7019-7101 : changeAccountAccess ;
+- tests/account-deactivation-deposits.test.js:25-85 : les assertions attendent pending_support et la reprise après réactivation ;
+- disbursement.js:1825-1827 : processOneRefundJob refuse explicitement un remboursement lié à un batch connu ;
+- xtu-deposit-worker.js:255-290 : affectation des transferts XTU inconnus ; xtu-deposit-worker.js:320-394 : account_deactivated et pending_support ; xtu-deposit-worker.js:455-465 : notifications d'expiration et d'affectation au common reserve ; xtu-deposit-worker.js:1262-1265 : blocage du crédit lorsque le compte est désactivé ;
+- routes.js:4960-5121 et 5154-5263 : challenge, preuve expéditeur et approbation administrative des remboursements XTU inconnus ;
+- routes.js:5302-5459 et 5495-5656 : challenge, preuve expéditeur et résolution administrative des remboursements BSC-USD inconnus ;
+- xtu-deposit-worker.js:2268-2304 et 2340-2445 : préparation et signature d'un remboursement XTU inconnu après approbation ;
+- refund-policy.js, outgoing-payout-policy.js et tests/refund-minimum-policy.test.js:20-35 : minimum net BSC-USD dérivé de deux fois le plafond de gas ; avec 0,4, le minimum est 0,8 ;
+- xtu-unknown-refund-policy.js et tests/xtu-unknown-refund-policy.test.js:7-35 : ancien calcul XTU, minimum de 0,8 et frais de contrat de 0,1 % ;
+- db.js:1396-1492 et db.js:1151-1232 : tables de remboursement BSC-USD et XTU, requests, références uniques et registres d'événements ;
+- docs/ONEXSERVER_SPECIFICATION_CONSOLIDEE_XTU_BSCUSD_REVISION4_2026-11-25.txt:414-570 : section 8, qui exclut le remboursement des dépôts de comptes connus et réserve le remboursement des transferts inconnus à une demande et une décision administrative.
+
+======================================================================
+2. RÈGLE UNIQUE D'ÉLIGIBILITÉ DES REMBOURSEMENTS AUTOMATIQUES
+======================================================================
+
+2.1. Catégories couvertes
+
+Le même moteur d'éligibilité et le même minimum net s'appliquent aux quatre catégories suivantes :
+
+A. Transfert officiel inconnu :
+- transfert du contrat exact BSC-USD officiel ou du contrat exact XTU officiel ;
+- BNB Smart Chain Mainnet, Chain ID 56 ;
+- destination égale à l'adresse officielle de réception OneX du token ;
+- adresse source from non enregistrée dans un compte OneX au moment du traitement ;
+- événement finalisé et rapproché.
+
+B. BSC-USD reçu pendant le disbursement global :
+- transfert BSC-USD officiel sur Chain ID 56 vers l'adresse officielle de réception OneX ;
+- réception pendant la période globale, y compris l'extension de réclamation de 30 jours ;
+- expéditeur enregistré ou inconnu ;
+- classement exclusif dans le circuit de remboursement automatique, sans essai de dépôt BSC-USD.
+
+C. Transfert officiel provenant d'un compte désactivé :
+- transfert du contrat exact BSC-USD ou XTU officiel sur Chain ID 56 vers l'adresse de réception OneX correspondante ;
+- adresse source enregistrée et liée à un compte dont account_active=0 au moment où le serveur traite l'événement ;
+- désactivation manuelle, administrative, à la suite du dépassement de la limite de transferts avant qualification, ou automatique après 360 jours d'inactivité ;
+- événement finalisé et rapproché.
+
+La catégorie C inclut les soldes non crédités des dépôts préexistants à la date de désactivation et chaque nouveau transfert reçu depuis cette adresse après la désactivation.
+
+D. Dossier d'achat BSC-USD d'un compte actif expiré sans qualification :
+- dossier d'achat alimenté par un ou plusieurs transferts BSC-USD officiels, finalisés et rapprochés, depuis une adresse enregistrée associée à un compte actif ;
+- échéance immuable de 30 jours calculée à partir du premier transfert finalisé du dossier, conformément à MAJ5 ;
+- minimum cumulé de qualification de 20 BSC-USD bruts non atteint dans la limite de cinq événements au moment de l'échéance ;
+- compte encore actif au moment du classement du dossier en catégorie D, et absence de classement prioritaire en catégorie B ou C ;
+- dossier non qualifié et montant source encore non crédité.
+
+À l'échéance, tous les événements du dossier qui correspondent à un principal réellement reçu mais non crédité sont transférés, événement par événement, au registre de remboursement automatique. La catégorie D ne reprend jamais une portion déjà créditée.
+
+Les catégories sont exclusives pour chaque événement source. Si le compte est désactivé avant le classement à l'échéance, la catégorie C prévaut. Un BSC-USD reçu pendant la campagne globale reste classé en catégorie B selon les règles de priorité de MAJ5.
+
+Les transferts non officiels, faux tokens, contrats différents, autres réseaux et destinations non prises en charge restent exclus. Ils ne créent aucun droit à remboursement.
+
+2.2. Priorité de routage d'un compte désactivé
+
+Dès que le serveur traite un transfert finalisé, il vérifie le statut du compte rattaché à l'adresse from. Si account_active=0 :
+- le routage de remboursement catégorie C prévaut sur le routage normal de dépôt ;
+- aucun actif initial n'est crédité à partir du BSC-USD ;
+- aucun XTU libre n'est crédité à partir du XTU ;
+- aucun cycle, activité, droit de service ou participation au disbursement global n'est créé par le transfert ;
+- le montant réellement reçu est ajouté au registre de remboursement du même token ;
+- le serveur réévalue immédiatement le cumul encore impayé de cette adresse et de ce token ;
+- le serveur ne demande ni réactivation du compte, ni demande de remboursement, ni signature de wallet, ni approbation administrative préalable.
+
+Lors de la désactivation, un worker transactionnel examine également les dépôts BSC-USD et les essais XTU libres déjà ouverts. Seules les portions réellement reçues mais non créditées sont transférées vers le remboursement. Toute portion déjà créditée reste acquise et ne peut pas être reprise ou remboursée par ce circuit.
+
+Une réactivation ultérieure du compte ne remet jamais un événement déjà affecté au remboursement dans le circuit de dépôt ou de crédit. Les remboursements réservés, signés, diffusés ou incertains continuent leur rapprochement jusqu'à leur résolution.
+
+2.2.1. Expiration d'un dossier BSC-USD non qualifié d'un compte actif — catégorie D
+
+À l'expiration de l'échéance immuable de 30 jours d'un dossier d'achat BSC-USD, le serveur vérifie sous verrou financier par adresse et sous verrou du dossier si le cumul brut a atteint le minimum de 20 BSC-USD au plus tard avec le cinquième événement. Si le minimum n'est pas atteint et que le compte est toujours actif :
+- clôturer l'essai/dossier d'achat comme `expired_unqualified` ;
+- transférer au registre de remboursement automatique, catégorie D, chacun des événements du dossier correspondant à un montant BSC-USD effectivement reçu et encore non crédité ;
+- conserver le montant brut réellement reçu comme principal remboursable, sans crédit d'actifs initiaux ni création d'activité d'achat ;
+- annuler toute tfees d'achat provisoire ou non définitivement comptabilisée ; aucun frais d'achat ne peut être cumulé avec la retenue automatique de remboursement de 1 % sur un principal jamais crédité ;
+- appliquer la formule générale de remboursement : retenue de 1 % par événement, gas estimé déduit une seule fois par paiement groupé, et minimum net de 1 BSC-USD ;
+- si le net disponible est inférieur à 1 BSC-USD, conserver les fonds sans limite de durée et réévaluer à chaque nouvel événement compatible dirigé vers le remboursement ainsi que par worker périodique ;
+- ne rien affecter à `common.total_units_price`, `common.backed_units`, `common.admin_expens` ni à une réserve commune au seul motif de cette expiration ;
+- ne pas désactiver le compte du seul fait de cette expiration ; la présente règle clôt le dossier de dépôt non qualifié et crée une obligation de restitution, sans modifier à elle seule `account_active` ;
+- enregistrer le motif `deposit_expired_without_minimum` et préserver la référence de chaque événement source ainsi que l'échéance initiale.
+
+Si le minimum de qualification de 20 BSC-USD a été atteint au plus tard avec le cinquième événement, le dossier reste soumis au traitement normal d'achat BSC-USD. Cette mise à jour ne transforme pas en remboursement un achat déjà qualifié dont le crédit attend uniquement un financement ou un traitement normal des réserves.
+
+Le worker d'expiration ne peut clôturer le dossier qu'après avoir vérifié que les scanners ont rattrapé tous les événements officiels finalisés jusqu'à la frontière blockchain correspondant à l'échéance. Un événement finalisé avant l'échéance mais découvert tardivement doit être réintégré à l'évaluation du dossier avant sa clôture. Un transfert finalisé après la frontière de clôture n'est pas ajouté rétroactivement au dossier expiré : il suit un nouvel essai de dépôt ou une autre catégorie prioritaire applicable.
+
+La transition vers la catégorie D est atomique et idempotente. Un événement source ne peut jamais rester simultanément dans un dossier de dépôt créditable et dans le registre de remboursement.
+
+Un nouveau transfert BSC-USD finalisé après la frontière de clôture du dossier expiré ne rejoint pas rétroactivement le dossier D. Pour un compte qui reste actif et hors campagne globale, il ouvre un nouvel essai/dossier d'achat ordinaire avec son propre compteur et sa propre échéance de 30 jours, sauf si une autre règle prioritaire de remboursement s'applique (notamment désactivation ou campagne globale). Cet événement de dépôt ordinaire ne peut pas être utilisé pour compléter artificiellement le minimum d'un groupe de remboursement D ; seul un événement qui a lui-même été classé au remboursement peut être agrégé dans ce groupe.
+
+2.3. Minimum net uniforme
+
+Le remboursement automatique est éligible uniquement si le bénéficiaire reçoit au moins une unité nette du token source après application de la retenue de remboursement et du gas estimé.
+
+Minimums fixes :
+- BSC-USD : R >= 1 BSC-USD ;
+- XTU : R >= 1 XTU.
+
+Ces minimums sont des règles métier fixes. Ils ne sont pas recalculés à partir de BSC_MAX_TX_FEE_BSC_USD, du minimum vendeur, du minimum de retrait XTU, du minimum de dépôt XTU ou du minimum d'un disbursement.
+
+Le contrôle de gas demeure séparé : une transaction sortante OneX ne peut pas être signée si son gas estimé dépasse 0,4 BSC-USD. Si le gas estimé est supérieur à ce plafond, le remboursement reste en attente et sera réévalué ultérieurement.
+
+2.4. Formule d'un remboursement unique ou groupé
+
+Pour chaque événement source i :
+
+A_i = montant du token source réellement reçu par le Hot Wallet pour cet événement ;
+F_i = A_i × 1 % ;
+
+Pour un groupe composé de n événements compatibles :
+
+A_total = somme(A_i) ;
+F_total = somme(F_i) ;
+G_group = estimation du gas BNB de l'unique transaction sortante du groupe, convertie dans le token source selon la parité comptable interne 1:1 ;
+R_group = A_total - F_total - G_group.
+
+Le groupe est éligible uniquement si R_group >= 1 unité du token source, si chaque événement composant le groupe est finalisé et si chacun a franchi son propre délai minimal de 30 minutes.
+
+Le gas est estimé une seule fois pour la transaction sortante groupée. Il ne doit pas être déduit une fois par événement source lorsque plusieurs événements sont payés dans une seule transaction. La retenue de 1 % reste calculée et auditée par événement source, puis additionnée au niveau du groupe.
+
+Aucune conversion BSC-USD/XTU n'est autorisée. La valeur comptable 1:1 sert uniquement à convertir le coût réel de gas dans le token source ; elle ne constitue pas une liquidité de remplacement.
+
+2.5. Conditions d'agrégation
+
+Les petits remboursements peuvent être agrégés exclusivement lorsque toutes les conditions suivantes sont réunies :
+- même réseau : BNB Smart Chain Mainnet, Chain ID 56 ;
+- même contrat exact de token ;
+- même token source : BSC-USD avec BSC-USD, ou XTU avec XTU ;
+- même adresse source from ;
+- même adresse de destination de remboursement, obligatoirement l'adresse source from vérifiée ;
+- événements distincts, finalisés, uniques et non déjà crédités, remboursés, réservés ou consommés ;
+- chaque événement a franchi individuellement son délai de 30 minutes.
+
+Il est interdit de regrouper :
+- deux adresses source différentes, même si elles appartiennent ou ont appartenu à des comptes OneX ;
+- BSC-USD et XTU ;
+- deux contrats différents ;
+- un transfert officiel et un token non pris en charge ;
+- des montants déjà crédités à un utilisateur et des montants non crédités ;
+- des événements dont l'affectation financière est en conflit ou en manual_review.
+
+Le groupe conserve le détail de tous ses événements sources. Un paiement agrégé ne supprime jamais la traçabilité individuelle des transferts reçus.
+
+======================================================================
+3. PETITS REMBOURSEMENTS — CONSERVATION SANS LIMITE DE DURÉE
+======================================================================
+
+3.1. Montant net inférieur à une unité
+
+Lorsque le remboursement d'un événement isolé ou d'un groupe donne un net inférieur à 1 unité du token source, aucun transfert on-chain n'est signé ni diffusé. Les montants restent dans le registre de conservation des remboursements automatiques sous le minimum, sans échéance d'expiration ou de revue fondée sur leur ancienneté.
+
+Le serveur conserve pour chaque événement :
+- le montant réellement reçu ;
+- la retenue de 1 % ;
+- le gas estimé ou la quote de gas utilisée pour l'évaluation ;
+- le montant net estimé ;
+- l'adresse source et le contrat exact ;
+- le hash, le log index, le bloc, le reçu et la preuve de finalité ;
+- l'heure de réception/finalisation et l'heure à laquelle son délai individuel de 30 minutes expire ;
+- la catégorie de remboursement et le compte concerné lorsqu'il existe ;
+- les montants réservés, déjà remboursés et restant dus.
+
+Le droit à restitution n'est ni annulé, ni transféré aux réserves communes, ni confisqué par le seul fait que le montant est inférieur au minimum ou qu'une longue période s'est écoulée.
+
+3.2. Réévaluation à chaque nouveau transfert
+
+À chaque nouveau transfert officiel finalisé classé dans une catégorie de remboursement automatique, ainsi que lors de chaque reprise périodique du worker, le serveur :
+1. enregistre l'événement de façon idempotente ;
+2. identifie son groupe par réseau, contrat exact, token et adresse source ;
+3. ajoute uniquement les événements encore impayés, disponibles et ayant franchi leur délai individuel de 30 minutes ;
+4. recalcule A_total, F_total, G_group et R_group ;
+5. compare R_group au minimum fixe d'une unité du token source ;
+6. si le minimum est atteint et que les contrôles de gas, liquidité, finalité et sécurité sont satisfaits, réserve atomiquement le groupe et prépare un seul remboursement vers l'adresse source ;
+7. sinon, conserve les montants sans limite de durée et attend le prochain transfert compatible ou la prochaine reprise périodique.
+
+Cette vérification s'applique également aux adresses enregistrées liées à un compte désactivé. La désactivation n'arrête pas la réception des événements blockchain : elle modifie leur destination comptable, qui devient exclusivement le registre de remboursement.
+
+Le worker périodique continue les réévaluations même lorsqu'aucun nouveau transfert n'arrive. Il ne doit toutefois pas créer de paiement tant que le minimum net n'est pas atteint ou qu'un verrou de sécurité non résolu est présent.
+
+3.3. Aucune échéance de conservation, aucune revue automatique liée à l'ancienneté
+
+Il n'existe aucun délai maximal de conservation des petits remboursements. En particulier :
+- aucune échéance de 30 jours n'est calculée pour les événements ou les groupes de remboursement ;
+- aucun statut `review_due` n'est créé en raison de l'ancienneté d'un montant ;
+- aucune revue administrative automatique n'est déclenchée simplement parce que 30 jours se sont écoulés ;
+- aucun montant sous le minimum n'est annulé, expiré, confisqué, affecté à common.total_units_price, transféré aux réserves communes ou envoyé à un tiers du seul fait du temps écoulé ;
+- le groupe et ses événements restent en custody, traçables et réévaluables sans limite de durée ;
+- toute anomalie réelle de sécurité, de rapprochement, d'identité, de finalité ou d'état blockchain peut toujours déclencher `manual_review`, indépendamment de l'ancienneté ;
+- un dossier `manual_review` demeure bloquant jusqu'à une résolution documentée ; la suppression du délai de 30 jours ne supprime pas les contrôles de sécurité ni la revue manuelle justifiée par une anomalie.
+
+Dès que le cumul net atteint au moins 1 unité, le remboursement automatique reprend sans demande utilisateur ni approbation administrative préalable, sous réserve des contrôles normaux. Le délai de 30 minutes reste appliqué individuellement à chaque événement source et n'est pas supprimé par cette mise à jour.
+
+3.4. Blocage de l'inscription d'une adresse possédant un remboursement en attente
+
+Toute tentative d'inscription via `POST /app/signup` est refusée lorsque l'adresse BSC soumise possède au moins une obligation de remboursement automatique non entièrement réglée, quel que soit le token officiel concerné ou la catégorie d'origine du remboursement (A, B, C ou D).
+
+La règle s'applique notamment aux cas suivants :
+- un groupe est encore sous le minimum net de 1 unité ;
+- le minimum net est atteint mais le worker n'a pas encore préparé ou exécuté le paiement ;
+- un paiement est réservé, signé, diffusé ou dans un état blockchain incertain ;
+- un paiement a échoué et le montant reste dû après restauration des réservations ;
+- un reliquat demeure après un paiement partiel, une correction de gas ou un rapprochement ;
+- un dossier est en `manual_review` à la suite d'une anomalie non résolue.
+
+Une adresse ne redevient admissible à l'inscription qu'après confirmation finale de tous les remboursements concernés et après constat qu'aucun principal, reliquat, paiement incertain, réservation ou obligation de restitution ne subsiste dans le registre. Une résolution administrative ne peut lever le blocage qu'après une décision explicite, justifiée et auditée qui clôt effectivement l'obligation ; le simple changement d'un statut ne suffit pas.
+
+Aucune migration automatique d'un événement du registre de remboursement vers un dépôt n'est autorisée lors de l'inscription. La proposition antérieure de réaffectation de remboursements inconnus vers un essai de dépôt est annulée et remplacée par le présent blocage. Un événement source conserve son affectation au remboursement jusqu'à son règlement complet ou sa résolution formelle.
+
+3.4.1. Présentation du montant en attente dans la réponse JSON
+
+Lorsque l'inscription est bloquée, `/app/signup` répond avec un statut HTTP 423 et une réponse JSON dont la clé de contrôle est `auth`. Tous les champs textuels et toutes les valeurs d'action sont en anglais.
+
+La réponse doit exposer le montant en attente ventilé par token et par contrat exact, sans additionner des unités BSC-USD et XTU. Elle comprend `pending_totals_by_asset`, qui présente le cumul brut encore dû pour chaque actif/contrat séparément, ainsi que `pending_refunds`, qui détaille l'estimation nette et l'action attendue pour chaque groupe. Pour chaque groupe ou contrat/token concerné, retourner au minimum :
+- `asset_code` : `BSC-USD` ou `XTU` ;
+- `token_contract` ;
+- `pending_gross_amount` : principal brut encore non réglé, y compris les montants réservés mais dont le paiement n'est pas confirmé ;
+- `net_amount_currently_eligible` : net calculé uniquement sur les événements ayant déjà franchi leur délai individuel de 30 minutes ;
+- `estimated_net_refund_amount` : net projeté sur l'ensemble des événements finalisés encore dus du même groupe, avec la retenue de 1 % par événement et une seule déduction du gas estimé pour le paiement groupé ;
+- `minimum_net_amount` : `1` ;
+- `additional_net_amount_required` : différence positive éventuelle entre le minimum de 1 et le net projeté ; il s'agit d'un déficit net indicatif, pas du montant brut exact à envoyer ;
+- `refund_status`, `next_eligible_at_ms` lorsqu'un événement attend encore son délai de 30 minutes, et `next_action`.
+
+Les montants en BSC-USD et en XTU ne doivent jamais être additionnés dans un total arithmétique commun. La réponse contient une liste ou une structure par actif permettant d'afficher séparément chaque obligation. Pour le calcul du minimum, le serveur présente à la fois le net immédiatement payable et le net projeté après expiration du délai de 30 minutes des événements les plus récents. Si le net projeté atteint 1, l'utilisateur doit attendre le paiement ou la fin du délai individuel de 30 minutes ; il ne doit pas être invité à compléter inutilement le minimum.
+
+Valeurs d'action minimales :
+- `COMPLETE_MINIMUM_REQUIRED` lorsque le net projeté reste inférieur à 1 et qu'un complément compatible du même token, contrat et expéditeur peut permettre d'atteindre le seuil. L'utilisateur doit envoyer le complément depuis la même adresse source vers le portefeuille OneX correspondant ; ce nouvel événement rejoint le même circuit de remboursement et reste soumis à sa propre finalité et à son propre délai de 30 minutes ;
+- `WAIT_FOR_REFUND_COMPLETION` lorsque le net projeté atteint déjà 1 et que l'utilisateur doit attendre l'expiration de tout délai individuel restant puis la confirmation du paiement automatique ;
+- `WAIT_FOR_REFUND_RESOLUTION` lorsqu'un état `manual_review`, une incohérence, un gas non calculable ou une incertitude de transaction empêche de déterminer un complément sûr ou de finaliser le paiement.
+
+Message anglais recommandé pour le blocage : `Signup is temporarily blocked because this wallet address has an outstanding automatic refund. Complete the required minimum or wait until the refund is fully completed, as indicated below.`
+
+Si plusieurs actifs ou groupes présentent des actions différentes, chaque entrée porte sa propre valeur `next_action`. Le champ `auth` indique globalement `refund_pending` et la réponse contient tous les détails disponibles. Si le registre est inaccessible ou ne peut pas être rapproché de manière fiable, l'inscription échoue en mode fermé avec HTTP 503 et une réponse d'indisponibilité en anglais, par exemple `{"auth":"refund_check_unavailable","message":"We cannot verify outstanding refunds for this wallet right now. Please try again later."}` ; le serveur ne doit jamais autoriser l'inscription faute d'avoir pu vérifier les remboursements.
+
+3.4.2. Synchronisation concurrente entre inscription, réception et remboursement
+
+La vérification doit être atomique par adresse. Ajouter dans le schéma définitif une table de verrouillage durable, par exemple `bsc_wallet_financial_locks`, avec `wallet_address_lower` comme clé primaire et les timestamps nécessaires. Ce verrou est un mécanisme SQL interne ; il ne constitue pas une inscription ni une réservation de portefeuille.
+
+Avant d'accepter une inscription, la route :
+1. normalise et valide l'adresse BSC en minuscules ;
+2. ouvre une transaction SQL ;
+3. crée la ligne de verrouillage par `INSERT IGNORE` si elle n'existe pas ;
+4. verrouille cette ligne avec `SELECT ... FOR UPDATE` ;
+5. relit sous verrou tous les groupes, événements et paiements de remboursement de cette adresse ;
+6. calcule les obligations encore non réglées, par token et contrat exact ;
+7. refuse l'inscription si une obligation subsiste ;
+8. n'insère l'adresse dans `bsc_wallet_address_registry` et ne crée le compte que si aucun remboursement en attente n'existe.
+
+Les scanners BSC-USD et XTU, les workers de constitution des groupes, les workers de paiement et les traitements de confirmation/restauration doivent prendre le même verrou d'adresse avant toute opération qui modifie l'affectation ou l'état financier d'un événement. Ils doivent relire l'association de l'adresse et le statut du compte après acquisition du verrou. Cela ferme la course dans laquelle un scanner classerait un transfert comme remboursement alors qu'une inscription simultanée serait en train d'associer l'adresse à un nouveau compte, ou inversement.
+
+Le verrou d'adresse est conservé comme ligne technique même après le règlement ; il peut être réutilisé par les événements ultérieurs. La réservation permanente de l'adresse dans `bsc_wallet_address_registry` reste une règle séparée et continue d'interdire la réutilisation d'une adresse déjà enregistrée, y compris après suppression du compte.
+
+Pour fermer également la fenêtre des événements blockchain finalisés mais pas encore indexés par un scanner, le serveur doit capturer un bloc finalisé de référence avant d'accepter l'inscription. Les scanners BSC-USD et XTU doivent avoir traité tous les événements officiels pertinents jusqu'à ce bloc, ou la route doit déclencher un rescan ciblé de l'adresse jusqu'à ce bloc sous le même verrou. Si le rattrapage n'est pas vérifiable, l'inscription échoue en mode fermé.
+
+Ajouter `registered_at_block` à `bsc_wallet_address_registry`. Ce champ conserve le dernier bloc finalisé utilisé comme frontière d'inscription. Tout événement officiel de cette adresse dont le bloc est inférieur ou égal à `registered_at_block` est traité selon l'état pré-inscription (adresse inconnue à la frontière) et rejoint le circuit de remboursement catégorie A s'il n'est pas déjà réglé. Les événements de bloc strictement supérieur à cette frontière suivent les règles normales du compte, notamment le routage catégorie C si le compte est désactivé. Cette frontière évite qu'un événement finalisé avant l'inscription, mais découvert tardivement, soit crédité comme un dépôt d'un compte qui n'existait pas encore.
+
+La séquence d'inscription est donc : verrouiller l'adresse ; capturer le bloc finalisé ; garantir le rattrapage des scanners jusqu'à ce bloc ; calculer et vérifier toutes les obligations ; refuser en présence d'un remboursement ; sinon créer le compte et enregistrer `registered_at_block` dans la même transaction logique. Le serveur doit définir ce bloc comme frontière déterministe d'effet de l'inscription et la conserver pour tous les traitements ultérieurs.
+
+3.5. Expiration des dépôts BSC-USD non qualifiés et transfert au remboursement
+
+Le délai d'expiration de 30 jours des dossiers d'achat BSC-USD reste applicable. Il commence à la finalisation du premier transfert du dossier et ne peut pas être repoussé par les transferts suivants. En revanche, la conséquence financière de cette expiration est modifiée : si le minimum de qualification de 20 BSC-USD bruts n'a pas été atteint au plus tard avec le cinquième événement, le reliquat réellement reçu et non crédité rejoint le circuit de remboursement automatique, catégorie D, au lieu d'être affecté aux réserves communes comme le prévoyait la règle antérieure de MAJ5.
+
+Le transfert au remboursement porte uniquement sur les montants non crédités du dossier non qualifié. Les portions déjà créditées restent définitivement acquises et ne sont ni reprises ni remboursées. Le compte reste actif, sauf s'il a été désactivé pour un motif indépendant ; dans ce cas, la catégorie C prévaut.
+
+À compter de sa transition en catégorie D, le reliquat est soumis sans exception au moteur commun : retenue de remboursement de 1 % par événement, gas estimé déduit une seule fois pour le paiement groupé, minimum net fixe de 1 BSC-USD, délai individuel minimal de 30 minutes déjà applicable à chaque événement et conservation sans limite de durée si le minimum net n'est pas atteint. Aucun montant n'est affecté à `common.total_units_price`, `common.backed_units`, `common.admin_expens` ou aux réserves communes en raison de cette expiration.
+
+La règle d'expiration de 30 jours et l'absence de limite de conservation des remboursements concernent donc deux étapes différentes : le dossier de dépôt non qualifié est clôturé après 30 jours, puis son obligation de remboursement peut rester en attente sans aucune échéance.
+
+======================================================================
+4. EXÉCUTION, RÉSERVATION ET RAPPROCHEMENT
+======================================================================
+
+4.1. Automatisation
+
+Pour tout groupe dont R_group atteint au moins une unité nette :
+- aucun formulaire ou demande préalable de l'expéditeur n'est requis ;
+- aucune signature EIP-191/EIP-1271 n'est requise pour le parcours normal ;
+- aucune approbation administrative préalable n'est requise ;
+- le bénéficiaire est fixé à l'adresse source from vérifiée ;
+- le token de sortie est strictement le même que le token reçu ;
+- la transaction est préparée uniquement après vérification du gas estimé, de la liquidité token, du solde BNB et des réservations.
+
+L'automatisation n'autorise pas le remboursement d'un actif non pris en charge, d'un faux token ou d'un transfert hors réseau officiel.
+
+4.2. Réservation et idempotence
+
+Avant toute signature :
+- verrouiller la ligne du groupe et tous ses événements sources ;
+- vérifier que chaque événement est finalisé, encore impayé et non réservé ailleurs ;
+- réserver le montant brut, la retenue et le gas selon la comptabilité du groupe ;
+- vérifier qu'aucun autre worker ne prépare un remboursement pour le même groupe ;
+- vérifier qu'aucun événement source n'est simultanément affecté à un dépôt ou à un crédit ;
+- conserver un identifiant unique de groupe et une clé d'idempotence de paiement.
+
+Une transaction incertaine doit être rapprochée à partir du hash, du nonce, du reçu et des logs avant toute nouvelle soumission. Aucun retry, redémarrage ou changement de statut de compte ne doit créer un deuxième paiement.
+
+Après confirmation finale :
+- vérifier le transfert sortant vers l'adresse source ;
+- consommer une seule fois les réservations ;
+- clôturer chaque événement source inclus dans le groupe ;
+- enregistrer le gas BNB réellement consommé et son équivalent ;
+- régulariser une seule fois l'écart entre gas estimé et gas réel ;
+- inscrire la retenue de 1 % selon la comptabilité de la section 9.3 de MAJ5 ;
+- conserver le hash du paiement et le lien vers tous les transferts sources.
+
+Après échec définitif, restaurer les réservations une seule fois et conserver les montants dans le registre du groupe. Un échec ou une insuffisance temporaire de liquidité ne supprime pas le droit à restitution.
+
+4.3. Gestion des corrections de gas
+
+Le gas estimé est déduit une seule fois lors du calcul du net du groupe. Après confirmation, le reçu détermine le gas réel.
+
+Si le gas estimé était supérieur au gas réel, la différence constitue un reliquat dû au même expéditeur et au même token. Elle est ajoutée à son registre de conservation et ne fait l'objet d'un envoi que lorsqu'un remboursement agrégé atteint le minimum net.
+
+Si le gas réel est supérieur à l'estimation, OneX couvre l'écart dans les limites de la politique de gas autorisée. Aucun complément rétroactif n'est prélevé sur un remboursement déjà confirmé.
+
+======================================================================
+5. REGISTRES ET DONNÉES À PRÉVOIR DANS db.js
+======================================================================
+
+La Révision 4 ne fournit pas de registre d'agrégation adapté aux remboursements automatiques groupés. La base définitive doit donc inclure des registres permettant de représenter un groupe et plusieurs événements sources, sans supprimer les tables d'audit existantes qui restent pertinentes.
+
+Créer au minimum les structures logiques suivantes (les noms définitifs peuvent être normalisés dans db.js, mais les relations et contraintes sont obligatoires) :
+
+A. automatic_refund_groups
+- id et référence unique du groupe ;
+- chain_id ;
+- token_contract ;
+- asset_code (BSC-USD ou XTU) ;
+- sender_address et payout_address ;
+- catégorie(s) d'origine et username lorsqu'un compte existe ;
+- total gross reçu, retenue 1 %, gas estimé, gas réel, net estimé, net envoyé et reliquat ;
+- premier événement, dernier événement et prochaine échéance d'éligibilité au délai individuel de 30 minutes ; aucune échéance d'expiration ou de revue liée à l'ancienneté ;
+- statut, motif, timestamps et champs de réservation.
+
+B. automatic_refund_group_events
+- group_id ;
+- table et identifiant de l'enregistrement source ;
+- event_identity unique fondée sur Chain ID, contrat, tx_hash et log_index ;
+- montant brut/net reçu, fee de 1 %, état de finalité ;
+- finalized_at_ms et refund_eligible_at_ms ;
+- aucune colonne `review_due_at_ms` ni échéance de revue de petit remboursement ;
+- montant réservé, montant remboursé et éventuel reliquat ;
+- état de l'événement et timestamps.
+
+C. automatic_refund_payouts ou registre de paiement équivalent
+- une référence unique par paiement groupé ;
+- group_id ;
+- adresse de destination ;
+- contrat/token ;
+- montant brut réservé, retenue, gas provisionné, montant net signé ;
+- nonce, raw transaction protégée, tx_hash, reçu, bloc et gas réel ;
+- état queued/signed/submitted/confirmed/failed/manual_review ;
+- erreurs, timestamps et journal d'événements.
+
+D. bsc_wallet_financial_locks
+- wallet_address_lower, clé primaire normalisée ;
+- created_at_ms et updated_at_ms ;
+- ligne de verrouillage commune aux routes signup, scanners BSC-USD/XTU et workers de remboursement ;
+- la ligne est créée à la demande et conservée même après le règlement des remboursements afin de sérialiser les événements ultérieurs.
+
+E. bsc_wallet_address_registry
+- ajouter `registered_at_block`, numéro du dernier bloc finalisé servant de frontière d'inscription ;
+- ce champ permet de classer correctement les événements découverts tardivement mais inclus dans un bloc antérieur ou égal à la frontière ;
+- la réservation permanente de l'adresse et l'unicité de `wallet_address_lower` restent inchangées.
+
+Les registres doivent préserver les références aux sources BSC-USD, XTU, aux batches de dépôts connus, aux essais XTU libres et aux transferts inconnus. Un événement source ne peut appartenir qu'à un seul groupe actif et ne peut être remboursé qu'une seule fois.
+
+Aucun statut ou échéance `review_due` n'est nécessaire. Les lignes en attente et confirmed restent auditables sans limite de durée. Les soldes de custody restent ventilés par contrat/token exact.
+
+Le projet n'étant pas déployé, intégrer le schéma définitif dans db.js et l'initialisation d'une base neuve. Ne pas créer de script de migration SQL.
+
+======================================================================
+6. RÈGLES COMPTABLES À PRÉSERVER
+======================================================================
+
+6.1. BSC-USD
+
+Le remboursement BSC-USD utilise uniquement le BSC-USD effectivement reçu et protégé dans le Hot Wallet. Le paiement sortant est en BSC-USD vers l'adresse source. La retenue de 1 % est comptabilisée après confirmation selon la règle MAJ5. Le gas BNB réel et sa récupération en équivalent token restent séparés.
+
+6.2. XTU
+
+Le remboursement XTU utilise uniquement les XTU effectivement reçus et protégés dans le Hot Wallet XTU. Le paiement sortant est en XTU vers l'adresse source. Le contrat XTU de la Révision 5 ne prélève aucune commission de token de 0,1 %. La retenue de remboursement hors chaîne de 1 % et le gas restent distincts.
+
+Pour un XTU reçu d'un compte désactivé correspondant à une externalisation antérieure vérifiée, conserver le rapprochement de common.xtu_wallets et de users_xtu_externalized_balances prévu en MAJ5 : rapprocher l'entrée brute une seule fois ; après confirmation du remboursement, réinscrire uniquement le montant XTU net effectivement retourné comme nouvelle externalisation, une seule fois. Si le rattachement de l'externalisation n'est pas vérifiable, ne pas corriger artificiellement ces compteurs ; la seule anomalie de rapprochement passe en manual_review, tandis que le transfert reste traçable dans le registre autonome.
+
+6.3. Absence de double prélèvement
+
+Un montant non crédité qui rejoint le circuit de remboursement ne supporte pas simultanément des tfees de dépôt, des tfees de réception XTU libres et la retenue de remboursement. Les éventuels tfees provisoires d'un essai XTU libre non qualifié sont annulés avant son transfert au remboursement. Seule la retenue de remboursement de 1 % et la récupération du gas autorisée s'appliquent à ce principal non crédité.
+
+La retenue de remboursement ne doit pas être confondue avec :
+- les tfees sur l'achat BSC-USD ;
+- les tfees normaux de réception XTU libres hors campagne ;
+- les frais de disbursement individuel/global, qui restent à 0 % ;
+- une commission contractuelle XTU, qui est supprimée.
+
+======================================================================
+7. MISES À JOUR DES AUTRES SECTIONS DE MAJ5
+======================================================================
+
+7.1. Section 0 — principes directeurs
+
+Compléter les puces relatives aux remboursements automatiques par le principe suivant :
+
+« Tous les remboursements automatiques, qu'ils concernent un transfert unique ou un groupe de transferts, appliquent le même minimum net fixe d'une unité du token source après retenue de remboursement et estimation du gas. Les montants sous ce seuil sont conservés et agrégés exclusivement par adresse source et contrat/token exact, sans limite de durée. Chaque nouvel événement finalisé et chaque reprise périodique déclenchent une réévaluation du cumul encore impayé. Pour un compte désactivé, tout dépôt non crédité à la désactivation et tout nouveau transfert officiel reçu depuis son adresse enregistrée sont dirigés vers ce circuit sans demande préalable. En outre, tout reliquat BSC-USD non crédité d'un dossier d'achat d'un compte actif qui expire après 30 jours sans atteindre le minimum de qualification est transféré à ce circuit (catégorie D), sans affectation aux réserves communes. Aucun montant sous le minimum de remboursement n'est expiré, annulé, confisqué ou affecté aux réserves communes en raison du temps écoulé. »
+
+7.2. Section 9.1 — périmètre
+
+Ajouter explicitement à la catégorie C que chaque transfert officiel reçu après la désactivation entre dans le registre de remboursement et déclenche une réévaluation de l'ensemble des montants non payés de même adresse source et de même contrat/token.
+
+7.3. Section 9.3 — base et formule
+
+Conserver la base réellement reçue et la retenue de 1 %. Préciser que, lorsqu'un paiement groupé est préparé, le gas estimé G_group correspond à une seule transaction sortante et n'est déduit qu'une fois du cumul du groupe. Le net d'éligibilité est calculé selon la formule de la section 2.4 du présent addendum.
+
+7.4. Section 9.5 — petits remboursements
+
+Remplacer toute formulation limitée aux seuls remboursements inconnus et aux retours BSC-USD pendant la campagne globale par une règle universelle applicable aux catégories A, B, C et D, y compris aux montants non crédités d'un compte désactivé et aux transferts ultérieurs reçus depuis son adresse. Réévaluer après chaque nouveau transfert et par worker périodique. Le minimum net reste 1 unité du token source. Conserver tout groupe sous le seuil sans limite de durée, sans review_due ni expiration ; continuer à réévaluer les transferts ultérieurs compatibles.
+
+7.5. Section 9.6 — exécution
+
+Étendre l'exécution automatique aux groupes multi-événements des catégories A, B, C et D. Le groupe doit être réservé atomiquement. Aucune demande ou signature expéditeur n'est exigée lorsque la destination est l'adresse source. Le paiement est unique par groupe et ne peut pas inclure un événement déjà crédité ou consommé.
+
+7.6. Section 9.7 — adresses enregistrées
+
+Remplacer la formulation indiquant seulement que le compte désactivé bascule vers catégorie C par une formulation précisant :
+- aucune nouvelle qualification ni crédit de dépôt pour le compte désactivé ;
+- les montants déjà reçus mais non crédités sont transférés au registre de remboursement ;
+- chaque nouvelle réception BSC-USD ou XTU est ajoutée au circuit de remboursement ;
+- le cumul de même token/adresse est contrôlé à chaque événement et par worker ;
+- la réactivation ne remet pas ces événements dans le circuit de dépôt.
+
+7.7. Section 9.8 — désactivation
+
+Préciser que le worker de désactivation transfère les portions non créditées événement par événement au circuit de remboursement automatique, et non simplement vers un statut de support bloqué. Les portions créditées restent intactes. Les nouveaux transferts entrants continuent d'être traités automatiquement même lorsque account_active=0. Le seuil d'une unité nette s'applique sans limite de conservation et sans expiration liée au temps. Les dossiers BSC-USD actifs non qualifiés sont transférés au même circuit à l'expiration de 30 jours (catégorie D), sans affectation aux réserves communes.
+
+7.8. Section 17.6 — résumé des remboursements
+
+Remplacer le résumé antérieur par les points cumulatifs suivants :
+- transferts officiels inconnus : remboursement automatique vers l'adresse source ;
+- BSC-USD officiel reçu pendant toute la campagne globale : remboursement automatique, expéditeur enregistré ou non ;
+- transfert officiel d'un compte désactivé : remboursement automatique, y compris les montants non crédités antérieurs et toutes les nouvelles réceptions ;
+- reliquat non crédité d'un dossier d'achat BSC-USD actif qui expire après 30 jours sans atteindre le minimum de qualification : transfert automatique à la catégorie D, sans affectation aux réserves communes ;
+- même token source, même adresse source et même contrat exact pour les regroupements ;
+- minimum net fixe de 1 BSC-USD ou 1 XTU selon le token, après retenue de 1 % et gas estimé ;
+- gas estimé d'une transaction groupée déduit une seule fois ;
+- chaque transfert doit être finalisé et avoir franchi son délai propre de 30 minutes ;
+- à chaque transfert et par worker, réévaluer le cumul en attente ;
+- sous le minimum : custody conservée sans limite de durée, sans revue automatique liée à l'ancienneté, confiscation, affectation aux réserves ou annulation du droit ;
+- aucun paiement en double, aucun mélange de tokens, aucun crédit et remboursement du même montant.
+
+======================================================================
+8. TESTS D'ACCEPTATION À AJOUTER OU À RÉVISER
+======================================================================
+
+Les tests suivants doivent être ajoutés. Ils constituent des critères d'acceptation métier et ne sont pas déclarés comme exécutés.
+
+A. Minimum et formule
+1. Un remboursement BSC-USD isolé dont le net après 1 % et gas est inférieur à 1 BSC-USD n'est pas signé.
+2. Un remboursement XTU isolé dont le net après 1 % et gas est inférieur à 1 XTU n'est pas signé.
+3. Un groupe de plusieurs événements du même expéditeur et du même token dont le net agrégé atteint 1 unité est payé en une seule transaction.
+4. Le gas estimé n'est déduit qu'une fois pour un paiement groupé.
+5. Le minimum reste 1 unité même si BSC_MAX_TX_FEE_BSC_USD change ; le plafond de gas reste un contrôle séparé.
+
+B. Isolation des groupes
+6. Deux expéditeurs différents ne sont jamais regroupés.
+7. BSC-USD et XTU ne sont jamais regroupés.
+8. Deux contrats différents ne sont jamais regroupés.
+9. Un événement déjà crédité, remboursé, réservé ou consommé ne peut pas être inclus une seconde fois.
+10. Les doublons du même tx_hash/log_index n'augmentent pas le cumul.
+
+C. Délai et conservation
+11. Aucun événement n'est inclus dans un paiement avant finalité et avant l'expiration de ses 30 minutes.
+12. Si un composant du groupe n'a pas encore franchi ses 30 minutes, il reste exclu du net immédiatement payable.
+13. Un groupe sous le minimum reste en custody sans aucune échéance de 30 jours, sans review_due et sans expiration.
+14. Un nouveau transfert compatible et chaque reprise périodique déclenchent une nouvelle évaluation ; si le cumul atteint le minimum et qu'aucun verrou manual_review n'existe, le remboursement automatique peut être préparé.
+15. Les montants sous le minimum ne sont jamais affectés aux réserves communes par expiration ordinaire, quel que soit le temps écoulé.
+16. `/app/signup` refuse une adresse dont une obligation de remboursement de catégorie A, B, C ou D reste impayée.
+17. La réponse de blocage expose les montants en attente séparément pour BSC-USD et XTU et indique `COMPLETE_MINIMUM_REQUIRED`, `WAIT_FOR_REFUND_COMPLETION` ou `WAIT_FOR_REFUND_RESOLUTION`.
+18. Une adresse ne peut être inscrite qu'après règlement complet de tous les remboursements ; aucun événement n'est migré vers un dépôt lors de l'inscription.
+19. Le verrou SQL par adresse sérialise le signup, l'arrivée d'événements, la réservation des remboursements et leur confirmation.
+20. Un remboursement sous le minimum reste bloqué et auditable après plus de 30 jours, sans expiration ni statut review_due.
+21. Un nouveau transfert du même expéditeur, token et contrat relance l'évaluation et peut rendre le groupe éligible.
+22. Une adresse avec un groupe sous le minimum reçoit HTTP 423 et `auth=refund_pending`, avec l'action `COMPLETE_MINIMUM_REQUIRED`.
+23. Une adresse dont le net projeté atteint 1 mais dont le paiement n'est pas confirmé reçoit `WAIT_FOR_REFUND_COMPLETION`.
+24. Une adresse ayant un paiement `signed`, `submitted`, `uncertain` ou `manual_review` reste bloquée jusqu'à un règlement ou une résolution formelle.
+25. Une adresse avec plusieurs obligations BSC-USD et XTU reçoit une ventilation distincte ; aucun total cross-token n'est calculé.
+26. Après confirmation de tous les paiements et constat d'absence de reliquat, de réservation ou d'obligation, l'inscription peut être acceptée si l'adresse n'est pas déjà enregistrée.
+27. Un événement finalisé avant la frontière `registered_at_block`, mais découvert après l'inscription, est traité comme réception pré-inscription et ne peut pas être crédité comme dépôt.
+28. Si le scanner ne peut pas confirmer son rattrapage jusqu'au bloc finalisé de référence, l'inscription échoue en mode fermé.
+29. Une inscription et un événement entrant simultanés sont sérialisés par `bsc_wallet_financial_locks`; aucun événement ne peut être à la fois dépôt et remboursement.
+30. Un dossier d'achat BSC-USD actif qui n'atteint pas 20 BSC-USD bruts au plus tard avec le cinquième événement à l'échéance de 30 jours transfère tous ses montants source non crédités vers le remboursement catégorie D.
+31. Le transfert catégorie D n'écrit rien dans les réserves communes ou `common.total_units_price`, ne désactive pas le compte et applique retenue de 1 %, gas groupé unique et minimum net 1 BSC-USD.
+32. Un dossier qui atteint 20 BSC-USD au plus tard avec le cinquième événement reste dans le traitement normal d'achat.
+33. Un compte désactivé avant la transition d'expiration suit la catégorie C ; le même événement ne peut pas être classé C et D.
+34. Un événement finalisé avant l'échéance mais indexé tardivement est inclus après rattrapage du scanner avant clôture ; un événement finalisé après la frontière de clôture ouvre un nouvel essai ou suit une catégorie prioritaire applicable.
+
+D. Compte désactivé
+16. À la désactivation, seuls les montants non crédités sont basculés en remboursement.
+17. Tout montant déjà crédité reste intact et n'est jamais repris.
+18. Chaque nouveau BSC-USD reçu depuis l'adresse d'un compte désactivé est dirigé vers le remboursement, sans crédit d'actifs initiaux.
+19. Chaque nouveau XTU reçu depuis l'adresse d'un compte désactivé est dirigé vers le remboursement, sans crédit XTU libre.
+20. Le serveur réévalue le cumul après chaque réception depuis ce compte.
+21. Une réactivation ne redirige pas vers le dépôt les événements déjà placés en remboursement.
+22. Un remboursement continue même lorsque les retraits volontaires du compte sont bloqués.
+
+E. Traitement automatique et comptabilité
+23. Aucun challenge EIP-191/EIP-1271 ou formulaire de demande n'est exigé pour le parcours automatique normal.
+24. Aucune approbation administrative préalable n'est requise lorsque l'événement et le groupe sont correctement rapprochés.
+25. Une anomalie réelle de rapprochement ou de sécurité place le dossier en manual_review.
+26. La retenue de 1 % est appliquée une seule fois par événement source et jamais en plus de tfees provisoires sur un principal qui n'a pas été crédité.
+27. Le paiement confirmé clôture tous les événements sources du groupe une seule fois.
+28. Un RPC incertain ne crée pas de deuxième transaction de remboursement.
+29. Le retour XTU correspondant à une externalisation antérieure vérifiée met à jour common.xtu_wallets et users_xtu_externalized_balances selon la règle MAJ5, une seule fois.
+
+Tests Révision 4 à remplacer/adapter :
+- tests/account-deactivation-deposits.test.js : ne plus exiger que le compte désactivé reste en pending_support en vue d'une réactivation ; tester le transfert vers le registre de remboursement et la continuité du remboursement après désactivation ;
+- tests/refund-minimum-policy.test.js : ne plus dériver le minimum de remboursement de deux fois le plafond de gas ; tester le minimum fixe net de 1 unité par token ;
+- tests/xtu-unknown-refund-policy.test.js : retirer la dépendance à l'ancien frais de contrat XTU de 0,1 % et tester la retenue de remboursement hors chaîne de 1 % ;
+- tests/xtu-unknown-refunds-workflow.test.js et tests/bsc-unknown-refund-request.test.js : vérifier que le parcours automatique standard n'exige plus de challenge expéditeur ni d'approbation administrative ; conserver manual_review pour les anomalies ;
+- ajouter les tests d'agrégation multi-événements, de conservation sans limite de durée, de blocage signup par remboursement en attente, de ventilation BSC-USD/XTU et de verrouillage concurrent par adresse.
+
+======================================================================
+9. DÉCISIONS QUI NE SONT PAS MODIFIÉES
+======================================================================
+
+MAJ6 ne modifie pas :
+- les contrats officiels BSC-USD et XTU, le réseau BNB Smart Chain Mainnet et Chain ID 56 ;
+- la finalité blockchain et l'identification unique par transaction/log ;
+- le délai minimal de 30 minutes par événement source ;
+- la retenue automatique de remboursement de 1 % définie en MAJ5 ;
+- le plafond de gas estimé de 0,4 BSC-USD ;
+- le remboursement dans le même token et vers l'adresse source ;
+- la séparation entre liquidité physique, custody XTU, valeur comptable, XTU libres et réserves ;
+- la règle selon laquelle aucun montant déjà crédité n'est repris ;
+- le délai de 30 jours des dossiers d'achat BSC-USD, avec transfert au remboursement automatique (catégorie D) de tout reliquat non crédité si le minimum de qualification de 20 BSC-USD n'est pas atteint ; l'ancienne affectation de ce reliquat aux réserves communes est supprimée ;
+- la période primaire de 90 jours et l'extension globale de 30 jours ;
+- les règles de disbursement individuel et global, leurs frais tfees nuls et leurs minimums propres ;
+- l'interdiction de retrait XTU volontaire pour un compte désactivé ;
+- la règle d'idempotence, de verrouillage SQL, de réservation et de rapprochement blockchain.
+
+MAJ6 remplace les comportements incompatibles de la Révision 4 concernant les remboursements, les dépôts de comptes désactivés et le mécanisme administratif de dépense des réserves communes. Elle ne transforme pas immédiatement un dépôt actif ordinaire en remboursement : seuls les dossiers d'achat BSC-USD actifs qui expirent sans qualification après 30 jours transfèrent leurs montants non crédités à la catégorie D. Les dépôts qualifiés et les dépôts encore dans leur période normale de 30 jours restent soumis au traitement ordinaire. Aucun remboursement d'un token non officiel n'est autorisé.
+
+======================================================================
+10. RÉSUMÉ DES RÈGLES DE REMBOURSEMENT
+======================================================================
+
+Un compte désactivé est automatiquement placé sous routage de remboursement : ses montants connus non crédités sont repris événement par événement, et tout nouveau transfert officiel provenant de son adresse enregistrée est dirigé vers le même circuit. À l'expiration de 30 jours d'un dossier d'achat BSC-USD d'un compte encore actif qui n'a pas atteint le minimum de qualification, ses montants non crédités sont également transférés au remboursement automatique (catégorie D), sans affectation aux réserves communes. À chaque événement de remboursement, le serveur réévalue les montants non payés du même expéditeur et du même contrat/token.
+
+Le remboursement n'est exécuté que si le montant net à envoyer atteint au moins 1 unité du token source : 1 BSC-USD pour un remboursement BSC-USD, ou 1 XTU pour un remboursement XTU. Plusieurs transferts peuvent être regroupés si et seulement si leur expéditeur, leur contrat et leur token sont identiques et si chacun est finalisé et a franchi son délai individuel de 30 minutes. La retenue de 1 % est calculée par événement ; le gas de la transaction groupée est déduit une seule fois.
+
+Tant que le cumul net reste inférieur au minimum, le serveur conserve les montants en custody sans limite de durée et les réévalue à chaque nouveau transfert et par worker. Aucun délai de 30 jours, review_due ou expiration ne s'applique aux petits remboursements. Si un transfert ultérieur fait atteindre le minimum, le remboursement automatique peut reprendre, sauf anomalie non résolue en manual_review.
+
+Le remboursement automatique reste autorisé malgré account_active=0. Il ne nécessite ni réactivation, ni demande de l'utilisateur, ni signature expéditeur, ni approbation administrative préalable lorsque les contrôles normaux sont satisfaits. Il ne peut jamais reprendre un montant déjà crédité ni produire un double paiement.
+======================================================================
+11. GESTION ADMINISTRATIVE DES RÉSERVES — DÉPENSES, RECOUVREMENTS ET DONS
+======================================================================
+
+11.1. Portée et objectifs
+
+La présente section complète MAJ6 par un circuit administratif distinct des dépôts utilisateurs, des réserves vendeurs, des XTU libres et des disbursements. Elle remplace l'ancien mécanisme de dépense de réserve commune de la Révision 4.
+
+Les trois opérations sont comptabilisées après que l'administration a réellement exécuté ou reçu le transfert physique BSC-USD en dehors de OneXServer :
+- `POST /admin/res/minus` : sortie BSC-USD de la trésorerie OneX vers le bénéficiaire administratif XADMIN ;
+- `POST /admin/res/plus` : retour/recouvrement BSC-USD de XADMIN vers la trésorerie OneX ;
+- `POST /admin/res/give` : don BSC-USD effectivement reçu par OneX.
+
+Ces routes sont des opérations de comptabilité interne. Elles ne signent, ne diffusent et ne déclenchent aucune transaction blockchain. Elles ne remplacent pas l'exécution externe du transfert. L'administration doit vérifier la réception ou la sortie effective avant d'enregistrer l'opération.
+
+La parité comptable applicable est celle déjà définie par MAJ5 :
+`1 BSC-USD = 1 XTU` à des fins de comptabilité interne uniquement.
+Cette parité ne constitue pas une preuve de liquidité physique et ne remplace jamais le contrôle des portefeuilles BSC-USD.
+
+11.2. Nouvelle colonne `common.admin_expens` et plafond administratif
+
+Ajouter à la table `common` :
+`admin_expens DECIMAL(50,30) NOT NULL DEFAULT 0`
+
+`common.admin_expens` est exprimé en actifs initiaux. Il représente l'encours net des dépenses administratives déjà sorties de la réserve commune et non encore recouvrées. Ce n'est ni un actif physique, ni une réserve distribuable, ni un compteur historique brut cumulatif.
+
+Cette définition découle directement du fonctionnement demandé : `/admin/res/minus` augmente `admin_expens`, tandis que `/admin/res/plus` le diminue lors du recouvrement.
+
+Plafond de l'encours administratif :
+`ADMIN_EXPENSE_CAP_INITIAL_ASSET = STOCK_LIMIT × SYSTEM_ADMIN_RESERVE_RATIO`
+
+Le ratio administratif est de 10 %. Avec le stock initial de référence de 18 000 000 actifs initiaux de la Révision 4 :
+`ADMIN_EXPENSE_CAP_INITIAL_ASSET = 18 000 000 × 10 % = 1 800 000 actifs initiaux`.
+
+Le plafond de 1 800 000 est donc le plafond de l'encours administratif non recouvré à un instant donné, et non le cumul historique de toutes les sorties administratives depuis la création du système. Après un recouvrement effectif, la capacité correspondante peut être utilisée à nouveau. Toutes les sorties et tous les recouvrements restent toutefois enregistrés individuellement dans les registres d'audit ; leur cumul brut peut ainsi être reconstitué.
+
+Règles impératives :
+- `0 <= common.admin_expens <= ADMIN_EXPENSE_CAP_INITIAL_ASSET` ;
+- aucune dépense ne peut dépasser la capacité administrative encore disponible ;
+- aucun recouvrement ne peut dépasser la valeur BSC-USD de `common.admin_expens` au prix global courant ;
+- `common.admin_expens` ne peut jamais devenir négatif ;
+- aucune dépense administrative ne peut rendre `common.backed_units` nul, négatif ou inférieur au plancher administratif restant ;
+- les calculs sont réalisés en `BigNumber`, jamais en nombres flottants JavaScript.
+
+11.3. Conservation de la réserve distribuable
+
+Le quota administratif initial `Q` reste calculé à 10 % de `STOCK_LIMIT`. Le montant administratif encore protégé dans `common.backed_units` est désormais calculé à partir de `common.admin_expens`, et non de l'ancien compteur cumulatif `common.sys_inactive_init_asset` :
+
+`Q = ADMIN_EXPENSE_CAP_INITIAL_ASSET`
+`admin_protected_backing = Q - common.admin_expens`
+`ordinary_backed_available = common.backed_units - admin_protected_backing`
+`ordinary_distributable_initial_assets = common.inactive_init_asset + ordinary_backed_available`
+
+Il faut conserver les contrôles existants qui excluent le plancher administratif restant des actifs initiaux distribuables. La nouvelle colonne ne doit pas rendre distribuable l'encours administratif ni permettre aux dépôts, bonus, ventes ou disbursements d'utiliser la portion administrative non dépensée.
+
+Invariant important : une dépense administrative et son recouvrement ne doivent pas augmenter ni réduire la disponibilité distribuable ordinaire, à prix global égal.
+
+En notant `A` les actifs initiaux correspondant à l'opération :
+- après une dépense : `backed_units` diminue de `A` et `admin_expens` augmente de `A` ; le plancher protégé diminue aussi de `A` ; la disponibilité ordinaire reste donc identique ;
+- après un recouvrement : `backed_units` augmente de `A` et `admin_expens` diminue de `A` ; le plancher protégé augmente aussi de `A` ; la disponibilité ordinaire reste identique.
+
+La réserve non administrative qui finance le fonctionnement ordinaire du système n'est donc pas consommée par ces opérations. Le plafond de 10 % limite la part des actifs initiaux pouvant être momentanément sortie à titre administratif sans recouvrement.
+
+11.4. Prix global et unités des opérations administratives
+
+Le prix utilisé est exclusivement `common.unit_price`, prix global absolu capturé avant l'opération. Aucun prix individuel utilisateur ne doit être utilisé.
+
+Soit :
+`P = common.unit_price avant l'opération` (XTU par actif initial)
+`M = montant BSC-USD saisi par l'administrateur`
+`A = M / P` (actifs initiaux correspondants)
+
+Le montant `M` est comptabilisé à la parité interne 1 BSC-USD = 1 XTU. Les valeurs financières stockées dans `activities.amount` sont exprimées en actifs initiaux ; elles doivent donc contenir `A`, et `activities.unit_price` doit conserver `P`. La conversion de l'historique `A × P` restitue ainsi le montant BSC-USD/XTU équivalent de l'opération, sous réserve de la précision décimale de stockage.
+
+Pour `/admin/res/minus` et `/admin/res/plus`, les variations de `total_units_price` et `backed_units` sont proportionnelles au prix global courant. Le ratio réserve/actifs initiaux demeure donc égal à `P`, à l'écart de précision décimale près. Le serveur doit néanmoins recalculer et sauvegarder `common.unit_price` avec la fonction centrale habituelle :
+`unit_price_after = max(unit_price_before, total_units_price_after / backed_units_after)`.
+
+Le prix global ne doit jamais diminuer automatiquement.
+
+11.5. Route `POST /admin/res/minus` — dépense administrative
+
+But : enregistrer une sortie BSC-USD de la trésorerie OneX vers le bénéficiaire administratif XADMIN, préalablement exécutée hors du serveur.
+
+Données de requête minimales :
+- authentifiants administratifs existants `pswd` et `pin` ;
+- `amount` : montant BSC-USD réellement envoyé, strictement positif, au maximum 18 décimales ;
+- `external_reference` : référence unique de la transaction ou preuve externe de règlement ; pour un transfert BEP-20, utiliser au minimum le `tx_hash` et le `log_index` de l'événement pertinent, concaténés sans ambiguïté.
+
+Calcul :
+`A = amount / P`
+`remaining_admin_capacity = Q - common.admin_expens`
+
+Conditions préalables :
+- `amount > 0` et valeur numérique finie ;
+- `A <= remaining_admin_capacity` ;
+- `amount < common.total_units_price` ;
+- `A < common.backed_units` ;
+- après opération, `common.admin_expens + A <= Q` ;
+- après opération, `common.backed_units - A >= Q - (common.admin_expens + A)` ;
+- l'opération externe n'a pas déjà été enregistrée sous le même `external_reference` ;
+- le compte de réserve commun est verrouillé avec `common_state` avant lecture et écriture.
+
+Écritures atomiques dans une seule transaction SQL :
+- `common.total_units_price` diminue de `amount` ;
+- `common.backed_units` diminue de `A` ;
+- `common.admin_expens` augmente de `A` ;
+- `common.unit_price` est recalculé par la fonction centrale et reste normalement égal à `P` ;
+- les autres colonnes financières de `common` ne changent pas ;
+- aucune modification de `common.inactive_init_asset`, `common.sellers_res`, `common.total_run_balance`, `common.total_tfees`, des soldes XTU libres, des soldes utilisateurs ou des réserves vendeurs n'est autorisée.
+
+Inscription obligatoire dans `activities` :
+- `sender = 'ONEX'` ;
+- `receiver = 'XADMIN'` ;
+- `type = 6` (nouveau type réservé : dépense administrative de réserve) ;
+- `amount = A` en actifs initiaux ;
+- `unit_price = P` (prix global avant l'opération) ;
+- `fees = 0` ;
+- `fee_unit_price = P` ;
+- `bsc_fee_cost_usd = 0` pour cette écriture comptable, car la route ne signe aucune transaction ;
+- `reference` unique et liée à l'opération administrative.
+
+Aucun tfees n'est prélevé ou ajouté. L'opération ne crée aucun cycle de rémunération et n'appelle aucune fonction de réinitialisation de cycle utilisateur.
+
+La route répond au succès avec la dernière ligne `common` enregistrée, par exemple :
+`{ status: 'ok', common: <ligne common créée>, reference: <référence>, activity_id: <id activity> }`.
+
+11.6. Route `POST /admin/res/plus` — recouvrement d'une dépense administrative
+
+But : enregistrer le retour BSC-USD de XADMIN vers la trésorerie OneX, après réception physique effective hors du serveur.
+
+Données de requête minimales : mêmes champs que `/admin/res/minus` : `pswd`, `pin`, `amount` et `external_reference` unique.
+
+Calcul :
+`A = amount / P`
+`maximum_recoverable_bsc_usd = common.admin_expens × P`
+
+Conditions préalables :
+- `amount > 0` et valeur numérique finie ;
+- `common.admin_expens > 0` ;
+- `amount <= maximum_recoverable_bsc_usd` ;
+- `A <= common.admin_expens` ;
+- l'opération externe n'a pas déjà été enregistrée ;
+- verrouillage `common_state` et lecture de la dernière ligne `common` dans la même transaction SQL.
+
+Écritures atomiques :
+- `common.total_units_price` augmente de `amount` ;
+- `common.backed_units` augmente de `A` ;
+- `common.admin_expens` diminue de `A` ;
+- `common.unit_price` est recalculé par la fonction centrale et reste normalement égal à `P` ;
+- les autres colonnes financières de `common` restent inchangées.
+
+Inscription obligatoire dans `activities` :
+- `sender = 'XADMIN'` ;
+- `receiver = 'ONEX'` ;
+- `type = 7` (nouveau type réservé : recouvrement d'une dépense administrative) ;
+- `amount = A` en actifs initiaux ;
+- `unit_price = P` ;
+- `fees = 0` ;
+- `fee_unit_price = P` ;
+- `bsc_fee_cost_usd = 0` pour cette écriture comptable, car la route ne signe aucune transaction ;
+- `reference` unique et liée à l'opération administrative.
+
+Correction de formulation : la destination du recouvrement est `ONEX`. La formulation « XADMIN comme expéditeur et ONEX l'expéditeur » est interprétée comme une répétition accidentelle ; le sens comptable inverse de `/admin/res/minus` impose `XADMIN` expéditeur et `ONEX` destinataire.
+
+Aucun tfees n'est appliqué. L'opération ne crée aucun cycle de rémunération et ne modifie aucun solde utilisateur.
+
+La route répond au succès avec la dernière ligne `common` enregistrée, par exemple :
+`{ status: 'ok', common: <ligne common créée>, reference: <référence>, activity_id: <id activity> }`.
+
+11.7. Route `POST /admin/res/give` — don à la réserve commune
+
+But : enregistrer un don BSC-USD réellement reçu par OneX, après vérification du transfert physique en dehors du serveur.
+
+Données de requête minimales : `pswd`, `pin`, `amount` strictement positif avec au maximum 18 décimales et `external_reference` unique.
+
+Écritures atomiques :
+- `common.total_units_price` augmente exactement de `amount`, à la parité comptable 1 BSC-USD = 1 XTU ;
+- `common.total_gifts` augmente exactement de `amount` ;
+- `common.unit_price` est recalculé par la formule centrale `max(prix antérieur, total_units_price / backed_units)` ;
+- `common.backed_units`, `common.admin_expens`, `common.inactive_init_asset`, `common.sellers_res`, `common.total_run_balance`, les réserves administratives, les soldes utilisateurs et les registres XTU restent inchangés.
+
+Le don ne crée aucun actif initial et ne crédite aucun utilisateur. Il augmente la valeur comptable commune et peut faire monter `common.unit_price`, sans jamais la faire baisser. `common.total_gifts` est un compteur cumulatif de BSC-USD effectivement reçus : il augmente uniquement, ne diminue jamais et ne doit pas être recalculé à partir d'un solde de portefeuille.
+
+Ajouter à `common` :
+`total_gifts DECIMAL(50,30) NOT NULL DEFAULT 0`
+
+Créer la table `gifts` pour conserver chaque don :
+- identifiant primaire ;
+- `reference` interne unique ;
+- `external_reference` unique ;
+- `amount_bsc_usd` ;
+- `unit_price_before` et `unit_price_after` ;
+- identifiant de la ligne `common` créée ;
+- administrateur ayant enregistré l'opération ;
+- date et heure.
+
+Aucune ligne artificielle `activities` n'est créée pour un don : le journal dédié `gifts` constitue la source de détail, tandis que `common.total_gifts` en conserve le cumul.
+
+La route répond au succès avec la dernière ligne `common` enregistrée et la référence du don, par exemple :
+`{ status: 'ok', common: <ligne common créée>, gift: <ligne gifts créée> }`.
+
+11.8. Idempotence, preuve externe, authentification et concurrence
+
+Les trois routes réutilisent l'authentification administrative existante par mot de passe et PIN. Elles doivent aussi recevoir une `external_reference` obligatoire, unique et non réutilisable, liée au transfert réellement exécuté ou reçu. Cette référence protège contre une double comptabilisation causée par un nouvel envoi de la même requête.
+
+Créer un registre commun `admin_external_settlements` afin d'empêcher qu'une même preuve externe soit réutilisée entre `/admin/res/minus`, `/admin/res/plus` et `/admin/res/give`. Le registre comporte au minimum :
+- `external_reference` avec contrainte UNIQUE ;
+- type d'opération (`reserve_minus`, `reserve_plus`, `gift`) ;
+- montant BSC-USD ;
+- référence interne ;
+- identifiant de snapshot `common` ;
+- identifiant d'activité ou de don correspondant ;
+- administrateur ;
+- horodatage.
+
+Si une référence a déjà été traitée :
+- ne jamais appliquer une seconde fois la variation des réserves ;
+- si la requête répétée correspond exactement à l'opération initiale, retourner le résultat déjà enregistré ;
+- si le type ou le montant diffère, refuser la requête comme conflit d'idempotence.
+
+Chaque route doit :
+- utiliser `withTransaction` ;
+- verrouiller la ligne `system_locks.lock_name='common_state'` avec `FOR UPDATE` ;
+- lire la dernière ligne `common` avec verrouillage ;
+- calculer toutes les valeurs avec `BigNumber` ;
+- insérer le nouveau snapshot via `insertCommonSnapshotTx()` ;
+- insérer le registre externe et la ligne `activities` ou `gifts` dans la même transaction ;
+- retourner la ligne exacte `common` qui vient d'être créée, pas une lecture ultérieure non liée à l'opération.
+
+Les routes ne valident pas par elles-mêmes la réalité blockchain de `external_reference` si le transfert est exécuté hors du serveur. L'authentification et la référence constituent une trace d'audit, pas une preuve cryptographique. L'administration doit confirmer le transfert avant l'appel. Si la référence correspond à un événement BEP-20, conserver le `tx_hash`, le `log_index`, le contrat, l'expéditeur, le destinataire et le montant vérifiés dans la preuve externe ou son dossier d'audit.
+
+Les opérations de réserve ne doivent pas modifier une photographie immuable de disbursement global ni les montants déjà réservés pour un paiement. Refuser ou différer les opérations lorsque la campagne globale est encore ouverte ou possède des règlements non résolus, selon le verrouillage et les états de campagne de MAJ5. Un simple changement de variable `.env` ne doit jamais autoriser une écriture qui contourne cet état.
+
+11.9. Remplacement du mécanisme Révision 4
+
+Supprimer la route `POST /admin/update-common-stock`. Elle ne doit pas rester comme alias, car son ancien contrat d'entrée et son calcul fondé sur l'ancien compteur administratif ne correspondent plus aux nouvelles routes.
+
+Elle est remplacée par :
+- `/admin/res/minus` pour les dépenses administratives ;
+- `/admin/res/plus` pour les recouvrements ;
+- `/admin/res/give` pour les dons.
+
+Remplacer la fonction `calculateAdminCommonStockUpdate()` par des fonctions distinctes et testées pour la dépense administrative, le recouvrement et le don. Ne pas conserver une fonction unique qui mélange sortie, retour et don.
+
+Remplacer l'utilisation de `calculateRemainingSystemAdminReserve(..., common.sys_inactive_init_asset)` dans toutes les fonctions de disponibilité distribuable par le calcul reposant sur `common.admin_expens`. Les composants concernés de la Révision 4 comprennent notamment `stock-accounting.js`, `common-accounting.js`, `db.js`, `deposit-availability.js`, `deposit-credit-policy.js`, `routes.js`, `xtu-deposit-worker.js` et `xtu-withdrawal-routes.js`, ainsi que leurs tests et les outils de lecture de l'historique commun.
+
+`common.sys_inactive_init_asset` est un ancien champ cumulatif de la Révision 4. Il n'est plus la source de vérité du plafond administratif, du plancher protégé ou des actifs distribuables. Pour éviter une suppression implicite non demandée, il peut rester temporairement dans le schéma comme champ legacy, initialisé à zéro et non modifié par les trois nouvelles routes ; aucune formule active de disponibilité ou de dépense ne doit continuer à s'appuyer sur lui. Toute suppression physique ultérieure de ce champ devra être accompagnée d'une vérification exhaustive de ses dernières références.
+
+La nouvelle logique doit également remplacer les tests et descriptions README qui affirment que `/admin/update-common-stock` augmente `sys_inactive_init_asset` ou utilise l'ancien mécanisme de dépense.
+
+11.10. Schéma et initialisation de la base
+
+Le projet n'étant pas déployé, intégrer directement le schéma définitif dans `db.js` et l'initialisation d'une base neuve. Ne pas créer de migration SQL.
+
+Dans `common` :
+- ajouter `admin_expens DECIMAL(50,30) NOT NULL DEFAULT 0` ;
+- ajouter `total_gifts DECIMAL(50,30) NOT NULL DEFAULT 0` ;
+- inclure les deux champs dans `COMMON_NUMERIC_FIELDS`, `commonSnapshotValues()`, les insertions de snapshots, les listes autorisées de lecture/historique et l'initialisation du premier snapshot ;
+- valider `admin_expens` comme montant courant non négatif et plafonné ;
+- valider `total_gifts` comme compteur cumulatif non négatif et monotone.
+
+Créer `gifts` et `admin_external_settlements` avec clés primaires, références internes uniques, référence externe unique, index temporels et colonnes de rapprochement décrites ci-dessus. Pour les dépenses et recouvrements, la ligne `activities` liée doit être créée atomiquement avec le snapshot `common`.
+
+Les nouvelles routes doivent avoir des limites indépendantes dans `http-rate-limiter.js`, une couverture de tests spécifique et les mêmes exigences administratives que les autres routes protégées.
+
+11.11. Interaction avec les règles MAJ5/MAJ6
+
+Ces opérations :
+- ne sont ni des dépôts utilisateurs ni des achats d'actifs initiaux ;
+- n'utilisent pas les tfees ;
+- ne produisent aucun XTU libre ;
+- ne modifient pas `users_stock.balance`, `users_stock.run_balance`, le prix individuel ni les cycles de rémunération ;
+- ne financent pas un vendeur et ne modifient pas les lots vendeurs ;
+- ne créent pas de droit individuel ou global à disbursement ;
+- ne changent pas les soldes physiques des portefeuilles par une transaction signée par le serveur ;
+- ne peuvent pas comptabiliser deux fois un transfert externe ;
+- ne modifient pas les règles de remboursement automatique de la section 9.
+
+Le don est la seule des trois opérations qui augmente `common.total_units_price` sans modifier `common.backed_units`. Les dépenses et recouvrements diminuent/augmentent `total_units_price` et `backed_units` dans les mêmes proportions, à la parité globale capturée.
+
+======================================================================
+12. TESTS D'ACCEPTATION — RÉSERVES ADMINISTRATIVES
+======================================================================
+
+Les tests ci-dessous sont des critères d'acceptation métier et ne sont pas déclarés comme exécutés.
+
+A. Plafond et disponibilité
+1. Avec `STOCK_LIMIT=18 000 000` et un ratio administratif de 10 %, le plafond est de 1 800 000 actifs initiaux.
+2. Une dépense qui ferait dépasser `common.admin_expens=1 800 000` est refusée.
+3. Une dépense respecte le montant encore disponible `Q - admin_expens` après conversion au prix global courant.
+4. `admin_expens` ne peut jamais être négatif ni dépasser Q.
+5. Le calcul des actifs distribuables utilise `Q - admin_expens` et non `sys_inactive_init_asset`.
+6. Une dépense puis son recouvrement intégral laissent inchangée la disponibilité distribuable ordinaire, sous réserve de l'arrondi décimal.
+7. Une opération administrative ne peut pas consommer la réserve ordinaire, une réserve vendeur ou un montant réservé à un disbursement.
+
+B. `/admin/res/minus`
+8. Une opération valide diminue `total_units_price` du montant BSC-USD et `backed_units` du montant initial `amount / unit_price`.
+9. La même opération augmente `admin_expens` du montant initial calculé.
+10. L'activité correspondante a `ONEX` comme expéditeur, `XADMIN` comme destinataire, type 6, `fees=0` et le prix global capturé.
+11. Les autres soldes utilisateurs, réserves vendeurs et compteurs sans rapport restent inchangés.
+12. Une dépense supérieure au plafond disponible est refusée sans écriture partielle.
+
+C. `/admin/res/plus`
+13. Un recouvrement valide augmente `total_units_price` du montant reçu et `backed_units` du montant initial calculé.
+14. Le même recouvrement diminue `admin_expens` du montant initial calculé.
+15. Un recouvrement supérieur à `admin_expens × unit_price` est refusé sans écriture.
+16. L'activité correspondante a `XADMIN` comme expéditeur, `ONEX` comme destinataire, type 7, `fees=0` et le prix global capturé.
+17. Un recouvrement partiel diminue proportionnellement l'encours sans le rendre négatif.
+
+D. `/admin/res/give`
+18. Un don valide augmente `total_units_price` et `total_gifts` du même montant BSC-USD.
+19. Le prix global peut augmenter ; il ne diminue jamais.
+20. `backed_units`, `admin_expens`, `inactive_init_asset`, les réserves vendeurs et les soldes utilisateurs ne changent pas.
+21. Une ligne `gifts` unique est liée au snapshot `common` créé.
+
+E. Sécurité, idempotence et atomicité
+22. Les trois routes exigent l'authentification administrative mot de passe + PIN.
+23. Une `external_reference` déjà utilisée sur n'importe laquelle des trois routes ne peut pas être réutilisée.
+24. Un retry strictement identique retourne l'opération existante sans seconde variation des réserves.
+25. Une réutilisation de la référence avec un type ou un montant différent est refusée.
+26. Une erreur avant commit annule le snapshot, l'activité/le don et le registre externe ensemble.
+27. Toutes les opérations utilisent `common_state` et `FOR UPDATE` afin d'empêcher les mises à jour concurrentes perdues.
+28. Aucune route n'envoie ou ne signe un transfert BSC-USD ; le serveur ne fait que consigner un transfert déjà réalisé et vérifié par l'administration.
+29. Les opérations sont bloquées ou différées tant qu'une campagne globale possède des réservations ou des règlements non résolus, conformément à la politique de snapshot.
+
+F. Remplacement de la Révision 4
+30. `/admin/update-common-stock` n'est plus enregistré et ne peut pas effectuer une dépense.
+31. `calculateAdminCommonStockUpdate()` et toute dépendance active à l'ancien calcul administratif sont supprimées ou remplacées.
+32. Aucun calcul d'actifs distribuables ne dépend encore de `sys_inactive_init_asset`.
+33. Les nouvelles colonnes `admin_expens` et `total_gifts` sont présentes dans chaque snapshot et dans les lectures administratives autorisées.
+
+======================================================================
+13. SYNTHÈSE CONSOLIDÉE DE MAJ6
+======================================================================
+
+Les remboursements automatiques de MAJ6 utilisent un minimum net fixe d'une unité du token source, après retenue de 1 % et déduction du gas estimé. Les petits montants sont conservés et agrégés par adresse source et contrat/token exact, sans limite de durée. Le routage automatique continue pour les comptes désactivés, y compris pour leurs nouvelles réceptions officielles, sans demande préalable, réactivation ou approbation administrative lorsque les contrôles normaux sont satisfaits.
+
+L'ancien minimum de remboursement de 0,8 BSC-USD/XTU issu de la Révision 4 est définitivement supprimé des règles opérationnelles. Il ne subsiste dans ce document qu'à titre d'historique explicatif de la Révision 4. Le minimum opérationnel unique est 1 unité nette du token source. Le plafond de gas de 0,4 BSC-USD reste un contrôle séparé et ne sert plus à calculer le minimum de remboursement.
+
+Les dépenses administratives utilisent `common.admin_expens`, exprimé en actifs initiaux et plafonné à 10 % du stock initial de référence, soit 1 800 000 actifs initiaux lorsque le stock initial vaut 18 000 000. Cette colonne représente l'encours des dépenses non encore recouvrées. `/admin/res/minus` enregistre une sortie ONEX → XADMIN et augmente cet encours ; `/admin/res/plus` enregistre le retour XADMIN → ONEX et le diminue ; les deux mouvements modifient `total_units_price` et `backed_units` proportionnellement au prix global et sont inscrits dans `activities` avec `tfees=0`.
+
+`/admin/res/give` comptabilise un don physique BSC-USD reçu hors serveur : `total_units_price` et `total_gifts` augmentent du même montant, puis le prix global est recalculé ; aucun actif initial ni solde utilisateur n'est créé. Les trois routes sont administratives, transactionnelles, idempotentes, auditées et ne signent aucun transfert blockchain.
+
+MAJ6 conserve la séparation entre valeur comptable, liquidité BSC-USD physique, actifs initiaux, XTU libres, réserves vendeurs, dépenses administratives et obligations de disbursement. Aucun montant ne peut être comptabilisé deux fois.
+
+======================================================================
+14. CONTRAT DE RÉPONSE JSON DE /app/signup
+======================================================================
+
+La route `/app/signup` doit utiliser des réponses en anglais. Pour le cas précis d'une adresse avec remboursement en attente, le contrat obligatoire est :
+
+HTTP 423 Locked
+
+{
+  "auth": "refund_pending",
+  "message": "Signup is temporarily blocked because this wallet address has an outstanding automatic refund.",
+  "pending_refunds": [
+    {
+      "asset_code": "BSC-USD",
+      "token_contract": "0x...",
+      "pending_gross_amount": "1.200000000000000000",
+      "net_amount_currently_eligible": "0.788000000000000000",
+      "estimated_net_refund_amount": "0.788000000000000000",
+      "minimum_net_amount": "1.000000000000000000",
+      "additional_net_amount_required": "0.212000000000000000",
+      "refund_status": "collecting",
+      "next_action": "COMPLETE_MINIMUM_REQUIRED"
+    }
+  ]
+}
+
+Le JSON ci-dessus est un exemple de structure uniquement ; les montants sont calculés à partir des registres réellement verrouillés et rapprochés. Les décimales sont renvoyées sous forme de chaînes afin d'éviter toute perte de précision côté client.
+
+Si le minimum est déjà atteint :
+- `auth` reste `refund_pending` tant que le remboursement n'est pas entièrement confirmé ;
+- `next_action` vaut `WAIT_FOR_REFUND_COMPLETION` ;
+- le message anglais précise que l'utilisateur doit attendre le succès du paiement automatique.
+
+Si une anomalie bloque la résolution :
+- `next_action` vaut `WAIT_FOR_REFUND_RESOLUTION` ;
+- le serveur ne demande pas à l'utilisateur d'envoyer davantage de tokens pour contourner `manual_review`.
+
+Si plusieurs tokens sont concernés, chaque token fait l'objet d'une entrée distincte. Ne jamais retourner un champ numérique qui additionne directement BSC-USD et XTU. Les statuts et montants doivent être calculés depuis les événements sources et les paiements, et non depuis un simple compteur agrégé non rapproché.
+
+Compatibilité du contrat existant : l'archive Révision 4 inspectée utilise des clés de réponse hétérogènes dans `/app/signup` (`msg`, `auths`, et des valeurs d'erreur), tandis que le contrat demandé ici impose `auth` pour le nouveau blocage de remboursement. L'implémentation doit conserver la compatibilité attendue par le client Android et ne pas renommer silencieusement les réponses de succès ou d'erreur existantes sans adapter et tester le client. Toutes les chaînes de réponse ajoutées ou modifiées dans le cadre de cette fonctionnalité restent en anglais.
+
+======================================================================
+15. ÉTAT DES IMPLÉMENTATIONS RESTANT À APPLIQUER AU CODE
+======================================================================
+
+La présente spécification définit la cible métier. L'archive `OneXServer-Revision4-MAJ6-Integration-partielle-2026-11-28.zip` précédemment produite n'implémente pas encore l'intégralité de cette cible. Les travaux suivants restent obligatoires avant toute activation des workers financiers :
+
+15.1. Remboursement automatique de bout en bout
+- raccorder le scanner BSC-USD au registre `automatic_refund_groups`, `automatic_refund_group_events` et `automatic_refund_payouts` ;
+- raccorder le scanner et le worker XTU aux mêmes règles d'agrégation, tout en préservant la comptabilité d'externalisation XTU de MAJ5 ;
+- transférer automatiquement les événements connus non crédités à la désactivation vers le registre de remboursement ;
+- diriger chaque nouveau BSC-USD/XTU reçu depuis un compte désactivé vers le remboursement ;
+- implémenter la catégorie D : à l'échéance immuable de 30 jours, si un dossier BSC-USD actif n'a pas atteint 20 BSC-USD bruts au plus tard avec le cinquième événement, transférer chaque événement source non crédité au registre de remboursement ; supprimer toute affectation automatique correspondante aux réserves communes ; préserver le statut actif du compte ;
+- supprimer les demandes, challenges de signature et approbations administratives préalables du parcours automatique normal ; conserver `manual_review` uniquement pour les anomalies réelles ;
+- finaliser le contrat XTU de Révision 5 sans commission contractuelle de 0,1 %, puis adapter ABI, compilation, déploiement futur et tests avant tout déploiement ;
+- assurer les réservations, signatures, transmissions, confirmations, restaurations après échec, rapprochements de nonce et corrections de gas sur des paiements groupés idempotents.
+
+15.2. Suppression du délai de conservation de 30 jours
+- retirer `SMALL_REFUND_REVIEW_DELAY_MS` de `automatic-refund-policy.js` et de toute configuration ;
+- retirer `review_due_at_ms`, `next_review_at_ms`, les sorties `reviewDue`, le statut `review_due` et tout worker/notification déclenché uniquement par 30 jours de conservation ;
+- ne conserver que le délai individuel de 30 minutes avant l'éligibilité de chaque événement ;
+- garder le worker périodique afin de réévaluer les groupes sans échéance de conservation ;
+- adapter les tests qui attendaient une revue après 30 jours et ajouter les cas d'attente indéfinie.
+
+15.3. Blocage signup et synchronisation par adresse
+- ajouter `bsc_wallet_financial_locks` au schéma neuf dans `db.js` ;
+- modifier `/app/signup` pour verrouiller l'adresse normalisée, lire les remboursements impayés de toutes les catégories et refuser l'inscription tant qu'une obligation existe ;
+- produire la ventilation des montants en attente par token et contrat, avec la prochaine action en anglais ;
+- appliquer le même verrou dans les scanners et workers chaque fois qu'ils ajoutent, réaffectent, réservent, confirment ou restaurent un événement de remboursement ;
+- ajouter `registered_at_block` et garantir le rattrapage des deux scanners jusqu'au bloc finalisé de référence avant l'inscription ; router les événements tardifs selon cette frontière ;
+- ne jamais migrer un événement de remboursement vers un essai de dépôt pendant l'inscription ;
+- tester les courses concurrentes signup/scanner/worker ainsi que le cas d'une adresse libérée après confirmation complète du remboursement.
+- tester l'expiration BSC-USD à 30 jours : dossier sous 20 BSC-USD basculé vers la catégorie D, compte toujours actif, aucune écriture aux réserves communes, principal non crédité remboursable ; dossier atteignant 20 BSC-USD au cinquième événement conserve le traitement d'achat normal ; compte désactivé avant expiration classé en C sans doublon ; événement finalisé avant l'échéance mais découvert tardivement inclus après rattrapage du scanner ; événement finalisé après la frontière d'expiration affecté à un nouvel essai ; remboursement D inférieur à 1 conservé sans limite de durée.
+
+15.4. Portage complet de MAJ5
+- terminer le registre autonome `users_xtu_free_balances`, son ledger, ses essais et la garde FIFO XTU ;
+- migrer les disbursements individuel et global vers les XTU libres, avec snapshot, réservations et règlements de MAJ5 ;
+- vérifier les protections des réserves et l'intégration des trois routes administratives MAJ6 avec les vrais chemins comptables ;
+- remplacer les tests Révision 4 incompatibles, ajouter des tests MySQL et EVM et vérifier les contraintes d'unicité/foreign keys dans une base neuve.
+
+15.5. Validation préalable
+- installer les dépendances déclarées par le projet ;
+- exécuter la suite complète de tests unitaires et d'intégration ;
+- initialiser une base MySQL neuve depuis `db.js` (aucun script de migration SQL n'est requis, le projet n'étant pas déployé) ;
+- tester les scanners avec des reçus blockchain contrôlés, les événements dupliqués, la finalité, les réorganisations, le gas, les paiements incertains et les paiements groupés ;
+- ne déclarer aucun test MySQL/EVM, déploiement ou transfert blockchain comme réalisé sans exécution réelle ;
+- ne pas activer les workers de remboursement/dépôt/disbursement en production avant la réussite de ces validations.
+
+FIN DE LA MISE À JOUR — RÉVISION 5, MAJ6 CONSOLIDÉE — MISE À JOUR 3 — 28 NOVEMBRE 2026

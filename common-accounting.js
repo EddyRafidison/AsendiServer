@@ -79,10 +79,16 @@ async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
   const stockLimit = new BigNumber(process.env.STOCK_LIMIT || "18000000");
   const adminRatio = new BigNumber(process.env.SYSTEM_ADMIN_RESERVE_RATIO || "0.10");
   const adminCap = stockLimit.multipliedBy(adminRatio);
+  const adminExpenses = new BigNumber(values.admin_expens);
+  const backedUnits = new BigNumber(values.backed_units);
   if (!stockLimit.isFinite() || !stockLimit.isGreaterThan(0) || !adminRatio.isFinite() ||
       adminRatio.isNegative() || !adminRatio.isLessThan(1) ||
-      new BigNumber(values.admin_expens).isGreaterThan(adminCap)) {
-    throw new RangeError("common.admin_expens exceeds the configured administrative expenditure cap.");
+      !adminExpenses.isFinite() || adminExpenses.isNegative() || adminExpenses.isGreaterThan(adminCap)) {
+    throw new RangeError("common.admin_expens must be non-negative and cannot exceed the configured administrative expenditure cap.");
+  }
+  const protectedAdminBacking = adminCap.minus(adminExpenses);
+  if (!backedUnits.isFinite() || !backedUnits.isGreaterThan(0) || backedUnits.isLessThan(protectedAdminBacking)) {
+    throw new RangeError("common.backed_units must remain at or above the unspent administrative reserve floor.");
   }
   const columns = [...COMMON_NUMERIC_FIELDS, "record_date", "record_time"];
   const placeholders = columns.map(() => "?").join(",");

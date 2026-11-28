@@ -2,27 +2,25 @@
 
 Node.js backend for the OneX platform. The current payment rail accepts **Binance-Peg BSC-USD (BEP-20)** on BNB Smart Chain mainnet (chain ID 56). This token is not USDt directly issued by Tether.
 
-## MAJ6 implementation status
+## MAJ6 implementation status — Stage 1
 
-This archive contains a **partial code integration** of the 28 November 2026 Revision 5 MAJ6 addendum on top of the Revision 4 codebase. It is not a completed Revision 5 migration and must not be treated as production-ready.
+This archive is the **Stage 1 foundation update**, based cumulatively on `OneXServer-Revision4-MAJ6-Integration-partielle-2026-11-28.zip` and aligned with `Revision 5 — MAJ6 consolidée — Mise à jour 3` dated 28 November 2026. It is not the complete MAJ6/MAJ5 implementation and is not production-ready.
 
-Integrated in this code snapshot:
-- `common.admin_expens` and `common.total_gifts` are included in fresh-schema creation and common snapshots.
-- The protected administrative backing calculation uses `STOCK_LIMIT × SYSTEM_ADMIN_RESERVE_RATIO - common.admin_expens`; `sys_inactive_init_asset` is retained as a legacy field.
-- `POST /admin/res/minus`, `POST /admin/res/plus`, and `POST /admin/res/give` record externally settled BSC-USD operations transactionally, with unique external references, common snapshots, activity/gift records, and independent rate limits. These routes do not sign or broadcast blockchain transactions.
-- The former `POST /admin/update-common-stock` route and `calculateAdminCommonStockUpdate()` helper have been removed.
-- The BSC refund minimum and the default XTU unknown-refund policy minimum are set to one net source-token unit, independently of the gas ceiling.
-- The new automatic-refund group/event/payout tables and a pure grouping/eligibility calculator are present as the schema and policy foundation.
+Implemented or carried forward in this stage:
+- The fresh database schema includes `common.admin_expens` and `common.total_gifts`; common snapshots validate the outstanding administrative-expense cap, the remaining protected backing floor and the monotonic gift counter.
+- The three separate administrative reserve routes are retained: `POST /admin/res/minus`, `/admin/res/plus` and `/admin/res/give`. They use transactional common snapshots, unique external references, audit records and independent rate limits. They record transfers already verified and executed outside OneXServer; they do not sign or broadcast blockchain transactions.
+- The old `POST /admin/update-common-stock` route and `calculateAdminCommonStockUpdate()` helper remain removed.
+- The automatic-refund schema no longer contains the obsolete 30-day small-refund review fields. `automatic-refund-policy.js` retains the individual 30-minute eligibility delay and the fixed 1-token net minimum, with no age-based review result. This policy is not yet connected to the scanners or payout workers.
+- The schema now includes `bsc_wallet_financial_locks` and `bsc_wallet_address_registry.registered_at_block`. The persistent lock and block-boundary structures are foundations only: signup catch-up and shared locking by scanners/workers are not yet wired.
+- The autonomous XTU-free register foundations are present: free balances, qualification attempts and source events, append-only balance ledger, reservation/allocation tables, XTU externalization ledgers, custody lots and the receive-fee ledger. Pure policy helpers cover qualification at 1 net XTU within at most five finalized events, event-frozen receive fees, the global zero-fee phase, available/reserved/consumed accounting and FIFO consolidation lots of at least 100 XTU.
 
-Still requiring implementation before MAJ6 can be considered complete:
-- The automatic-refund group policy is not yet connected to the BSC payment scanner, XTU deposit scanner, or payout workers.
-- R4 still routes deposits received by deactivated accounts to `pending_support`; it does not yet automatically move every uncredited source event and later incoming transfer into the grouped refund ledger.
-- The R4 BSC refund worker still refuses known-account deposit batches and retains the legacy unknown-transfer request/approval flow.
-- The R4 XTU unknown-refund worker still uses its legacy approval flow and the current XTU contract/worker still contains the 0.1% contract-fee design. MAJ5's fee-free XTU contract and the MAJ6 off-chain 1% refund retention are not fully integrated into that execution path.
-- The other MAJ5 changes outside the MAJ6 addendum (including the autonomous XTU-free ledger and the MAJ5 individual/global disbursement architecture) have not been ported in full from the Revision 4 codebase.
+Not implemented in Stage 1:
+- The XTU-free ledger/helper is not yet connected to the XTU scanner, consolidation worker, withdrawal path or individual/global disbursement workers. The existing R4 disbursement paths still require the full MAJ5 migration.
+- The automatic-refund groups/events/payouts are not yet wired end-to-end to the BSC-USD and XTU scanners/workers. Categories A–D, deactivation routing, payout signing/confirmation/restoration and signup blocking remain outstanding.
+- The shared wallet lock is not yet used by signup/scanners/refund workers, and `registered_at_block` remains a zero sentinel until the finalized-block catch-up flow is implemented.
+- The XTU contract/worker path still requires the MAJ5 fee-free contract migration and removal of the legacy 0.1% contract-fee design.
 
-The schema is designed for a fresh database, as required by the project specifications; no SQL migration script is included. Static JavaScript syntax validation has been run. Runtime/database/blockchain integration tests have not been run in this environment because the project dependencies are not installed. Do not enable refund or payment workers in a live environment until the outstanding paths above are implemented and tested.
-
+The project is designed for a **fresh database**; no SQL migration script is included. JavaScript syntax validation and dependency-free structural tests have been run (details in `docs/MAJ6_STAGE1_IMPLEMENTATION_REPORT.md`). BigNumber-dependent tests, MySQL initialization, EVM tests and end-to-end financial tests have not been validated in this environment because the project dependencies are not installed. Do not enable financial workers or treat this archive as deployable until the remaining stages and validations are complete.
 
 ## Public unit: XTU (Extended Unit)
 

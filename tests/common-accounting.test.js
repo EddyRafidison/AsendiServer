@@ -4,6 +4,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { commonSnapshotValues } = require("../common-accounting");
 
+// Small deterministic fixture quota: 10 initial assets, independent from production defaults.
+process.env.STOCK_LIMIT = "100";
+process.env.SYSTEM_ADMIN_RESERVE_RATIO = "0.10";
+
 function commonRow(overrides = {}) {
   return {
     total_units_price: "100",
@@ -48,4 +52,24 @@ test("common.xtu_wallets is an evolving non-negative externalized balance that c
   });
   assert.equal(values.xtu_wallets, "7.5");
   assert.throws(() => commonSnapshotValues(commonRow({ xtu_wallets: "1" }), { xtu_wallets: "-0.01" }), /non-negative/);
+});
+
+
+test("common administrative expense is bounded by the protected reserve and gifts are monotone", () => {
+  const base = commonRow({
+    total_units_price: "18000000",
+    unit_price: "1",
+    backed_units: "18000000",
+    admin_expens: "5",
+    total_gifts: "250",
+  });
+  const next = commonSnapshotValues(base, {
+    backed_units: "95",
+    admin_expens: "5",
+    total_gifts: "300",
+  });
+  assert.equal(next.total_gifts, "300");
+  assert.throws(() => commonSnapshotValues(base, { total_gifts: "249" }), /invalid|cumulative/i);
+  assert.throws(() => commonSnapshotValues(base, { backed_units: "9", admin_expens: "0" }), /protected reserve floor/);
+  assert.throws(() => commonSnapshotValues(base, { admin_expens: "11" }), /cap/);
 });

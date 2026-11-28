@@ -5,7 +5,6 @@ const assert = require("node:assert/strict");
 const {
   MINIMUM_AUTOMATIC_REFUND_NET,
   REFUND_ELIGIBILITY_DELAY_MS,
-  SMALL_REFUND_REVIEW_DELAY_MS,
   getAutomaticRefundGroupKey,
   calculateAutomaticRefundGroupQuote,
 } = require("../automatic-refund-policy");
@@ -27,7 +26,6 @@ function event(overrides = {}) {
     finalized: true,
     finalizedAtMs,
     refundEligibleAtMs: finalizedAtMs + REFUND_ELIGIBILITY_DELAY_MS,
-    reviewDueAtMs: finalizedAtMs + SMALL_REFUND_REVIEW_DELAY_MS,
     status: "collecting",
     ...overrides,
   };
@@ -93,7 +91,7 @@ test("gas above the ceiling blocks signing without changing the one-unit minimum
   assert.equal(quote.eligible, false);
 });
 
-test("manual review blocks an otherwise eligible group and review_due does not", () => {
+test("manual review blocks an otherwise eligible group and no age-based review state exists", () => {
   const blocked = calculateAutomaticRefundGroupQuote({
     events: [event({ eventIdentity: "0x51", grossAmount: "2", status: "manual_review" })],
     estimatedGasFeeToken: "0.01", nowMs: now,
@@ -101,9 +99,11 @@ test("manual review blocks an otherwise eligible group and review_due does not",
   assert.equal(blocked.manualReview, true);
   assert.equal(blocked.eligible, false);
 
-  const reviewDue = calculateAutomaticRefundGroupQuote({
-    events: [event({ eventIdentity: "0x52", grossAmount: "2", status: "review_due" })],
+  const retained = calculateAutomaticRefundGroupQuote({
+    events: [event({ eventIdentity: "0x52", grossAmount: "0.5", finalizedAtMs: now - 365 * 24 * 60 * 60 * 1000, refundEligibleAtMs: now - 365 * 24 * 60 * 60 * 1000 })],
     estimatedGasFeeToken: "0.01", nowMs: now,
   });
-  assert.equal(reviewDue.eligible, true);
+  assert.equal(retained.eligible, false);
+  assert.equal(retained.netAmount.toFixed(8), "0.48500000");
+  assert.equal(Object.hasOwn(retained, "reviewDue"), false);
 });

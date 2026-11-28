@@ -1,0 +1,1313 @@
+ONEXSERVER — SPÉCIFICATION CONSOLIDÉE DES RÈGLES BSC-USD, XTU LIBRES ET DISBURSEMENTS
+Version de référence : 27 novembre 2026
+Révision : 5 — mise à jour complémentaire MAJ5 du 27 novembre 2026 ; dépôts fractionnés limités à cinq transferts avant le minimum ; remboursement automatique des transferts des comptes désactivés ; désactivation après 360 jours d'inactivité ; minimums et frais de disbursement révisés ; bonus global par défaut de 1 %
+Statut : décisions métier confirmées. La destination finale des paiements globaux non réclamés et des remboursements globaux restés impayés demeure indéterminée ; toute éventuelle affectation future reste une préférence à examiner selon les circonstances réelles, et non une décision d'exécution.
+
+======================================================================
+0. PORTÉE, PRIORITÉ ET PRINCIPES DIRECTEURS
+======================================================================
+
+La présente Révision 5 remplace la Révision 4 pour toute règle qu'elle modifie expressément. Les règles de la Révision 4 qui ne sont pas incompatibles avec la présente révision restent applicables, notamment les garanties d'idempotence, de finalité blockchain, de verrouillage SQL, le seuil de gas, le FIFO vendeur, les protections des réserves, la séparation des portefeuilles et les exigences d'audit.
+
+La Révision 5 établit les principes suivants :
+- seul le BSC-USD officiel sur BNB Smart Chain Mainnet (Chain ID 56) permet d'acheter des actifs initiaux OneX ;
+- aucun XTU ne peut être utilisé pour acheter ou créditer des actifs initiaux ;
+- le minimum cumulé d'un dépôt d'achat BSC-USD est de 20 BSC-USD ; il peut être atteint en au plus cinq transferts blockchain uniques et finalisés ;
+- le minimum d'un dépôt XTU libres est de 1 XTU net créditable, atteint en au plus cinq transferts blockchain uniques et finalisés ; ce minimum reste identique pendant le disbursement global ;
+- pour chacun de ces deux actifs, si le sixième transfert arrive alors que le minimum de l'essai de dépôt n'a toujours pas été atteint, le compte est désactivé et tous les montants de cet essai qui n'ont pas déjà été crédités sont envoyés au circuit de remboursement automatique ;
+- le compteur des dépôts BSC-USD est indépendant du compteur des dépôts XTU libres ; les événements ne sont jamais mélangés entre tokens, comptes, contrats ou essais ;
+- les XTU reçus d'un utilisateur enregistré et actif alimentent un registre autonome de « XTU libres » ; hors campagne globale, les tfees de réception XTU restent applicables selon la politique de réception ; pendant toute la campagne globale, leur taux est strictement de 0 % ;
+- les XTU libres ne modifient pas users_stock.balance, ne démarrent aucun cycle et ne permettent aucune activité autre que les disbursements individuel et global ;
+- les XTU libres restent des tokens XTU sous garde et suivent la consolidation XTU FIFO par lots d'au moins 100 XTU ;
+- common.xtu_wallets diminue du montant brut de XTU réellement retourné et rapproché une seule fois ; les remboursements de XTU d'un compte désactivé utilisent un registre de remboursement autonome et doivent être réconciliés sans double diminution ni double réaugmentation de l'exposition externalisée ;
+- hors disbursement global, les frais tfees éventuellement appliqués à la réception de XTU libres sont valorisés en BSC-USD à la parité comptable et crédités à common.total_units_price, sans créer de BSC-USD physique ; pendant la campagne globale, aucune tfees de réception XTU libre n'est prélevée ;
+- les disbursements individuel et global sont fondés sur les XTU libres réservés et non sur users_stock.balance ni sur le prix individuel ; leurs frais de service tfees sont strictement nuls ; seuls les coûts réels de gas BNB, estimés puis rapprochés, peuvent être déduits du paiement ;
+- le minimum de disbursement individuel est de 20 XTU libres ; le minimum de disbursement global reste de 1 XTU libre pendant la période primaire et les 30 jours supplémentaires ;
+- pendant toute l'opération globale, y compris la période finale de réclamation de 30 jours, la réception des XTU libres depuis les adresses enregistrées et actives reste sans tfees de réception ; les réceptions postérieures à la photographie sont inscrites dans un registre complémentaire append-only et peuvent participer au même disbursement global sans modifier la photographie initiale ;
+- le retrait XTU volontaire vers le portefeuille personnel a un minimum brut de 1 XTU ; il reste soumis aux contrôles habituels, mais il est interdit à tout compte désactivé ;
+- pendant le disbursement global, tout BSC-USD officiel reçu sur le circuit de dépôt OneX est automatiquement retourné dans le même token après le délai minimal de 30 minutes, que l'adresse expéditrice soit enregistrée ou non ; les frais de remboursement habituels restent applicables ;
+- tout transfert officiel BSC-USD ou XTU reçu d'une adresse enregistrée liée à un compte désactivé est automatiquement remboursé dans le même token et vers l'adresse source, sans crédit d'actifs initiaux ni de XTU libres ; cette règle s'applique également aux montants de dépôts connus encore non crédités au moment de la désactivation ;
+- les transferts officiels BSC-USD ou XTU provenant d'une adresse expéditrice non enregistrée sont automatiquement remboursés dans le même token, après finalité et délai minimal de 30 minutes, sous déduction d'une retenue de 1 % et du gas imputable ;
+- les comptes qui n'effectuent aucune activité transactionnelle ou financière admissible pendant 360 jours consécutifs sont automatiquement désactivés ; une connexion, une consultation de solde ou une tâche automatique du serveur ne suffit pas à réinitialiser ce délai ;
+- toute désactivation automatique est journalisée avec son motif précis et déclenche une notification en anglais ; Telegram est utilisé lorsque l'utilisateur y a lié un canal, avec un canal de notification alternatif disponible (notamment e-mail) lorsque Telegram n'est pas lié ;
+- le bonus global vaut 1 % par défaut (`GLOBAL_DISBURSEMENT_BONUS=1`), est configurable explicitement entre 0 et 10 %, et est figé dans le snapshot ; il s'applique uniquement aux demandes acceptées pendant la période primaire ; les nouvelles demandes acceptées pendant l'extension reçoivent 0 % ;
+- le bonus est une récompense conditionnelle non garantie et ne promet pas de couvrir les frais de gas, les frais de réseau, les dépenses liées aux services OneX ni les dépenses de l'utilisateur ;
+- les remboursements automatiques ne nécessitent aucune demande préalable et commencent après finalité et expiration du délai minimal de 30 minutes ; ils ne sont pas retardés par les périodes de 90 jours et de 30 jours, mais tout remboursement lié à la campagne globale qui demeure impayé à la date limite finale est isolé dans un registre distinct en attente d'une décision ultérieure ;
+- les paiements globaux non réclamés et remboursements globaux restés impayés restent des soldes isolés et traçables ; aucune destination finale n'est décidée ; toute éventuelle affectation à la trésorerie nationale ou à une institution publique/financière reste une préférence à étudier selon les circonstances réelles ;
+- les deux modes de disbursement sont activés et clôturés par décision administrative enregistrée en base de données, jamais par un simple changement d'état dans .env ;
+- les transferts XTU entre portefeuilles ne supportent aucune commission contractuelle de 0,1 % ; seuls les frais réels de gas BNB restent applicables aux transactions signées par OneX ;
+- toutes les notifications Telegram émises par OneX, qu'elles soient destinées aux utilisateurs ou à l'administration, sont rédigées en anglais.
+
+Le projet n'étant pas déployé :
+- ne créer aucun script de migration SQL ;
+- intégrer le schéma définitif dans db.js et l'initialisation des nouvelles bases ;
+- ne pas déclarer un déploiement, un test EVM, MySQL ou une transaction blockchain comme effectué sans exécution réelle ;
+- conserver des registres strictement séparés pour BSC-USD, XTU libres, XTU en conservation, remboursements automatiques, disbursements et règlements vendeurs ;
+- ne jamais confondre valeur comptable, liquidité BSC-USD physique, soldes de tokens on-chain et droits XTU libres des utilisateurs.
+
+RÈGLE GLOBALE SUR LES FRAIS ET LE BONUS : les tfees applicables aux demandes de disbursement individuel et global sont strictement égaux à 0 % pendant toutes les phases de ces deux modes. Aucune ligne de frais tfees de disbursement n'est créée dans common.total_units_price ou dans un registre de récupération de frais. Le montant XTU libre réservé est converti à la parité comptable interne de 1 BSC-USD par XTU, puis seuls les coûts réels de gas BNB autorisés sont déduits du paiement. Le bonus global vaut 1 % par défaut, configurable entre 0 et 10 %, figé dans le snapshot et appliqué uniquement aux demandes acceptées pendant la période primaire ; une demande primaire conserve son bonus si le paiement intervient pendant l'extension, tandis que les nouvelles demandes de l'extension reçoivent 0 %. Le bonus est une récompense conditionnelle non garantie et ne promet pas de couvrir les coûts réels ni les dépenses liées à l'utilisation des services OneX. Les tfees éventuellement appliqués à la réception de XTU libres hors campagne globale restent distincts de ces règles ; ils ne sont pas des frais de disbursement. La retenue de remboursement automatique de 1 % et les coûts réels de gas restent également distincts et continuent de s'appliquer aux remboursements automatiques.
+
+PRINCIPE DE PRIORITÉ : l'achat d'actifs initiaux relève exclusivement du circuit BSC-USD. La réception XTU d'un utilisateur enregistré relève exclusivement du registre XTU libres, y compris pendant le disbursement global. Les réceptions XTU postérieures à la photographie globale restent séparées de celle-ci, mais peuvent être utilisées dans le règlement global par un registre complémentaire. Les disbursements sont les seuls traitements autorisés à consommer les XTU libres. Les remboursements automatiques sont un circuit de retour autonome : ils ne nécessitent aucune demande préalable et ne créent aucun compte ni droit de service.
+
+======================================================================
+1. ACTIFS, PARITÉ COMPTABLE ET PORTEFEUILLES
+======================================================================
+
+1.1. BSC-USD
+
+- actif accepté pour l'achat d'actifs initiaux : contrat Binance-Peg BSC-USD officiellement configuré ;
+- réseau : BNB Smart Chain Mainnet, Chain ID 56 ;
+- vérifier l'adresse exacte du contrat, le destinataire, l'expéditeur, l'événement Transfer, le hash, le log, le bloc, le reçu et la finalité ;
+- aucun autre token portant un symbole similaire n'est accepté ;
+- les règles d'achat, de dépôt, de frais tfees, de financement ONEX/vendeurs et d'expiration de 30 jours restent les règles du circuit BSC-USD.
+
+1.2. XTU
+
+- réseau : BNB Smart Chain Mainnet, Chain ID 56 ;
+- standard : BEP-20 ; 18 décimales ;
+- offre fixe : 100 000 000 000 XTU ; aucun mint ultérieur ;
+- l'offre initiale est attribuée au Hot Wallet principal OneX ;
+- le Distribution Wallet XTU est distinct du Hot Wallet et reçoit les lots consolidés ; il ne reçoit pas l'offre initiale ;
+- les portefeuilles personnels enregistrés reçoivent les retraits XTU ;
+- la parité 1 XTU = 1 BSC-USD est une convention comptable interne uniquement ; elle ne crée pas de BSC-USD, ne constitue pas un oracle de prix et ne garantit pas une conversion immédiate ni une liquidité physique.
+
+1.3. Rôles des portefeuilles
+
+- Hot Wallet XTU : détient l'offre initiale XTU et reçoit les XTU retournés par les utilisateurs ;
+- Distribution Wallet XTU : reçoit les XTU libres consolidés et les lots XTU transférés selon les règles de garde ;
+- portefeuille personnel : adresse BSC enregistrée et unique de l'utilisateur ;
+- Hot Wallet BSC-USD : reçoit les paiements BSC-USD et exécute les opérations de trésorerie autorisées selon la configuration ;
+- Cold Wallet BSC-USD : stockage à froid, clé privée jamais présente sur le serveur ;
+- Disbursement Wallet BSC-USD : portefeuille distinct qui paie les disbursements individuels et globaux ;
+- portefeuille(s) BNB de gas : portefeuille(s) autorisé(s) à payer le gas des transactions OneX, avec journal de dépense et rattachement à l'opération concernée.
+
+Séparer toutes les adresses et tous les secrets. Une clé privée BSC-USD ne doit jamais être réutilisée pour signer des transactions XTU. La clé du Cold Wallet ne doit jamais être stockée sur le serveur.
+
+======================================================================
+2. CONTRAT XTU — TRANSFERTS SANS COMMISSION DE TOKEN
+======================================================================
+
+2.1. Suppression définitive de la commission de 0,1 %
+
+La commission contractuelle XTU de 0,1 % est supprimée.
+
+Le contrat OneXToken.sol doit se comporter comme un BEP-20 standard pour les transferts :
+- transfer : aucun frais de token ;
+- transferFrom : aucun frais de token ;
+- aucun prélèvement de 0,1 % ;
+- aucun transfert automatique de commission vers le Distribution Wallet ;
+- aucun événement TransferWithFee requis par l'ancien mécanisme de commission ;
+- les événements Transfer BEP-20 standards suffisent au rapprochement des transferts ;
+- transfert Hot Wallet → Distribution Wallet : aucun frais de token, mais gas BNB normal ;
+- transfert Distribution Wallet → portefeuille utilisateur : aucun frais de token, mais gas BNB normal ;
+- retrait XTU utilisateur → portefeuille personnel : aucun frais de token, mais gas BNB payé par le signataire OneX.
+
+Les frais tfees décrits dans cette spécification sont des frais comptables de service prélevés hors chaîne dans les registres OneX. Ils ne sont pas une commission du contrat XTU et ne changent jamais le montant BEP-20 reçu par le portefeuille de destination.
+
+2.2. Conséquence sur le déploiement
+
+Le projet n'étant pas déployé, modifier le contrat source, l'ABI, les scripts de compilation/déploiement, les tests et les configurations avant le premier déploiement. Ne pas prétendre supprimer les frais d'un contrat déjà déployé et immuable : une ancienne adresse de contrat ne peut pas être transformée rétroactivement en nouveau contrat sans nouvelle procédure de déploiement.
+
+2.3. Portefeuilles
+
+Le déploiement attribue les 100 milliards XTU au Hot Wallet principal. Le Distribution Wallet est configuré séparément et ne reçoit pas l'offre initiale. Le contrat ne doit contenir aucune exemption générale ou règle de taxation par adresse, puisque la commission de token est supprimée pour tous les transferts.
+
+======================================================================
+3. ACHAT D'ACTIFS INITIAUX — BSC-USD UNIQUEMENT
+======================================================================
+
+3.1. Actif autorisé
+
+Seul le BSC-USD officiel peut financer un achat d'actifs initiaux OneX.
+
+Toute la mécanique d'achat XTU de la Révision 4 est annulée, notamment :
+- achat d'actifs initiaux avec XTU ;
+- crédit de users_stock.balance issu d'un transfert XTU ;
+- frais de dépôt XTU à 75 % de tfees ;
+- utilisation des XTU pour financer un achat par ONEX ou par les vendeurs ;
+- conversion d'un montant XTU en actifs initiaux au prix global ;
+- création d'une activité d'achat pour une réception XTU.
+
+Les transferts XTU d'utilisateurs enregistrés sont dirigés vers le circuit XTU libres de la section 4 et ne sont jamais transmis aux fonctions de crédit d'actifs initiaux.
+
+3.2. Limites des dépôts BSC-USD
+
+Conserver les paramètres communs du circuit d'achat BSC-USD :
+
+`DEPOSIT_MIN_AMOUNT=20`
+`DEPOSIT_MAX_AMOUNT=100`
+`DEPOSIT_PENDING_EXPIRATION_DAYS=30`
+`DEPOSIT_MAX_TRANSFERS_BEFORE_MIN=5`
+`XTU_FREE_DEPOSIT_MAX_TRANSFERS=5`
+
+Ces deux plafonds sont des règles métier strictes : aucune configuration ne peut les augmenter au-delà de cinq.
+
+- minimum cumulé de qualification d'un essai : 20 BSC-USD bruts réellement reçus ;
+- le minimum de 20 est exprimé en BSC-USD et non en XTU ; la parité comptable XTU/BSC-USD ne rend pas les tokens interchangeables ;
+- un essai peut être alimenté par un à cinq événements BEP-20 distincts, finalisés et rapprochés ; un transfert unique peut atteindre ou dépasser le minimum ;
+- chaque événement est identifié par Chain ID, adresse exacte du contrat, `tx_hash` et `log_index` ; une redétection RPC, un retry, une réorganisation ou un doublon de scanner ne compte jamais comme un nouveau transfert ;
+- si le cumul est encore inférieur à 20 BSC-USD avant l'arrivée d'un sixième événement, le sixième événement provoque la désactivation du compte avec le motif `deposit_attempt_exceeded_transfer_limit` ; tous les montants de cet essai qui n'ont pas déjà été crédités sont transmis au remboursement automatique ; le sixième événement est lui aussi remboursé ;
+- si le cumul atteint 20 BSC-USD au plus tard avec le cinquième événement, l'essai est qualifié et son montant est transmis au traitement d'achat BSC-USD existant ; le compteur de qualification est clôturé ; tout nouvel essai de dépôt possède son propre identifiant et son propre compteur ;
+- le plafond de chaque tranche automatique de crédit reste de 100 BSC-USD ;
+- aucun délai de 60 minutes ; chaque transfert finalisé déclenche immédiatement une évaluation du cumul ; les BSC-USD reçus pendant une campagne globale étant des remboursements automatiques et non des dépôts d'achat, ils ne sont jamais ajoutés à un essai et ne comptent pas dans le plafond de cinq événements ;
+- le premier transfert finalisé fixe l'échéance immuable de 30 jours du dossier d'achat existant ; les transferts successifs ne repoussent jamais cette échéance ;
+- les essais qualifiés et tranches suivantes restent rattachés au dossier selon les règles de collecte et de crédit existantes ;
+- si un compte est désactivé avant le crédit intégral d'un dossier, chaque portion encore non créditée est remboursée dans le même token ; une portion déjà créditée n'est jamais remboursée ni reprise par le circuit de remboursement ;
+- si le délai de 30 jours expire sans désactivation et sans qualification, conserver la règle d'expiration et d'affectation du reliquat à la réserve commune prévue par la Révision 4 ; cette règle ne s'applique pas à un essai déjà transféré au circuit de remboursement à cause d'une désactivation ;
+- les dépôts BSC-USD sont identifiés par utilisateur, token et essai ; le compteur BSC-USD est indépendant du compteur XTU libres ;
+- ne pas réintroduire les anciennes limites 70–140 ni une fenêtre de collecte de 60 minutes.
+
+3.3. Financement hebdomadaire ONEX
+
+La limite de sept jours porte uniquement sur le droit à un achat financé positivement par les réserves système ONEX :
+- au plus un achat ONEX financé positivement par utilisateur sur sept jours glissants ;
+- tout montant positif financé par ONEX consomme le droit, quel que soit son montant ;
+- le compteur est consommé une seule fois par dossier d'achat, pas par tranche ;
+- un achat financé exclusivement par les réserves vendeurs ne consomme pas le droit ;
+- un achat mixte ONEX + vendeurs le consomme ;
+- après consommation du droit, rechercher un financement vendeur exclusif ; si insuffisant, garder le crédit BSC-USD en attente et le réévaluer.
+
+Puisque les XTU ne financent plus d'achat d'actifs initiaux, le compteur hebdomadaire des achats ONEX ne concerne désormais que les achats BSC-USD.
+
+3.4. Crédit et cycle de rémunération
+
+- calculer les actifs initiaux selon common.unit_price, prix global absolu ;
+- ne jamais recalculer automatiquement common.unit_price à la baisse à partir de total_units_price / backed_units ;
+- appliquer tfees selon les règles d'achat BSC-USD ;
+- créditer users_stock.balance après validation des réserves ;
+- ne jamais redémarrer un cycle de rémunération existant en raison d'un dépôt ;
+- réévaluer les crédits BSC-USD en attente à chaque mise à jour de users_stock.balance et par worker de reprise ;
+- à l'échéance, le reliquat connu d'un compte toujours actif et non disqualifié est affecté aux réserves communes selon la Révision 4 ; exception prioritaire : toute portion non créditée d'un compte désactivé ou d'un essai disqualifié est remboursée automatiquement selon les sections 9.1 et 9.8 et ne peut pas être affectée aux réserves.
+
+======================================================================
+4. XTU LIBRES — RÉCEPTION, FRAIS ET REGISTRE AUTONOME
+======================================================================
+
+4.1. Définition
+
+Les « XTU libres » sont les XTU reçus dans le Hot Wallet depuis l'adresse personnelle BSC enregistrée d'un utilisateur OneX et crédités dans un registre autonome. Ils ne sont pas des actifs initiaux et ne constituent pas une augmentation de users_stock.balance.
+
+Les XTU libres peuvent uniquement servir aux disbursements individuel et global, selon les sections 7 et 8. Ils ne peuvent pas servir à :
+- acheter des actifs initiaux ;
+- participer à une activité P2P ;
+- financer ou alimenter une campagne vendeur ;
+- déclencher une accumulation ou une rémunération ;
+- modifier le prix individuel ;
+- augmenter backed_units, inactive_init_asset ou sys_inactive_init_asset ;
+- être utilisés comme liquidité BSC-USD physique ;
+- payer les vendeurs ou financer une consolidation BSC-USD.
+
+4.2. Vérification avant crédit XTU libre et qualification du dépôt
+
+À chaque transfert XTU finalisé vers le Hot Wallet XTU :
+- vérifier Chain ID 56 et l'adresse exacte du contrat XTU configuré ;
+- vérifier le destinataire Hot Wallet et l'événement BEP-20 `Transfer` ;
+- vérifier l'adresse expéditrice réelle ;
+- identifier le compte auquel l'adresse était associée à la date de réception ;
+- vérifier hash, log index, bloc, reçu et finalité ;
+- identifier l'essai de dépôt XTU libre auquel appartient l'événement ;
+- verrouiller le compte, l'essai, `common`, le registre d'externalisation et le lot de garde avant les écritures ;
+- compter uniquement les événements finalisés et rapprochés ayant une clé source unique `(chain_id, token_contract, tx_hash, log_index)` ;
+- vérifier common.xtu_wallets et le registre `users_xtu_externalized_balances` pour les transferts qui constituent effectivement un retour d'XTU précédemment externalisé.
+
+Un transfert XTU provenant d'une adresse enregistrée liée à un compte actif peut contribuer à un essai de dépôt XTU libres. Le minimum de qualification est de 1 XTU net créditable. Il peut être atteint par un à cinq événements finalisés et rapprochés. Les montants inférieurs à ce seuil restent dans le registre de l'essai et ne sont pas encore utilisables comme XTU libres.
+
+Si le cumul net admissible reste inférieur à 1 XTU avant l'arrivée d'un sixième événement :
+- désactiver le compte avec le motif `deposit_attempt_exceeded_transfer_limit` ;
+- clôturer l'essai comme disqualifié ;
+- envoyer chaque événement source et le montant brut non crédité dans le circuit de remboursement automatique de la section 9 ;
+- appliquer au remboursement la retenue de 1 %, le gas et le minimum net de 1 XTU ;
+- ne créditer aucun XTU libre et ne comptabiliser aucun tfees de réception sur un essai qui n'a pas été qualifié ;
+- notifier l'utilisateur en anglais en précisant que le seuil de 1 XTU n'a pas été atteint dans la limite de cinq transferts et que le compte a été désactivé ;
+- notifier également l'administration.
+
+Si le cumul net atteint au moins 1 XTU au plus tard avec le cinquième événement :
+- clôturer l'étape de qualification de l'essai ;
+- finaliser une seule fois les éventuels tfees de réception par événement, hors campagne globale ;
+- créditer le montant XTU libre net cumulé dans `users_xtu_free_balances` ;
+- poursuivre le registre de garde et l'éventuelle inscription au registre complémentaire global selon les règles applicables ;
+- les transferts ultérieurs appartiennent à un nouvel essai de qualification, avec un nouveau compteur.
+
+Si `common.xtu_wallets` ou le registre d'externalisation utilisateur ne couvre pas un montant qui doit être comptabilisé comme retour d'XTU externalisés, ou si un événement ne se rapproche pas :
+- placer la seule écriture d'externalisation concernée en attente administrative ;
+- ne pas décrémenter artificiellement un compteur ;
+- ne pas créditer les XTU libres ;
+- ne pas placer le montant dans un lot consolidable ;
+- conserver les preuves blockchain, montants, soldes observés et motif ;
+- notifier l'administration en anglais ;
+- un échec de rapprochement ne doit jamais entraîner un crédit fictif ou une double diminution.
+
+Un transfert provenant d'une adresse liée à un compte déjà désactivé relève directement du remboursement automatique de la section 9. Il n'entre pas dans un nouvel essai XTU libre et ne doit pas être crédité, même si le token, l'adresse et le hash sont autrement valides.
+
+4.3. Application des frais tfees à l'entrée des XTU libres
+
+Le transfert XTU reçu est sans commission contractuelle. Le minimum de 1 XTU porte sur le montant net qui sera crédité au registre XTU libres. En dehors d'une campagne globale, les tfees de réception sont calculés individuellement pour chaque événement appartenant à un essai qui atteint le minimum. Le calcul reste provisoire tant que l'essai n'est pas qualifié : aucun frais tfees n'est définitivement comptabilisé tant que les XTU libres ne sont pas crédités. Le taux et la phase applicables à chaque événement sont déterminés et figés selon l'état du disbursement global au moment où cet événement devient finalisé. Si un essai traverse le début ou la fin d'une campagne globale, chaque événement conserve son propre traitement : aucun taux tfees ne peut être recalculé rétroactivement du seul fait que l'essai atteint le minimum plus tard. Pendant la campagne globale, tout événement finalisé bénéficie du taux de réception de 0 % ; hors campagne, le taux normal est enregistré pour l'événement concerné.
+
+Pour chaque événement d'un essai qualifié hors campagne globale :
+
+`G_i = montant XTU brut réellement reçu pour l'événement i`
+`V_i = G_i × 1 BSC-USD par XTU`
+`F_i = V_i × tfees_rate_i / 100`
+`F_i_XTU = F_i / 1`
+`net_i = G_i - F_i_XTU`
+`attempt_net = somme(net_i)`
+
+L'essai est qualifié lorsque `attempt_net >= 1 XTU` et que le nombre d'événements uniques est inférieur ou égal à cinq.
+
+Pendant la campagne globale, depuis son activation jusqu'à la date limite finale de l'extension de 30 jours :
+
+`global_receive_tfees_rate = 0`
+`global_receive_tfees = 0`
+`net_i = G_i`
+`attempt_net = somme(G_i)`
+
+Le minimum de dépôt XTU libre reste 1 XTU pendant les 90 jours primaires et les 30 jours supplémentaires.
+
+À la qualification et au rapprochement atomiques, hors campagne globale :
+- common.xtu_wallets diminue du montant brut effectivement retourné et rapproché, une seule fois, selon la comptabilité d'externalisation ;
+- le registre `users_xtu_externalized_balances` de l'utilisateur diminue du brut applicable ; si le solde ne couvre pas la transaction, la partie concernée reste en attente administrative et aucun crédit libre n'est effectué ;
+- le solde XTU libre augmente du total net `attempt_net` ;
+- common.total_units_price augmente de la somme des frais `F_i` une seule fois ;
+- le registre de garde XTU reçoit et protège la totalité physique des XTU bruts ;
+- aucune modification de users_stock.balance, backed_units, inactive_init_asset, sys_inactive_init_asset ou common.unit_price n'est effectuée ;
+- l'écriture common.total_units_price est une valeur comptable, pas une réception ou création de BSC-USD physique.
+
+Pendant la campagne globale, à la qualification et au rapprochement atomiques :
+- common.xtu_wallets et le registre d'externalisation sont rapprochés une seule fois selon les règles de retour ;
+- le solde XTU libre augmente de la totalité du montant brut de l'essai qualifié ;
+- aucun tfees n'est calculé, retenu ou crédité à common.total_units_price ;
+- le registre de garde XTU reçoit et protège la totalité physique du montant brut ;
+- si la réception intervient avant la date limite finale, les événements peuvent être inscrits au registre complémentaire global sans modifier le snapshot initial ;
+- aucune modification de users_stock.balance, backed_units, inactive_init_asset, sys_inactive_init_asset ou common.unit_price n'est effectuée.
+
+Si l'essai est disqualifié avant qualification par dépassement de cinq événements, ou si le compte est désactivé pour un autre motif avant le crédit, les tfees provisoires sont annulés. Le montant brut non crédité est traité comme principal de remboursement ; seules la retenue de remboursement de 1 % et la récupération du gas restent applicables. Il est interdit de prélever à la fois des tfees de réception et des frais de remboursement sur le même montant qui n'a jamais été crédité comme XTU libre.
+
+4.4. Registres des essais et des XTU libres
+
+Créer au minimum les registres logiques suivants dans la même base MySQL, avec transactions atomiques :
+- `users_xtu_free_balances` : soldes disponibles, réservés et consommés par utilisateur ;
+- `users_xtu_free_ledger` : journal immuable de chaque réception brute, tfees effectivement comptabilisé, crédit net, réservation, règlement, annulation ou régularisation ;
+- `users_xtu_free_reservations` : montant réservé pour un disbursement individuel ou global ;
+- `users_xtu_free_deposit_attempts` : identifiant de l'essai, utilisateur, adresse source, contrat, seuil net 1 XTU, compteur unique, maximum cinq, cumul brut/net, phase de campagne, statut et horodatages ;
+- `users_xtu_free_deposit_attempt_events` : un événement blockchain source par ligne, clé unique `(chain_id, token_contract, tx_hash, log_index)`, montant brut, taux tfees provisoire/effectif, frais, montant net, numéro séquentiel de l'essai et état ;
+- `users_xtu_externalized_balances` et son ledger : exposition XTU externalisée et non encore retournée par utilisateur, alimentée uniquement après retrait XTU confirmé et rapprochée lors du retour ;
+- `xtu_free_custody_lots` ou registre de garde équivalent : provenance et quantité physique XTU conservée au Hot Wallet et statut de consolidation ;
+- `xtu_free_fee_ledger` : détail des frais tfees de réception crédités à common.total_units_price hors campagne globale ; aucun enregistrement positif pendant la campagne globale ;
+- le registre de remboursement automatique de la section 9 doit pouvoir référencer un essai XTU libre disqualifié ou suspendu par désactivation, avec ses événements sources individuels.
+
+Chaque ligne doit contenir le compte lorsqu'il existe, l'adresse source, le contrat, le hash, le log index, le montant brut, le taux tfees provisoire/validé, les frais éventuels, le montant libre crédité, le montant réservé, le montant consommé, le statut et les horodatages. Les transferts inconnus restent sans username et ne créent aucun compte.
+
+4.5. Petits soldes XTU libres et essais sous le minimum
+
+- les événements dont le cumul net n'a pas encore atteint 1 XTU restent dans un essai de dépôt non qualifié ; ils ne sont pas encore disponibles pour un disbursement et ne sont pas ajoutés au solde libre ;
+- un essai peut contenir au maximum cinq événements blockchain uniques et finalisés avant qualification ; le sixième événement avant atteinte du seuil entraîne la désactivation et le remboursement automatique des montants non crédités ;
+- l'essai XTU libre ne reçoit pas d'expiration automatique de 30 jours ; il reste traçable jusqu'à qualification, remboursement ou résolution administrative ;
+- après qualification, les XTU libres crédités peuvent ensuite être fractionnaires à la suite des frais, réservations, gas ou règlements ; ces fractions restent conservées sans arrondi, suppression, confiscation ou affectation automatique à common.total_units_price ;
+- les fractions créditées peuvent être regroupées avec les soldes du même utilisateur pour vérifier le minimum de disbursement applicable : 20 XTU libres pour l'individuel et 1 XTU libre pour le global ;
+- le minimum de dépôt XTU libre de 1 XTU ne doit pas être confondu avec le minimum de retrait XTU de 1 XTU ni avec les minimums de disbursement individuel/global ;
+- aucune suppression destructive d'un compte ne peut intervenir tant qu'un solde XTU libre, une fraction, un essai non résolu, une réservation ou une obligation subsiste.
+
+Les XTU libres et essais de dépôt XTU ne sont pas soumis à l'expiration de 30 jours des dépôts d'achat BSC-USD.
+
+======================================================================
+5. CONSOLIDATION XTU — GARDE PHYSIQUE DES XTU LIBRES
+======================================================================
+
+5.1. Seuil strict
+
+La consolidation Hot Wallet → Distribution Wallet reste strictement organisée par lots FIFO d'au moins 100 XTU nets effectivement reçus et disponibles à la consolidation.
+
+- le seuil de 100 XTU s'applique au cumul physique brut effectivement reçu et détenu au Hot Wallet dans les lots XTU identifiés, finalisés et protégés ; hors campagne globale, il inclut aussi la portion physique éventuellement retenue comme tfees ; pendant le global, aucune portion tfees n'est retenue ;
+- un lot peut dépasser 100 XTU ; privilégier une seule transaction pour le plus grand lot FIFO admissible plutôt que des transferts fragmentés ;
+- aucun transfert inférieur à 100 XTU n'est autorisé pour réduire les coûts de gas ;
+- le seuil s'applique également aux XTU libres et à leurs fractions inférieures à 1 ;
+- le seuil ne bloque pas le crédit du solde XTU libre ;
+- le seuil ne permet jamais de transférer l'offre initiale du Hot Wallet ;
+- ne transférer que les montants traçables figurant dans les lots de garde, non réservés ni déjà consolidés.
+
+5.2. Protection et réconciliation
+
+Avant toute consolidation :
+- réserver atomiquement les lignes FIFO sélectionnées ;
+- vérifier le solde réel XTU du Hot Wallet ;
+- exclure l'offre initiale et toutes les allocations non transférables ;
+- vérifier que le total des allocations protégées ne dépasse pas le solde réel disponible ;
+- estimer le gas BNB et convertir en équivalent BSC-USD via Chainlink BNB/USD ;
+- ne pas signer si le gas estimé dépasse 0,4 BSC-USD.
+
+Après confirmation :
+- marquer chaque lot inclus comme consolidé ;
+- rapprocher le montant envoyé et reçu ;
+- enregistrer hash, nonce, reçu, gas BNB réel et équivalent BSC-USD ;
+- ne pas modifier une seconde fois common.xtu_wallets ni common.total_units_price ;
+- ne pas débiter les XTU libres de l'utilisateur au seul motif de la consolidation ;
+- ne jamais utiliser les BSC-USD reçus des acheteurs pour financer ou comptabiliser un transfert de consolidation XTU ; le gas est payé en BNB et imputé au registre gas approprié.
+
+La consolidation est un mouvement de garde interne, pas un dépôt, pas un disbursement et pas une vente.
+
+5.3. Règle de gas
+
+- le gas estimé est réservé/provisionné avant signature ;
+- le reçu blockchain détermine le gas réel ;
+- l'allocation du gas réel aux lots est déterministe, FIFO, proportionnelle et documentée ;
+- l'écart entre provision et coût réel est régularisé une fois ;
+- un gas réel supérieur à la provision est couvert selon le registre de dépenses OneX sans reprise rétroactive sur un solde libre déjà crédité ;
+- un gas estimé supérieur à 0,4 BSC-USD reporte la consolidation, sans réduire le seuil de 100 XTU.
+
+======================================================================
+6. RETRAIT XTU VERS LE PORTEFEUILLE PERSONNEL
+======================================================================
+
+Route utilisateur conservée : `POST /app/xtu2wallet`.
+
+- montant brut minimum : 1 XTU ;
+- destination : exclusivement l'adresse BSC personnelle enregistrée et validée dans le compte ;
+- aucun champ permettant de fournir une adresse de retrait arbitraire ;
+- aucune demande de clé privée ou de seed ;
+- retraits désactivés par défaut et activables par le contrôle administratif existant ;
+- le retrait volontaire est interdit si `account_active=0` ou si le compte est soumis à une restriction de sécurité équivalente ;
+- le contrat ne prélève aucune commission de token de 0,1 % ; aucune tfees de retrait XTU supplémentaire n'est créée par cette section ;
+- le gas BNB estimé est converti en équivalent XTU à la parité comptable 1:1 et déduit du montant brut demandé avant l'appel ;
+- le montant net à transférer doit être strictement positif ; si le gas estimé consomme tout le montant ou rend le transfert impossible, refuser temporairement la demande sans consommer le solde ;
+- si le gas estimé dépasse 0,4 BSC-USD, ne pas signer ;
+- la transaction XTU transfère exactement le montant net préparé, sans commission de token ;
+- après confirmation, common.xtu_wallets augmente du montant net réellement externalisé vers le portefeuille personnel ;
+- augmenter du même montant le registre users_xtu_externalized_balances de l'utilisateur ; les retraits non confirmés n'augmentent aucun des deux compteurs ;
+- réserver le principal et la couverture BSC-USD avant l'envoi selon les règles de retrait de la Révision 4 encore compatibles ;
+- un retrait XTU ne réinitialise jamais un cycle de rémunération ;
+- ne pas appeler recordUserOperationTx ou une fonction qui réinitialise le cycle ;
+- en cas d'échec définitif, restaurer les réservations une fois ; en cas de RPC incertain, rapprocher hash, nonce et reçu avant toute nouvelle soumission.
+
+La partie du principal ainsi externalisée cesse d'être disponible dans users_stock.balance selon la comptabilité de retrait existante. L'utilisateur qui souhaite utiliser ce montant pour un disbursement doit faire revenir les XTU au Hot Wallet depuis son adresse personnelle enregistrée ; ce retour alimente le registre XTU libres après finalité, rapprochement et qualification d'un essai de dépôt d'au moins 1 XTU net. Hors campagne globale, les tfees normaux de réception XTU s'appliquent uniquement après qualification de l'essai ; pendant toute la campagne globale, le taux de réception XTU est nul.
+
+Pendant le disbursement global, `/app/xtu2wallet` reste disponible pour les comptes actifs selon le contrôle d'activation administratif normal, avec un minimum brut de 1 XTU, l'adresse personnelle enregistrée, le plafond de gas et les contrôles de réservation. Un retrait ne devient pas immédiatement un XTU libre ; il ne le devient qu'après son retour confirmé au Hot Wallet depuis l'adresse enregistrée et sa qualification. Si ce retour est qualifié avant la date limite finale de réclamation globale, il peut alimenter le registre complémentaire sans modifier le snapshot initial.
+
+Pour un compte désactivé, aucune nouvelle demande de retrait volontaire ne peut être acceptée. Toute demande non encore signée est suspendue et sa réservation est restaurée ou maintenue en attente selon un état déterministe, une seule fois. Toute transaction déjà signée ou diffusée doit continuer à être rapprochée jusqu'à son état final ; une désactivation ne peut pas annuler une transaction blockchain déjà diffusée. Cette interdiction de retrait volontaire n'empêche pas un remboursement automatique de la section 9 vers l'adresse source.
+
+======================================================================
+7. DISBURSEMENTS INDIVIDUEL ET GLOBAL — BASE XTU LIBRES
+======================================================================
+
+7.1. Principe général
+
+Les disbursements individuel et global ne lisent plus users_stock.balance pour calculer, réserver ou régler un paiement. Ils utilisent exclusivement les XTU libres nets disponibles dans `users_xtu_free_balances`.
+
+Les règles de frais, bonus, minimums, réservations, délais administratifs, notifications et contrôles propres à chaque mode sont conservées, sauf dispositions expressément remplacées ici.
+
+Aucune demande ne peut être confirmée si le solde XTU libre disponible, après exclusion des réservations existantes, ne couvre pas le montant XTU requis.
+
+7.2. Base de réservation
+
+Q = montant brut XTU libre réservé pour la demande.
+
+Q doit être inférieur ou égal au solde XTU libre disponible de l'utilisateur. La réservation est atomique et identifiée par une référence unique. Un même XTU libre ne peut pas être réservé par deux demandes ou deux modes simultanément.
+
+Pour le disbursement global, la réservation doit également identifier ses sources : solde admissible de la photographie initiale et, le cas échéant, lignes du registre complémentaire post-snapshot. Les réservations des deux sources sont atomiques et s'appuient sur le solde XTU libre partagé ; un montant réservé ou consommé dans un mode est exclu de l'autre. L'allocation des sources est FIFO et chaque ligne source ne peut être consommée qu'une fois.
+
+Parité comptable :
+`gross_bsc_usd_equivalent = Q × 1 BSC-USD/XTU`.
+
+Ne pas utiliser :
+- users_stock.balance ;
+- common.unit_price ;
+- le prix individuel ;
+- un rapport calculé entre total_units_price et backed_units.
+
+7.3. Disbursement individuel
+
+Le disbursement individuel sert à satisfaire le besoin de l'utilisateur. Il n'est pas déclenché selon un calendrier hebdomadaire ou mensuel et ne répond pas à une nécessité du marché interne.
+
+- l'administration ouvre et ferme la période d'acceptation ;
+- seul un compte actif peut déposer une nouvelle demande ;
+- un utilisateur demande un montant XTU libre ;
+- le système vérifie directement sa disponibilité ;
+- le minimum individuel est de 20 XTU libres bruts réservés ;
+- supprimer le cooldown périodique fixe de 30 jours pour le disbursement individuel ;
+- une seule demande non résolue peut être ouverte par utilisateur ;
+- un délai de réservation technique court peut être conservé pour éviter les réservations abandonnées, mais il ne constitue pas une périodicité hebdomadaire ou mensuelle ;
+- aucun bonus individuel n'est ajouté si la politique individuelle existante n'en prévoit pas.
+
+Calcul individuel, en unités BSC-USD à la parité comptable :
+
+`Q = montant brut XTU libre réservé`
+`gross_value = Q × 1 BSC-USD/XTU`
+`individual_tfees_rate = 0`
+`individual_tfees = 0`
+`value_after_tfees = gross_value`
+`gas_recovery = estimated_gas_bsc_usd`
+`bsc_usd_payout = value_after_tfees - gas_recovery`
+
+Le paiement ne peut être signé que si :
+- Q respecte le minimum individuel de 20 XTU libres ;
+- le solde XTU libre disponible couvre Q ;
+- le paiement après gas est strictement positif et respecte les minimums techniques de paiement sortant ;
+- aucun frais de service tfees ni autre commission OneX de disbursement n'est ajouté ;
+- le Disbursement Wallet possède le BSC-USD physique disponible ;
+- le portefeuille signataire possède le BNB nécessaire ;
+- le gas estimé ne dépasse pas 0,4 BSC-USD.
+
+7.4. Disbursement global
+
+Le disbursement global conserve les garanties de la Révision 4 :
+- annonce préalable d'au moins 7 jours ;
+- période primaire de demande d'au moins 90 jours ;
+- la configuration peut augmenter la période mais jamais la réduire sous 90 jours ;
+- après la période primaire retenue, période supplémentaire de réclamation de 30 jours consécutifs ; cette période commence à l'expiration de la période primaire et n'est pas confondue avec le préavis d'annonce de 7 jours ;
+- photographie initiale immuable ;
+- obligations déjà acquises et transactions en cours non annulables ;
+- bonus global fixé par défaut à `GLOBAL_DISBURSEMENT_BONUS=1`, configurable explicitement entre 0 et 10 %, puis figé dans la photographie ;
+- minimum de demande global : 1 XTU libre ; ce minimum ne change pas pendant les 30 jours supplémentaires ;
+- les tfees de disbursement global sont strictement égaux à 0 % pendant la période primaire et l'extension ; seuls les coûts réels de gas restent imputables selon la présente spécification.
+
+La photographie globale initiale est fondée sur les XTU libres et les paramètres globaux au moment de son activation, et non sur users_stock.balance. Elle demeure strictement immuable et conserve les participants, les soldes admissibles, les plafonds initiaux, le taux de bonus, les dates, les minimums et les paramètres financiers figés à cet instant. Le taux de bonus par défaut est de 1 % et le taux effectif doit être enregistré dans le snapshot. Le contrôle de capacité ne doit projeter aucun tfees de disbursement ; il doit vérifier le montant XTU libre, le paiement de base projeté, le bonus éventuel, la liquidité BSC-USD physique et le gas sans créer d'obligation non couverte.
+
+Une réception XTU libre postérieure à cette photographie ne modifie jamais le snapshot initial. Les XTU libres reçus d'une adresse personnelle enregistrée et associée à un compte actif pendant l'opération globale restent éligibles au même disbursement global. Ils sont suivis séparément dans un registre complémentaire append-only décrit à la section 7.4.1. Ce registre peut contenir des compléments pour un participant déjà présent dans le snapshot ou pour un autre utilisateur OneX enregistré ; il ne réécrit ni la liste ni les montants de la photographie initiale.
+
+La réception XTU libre reste soumise aux contrôles de la section 4, notamment la finalité blockchain et le rapprochement de common.xtu_wallets. Pendant toute la campagne globale, aucun tfees de réception n'est appliqué : le montant XTU brut réellement reçu et rapproché est crédité intégralement après qualification de l'essai d'au plus cinq transferts et seuil net de 1 XTU. Les demandes de disbursement peuvent utiliser les droits du snapshot initial et les compléments postérieurs, sans double réservation ni double consommation. Les montants complémentaires sont plafonnés au montant intégralement crédité après la photographie, diminué des réservations et consommations déjà enregistrées.
+
+Les demandes globales ne supportent aucun tfees de disbursement, qu'elles soient acceptées pendant la période primaire ou pendant l'extension. Le taux de bonus est figé dans la photographie initiale : il vaut 1 % par défaut (configurable explicitement entre 0 et 10 %) et s'applique au montant de base équivalent au XTU libre brut réservé pour les demandes acceptées pendant la période primaire, y compris si leur paiement est exécuté pendant l'extension ; il est de 0 % pour toute nouvelle demande acceptée pendant les 30 jours supplémentaires. Le bonus reste soumis à la disponibilité réelle et à la réservation préalable de sa provision ; aucun bonus non financé ni obligation de paiement non couverte ne peut être créé. Les demandes acceptées avant la date limite finale restent des obligations acquises jusqu'à leur règlement ou résolution auditée ; elles ne deviennent pas des droits « non réclamés » du seul fait que le transfert BSC-USD n'a pas encore été confirmé. À cette même date limite, les droits globaux n'ayant fait l'objet d'aucune demande sont isolés séparément. Les remboursements automatiques générés pendant la campagne ne requièrent aucune demande de l'expéditeur et continuent d'être traités dès leur éligibilité ; tout solde de remboursement encore impayé à l'expiration des 90 jours et des 30 jours supplémentaires est isolé dans un registre distinct, sans destination finale prédéterminée.
+
+Pendant la période globale, les utilisateurs actifs peuvent continuer à retirer leurs XTU vers leur portefeuille personnel selon la section 6, puis les retourner au Hot Wallet depuis l'adresse enregistrée. Un retour confirmé et qualifié avant la date limite finale peut alimenter le registre complémentaire ; il ne modifie jamais le snapshot initial. Après la date limite finale, les nouvelles réceptions XTU continuent d'alimenter le registre XTU libres ordinaire, mais ne peuvent plus être ajoutées au règlement de cette campagne globale. Elles restent utilisables pour un mode de disbursement ultérieur autorisé.
+
+Un utilisateur présent dans le snapshot initial peut donc augmenter son montant global admissible par des retours XTU confirmés pendant l'opération. Un utilisateur absent du snapshot peut également participer uniquement au moyen d'un complément postérieur dûment crédité et demandé avant la date limite finale. Un compte désactivé ne peut pas présenter de nouvelle demande ; les demandes déjà acceptées restent des obligations acquises et suivent leur règlement normal. Dans tous les cas, la campagne n'accepte que des XTU libres effectivement disponibles et la liquidité BSC-USD ainsi que la provision de bonus doivent être vérifiées avant toute obligation de paiement. Le minimum global demeure 1 XTU libre.
+
+Calcul global :
+
+`Q = montant brut XTU libre réservé`
+`gross_value = Q × 1 BSC-USD/XTU`
+`global_tfees_rate = 0`
+`global_tfees = 0`
+`net_value = gross_value`
+`global_bonus_rate = (request_phase == primary) ? snapshot_bonus_rate : 0`
+`global_bonus = net_value × global_bonus_rate / 100`
+`payout_before_gas = net_value + global_bonus`
+`gas_recovery = estimated_gas_bsc_usd`
+`bsc_usd_payout = payout_before_gas - gas_recovery`
+
+Le worker règle le montant net et le bonus déjà enregistrés, en déduisant uniquement le gas réellement imputable selon le mécanisme de réservation et de rapprochement. Il ne doit ni recalculer des tfees ni appliquer un autre frais de service au moment du paiement. Le taux de bonus est de 1 % par défaut, avec plafond configurable de 10 %, et il est figé dans la photographie. Il est accordé uniquement aux demandes acceptées pendant la période primaire. Une demande primaire conserve son bonus même si le paiement intervient pendant l'extension. Toute nouvelle demande acceptée pendant les 30 jours supplémentaires reçoit un bonus de 0 %. Le bonus est payé uniquement si la provision correspondante est disponible et réservée. Le bonus est une récompense conditionnelle non garantie ; il ne promet pas de couvrir les frais de gas, les coûts réels du disbursement ou les dépenses associées à l'utilisation des services OneX, en totalité ou en partie. Le paiement final dépend également de la liquidité BSC-USD physique du Disbursement Wallet et du BNB disponible.
+
+7.4.1. Registre complémentaire des XTU libres postérieurs au snapshot
+
+Créer un registre append-only distinct de la photographie initiale, au minimum avec : l'identifiant de la campagne globale, username, adresse expéditrice enregistrée, contrat XTU, hash, log index, bloc, horodatage de réception, montant brut, tfees (toujours égal à 0 pendant la campagne), montant XTU crédité intégralement, montant réservé, montant consommé, reliquat disponible et statut.
+
+Règles :
+- chaque événement XTU reçu après le snapshot et avant la date limite finale est identifié une seule fois par contrat, hash et log index ;
+- seuls les transferts XTU provenant d'une adresse personnelle enregistrée et associée à un compte actif peuvent alimenter ce registre ;
+- le transfert doit être finalisé, rapproché et accepté par le circuit XTU libres de la section 4 ; une opération en attente de rapprochement ou un essai non qualifié n'est jamais admissible ;
+- l'inscription au registre complémentaire est atomique avec le crédit XTU libre correspondant, ou réalisée par un mécanisme idempotent permettant de retrouver sans ambiguïté l'événement source ;
+- le montant brut intégral effectivement crédité pendant la campagne est la limite maximale pouvant être réservé au titre du complément ; aucun tfees de réception n'est retranché et les soldes XTU libres antérieurs ne peuvent pas être comptés une seconde fois ;
+- les demandes peuvent combiner, dans une même réservation, le reliquat admissible du snapshot et les compléments postérieurs ; les lignes sources consommées doivent être explicitement enregistrées, avec une allocation déterministe FIFO ;
+- une réservation globale ne peut jamais dépasser le solde libre réellement disponible ni le total du snapshot restant et des compléments intégralement crédités non réservés ;
+- les demandes globales sur snapshot et compléments n'appliquent aucun tfees ; le bonus est applicable uniquement si la demande est acceptée pendant la période primaire ; les nouvelles demandes de l'extension reçoivent 0 % de bonus ;
+- le paiement d'un complément reste conditionné à la liquidité BSC-USD physique, au BNB de gas et à la provision de bonus disponible ; aucun montant comptable XTU ne vaut preuve de liquidité BSC-USD ;
+- après la date limite finale, le registre complémentaire est fermé aux nouvelles entrées pour cette campagne ; les nouveaux XTU libres reçus restent dans le registre ordinaire pour un mode ultérieur ;
+- les XTU libres ajoutés au registre complémentaire sont affectés au règlement de la campagne globale jusqu'à cette date limite ; ils ne peuvent pas être simultanément réservés pour le disbursement individuel ;
+- une annulation ou un échec définitif restaure le montant réservé dans les mêmes lignes sources, une seule fois ; un résultat RPC incertain conserve la réservation jusqu'au rapprochement.
+
+Le registre complémentaire ne constitue pas une nouvelle photographie et ne modifie aucun champ du snapshot initial. Il représente uniquement les événements XTU libres réellement reçus pendant la campagne et autorisés à participer à son règlement.
+
+7.5. Déduction du solde XTU libre et comptabilité de règlement
+
+- avant envoi blockchain, réserver Q dans `users_xtu_free_reservations` ;
+- après confirmation définitive du paiement BSC-USD, débiter Q du solde libre de l'utilisateur et marquer la réservation comme consommée ;
+- en cas d'échec définitif, restaurer Q une seule fois ;
+- en cas de résultat RPC incertain, maintenir la réservation et rechercher hash, nonce et reçu ;
+- le paiement ne diminue jamais users_stock.balance ;
+- ne pas modifier backed_units, inactive_init_asset ou common.unit_price au titre du principal XTU libre ;
+- conserver dans un registre dédié la valeur XTU libérée de l'obligation utilisateur, le montant brut demandé, `tfees_rate=0`, `tfees_amount=0`, le montant de base, le bonus éventuel, le BSC-USD envoyé, le gas estimé/réel, le hash, le nonce et l'état ;
+- après confirmation, le montant XTU libre Q dont la dette utilisateur est éteinte devient un actif XTU OneX libre de cette obligation ; les tokens physiques correspondants restent dans le registre de garde et suivent la consolidation FIFO, avec un statut de propriété comptable système, sans retrait anticipé du Hot Wallet ;
+- enregistrer la variation nette de règlement dans le sous-registre de réserves XTU libres : `reserve_delta = Q - bsc_usd_payout - actual_gas_bsc_usd` ; cette variation peut être positive ou négative et est appliquée une seule fois à common.total_units_price selon les règles de réserve, sous contrôle de non-négativité et de disponibilité ; elle n'est pas une écriture d'actif initial et ne modifie pas backed_units, inactive_init_asset, sys_inactive_init_asset ou le prix individuel ;
+- aucun tfees de réception n'est appliqué aux XTU libres reçus pendant la campagne globale ; les demandes globales ont également `tfees_rate=0` et `tfees_amount=0` ; aucune recette de tfees de disbursement n'est créée ; le worker ne doit déduire que le gas réel autorisé, une seule fois ;
+- common.total_units_price demeure une valeur comptable et ne remplace jamais le contrôle des soldes physiques BSC-USD et BNB.
+
+7.6. Liquidité BSC-USD et réserves de bonus
+
+- les paiements sont exécutés depuis le Disbursement Wallet BSC-USD configuré ;
+- vérifier le solde physique BSC-USD et les montants déjà réservés avant d'accepter et juste avant de signer ;
+- ne jamais considérer les XTU libres ou leur valeur comptable comme des BSC-USD physiques ;
+- ne jamais payer un montant supérieur à la liquidité BSC-USD réelle disponible ;
+- les bonus globaux doivent être entièrement couverts par une provision/affectation de bonus disponible ; à défaut, la demande reste en attente et aucune obligation non financée n'est créée ;
+- les gas sont payés en BNB et enregistrés séparément ;
+- le plafond de gas estimé reste 0,4 BSC-USD par transaction sortante.
+
+======================================================================
+8. ACTIVATION ADMINISTRATIVE DES DISBURSEMENTS
+======================================================================
+
+Aucun disbursement individuel ou global ne peut être activé ou désactivé par un booléen `.env`, le redémarrage du serveur ou une modification de configuration locale.
+
+L'état d'activation réside dans la base de données et ne peut changer qu'après authentification administrative existante (mot de passe + PIN), audit et transition transactionnelle.
+
+8.1. Individuel
+
+Route : `POST /admin/disbursement/individual`
+
+Corps :
+`{ "action": "start" }` ou `{ "action": "finish" }`.
+
+- start ouvre l'acceptation de nouvelles demandes individuelles ;
+- finish ferme l'acceptation de nouvelles demandes ;
+- finish n'annule pas les réservations confirmées, transactions signées/diffusées, ni les paiements en cours ;
+- les obligations déjà acquises continuent jusqu'à confirmation ou réconciliation ;
+- aucune périodicité hebdomadaire/mensuelle automatique n'est définie ; l'administration ouvre selon les demandes utilisateurs et décide de la clôture.
+
+8.2. Global
+
+Route : `POST /admin/disbursement/global`
+
+Corps :
+`{ "action": "start" }` ou `{ "action": "finish" }`.
+
+- start crée ou active une exécution globale après validation de l'annonce, du délai de préavis, de la photographie immuable, des réserves, des participants et des dates ;
+- `finish` clôture les nouvelles demandes uniquement à compter de la date limite finale ; avant cette date, une demande `finish` ordinaire est refusée afin de ne pas réduire la période primaire minimale ni l'extension de 30 jours ;
+- finish n'annule jamais un paiement déjà réservé, signé, diffusé ou acquis ;
+- la période primaire de demande globale ne peut être inférieure à 90 jours ; si une période supérieure est configurée, le délai supplémentaire de réclamation de 30 jours commence après cette période primaire effectivement retenue ;
+- à la fin de la période primaire, la campagne passe automatiquement dans un état `claim_extension` pendant exactement 30 jours consécutifs ; les nouvelles demandes globales restent permises durant cette extension ;
+- enregistrer en UTC l'horodatage d'activation globale, la date de prise de photographie, le début de la période primaire, sa date limite et la date limite finale ; la période primaire commence après le préavis annoncé d'au moins 7 jours ;
+- la date limite finale est calculée et enregistrée en base dès l'activation, en UTC : `final_claim_deadline = primary_request_deadline + 30 days` ; elle ne peut pas être repoussée par une nouvelle réception ou une nouvelle demande ;
+- la réception XTU libre et les retraits XTU vers portefeuille personnel ne sont pas suspendus automatiquement pendant la période primaire ni pendant l'extension ; les compléments ne sont admis dans la campagne que jusqu'à la date limite finale ;
+- à la date limite finale, le système ferme les nouvelles demandes et les nouvelles entrées du registre complémentaire global, puis passe à l'état `closed_pending_settlement` ;
+- l'action administrative `finish` ne peut pas raccourcir les durées minimales de la période primaire ou de l'extension ; elle clôture la campagne à l'issue de la date limite finale, sans annuler les demandes acceptées auparavant ;
+- les paiements déjà demandés, réservés ou autrement acquis avant la date limite finale restent des obligations en cours et continuent d'être traités après celle-ci ; ils ne sont pas considérés comme non réclamés ;
+- l'activation, les dates calculées, le passage à `claim_extension`, la clôture des nouvelles demandes et la fin de campagne sont journalisés en base ;
+- les paramètres `.env` peuvent fixer les limites, les adresses, les clés et les paramètres techniques, mais ne peuvent pas démarrer ou arrêter le mode.
+
+8.3. Exclusivité des modes
+
+L'utilisateur ne peut pas réserver deux fois les mêmes XTU libres. Si les deux modes sont ouverts par décision administrative, les réservations et plafonds sont communs et atomiques. Une XTU libre déjà réservée à l'un est indisponible pour l'autre.
+
+8.4. Paiements globaux non réclamés à la date limite finale
+
+À l'expiration de la période primaire d'au moins 90 jours puis de l'extension de réclamation de 30 jours, établir pour chaque utilisateur la part de son droit global admissible qui n'a fait l'objet d'aucune demande enregistrée avant la date limite finale. Le calcul couvre les montants issus du snapshot initial et les compléments postérieurs admissibles. Une demande reçue à temps reste une demande valable même si son paiement n'a pas encore été exécuté. Seule la portion non demandée est classée comme non réclamée.
+
+- inscrire chaque montant non réclamé dans un registre distinct `global_disbursement_unclaimed_ledger`, avec campagne, bénéficiaire, montant XTU de référence, équivalent BSC-USD calculé selon les paramètres figés, source snapshot/complément, `tfees=0`, bonus applicable éventuel, gas de règlement éventuel, date limite, motif, état et références d'audit ;
+- isoler la portion non réclamée dans un état de conservation dédié et la rendre indisponible aux nouvelles réservations, tout en préservant son titulaire de référence, son montant et sa provenance ; ne pas la traiter comme un paiement exécuté ni comme un abandon de propriété ; ne pas la mélanger aux réserves système, au budget de bonus, à la liquidité BSC-USD, aux XTU libres ordinaires ou à la custody des remboursements ;
+- ne pas transférer automatiquement ces sommes à la trésorerie nationale, à une institution financière ou à une institution publique ; aucune institution, adresse, procédure de remise ni base d'exécution n'est confirmée à ce stade ;
+- la préférence exprimée est d'étudier ultérieurement une éventuelle affectation à la trésorerie nationale ou à une institution financière/publique, selon les circonstances réelles et après décision distincte. Cette préférence n'autorise aucune transaction, confiscation, appropriation, conversion ou redistribution automatique ;
+- jusqu'à une décision ultérieure explicite et techniquement/juridiquement validée, conserver les montants dans un état isolé `unclaimed_pending_review`, sans les utiliser pour financer un paiement, un bonus, une réserve, une campagne ou une autre obligation ;
+- les paiements demandés dans les délais, même encore en attente de liquidité ou de confirmation blockchain, restent dans le registre normal des obligations globales et ne sont jamais transférés au registre non réclamé ;
+- cette règle de réclamation concerne les paiements du disbursement global uniquement. Elle ne retarde ni ne remplace les remboursements automatiques : un remboursement éligible est lancé sans demande après le délai minimal de 30 minutes, conformément à la section 9 ; les expéditeurs non enregistrés ne deviennent pas des bénéficiaires du disbursement global et leurs transferts officiels éligibles restent dans le circuit de remboursement automatique.
+
+======================================================================
+9. REMBOURSEMENTS AUTOMATIQUES DES TRANSFERTS OFFICIELS
+======================================================================
+
+9.1. Périmètre
+
+Trois cas sont éligibles au remboursement automatique, sous réserve des contrôles ci-dessous :
+
+A. Transfert officiel inconnu, en fonctionnement normal ou pendant le disbursement global :
+- il provient du contrat exact BSC-USD officiel ou du contrat exact XTU officiel ;
+- le réseau est BNB Smart Chain Mainnet, Chain ID 56 ;
+- le destinataire est l'adresse de réception OneX officielle correspondante ;
+- l'adresse expéditrice réelle `from` n'est enregistrée dans aucun compte OneX au moment de la réception ;
+- le transfert est finalisé et rapproché.
+
+B. BSC-USD reçu pendant le disbursement global :
+- il provient du contrat exact BSC-USD officiel sur BNB Smart Chain Mainnet, Chain ID 56 ;
+- il est envoyé à l'adresse officielle de réception BSC-USD OneX ;
+- il est reçu pendant la période globale, y compris l'extension finale de réclamation de 30 jours ;
+- l'adresse expéditrice peut être enregistrée ou non dans OneX ; son statut ne change pas l'obligation de retour pendant cette période ;
+- il est classé exclusivement comme remboursement et ne compte pas comme événement d'un essai de dépôt BSC-USD ;
+- le transfert est finalisé et rapproché.
+
+C. Transfert officiel provenant d'une adresse enregistrée associée à un compte désactivé :
+- il provient du contrat exact BSC-USD officiel ou du contrat exact XTU officiel sur BNB Smart Chain Mainnet, Chain ID 56 ;
+- il est envoyé à l'adresse de réception OneX officielle correspondant au token ;
+- l'adresse expéditrice est enregistrée et associée à un compte dont `account_active=0` au moment où le serveur traite l'événement ;
+- la désactivation peut être manuelle/administrative, provoquée par le dépassement de cinq transferts avant le minimum ou déclenchée automatiquement après 360 jours d'inactivité ;
+- le transfert est finalisé et rapproché ;
+- aucun crédit de dépôt BSC-USD, d'actif initial ou de XTU libre n'est autorisé ; le transfert est envoyé au remboursement automatique dans le même token et vers l'adresse source ;
+- tout montant d'un dépôt connu encore non crédité à la date de désactivation est également transféré au remboursement, événement source par événement source ; les montants déjà crédités ne sont jamais repris ni remboursés une seconde fois.
+
+La catégorie C s'applique également aux tentatives de dépôt disqualifiées par le sixième transfert avant atteinte du minimum : tous les événements de l'essai non déjà crédités, y compris le sixième, sont placés dans le registre de remboursement. Le compte reste désactivé même si le cumul brut ou net dépasse le minimum à cause du sixième événement arrivé après le dépassement autorisé.
+
+Pendant le disbursement global, le circuit d'achat d'actifs initiaux BSC-USD est suspendu : aucun BSC-USD reçu pendant cette période ne peut créer ou alimenter un dossier d'achat, ni créditer des actifs initiaux. Tout transfert BSC-USD officiel reçu sur le circuit OneX est donc traité par le chemin automatique de retour, même lorsque l'adresse `from` appartient à un utilisateur enregistré et actif. Si le compte correspondant est désactivé, l'événement est classé prioritairement avec le motif de désactivation tout en conservant également l'indicateur de réception pendant campagne globale ; un seul remboursement est créé.
+
+Pour un transfert XTU, la priorité est la suivante : compte désactivé → remboursement automatique catégorie C ; sinon adresse enregistrée et compte actif → tentative de dépôt XTU libres de la section 4 ; sinon adresse non enregistrée → remboursement automatique catégorie A. Aucun compte OneX n'est créé pour une adresse inconnue, aucun XTU libre ne lui est crédité et aucun service OneX ne lui est imposé. Dans tous les cas de remboursement, le retour porte sur le même token et la même adresse source.
+
+Les faux tokens, autres contrats BEP-20, symboles similaires, tokens non acceptés et transferts provenant d'autres réseaux sont ignorés ; ils ne sont ni crédités ni remboursés. OneX ne garantit ni leur détection, ni leur récupération.
+
+9.2. Délai minimal de 30 minutes
+
+Le remboursement ne peut être signé ou diffusé avant l'expiration d'au moins 30 minutes à compter de la réception du transfert source.
+
+L'éligibilité effective intervient lorsque les deux conditions sont vraies :
+- le transfert source est finalisé ;
+- au moins 30 minutes se sont écoulées depuis son horodatage blockchain/réception enregistré.
+
+Le worker vérifie régulièrement les dossiers en attente et reprend automatiquement les traitements différés.
+
+9.3. Base et formule
+
+La base remboursable est le montant net réellement reçu par le Hot Wallet au titre du transfert source. Pour XTU, le contrat est sans commission : le montant du transfert est intégralement reçu par le Hot Wallet. Pour BSC-USD, utiliser le montant réellement reçu par le Hot Wallet.
+
+Soit :
+`A = montant net initialement reçu par le Hot Wallet`
+`F = A × 1 %`
+`G = estimation gas BNB en BSC-USD, convertie dans le même token à la parité comptable 1:1`
+`R = A - F - G`
+
+- le frais de traitement est 1 % de A ; cette portion est retenue dans le même token et inscrite dans le registre de frais OneX ; après confirmation du remboursement, sa valeur comptable est créditée une seule fois à common.total_units_price à la parité interne ; pour XTU, les tokens physiques correspondant à cette portion restent dans la custody XTU de frais et ne deviennent pas un solde utilisateur ; cette écriture ne crée pas de BSC-USD physique ;
+- le gas est imputé au transfert de remboursement ; la portion G retenue dans le token source est suivie dans un compte de récupération de gas séparé, rapproché avec le gas BNB réellement dépensé ;
+- le remboursement est effectué dans le token source : BSC-USD reçu → BSC-USD retourné ; XTU reçu → XTU retourné ;
+- aucune conversion entre BSC-USD et XTU n'est autorisée ;
+- `R` doit être au moins égal à 1 unité du token source après déductions ;
+- le frais de 1 % et le gas sont des déductions distinctes ;
+- le gas n'est jamais compté deux fois ;
+- les portions XTU retenues comme frais ou récupération de gas restent dans un registre de custody XTU propre aux remboursements inconnus ; si elles doivent être consolidées vers le Distribution Wallet, elles ne peuvent être ajoutées qu'à un lot XTU système identifié d'au moins 100 XTU ; elles ne deviennent jamais des XTU libres d'un utilisateur et ne décrémentent jamais common.xtu_wallets.
+
+Le transfert sortant est préparé avec l'estimation du gas. Après confirmation, le reçu fournit le gas réel. Si le gas estimé déduit est supérieur au gas réel, la différence devient un reliquat dû au même expéditeur et au même token ; elle est ajoutée au registre de conservation et n'est renvoyée que lorsqu'un remboursement agrégé atteint au moins 1 unité nette. Si le gas réel est supérieur à l'estimation, OneX couvre l'écart dans la limite du plafond autorisé et ne prélève pas rétroactivement un complément sur l'expéditeur. Ne jamais déclencher un second transfert de remboursement uniquement pour corriger une différence de gas sans analyse coût/bénéfice et décision idempotente.
+
+9.4. Plafond de gas
+
+- le gas estimé de toute transaction sortante OneX doit être inférieur ou égal à 0,4 BSC-USD ;
+- si l'estimation dépasse 0,4, ne pas signer ni diffuser ; garder le remboursement en attente et réévaluer périodiquement ;
+- le système ne peut pas empêcher un expéditeur de payer son propre gas pour un transfert entrant ; cette limite concerne les transactions signées par OneX ;
+- les soldes BNB et token doivent être vérifiés avant signature.
+
+9.5. Petits remboursements inférieurs au minimum
+
+Si `R < 1` :
+- ne pas envoyer un transfert on-chain inférieur au minimum ;
+- placer le montant en conservation dans un registre dédié, distinct des dépôts connus et des XTU libres ;
+- regrouper uniquement les transferts du même expéditeur et du même contrat/token exact ; ne jamais mélanger BSC-USD et XTU ni deux adresses différentes ;
+- réévaluer après chaque nouveau transfert officiel finalisé du même expéditeur et du même token, et par le worker périodique ;
+- chaque transfert composant le lot doit avoir franchi son propre délai de 30 minutes ;
+- dès que le montant net agrégé après frais et gas permet un remboursement net d'au moins 1, envoyer un seul remboursement groupé vers l'adresse source ;
+- après 30 jours sans seuil atteint, déclencher une revue administrative et conserver le montant en custody ; ce délai de revue des petits remboursements est calculé selon les règles propres au lot et reste distinct de la date limite finale de la campagne globale ; pour tout remboursement lié à la campagne globale qui demeure impayé à l'expiration de la période primaire de 90 jours et de l'extension de 30 jours, isoler également le solde dû dans le registre des remboursements globaux non réglés ; aucune affectation automatique aux réserves communes, aucune conversion, aucune création de compte, aucune confiscation et aucun transfert vers un tiers ne sont autorisés par cette seule échéance ;
+- toute résolution administrative doit rester dans le même token et être auditée.
+
+Cette règle de conservation des petits remboursements est distincte de l'expiration des dépôts BSC-USD d'achat d'actifs initiaux. Elle s'applique aux remboursements inconnus et aux retours BSC-USD déclenchés pendant le disbursement global. Elle ne crée aucun nouveau dépôt d'achat ni actif initial. Pour un remboursement lié à la campagne globale, si le solde reste impayé à la date limite finale de 90 jours primaires + 30 jours supplémentaires, il est aussi enregistré comme obligation de remboursement globale non réglée ; le classement ne déclenche aucune affectation ni aucun transfert automatique.
+
+9.6. Exécution automatique et états
+
+Pour les transferts éligibles au-dessus du minimum net :
+- aucune demande de remboursement de l'individu, qu'il soit enregistré ou non, ni signature EIP-191/EIP-1271 n'est exigée pour le chemin automatique, puisque la destination est imposée à l'adresse `from` source ;
+- le remboursement éligible est mis en traitement automatiquement après finalité et expiration du délai minimal de 30 minutes ; il n'attend pas l'expiration des 90 jours ou de l'extension de 30 jours du disbursement global ; toutefois, si un remboursement lié à la campagne globale demeure impayé à la date limite finale (période primaire de 90 jours plus extension de 30 jours), son solde net restant est isolé dans le registre des remboursements globaux non réglés, sans être annulé ni affecté automatiquement à une destination ;
+- aucune approbation administrative préalable n'est exigée dans le parcours normal ;
+- les anomalies, divergences, conflits de compte, suspicion d'événement, réorganisation ou échec restent soumis à `manual_review` ;
+- réserver atomiquement les tokens source avant signature ;
+- une seule transaction de remboursement peut être en cours pour un même événement ou groupe de custody ;
+- vérifier hash, nonce, reçu et logs avant toute nouvelle soumission après RPC incertain ;
+- confirmer uniquement après finalité blockchain et vérification du transfert sortant vers l'adresse source ;
+- après succès, consommer la réservation et clôturer les événements sources ;
+- pour un remboursement XTU inconnu, ne jamais décrémenter common.xtu_wallets, car ce transfert n'est pas le retour d'une externalisation XTU enregistrée à un utilisateur OneX ; suivre le principal remboursé, le 1 % retenu et le gas récupéré dans le registre inconnu séparé ;
+- après échec définitif, restaurer la réservation une seule fois ;
+- conserver base A, frais 1 %, estimation gas, gas réel, montant net, adresse source, contrat, hash, log index, nonce, reçu et timestamps.
+
+9.7. Règles propres aux adresses enregistrées
+
+En fonctionnement normal, un transfert depuis une adresse enregistrée suit le circuit correspondant au compte, sous réserve que celui-ci soit actif :
+- BSC-USD : essai de dépôt d'achat d'actifs initiaux, minimum cumulé 20 BSC-USD, au plus cinq événements uniques avant qualification, sous réserve que le mode global ne soit pas actif ;
+- XTU : essai de dépôt XTU libres, minimum net 1 XTU, au plus cinq événements uniques avant qualification ; hors campagne globale, les tfees normaux de réception sont appliqués seulement lorsque l'essai est qualifié ; pendant la campagne globale, tfees de réception = 0 et le montant brut est crédité intégralement après qualification ;
+- si le compte est désactivé, le routage de dépôt est remplacé par le remboursement automatique catégorie C pour les deux tokens ; aucun dépôt ne peut réactiver ou créditer le compte.
+
+Exception pendant le disbursement global : tout BSC-USD officiel reçu sur l'adresse de réception OneX est automatiquement retourné à l'adresse `from`, même si celle-ci est enregistrée dans un compte actif. Aucun dépôt d'achat, crédit d'actifs initiaux ou remboursement manuel sur demande n'est créé. Le délai minimal de 30 minutes et les frais de remboursement de la section 9.3 restent applicables. Si le compte est désactivé, le même mécanisme de remboursement s'applique avec priorité au motif de désactivation, sans double traitement.
+
+Cette exception ne s'étend pas aux transferts XTU provenant d'une adresse enregistrée liée à un compte actif : ceux-ci continuent d'alimenter les XTU libres après qualification et, jusqu'à la date limite finale, le registre complémentaire du disbursement global. Les XTU provenant d'une adresse liée à un compte désactivé sont au contraire automatiquement remboursés ; ils n'alimentent jamais les XTU libres, le snapshot ou le registre complémentaire. Les remboursements d'adresses inconnues restent automatiques et ne nécessitent jamais une demande préalable. Les règles de conservation des remboursements sous le minimum restent celles de la section 9.5.
+
+9.8. Désactivation du compte, dépôts en cours et remboursements
+
+Lorsqu'un compte est désactivé, un worker transactionnel doit examiner tous les dossiers de dépôt BSC-USD et essais XTU libres qui le concernent :
+- les portions non créditées de chaque transfert source passent au statut `refund_pending` ;
+- les portions déjà créditées en actifs initiaux ou en XTU libres restent créditées et ne sont pas reprises par ce remboursement ;
+- les frais tfees de réception XTU seulement provisoires sur un essai non qualifié sont annulés ; aucun tfees de dépôt n'est prélevé sur un montant finalement remboursé ;
+- les dossiers sources sont verrouillés pour empêcher une course entre crédit, désactivation et remboursement ; une transition atomique garantit qu'un événement source ne peut être soit crédité, soit remboursé, jamais les deux ;
+- les mêmes conditions de délai de 30 minutes après finalité, de retenue de 1 %, de gas, de minimum net 1 et de plafond de gas de 0,4 BSC-USD s'appliquent ;
+- pour un retour XTU d'un compte désactivé qui correspond à une externalisation XTU antérieure vérifiée, rapprocher l'entrée brute dans le registre d'externalisation une seule fois ; après confirmation du remboursement, réinscrire uniquement le montant XTU net effectivement retourné comme nouvelle externalisation, une seule fois ; la retenue de 1 % et le montant de gas récupéré restent dans leurs registres séparés ;
+- si le retour XTU ne peut pas être rattaché de manière certaine à une externalisation antérieure, ne pas modifier artificiellement `common.xtu_wallets` ni le solde externe du compte ; traiter le transfert dans le registre de remboursement autonome et soumettre uniquement l'anomalie de rapprochement à `manual_review` ;
+- l'exécution de ce remboursement automatique reste autorisée même si le compte est désactivé et même si les retraits volontaires de la section 6 sont suspendus ;
+- une réactivation ultérieure ne remet jamais automatiquement un événement précédemment classé `refund_pending`, `refund_submitted`, `refund_confirmed` ou `refund_manual_review` dans un circuit de dépôt ou de crédit ;
+- les remboursements déjà soumis, diffusés ou incertains continuent leur rapprochement jusqu'à résolution ; aucun second remboursement n'est émis en raison d'une réactivation ou d'un redémarrage du serveur.
+
+Un transfert connu provenant d'un compte désactivé ne nécessite aucune demande préalable de l'utilisateur. Si le montant net remboursable reste inférieur à 1 unité, appliquer la conservation et l'agrégation par adresse source et token de la section 9.5 ; ne pas annuler le droit de restitution, ne pas le transférer aux réserves communes et ne pas exiger une réactivation du compte pour continuer le traitement.
+
+======================================================================
+10. CAMPAGNES VENDEURS — CHOIX DE users_stock.seller_res
+======================================================================
+
+Le vendeur prioritaire peut choisir de mettre en vente/immobiliser de 50 % à 100 % de son solde principal dans sa campagne vendeur.
+
+Les seules valeurs acceptées par le serveur sont :
+`50, 60, 70, 80, 90, 100`.
+
+Le champ `users_stock.seller_res` devient un pourcentage numérique, et non un simple booléen ou un ratio fixe codé en dur.
+
+- valeur par défaut pour un compte existant/nouveau : 50 ;
+- le vendeur choisit une valeur autorisée avant l'activation de la campagne ;
+- la valeur est validée côté serveur même si Android limite l'affichage aux six choix ;
+- la part immobilisée est `users_stock.balance × seller_res / 100` au moment de l'activation ;
+- la campagne et le lot de réserve enregistrent une copie immuable du pourcentage et du principal immobilisé ;
+- le changement de choix ne modifie pas une campagne déjà active ni les lots déjà engagés ;
+- les règles de rémunération, le cycle, les intérêts, le prix individuel et la progression restent inchangés ;
+- un vendeur ne peut pas immobiliser plus que son solde principal disponible ;
+- une seule campagne active par vendeur/cycle selon les règles existantes ;
+- les réserves vendeurs sont consommées FIFO ; les paiements vendeurs restent intégraux, sans fragmentation d'une même dette.
+
+Le seuil actuel d'éligibilité du vendeur prioritaire, la durée de campagne, les conditions de fermeture et les autres règles non expressément modifiées par cette révision restent ceux du projet et de la Révision 4.
+
+======================================================================
+11. PAIEMENTS VENDEURS ET AFFECTATION DES BSC-USD DES ACHETEURS
+======================================================================
+
+11.1. Origine des fonds vendeurs
+
+Les paiements vendeurs sont financés par le flux BSC-USD reçu des acheteurs pour l'achat d'actifs initiaux, selon les réservations vendeurs effectivement consommées.
+
+Le système doit maintenir une traçabilité comptable entre :
+- chaque transfert BSC-USD finalisé d'un acheteur ;
+- le dossier d'achat et le crédit d'actifs initiaux ;
+- les réserves vendeurs consommées ;
+- les lots FIFO et le vendeur bénéficiaire ;
+- l'obligation de paiement créée ;
+- le transfert BSC-USD sortant et sa confirmation.
+
+Les paiements vendeurs sont exécutés en BSC-USD depuis le portefeuille de trésorerie autorisé, avec BNB payé séparément pour le gas.
+
+11.2. Séparation avec XTU et consolidation
+
+- les XTU libres ne financent jamais un paiement vendeur ;
+- un lot de consolidation XTU ne consomme aucun BSC-USD reçu des acheteurs ;
+- la consolidation XTU est un transfert XTU Hot Wallet → Distribution Wallet et son gas est payé en BNB ;
+- ne pas déduire une dépense de consolidation XTU d'un solde BSC-USD utilisateur, d'un lot de paiement vendeur ou d'une réserve BSC-USD réservée aux vendeurs ;
+- ne pas utiliser le Disbursement Wallet BSC-USD pour consolider des XTU ;
+- séparer les écritures de trésorerie BSC-USD, de garde XTU et de gas BNB.
+
+11.3. FIFO et paiement intégral
+
+Conserver les règles validées :
+- consommer les réserves vendeurs selon FIFO (activated_at_ms, puis identifiant stable) ;
+- accumuler les obligations jusqu'à couverture intégrale du paiement attendu par vendeur ;
+- une seule demande de paiement non résolue par vendeur ;
+- aucun paiement partiel ou fractionnement artificiel d'une même dette ;
+- conserver les réserves jusqu'à confirmation définitive ou résolution ;
+- résultat RPC incertain : rechercher hash, nonce et reçu avant toute nouvelle soumission ;
+- ne pas appliquer tfees au paiement vendeur ; le gas réel BNB est comptabilisé séparément ;
+- respecter le minimum net vendeur existant, égal à deux fois BSC_MAX_TX_FEE_BSC_USD, soit 0,8 BSC-USD lorsque le plafond vaut 0,4 ; le brut doit couvrir le net et les frais autorisés.
+
+11.4. Traçabilité des fonds acheteurs
+
+Créer ou compléter un registre d'allocation BSC-USD qui distingue : montant reçu, montant affecté à l'achat, montant destiné à la couverture/réserve, montant engagé envers les vendeurs, montant payé, montant disponible et gas réel. Les allocations sont idempotentes et ne doivent pas être réutilisées deux fois.
+
+======================================================================
+12. CONTRÔLE GLOBAL DU GAS ET TRANSACTIONS SORTANTES
+======================================================================
+
+`BSC_MAX_TX_FEE_BSC_USD=0.4` reste le plafond absolu de gas estimé par transaction sortante signée par OneX. Ce n'est pas un frais fixe.
+
+S'applique au minimum à :
+- retrait XTU ;
+- remboursement automatique BSC-USD ;
+- remboursement automatique XTU ;
+- transfert XTU Hot Wallet → Distribution Wallet ;
+- paiement vendeur BSC-USD ;
+- disbursement individuel ;
+- disbursement global ;
+- transfert Hot Wallet BSC-USD → Cold Wallet ;
+- toute autre transaction sortante signée par un portefeuille OneX.
+
+Règles :
+- estimer gasLimit × gasPrice et convertir par Chainlink BNB/USD ;
+- si le coût estimé dépasse 0,4 BSC-USD, ne pas signer ni diffuser ;
+- reconsidérer périodiquement l'opération en attente ;
+- vérifier le prix Chainlink et sa fraîcheur ;
+- vérifier le solde BNB du signataire et le solde token à envoyer ;
+- calculer le gas réel exclusivement depuis le reçu blockchain ;
+- imputer et rapprocher le gas réel une seule fois ;
+- le WebSocket est un signal de réveil, pas une preuve financière ; le scanner HTTP, les logs vérifiés, le reçu et la finalité font foi.
+
+Le plafond ne s'applique pas aux transferts entrants que les utilisateurs signent depuis leurs propres portefeuilles : OneX ne contrôle pas leur gas. Pour ces transferts, le serveur contrôle seulement le token, le réseau, l'événement, le destinataire et la finalité.
+
+======================================================================
+13. API, CONTRÔLES DE SOLDE ET PROTECTION DES COMPTES
+======================================================================
+
+13.1. `/app/user-last-stock`
+
+La réponse doit distinguer clairement :
+- `initial_asset_balance` : users_stock.balance ;
+- `account.active`, `account.deactivation_reason`, `account.deactivated_at_ms` et `account.last_qualifying_activity_at_ms` ;
+- `xtu_free.available` : XTU libres nets non réservés ;
+- `xtu_free.reserved` : XTU libres bloqués pour disbursement ;
+- `xtu_free.pending` : XTU en attente de rapprochement ou appartenant à un essai de dépôt XTU non encore qualifié ;
+- `xtu_free.dust` : fractions déjà créditées qui restent conservées, non arrondies et utilisables seulement lorsque le minimum du mode est atteint ;
+- les essais de dépôts BSC-USD et XTU libres, leurs identifiants, montants cumulés, nombres d'événements uniques sur cinq, minimum restant, échéance éventuelle et raison de rejet/remboursement ;
+- les dépôts BSC-USD en attente, raison, échéance et temps restant ;
+- les remboursements automatiques d'un compte désactivé : token, brut, frais de 1 %, gas, net, motif précis, statut et transaction source ;
+- les états des demandes individuel/global et des réservations existantes ;
+- pour une campagne globale active, le montant complémentaire post-snapshot disponible, réservé et consommé, distinct du solde figé initial ;
+- les dates de début/fin de la période primaire, de début/fin de l'extension de 30 jours et la date limite finale de réclamation ;
+- le taux de bonus global effectif figé dans le snapshot, avec valeur par défaut de 1 %, le montant du bonus calculé, son statut non garanti et la phase d'acceptation de chaque demande ;
+- les montants bruts, tfees de disbursement (toujours 0), montant de base, bonus, gas et montants payés pour chaque demande globale ;
+- l'état d'un éventuel droit global non réclamé, sans le confondre avec un paiement déjà demandé ;
+- les remboursements automatiques liés à la campagne globale : montant brut, frais de 1 %, gas, montant net restant, état du paiement et éventuel classement à l'échéance finale comme remboursement global non réglé. Pour un expéditeur non enregistré, ces informations restent dans les registres et interfaces d'administration, sans création de compte OneX.
+
+Les montants sont retournés en chaînes décimales ; ne jamais additionner XTU et BSC-USD dans un même champ. Les booléens de disponibilité sont dérivés des soldes numériques et ne les remplacent pas.
+
+Exemple indicatif :
+
+{
+  "account": {
+    "active": true,
+    "deactivation_reason": null,
+    "last_qualifying_activity_at_ms": 0
+  },
+  "initial_asset_balance": "125.000000000000000000000000000000",
+  "xtu_free": {
+    "available": "245.500000000000000000",
+    "reserved": "100.000000000000000000",
+    "pending": "0.000000000000000000",
+    "dust": "0.500000000000000000",
+    "eligible_individual": true,
+    "eligible_global": true
+  },
+  "deposit_attempts": {
+    "bsc_usd": {"transfers_count": 2, "max_transfers": 5, "qualifying_minimum": "20.00", "cumulative_amount": "14.00"},
+    "xtu_free": {"transfers_count": 1, "max_transfers": 5, "qualifying_minimum": "1.000000000000000000", "cumulative_net": "0.60"}
+  }
+}
+
+13.2. Contrôles de solde
+
+Repérer et mettre à jour toute fonction qui lit ou modifie les soldes afin d'empêcher une confusion entre :
+- users_stock.balance ;
+- XTU libres ;
+- XTU libres réservés ;
+- XTU externalisés non retournés (`common.xtu_wallets`) ;
+- XTU physiques protégés dans le Hot Wallet ;
+- XTU consolidés dans le Distribution Wallet ;
+- BSC-USD physique dans Hot Wallet, Cold Wallet et Disbursement Wallet ;
+- réserves comptables common.total_units_price et common.backed_units.
+
+Les P2P, l'accumulation, les campagnes vendeurs et les achats d'actifs initiaux ne doivent jamais lire ou dépenser `users_xtu_free_balances`.
+
+Les disbursements ne doivent jamais lire ou modifier `users_stock.balance` pour la réservation ou le règlement.
+
+13.3. Suppression, désactivation et anonymisation
+
+A. Désactivation automatique après inactivité
+
+Tout compte qui ne présente aucune activité transactionnelle ou financière admissible pendant 360 jours consécutifs (360 × 24 heures, et non douze mois calendaires) est automatiquement désactivé.
+
+- ajouter `auths.last_qualifying_activity_at_ms` ; pour un nouveau compte, initialiser cette valeur à `created_at_ms` ; pour un compte existant lors de l'initialisation de la nouvelle base, utiliser la dernière opération financière admissible vérifiable ou, en l'absence d'historique suffisant, `created_at_ms` ; ne pas utiliser `last_login_at_ms` comme approximation ;
+- cette valeur est mise à jour par les opérations financières/transactionnelles admissibles confirmées ou valablement acceptées : chaque dépôt officiel finalisé d'un compte actif, y compris un transfert partiel appartenant à un essai non encore qualifié, transfert P2P réussi en émission ou réception, achat/vente confirmé, retrait XTU confirmé, demande de disbursement valide acceptée, ou autre opération financière utilisateur définie dans le registre d'activité ;
+- une simple connexion, consultation de solde, ouverture de l'application, appel de polling, tâche automatique, retry RPC, remboursement automatique ou notification générée par le serveur ne réinitialise pas le délai ;
+- la date de dernière activité doit être alimentée par un journal `account_activity_events` idempotent, et non déduite uniquement de `last_login_at_ms` ;
+- un worker périodique recherche les comptes ayant dépassé le délai, verrouille le compte, relit la dernière activité puis désactive atomiquement le compte si la condition est toujours vraie ;
+- enregistrer `account_active=0`, `account_deactivation_reason='inactive_360_days'`, `account_deactivated_at_ms`, l'origine automatique et l'événement d'audit ;
+- une notification en anglais précise que le compte a été désactivé après 360 jours sans activité financière/transactionnelle ; Telegram est utilisé si le canal est lié, sinon envoyer un e-mail si une adresse est disponible et journaliser le résultat de livraison ;
+- l'inactivité ne supprime ni le solde, ni les réservations, ni les droits, ni les obligations déjà acquises.
+
+B. Désactivation après dépassement du nombre de transferts
+
+Si un essai BSC-USD ou XTU libres reçoit un sixième événement finalisé alors que son minimum de qualification n'a pas été atteint, le compte est désactivé avec `account_deactivation_reason='deposit_attempt_exceeded_transfer_limit'`. Le worker annule le crédit et les frais provisoires de cet essai, déclenche le remboursement automatique des événements non crédités et notifie l'utilisateur en anglais en précisant le token, le seuil non atteint, les six événements constatés et le statut des remboursements.
+
+C. Effets d'une désactivation
+
+- bloquer les nouvelles opérations volontaires réservées aux comptes actifs, notamment un nouveau retrait XTU personnel, un nouveau disbursement, un achat initial, un transfert P2P et un nouveau dépôt à créditer ;
+- laisser fonctionner les remboursements automatiques, les rapprochements blockchain, la réconciliation des obligations déjà acquises et le paiement des demandes de disbursement acceptées avant la désactivation ;
+- transférer au remboursement automatique les portions de dépôts connues et non créditées, sans reprendre les sommes déjà créditées ;
+- suspendre tout retrait volontaire XTU non encore signé ; restaurer ou conserver la réservation selon un état unique et idempotent ; les transactions déjà signées/diffusées continuent d'être rapprochées et ne sont pas annulées artificiellement ;
+- ne jamais permettre qu'une réactivation réinjecte dans un circuit de crédit un transfert déjà routé vers le remboursement ;
+- conserver les soldes et historiques jusqu'à résolution de toutes les obligations.
+
+D. Réactivation
+
+Une réactivation n'est jamais automatique à la suite d'une connexion ou d'un nouveau transfert. Le titulaire doit contacter le support par un canal officiel vérifiable. Le support peut, selon le motif et le contexte, demander des frais de traitement/réactivation payables en dehors de OneXServer ; leur montant, leur motif et les modalités sont communiqués au cas par cas par un canal officiel vérifié. Aucun montant fixe ni aucune adresse de paiement n'est codé en dur dans la présente spécification. Le paiement ne garantit pas la réactivation ; aucune demande de mot de passe, seed ou clé privée n'est autorisée. L'existence éventuelle de ces frais doit être explicitée dans les Terms et traitée avec transparence dans les données de support.
+
+E. Suppression et anonymisation
+
+Interdire la suppression destructive d'un compte tant que l'un des éléments suivants est positif ou non résolu :
+- users_stock.balance ou principal engagé ;
+- XTU libres disponibles, réservés ou dust ;
+- essai de dépôt incomplet ou remboursement lié au compte ;
+- XTU externalisés non rapprochés ;
+- retrait XTU en cours ;
+- disbursement individuel/global en attente, réservé, signé ou diffusé ;
+- campagne vendeur, réserve vendeur ou paiement vendeur dû ;
+- dépôt BSC-USD en attente ou en réconciliation ;
+- remboursement, transfert inconnu ou dossier administratif lié au compte.
+
+La fermeture de compte peut prendre un état `closure_pending`/`restricted`, mais les droits et journaux financiers doivent être conservés. L'anonymisation ne peut intervenir qu'après résolution de toutes les obligations et conservation des données légalement/financièrement nécessaires. Aucun solde ou droit de remboursement ne peut être supprimé ou affecté arbitrairement aux réserves.
+
+13.4. Routes administratives
+
+Ajouter ou confirmer :
+- `POST /admin/disbursement/individual` avec `action=start|finish` ;
+- `POST /admin/disbursement/global` avec `action=start|finish` ;
+- routes de consultation de l'état et des historiques ;
+- authentification administrative par mot de passe + PIN ;
+- journal d'audit de l'administrateur, de l'action, de l'état avant/après, du motif et de l'horodatage.
+
+Les variables `.env` ne doivent jamais activer ou désactiver les disbursements.
+
+======================================================================
+14. NOTIFICATIONS UTILISATEURS ET TELEGRAM — ANGLAIS OBLIGATOIRE
+======================================================================
+
+Toutes les notifications Telegram OneX sont rédigées exclusivement en anglais : notifications utilisateurs, notifications administratives, erreurs, alertes de sécurité, désactivations, remboursements, rappels, paiements et états blockchain. Aucun texte français ne doit être envoyé par Telegram. Les documents légaux, e-mails et interfaces peuvent rester disponibles en français et en anglais.
+
+Mettre à jour toutes les fonctions qui appellent `queueTelegramMessageTx`, les outboxes, les e-mails et les workers. Chaque notification doit avoir une clé d'événement idempotente et être envoyée après la transition SQL/financière correspondante.
+
+Telegram étant un canal lié volontairement par l'utilisateur, le serveur ne doit pas prétendre qu'une notification Telegram a été délivrée en l'absence de `chat_id` actif. Si aucun Telegram n'est lié, utiliser l'adresse e-mail vérifiée lorsqu'elle existe ; si aucun canal n'est disponible, conserver une notification interne et un événement de livraison non aboutie.
+
+14.1. XTU libres et dépôts fractionnés
+
+Notifier en anglais :
+- XTU free transfer detected and awaiting finality;
+- XTU free deposit attempt progress, showing unique transfer count out of five, gross amount, provisional net amount and remaining amount required to reach 1 XTU;
+- XTU free deposit attempt qualified, with gross amount, tfees (if applicable outside the global campaign) and net amount credited;
+- XTU free deposit attempt rejected after the sixth transfer before reaching the 1 XTU minimum; account deactivated and automatic refund started;
+- exact top-up failure reason, including the token, required minimum, number of unique transfers received, deactivation reason code, uncredited amount and automatic refund status;
+- small credited XTU free balance retained as dust and grouped with the same account/source/token;
+- XTU free balance reserved for individual/global disbursement;
+- payout submitted, confirmed, delayed by gas cap, failed definitively or sent to manual review;
+- account closure blocked because free XTU, an attempt, a reservation or an obligation remains.
+
+14.2. Dépôts et retours BSC-USD
+
+En fonctionnement normal, conserver les notifications du circuit d'achat BSC-USD : montant reçu/cumulé, nombre de transferts uniques sur cinq, minimum restant jusqu'à 20 BSC-USD, tranche créditable, capacité manquante, réserves insuffisantes, date d'expiration de 30 jours, temps restant et action recommandée. Si le sixième événement survient avant que le minimum soit atteint, notifier la désactivation avec le motif exact et le transfert automatique de toutes les portions non créditées. Pour l'utilisateur, le message en anglais indique explicitement que le top-up n'a pas été qualifié, rappelle le minimum de 20 BSC-USD, le nombre d'événements uniques constatés, le code/motif de désactivation et le statut du remboursement automatique du montant non crédité. Pendant le disbursement global, ne pas présenter les BSC-USD reçus comme des dépôts d'achat ni les inclure dans le compteur de cinq transferts : notifier leur mise en retour automatique, le délai de 30 minutes, les frais de 1 %, le gas estimé/réel, le montant net retournable, la destination source et le statut blockchain.
+
+14.3. Remboursements automatiques
+
+Notifier l'administration en anglais lors de la détection, de l'éligibilité après 30 minutes, de la mise en attente sous le minimum, d'un gas supérieur à 0,4, d'une anomalie, d'un envoi, d'une confirmation ou d'un échec. Distinguer les expéditeurs inconnus, les BSC-USD retournés pendant le disbursement global et les remboursements de comptes désactivés. Pour un compte enregistré désactivé, notifier l'utilisateur du motif précis empêchant le crédit du dépôt, notamment `account_deactivated`, `inactive_360_days` ou `deposit_attempt_exceeded_transfer_limit`, du token et montant concernés, du hash source, du délai, de la retenue de 1 %, du gas et de l'état du remboursement. À la date limite finale de la campagne, signaler séparément tout remboursement global encore impayé et son classement dans le registre des obligations non réglées. Une adresse inconnue n'a pas de compte OneX ; ne pas lui créer un canal Telegram ou une inscription.
+
+14.4. Vendeurs et acheteurs
+
+Mettre à jour les notifications des campagnes vendeurs, du pourcentage seller_res choisi, de l'immobilisation effective, de la consommation FIFO, de la dette cumulée, du paiement vendeur et du crédit BSC-USD acheteur. Les messages indiquent clairement le token et ne confondent jamais les fonds BSC-USD avec les XTU libres.
+
+14.5. Disbursement et désactivation
+
+Notifier en anglais les ouvertures/fermetures de fenêtres, le début de l'extension finale de 30 jours, la date limite finale, les demandes acceptées/refusées, les XTU libres du snapshot et les compléments post-snapshot réservés, le taux tfees de disbursement (toujours 0 %), le bonus applicable ou nul selon la phase de la demande, le gas estimé/réel, le montant BSC-USD envoyé, l'adresse de destination, le hash, le statut et l'éventuelle réconciliation manuelle. Le minimum individuel est de 20 XTU libres, le minimum global de 1 XTU libre et le retrait personnel de 1 XTU.
+
+Notifier également la désactivation automatique après 360 jours consécutifs sans activité financière/transactionnelle admissible, avec la date de dernière activité prise en compte et le motif exact. Notifier les comptes désactivés que les retraits volontaires sont suspendus, tandis que les remboursements automatiques et les obligations de paiement déjà acquises continuent selon leurs règles. À la clôture globale, notifier séparément les droits globaux non demandés et les remboursements automatiques globaux encore impayés, chacun dans son registre distinct et en attente de décision ; ne jamais annoncer un transfert à une institution comme déjà décidé.
+
+15. TERMS ET PRIVACY — MODIFICATIONS OBLIGATOIRES
+======================================================================
+
+Mettre à jour les quatre documents :
+- `terms_fr.html` ;
+- `terms_en.html` ;
+- `privacy_fr.html` ;
+- `privacy_en.html`.
+
+15.1. Conditions à expliquer dans les Terms
+
+Les Terms doivent expliquer de manière cohérente, sans promesse de rendement ou de liquidité non garantie :
+- seul le BSC-USD officiel permet d'acheter des actifs initiaux ; XTU n'est pas un moyen d'achat ;
+- le minimum cumulé d'un essai de dépôt BSC-USD est de 20 BSC-USD, atteint en au plus cinq transferts finalisés et uniques ;
+- le minimum d'un essai de dépôt XTU libres est de 1 XTU net créditable, atteint en au plus cinq transferts finalisés et uniques ; ce seuil reste identique pendant une campagne globale ;
+- un sixième transfert avant atteinte du minimum applicable entraîne la désactivation du compte et le remboursement automatique des sommes de cet essai qui n'ont pas déjà été créditées ; un même transfert blockchain ne compte qu'une fois ;
+- les dépôts BSC-USD qualifiés suivent le traitement d'achat, le plafond de tranche et l'échéance de dossier de 30 jours existants ; un dépôt déjà crédité n'est pas annulé du fait d'une désactivation ultérieure ;
+- les XTU reçus d'un utilisateur enregistré et actif alimentent un registre XTU libres distinct après qualification ; les XTU libres ne sont pas des actifs initiaux et ne participent ni au P2P, ni à l'accumulation, ni à la rémunération, ni aux campagnes vendeurs ;
+- les XTU libres sont utilisables uniquement pour les disbursements individuel et global ; le minimum individuel est de 20 XTU libres et le minimum global reste 1 XTU libre, y compris pendant l'extension ;
+- le disbursement individuel répond à la demande de l'utilisateur et n'est pas périodique hebdomadaire ou mensuel ; l'administration ouvre et ferme les fenêtres ;
+- le disbursement global conserve le préavis, la photographie initiale immuable et une période primaire de demande d'au moins 90 jours, suivie d'une extension finale de réclamation de 30 jours ;
+- les XTU libres reçus depuis une adresse enregistrée et liée à un compte actif après la photographie restent recevables pendant l'opération globale et sont inscrits dans un registre complémentaire séparé, sans modification du snapshot initial ;
+- le retrait XTU vers le portefeuille personnel a un minimum brut de 1 XTU, vers la seule adresse personnelle enregistrée ; les retraits volontaires sont suspendus tant que le compte est désactivé ; les remboursements automatiques ne sont pas des retraits volontaires et restent exécutables ;
+- aucun tfees ni frais de service OneX n'est appliqué à un disbursement individuel ou global ; seuls les coûts réels de gas BNB, estimés puis rapprochés, peuvent être déduits ; les frais de réception XTU hors campagne globale et les retenues de remboursement automatique de 1 % sont des règles distinctes ;
+- le bonus global est une récompense conditionnelle non garantie. Son taux par défaut est de 1 %, sauf taux différent expressément configuré et annoncé pour la campagne, dans la limite de 0 à 10 %. Il est réservé aux demandes acceptées pendant la période primaire. Les nouvelles demandes acceptées pendant l'extension de 30 jours reçoivent 0 %. Une demande primaire conserve le bonus enregistré si son paiement intervient pendant l'extension. Le bonus dépend de l'éligibilité, des paramètres figés de la campagne et de la disponibilité effective de la provision correspondante ; il ne constitue ni un intérêt, ni un rendement garanti, ni un remboursement de frais, et ne promet pas de couvrir les coûts de gas, les frais de réseau, les dépenses liées à l'utilisation des services OneX ou toute autre dépense de l'utilisateur, en totalité ou en partie ;
+- un compte qui n'effectue aucune activité transactionnelle ou financière admissible pendant 360 jours consécutifs est automatiquement désactivé ; une simple connexion ou consultation de l'application ne réinitialise pas ce délai ;
+- lorsqu'un compte est désactivé, tout dépôt officiel non encore crédité est acheminé vers un remboursement automatique dans le même token, après finalité et au moins 30 minutes ; la retenue de remboursement de 1 %, le gas, le minimum net remboursable de 1 unité et le plafond de gas s'appliquent ; les montants déjà crédités ne sont pas repris ;
+- les transferts officiels BSC-USD/XTU reçus depuis une adresse inconnue sont automatiquement retournés dans le même token après un délai minimal de 30 minutes, avec retenue de 1 % et déduction du gas estimé/réconcilié ; pendant le disbursement global, tout BSC-USD officiel reçu est également retourné automatiquement, même si l'adresse expéditrice appartient à un compte actif ;
+- les remboursements automatiques ne nécessitent aucune demande préalable ; les montants sous le minimum net sont conservés et réévalués, sans confiscation ni affectation automatique aux réserves communes ;
+- les comptes désactivés ne peuvent pas effectuer de retrait volontaire XTU ni présenter de nouvelle demande de disbursement ; les paiements déjà acceptés restent des obligations acquises et continuent leur traitement ;
+- pour réactiver un compte, le titulaire doit contacter le support par un canal officiel vérifiable. Le support peut, selon le motif et le contexte, demander des frais de traitement/réactivation payables en dehors de OneXServer. Le montant, le motif et le moyen de paiement sont communiqués au cas par cas par un canal officiel vérifié ; aucun frais fixe ni aucune adresse de paiement universelle n'est défini dans ces Terms. Le paiement ne garantit pas la réactivation. OneX ne demande jamais de mot de passe, seed ou clé privée ;
+- le paiement est effectué en BSC-USD depuis le Disbursement Wallet, sous réserve de la liquidité physique et du gas ;
+- les transferts XTU ne supportent aucune commission contractuelle de 0,1 % ; les transactions sortantes OneX consomment du gas BNB ;
+- la consolidation XTU s'effectue par lots FIFO d'au moins 100 XTU et ne retarde pas le crédit XTU libre ;
+- les petites fractions XTU libres déjà créditées sont conservées, sans arrondi, confiscation ou affectation automatique aux réserves communes ;
+- à la date limite finale globale, les portions de paiement qui n'ont fait l'objet d'aucune demande sont isolées dans un registre de droits globaux non réclamés ; les demandes déjà acceptées restent des obligations ; les remboursements automatiques globaux impayés sont isolés dans un registre distinct ; aucune destination finale n'est désignée et aucun transfert automatique à une institution ou à la trésorerie nationale n'est décidé ; toute éventuelle affectation reste une préférence à étudier selon les circonstances réelles ;
+- les faux tokens, autres contrats BEP-20, tokens similaires et transferts d'autres réseaux sont ignorés et non remboursables ;
+- le gas estimé d'une transaction sortante OneX ne peut dépasser 0,4 BSC-USD ;
+- un vendeur prioritaire choisit 50, 60, 70, 80, 90 ou 100 % de son principal à immobiliser pour la campagne ; ce choix n'affecte pas sa rémunération ;
+- les paiements vendeurs sont financés à partir du flux BSC-USD acheteur selon les lots FIFO ; les consolidations XTU sont séparées et ne consomment pas ces BSC-USD ;
+- l'utilisateur est responsable de vérifier le réseau, le contrat et l'adresse de réception avant l'envoi.
+
+15.2. Confidentialité et données
+
+Les Privacy doivent expliquer la collecte, l'utilisation et la conservation proportionnée des données suivantes :
+- adresses BSC et associations de comptes ;
+- transferts XTU libres, hashes, montants bruts, taux tfees de réception, frais, soldes, réservations, tentatives de dépôt et consolidations ;
+- transferts BSC-USD et XTU partiels, compteurs d'événements uniques, identifiants d'essais, seuils atteints ou non et décisions de qualification ;
+- demandes de disbursement, décisions administratives, montants, adresses de paiement, calculs de bonus, coûts de gas et reçus ;
+- transferts inconnus et registres de conservation/remboursement, motifs de remboursement des comptes désactivés, source transactionnelle et statuts de restitution ;
+- `last_qualifying_activity_at_ms`, événements financiers admissibles, date et motif de désactivation, historique de réactivation et journal d'audit ;
+- données de livraison des notifications Telegram/e-mail, identifiants de canal lorsqu'ils sont liés et état de livraison ;
+- communications de support et, lorsqu'il y a lieu, preuve minimale de traitement d'éventuels frais de réactivation payés hors serveur ;
+- mesures de sécurité, durée de conservation comptable et restrictions de suppression/anonymisation lorsqu'un solde ou une obligation subsiste.
+
+Ne pas promettre une conversion immédiate ou une liquidité physique sur la seule base de la parité comptable XTU/BSC-USD. Les données relatives à un éventuel paiement de réactivation effectué hors serveur ne doivent pas inclure de secret d'authentification, seed ou clé privée ; seules les informations nécessaires à la vérification du dossier et à l'audit peuvent être conservées.
+
+Insérer également dans les quatre documents Terms/Privacy une information cohérente sur le bonus global :
+- Terms FR : « Le bonus global est une récompense conditionnelle et non garantie. Son taux par défaut est de 1 %, sauf taux différent expressément configuré et annoncé pour la campagne, dans la limite de 0 à 10 %. Il est réservé aux demandes acceptées pendant la période primaire. Les nouvelles demandes acceptées pendant l'extension de 30 jours ne reçoivent pas de bonus. Une demande acceptée pendant la période primaire conserve le bonus enregistré si son paiement intervient pendant l'extension. Le bonus dépend de l'éligibilité, des paramètres figés de la campagne et de la disponibilité effective de la provision correspondante. Il ne constitue ni un intérêt, ni un rendement garanti, ni un remboursement de frais, et ne promet pas de couvrir les frais de gas, les frais de réseau, les dépenses liées à l'utilisation des services OneX ou toute autre dépense de l'utilisateur, en totalité ou en partie. »
+- Terms EN : « The global disbursement bonus is a conditional, non-guaranteed reward. Its default rate is 1%, unless a different rate is expressly configured and announced for the campaign, within the 0–10% range. It is available only for requests accepted during the primary period. New requests accepted during the 30-day extension receive no bonus. A request accepted during the primary period retains its recorded bonus if payment takes place during the extension. The bonus is subject to eligibility, the campaign parameters fixed at activation, and the actual availability of the corresponding bonus reserve. It is not interest, a guaranteed return, or a fee refund, and it does not promise to cover gas costs, network charges, expenses associated with using OneX services, or any other user expense, in whole or in part. »
+- Privacy FR : « Dans le cadre d'une campagne de disbursement global, OneX traite et conserve le taux de bonus annoncé, la phase de la demande, les paramètres d'éligibilité, les montants XTU et BSC-USD, les calculs et montants de bonus, les réserves disponibles, les coûts de gas, les statuts de paiement et les journaux d'audit afin d'administrer, de sécuriser et de vérifier la campagne. Le bonus constitue une récompense conditionnelle non garantie ; le traitement de ces données ne crée aucun droit à un bonus garanti et ne constitue aucune promesse de prise en charge des frais ou dépenses liés à l'utilisation des services OneX. »
+- Privacy EN : « For a global disbursement campaign, OneX processes and retains the announced bonus rate, request phase, eligibility parameters, XTU and BSC-USD amounts, bonus calculations and amounts, available reserves, gas costs, payment statuses, and audit records to administer, secure, and verify the campaign. The bonus is a conditional, non-guaranteed reward; processing this information does not create an entitlement to a guaranteed bonus or a promise to cover fees or expenses associated with using OneX services. »
+
+16. SCHÉMA SQL, FONCTIONS ET FICHIERS À METTRE À JOUR
+======================================================================
+
+Aucun script de migration SQL. Tout le schéma final doit être déclaré dans db.js pour les nouvelles bases.
+
+16.1. Schéma minimal à ajouter ou adapter
+
+Aucun script de migration SQL. Tout le schéma définitif doit être déclaré dans `db.js` pour les nouvelles bases.
+
+- `auths.last_qualifying_activity_at_ms`, `account_deactivation_reason`, `account_deactivated_at_ms`, `account_deactivated_by` et les champs d'état de désactivation/réactivation ;
+- `account_activity_events` : activité financière admissible, horodatage, clé d'idempotence, utilisateur, catégorie, statut et référence de l'opération ;
+- `account_access_events` : historique des activations, désactivations, motifs et réactivations ;
+- `users_bsc_deposit_attempts` et `users_bsc_deposit_attempt_events` : essais BSC-USD, montant cumulé, minimum 20, compteur maximal de cinq événements uniques avant qualification, identifiants sources, statut, expiration et motif de fermeture ;
+- `users_xtu_free_deposit_attempts` et `users_xtu_free_deposit_attempt_events` : essais XTU libres, minimum net de 1 XTU, maximum de cinq événements uniques avant qualification, frais provisoires/effectifs, montant net, statut et références sources ;
+- `users_xtu_free_balances` ;
+- `users_xtu_free_ledger` ;
+- `users_xtu_free_reservations` ;
+- `xtu_free_custody_lots` ;
+- `xtu_free_fee_ledger` ;
+- `xtu_free_disbursement_settlements` ;
+- registre immuable des photographies globales XTU libres ;
+- registre complémentaire append-only des XTU libres reçus après le snapshot pendant la campagne globale, avec soldes disponibles/réservés/consommés par utilisateur et références source ;
+- registre des compléments post-snapshot exclus de la campagne après la date limite finale et conservés dans les XTU libres ordinaires ;
+- colonnes et états DB des dates de période primaire, d'extension de 30 jours et de date limite finale ;
+- registre `global_disbursement_unclaimed_ledger` pour les droits globaux non demandés dans les délais, avec état `unclaimed_pending_review` ;
+- registre `global_unpaid_refund_ledger` pour les remboursements automatiques liés à la campagne globale qui restent impayés à la date limite finale ;
+- registre commun des remboursements automatiques avec `username` nullable, adresse source, compte et état du compte au moment de réception, token, contrat, montant brut, frais de 1 %, gas, montant net, délai d'éligibilité, raison (`unknown_sender`, `global_bsc_usd_return`, `disabled_account`, `deposit_attempt_exceeded_transfer_limit`), références sources, statut et timestamps ;
+- registre de conservation des petits remboursements officiels sous le minimum, groupés par adresse source et token exact ;
+- registres de gas BNB par opération et lots ;
+- registre d'allocation des paiements acheteurs BSC-USD vers obligations vendeurs ;
+- colonne `users_stock.seller_res` numérique, valeur par défaut 50, contraintes de valeurs permises ;
+- état DB des disbursements individuel/global et journal d'administration ;
+- journal de livraison Telegram/e-mail et outbox idempotente pour les notifications de désactivation et de remboursement.
+
+Les compteurs de transfert doivent être fondés sur les événements finalisés et rapprochés, avec une unicité au minimum sur `(chain_id, token_contract, tx_hash, log_index)`. Les compteurs BSC-USD et XTU sont indépendants. Les tentatives qualifiées sont clôturées ; une nouvelle tentative reçoit un nouvel identifiant. Toutes les tables financières utilisent des types décimaux adaptés, des contraintes d'idempotence, des index par utilisateur/statut/date et InnoDB. Les hashes et log index sources sont uniques dans leur périmètre.
+
+16.2. Fichiers principaux
+
+Examiner et mettre à jour au minimum :
+- `contracts/OneXToken.sol`, ABI, scripts de compilation/déploiement et tests du contrat ;
+- `db.js` ;
+- `routes.js` ;
+- `pay.js` et scanner BSC-USD ;
+- `disbursement.js`, `disbursement-policy.js`, `global-disbursement-policy.js`, `disbursement-worker.js` ;
+- service de gestion des compléments XTU post-snapshot et worker de clôture de la période finale de réclamation ;
+- service/worker d'isolation des droits globaux non réclamés, sans transfert automatique vers une institution ;
+- `xtu-deposit-worker.js` à convertir en traitement XTU libres et consolidation, sans achat d'actifs initiaux ;
+- services de qualification des essais de dépôt BSC-USD/XTU, compteurs de transferts blockchain uniques et workers de remboursement des essais disqualifiés ;
+- `account-activity-policy.js` ou module équivalent, worker périodique de désactivation après 360 jours et gestion vérifiée des réactivations ;
+- `xtu-withdrawal-policy.js`, `xtu-withdrawal-chain.js`, `xtu-withdrawal-worker.js`, `xtu-withdrawal-accounting.js` ;
+- `official-transfer-refund-policy.js` et worker de remboursement automatique BSC-USD/XTU ;
+- `seller-accounting.js`, `seller-worker.js`, `treasury-liquidity.js` ;
+- politique gas BSC et module Chainlink BNB/USD ;
+- les fonctions de suppression, fermeture, récupération et désactivation de compte ;
+- tous les modules de notification Telegram et outboxes ;
+- `.env.example`, `.env.xtu.example`, `.env.disbursement.example` et exemples de clés ;
+- README, changelog et guides Android ;
+- `terms_fr.html`, `terms_en.html`, `privacy_fr.html`, `privacy_en.html`.
+
+16.3. Fonctions et appels à rechercher systématiquement
+
+- toute fonction qui crédite users_stock.balance depuis XTU : supprimer ou rediriger vers XTU libres ;
+- toute fonction qui applique 0,1 % de commission contractuelle XTU : supprimer ;
+- toute référence à `TransferWithFee` ou commission XTU : retirer du flux de contrat neuf ;
+- tout calcul individuel/global utilisant users_stock.balance, common.unit_price ou prix individuel : remplacer par la base Q XTU libre ;
+- tout usage de DISBURSEMENT_COOLDOWN_DAYS=30 : supprimer comme cooldown périodique individuel ;
+- tout booléen `.env` activant un disbursement : le remplacer par un état SQL contrôlé administrativement ;
+- toute fonction de suppression de compte : inclure les XTU libres, dust, essais incomplets, remboursements, réservations et opérations ;
+- toute fonction de désactivation : convertir les dépôts connus non crédités en remboursements automatiques et bloquer les retraits volontaires ;
+- toute opération financière utilisateur admissible : mettre à jour `last_qualifying_activity_at_ms` de manière transactionnelle et idempotente ;
+- tout traitement de dépôt fractionné : compter les événements finaux uniques au plus cinq avant qualification et désactiver au sixième événement avant seuil ;
+- toute consolidation XTU : vérifier le lot minimal 100 et la garde FIFO ;
+- tout calcul de liquidité vendeur : exclure les XTU libres et les lots de consolidation ;
+- tous les textes envoyés par Telegram : les remplacer par des messages anglais cohérents avec ces règles.
+
+16.4. Écart de référence avec l'archive Révision 4 fournie
+
+L'archive `OneXServer-Revision4.zip` a servi de référence comparative pour identifier les règles héritées à modifier. Cette comparaison ne signifie pas que le code a été corrigé ni que les tests ont été exécutés. La présente MAJ5 met d'abord à jour la spécification.
+
+Les divergences de référence à corriger lors de la future mise à jour du code sont notamment :
+- la logique actuelle de désactivation place les dépôts BSC-USD non crédités en attente de support (`pending_support`) et peut les libérer après réactivation ; la MAJ5 remplace ce comportement par un remboursement automatique des portions non créditées et interdit le re-crédit ultérieur des mêmes événements ;
+- le code de Révision 4 ne possède pas encore le champ de dernière activité financière `last_qualifying_activity_at_ms` ; `last_login_at_ms` ne doit pas servir de substitut ;
+- `xtu-withdrawal-policy.js` utilise un minimum de 5 XTU dans la référence et doit passer à 1 XTU, tout en bloquant les retraits volontaires des comptes désactivés ;
+- le flux XTU de la référence applique une commission contractuelle historique de 0,1 % ; l'architecture Révision 5 conserve la suppression de cette commission ;
+- le code de Révision 4 calcule les disbursements depuis l'ancien modèle de stock/prix et doit être aligné sur le registre XTU libres de Révision 5 ;
+- les minimums de disbursement et la formule de frais doivent être alignés sur la MAJ5 : individuel 20 XTU, global 1 XTU, `tfees=0` pour les deux modes, gas réel uniquement ;
+- le bonus global par défaut doit devenir 1 % dans `.env.example`, les valeurs de repli du code, le snapshot, les tests, les Terms et les Privacy ; il doit rester indépendant de tfees et compris entre 0 et 10 % ;
+- les compteurs de dépôt fractionné (BSC-USD 20 BSC-USD, XTU libres 1 XTU net), la limite de cinq événements uniques et la désactivation au sixième événement avant qualification doivent être ajoutés ;
+- le circuit de remboursement doit prendre en charge les adresses enregistrées d'un compte désactivé, les montants de dépôts connus non crédités, et l'annulation des tfees XTU provisoires sur un essai disqualifié ;
+- les notifications Telegram/e-mail doivent donner le motif précis de l'échec du dépôt et de la désactivation, sans envoyer de message Telegram à un utilisateur qui n'a lié aucun canal.
+
+Fichiers et comportements à vérifier lors de l'implémentation : `db.js`, `routes.js`, scanner BSC-USD/XTU, workers de dépôt et de remboursement, `account-deactivation`, journal d'activité, `xtu-withdrawal-policy.js`, `xtu-withdrawal-worker.js`, `disbursement-policy.js`, `global-disbursement-policy.js`, `disbursement-worker.js`, `.env.example`, notifications et tests. La MAJ5 n'autorise aucun script de migration SQL tant que le projet n'est pas déployé ; les nouvelles colonnes et tables doivent être créées dans l'initialisation de base de `db.js`.
+
+======================================================================
+17. TESTS ET CRITÈRES D'ACCEPTATION
+======================================================================
+
+17.1. Achat d'actifs initiaux
+
+- un dépôt BSC-USD officiel peut acheter des actifs initiaux selon les règles existantes ;
+- un transfert XTU ne peut jamais appeler une fonction de crédit d'actifs initiaux ;
+- aucune écriture XTU ne modifie users_stock.balance ;
+- les limites 20/100/30 jours s'appliquent au BSC-USD connu uniquement ;
+- aucun timer de 60 minutes n'existe.
+
+17.2. XTU libres
+
+- transfert depuis une adresse enregistrée est détecté et finalisé ;
+- le contrat ne prélève aucun 0,1 % ;
+- common.xtu_wallets diminue du brut effectivement retourné ;
+- hors campagne globale, tfees est calculé sur l'équivalent BSC-USD du brut ;
+- hors campagne globale, common.total_units_price augmente de la valeur tfees une seule fois ;
+- les XTU libres sont crédités uniquement après qualification de l'essai : minimum net 1 XTU atteint en au plus cinq événements uniques ; hors campagne globale, le montant libre est net après tfees de réception ; pendant la campagne globale, il est crédité intégralement sans tfees de réception ; les disbursements individuel et global n'appliquent jamais de tfees ;
+- aucun changement de users_stock.balance, backed_units, inactive_init_asset ou unit_price ;
+- une incohérence common.xtu_wallets bloque le crédit et la consolidation ;
+- les essais de dépôt non qualifiés dont le cumul reste inférieur à 1 XTU demeurent dans le registre d'essai ; les fractions déjà créditées après qualification sont conservées sans arrondi ni confiscation ;
+- aucun solde libre n'expire ou n'est affecté automatiquement aux réserves après 30 jours.
+
+17.3. Consolidation
+
+- les lots XTU protégés sont sélectionnés FIFO ;
+- aucun transfert interne sous 100 XTU ;
+- les XTU libres utilisateur restent inchangés lors de la consolidation ;
+- aucun BSC-USD acheteur n'est utilisé pour le transfert XTU ;
+- le gas est payé en BNB et comptabilisé séparément ;
+- le Hot Wallet ne balaie jamais l'offre initiale ;
+- une consolidation répétée ne crée aucune double écriture.
+
+17.4. Disbursement individuel
+
+- mode inactif par défaut ; seul `POST /admin/disbursement/individual` action start l'ouvre ;
+- finish ferme les nouvelles demandes mais laisse les demandes déjà acquises en cours ;
+- pas de périodicité hebdomadaire/mensuelle ou cooldown fixe de 30 jours ;
+- minimum individuel de 20 XTU libres ;
+- montant demandé réservé à partir du seul solde XTU libre ;
+- tfees individuel strictement égal à 0 ;
+- formule `Q - gas_estimated`, sans frais de service ni commission additionnelle ;
+- paiement BSC-USD émis depuis le Disbursement Wallet ;
+- aucune lecture ou modification de users_stock.balance ;
+- un compte désactivé ne peut pas faire de nouvelle demande ;
+- gas estimé supérieur à 0,4 bloque la signature ;
+- échec définitif restaure Q une seule fois ; RPC incertain ne déclenche aucun doublon.
+
+17.5. Disbursement global
+
+- mode inactif par défaut et activé par la route administrative globale ;
+- préavis et période minimale de 90 jours conservés ;
+- photographie globale XTU libres immuable à l'activation ;
+- snapshot n'utilise pas users_stock.balance ;
+- minimum global 1 XTU libre pendant la période primaire et pendant l'extension de 30 jours ;
+- période primaire d'au moins 90 jours puis extension finale de 30 jours, avec horodatages UTC calculés et contrôlés ;
+- demandes recevables pendant l'extension de 30 jours ; aucune nouvelle demande après la date limite finale ;
+- réception de XTU libres depuis une adresse enregistrée et liée à un compte actif continue pendant la campagne sans tfees de réception ; retrait `/app/xtu2wallet` reste disponible pour les comptes actifs avec un minimum brut de 1 XTU ;
+- un retour XTU confirmé après le snapshot est inscrit dans le registre complémentaire après qualification de l'essai de dépôt (minimum 1 XTU, maximum cinq événements uniques) et peut participer au même disbursement sans modifier le snapshot initial ;
+- un utilisateur non présent dans le snapshot peut participer uniquement sur la base d'un complément XTU intégralement crédité et demandé avant la date limite finale ;
+- aucune entrée post-snapshot après la date limite finale n'est ajoutée à la campagne clôturée ; elle reste dans les XTU libres ordinaires ;
+- demande globale pendant les 90 jours ou les 30 jours supplémentaires : tfees de disbursement égal à 0 ; seuls le gas estimé/réel sont déduits ;
+- taux de bonus par défaut 1 %, configurable entre 0 et 10 %, uniquement pour les demandes acceptées pendant la période primaire ; bonus de 0 % pour les nouvelles demandes de l'extension ; une demande primaire conserve son bonus si elle est réglée pendant l'extension ;
+- bonus physiquement couvert et non garanti ; il ne promet pas de couvrir le gas, les frais réels ni les dépenses liées à l'utilisation des services ;
+- paiements limités aux XTU libres réservés du snapshot et du registre complémentaire, sans double réservation ;
+- un compte désactivé ne peut pas présenter de nouvelle demande ; les paiements déjà acceptés restent dus ;
+- les portions non demandées à la date limite sont isolées dans le registre des droits globaux non réclamés, sans transfert automatique à une institution ni réaffectation aux réserves ;
+- les demandes acceptées avant la date limite restent des obligations acquises jusqu'à paiement ou résolution auditée, même si le paiement n'est pas encore confirmé ;
+- les remboursements automatiques liés à la campagne qui demeurent impayés à la date limite sont isolés dans un registre distinct, sans annulation ni destination automatique ;
+- finish n'annule aucune obligation en cours et ne raccourcit pas les périodes minimales.
+
+17.6. Remboursements automatiques officiels
+
+- seuls les contrats officiels BSC-USD ou XTU sur Chain ID 56 sont éligibles ;
+- les expéditeurs inconnus sont automatiquement remboursés ;
+- les expéditeurs connus liés à un compte désactivé sont également automatiquement remboursés, pour les deux tokens et dans tous les modes ;
+- toute portion de dépôt d'un compte désactivé qui n'a pas déjà été créditée est envoyée au remboursement ; aucune somme déjà créditée n'est reprise ;
+- un essai disqualifié au sixième transfert avant qualification envoie tous ses événements non crédités au remboursement ;
+- aucune création de compte ni attribution XTU libre pour un expéditeur inconnu ;
+- retour dans le même token et vers l'adresse source ;
+- délai d'au moins 30 minutes après réception et finalité ;
+- formule base reçue - 1 % - gas équivalent ; minimum net 1 unité ;
+- sous-minimum : custody séparée et groupement par expéditeur/token ; aucune confiscation automatique après 30 jours ; revue administrative si longue attente ;
+- gas estimé > 0,4 : pas de signature ;
+- aucun besoin de demande préalable ; le remboursement reste autorisé même lorsque le compte est désactivé et que les retraits volontaires sont suspendus ;
+- BSC-USD officiel reçu pendant le disbursement global est retourné automatiquement, même depuis une adresse enregistrée active, et n'incrémente pas le compteur des essais de dépôt BSC-USD ;
+- XTU provenant d'une adresse enregistrée active pendant le disbursement global alimente les XTU libres uniquement après qualification ; XTU d'un compte désactivé est remboursé ;
+- l'extension globale de 30 jours ne retarde ni ne remplace le remboursement automatique ; tout solde global impayé à la date finale est isolé dans un registre distinct sans destination prédéterminée ;
+- transaction répétée, RPC incertain, remboursement déjà réglé : aucun doublon.
+
+17.7. Vendeurs et acheteurs
+
+- seller_res accepte exactement 50/60/70/80/90/100 ; toutes autres valeurs refusées ;
+- valeur choisie figée pour la campagne ;
+- principal immobilisé correspond au pourcentage du solde principal disponible ;
+- aucun changement des règles de rémunération ;
+- consommation FIFO et paiement intégral ;
+- BSC-USD acheteurs tracé vers les obligations vendeurs ;
+- consolidation XTU ne dépense pas de BSC-USD acheteur.
+
+17.8. Protection de compte et notifications
+
+- aucune suppression destructive tant qu'un solde XTU libre, un essai, une réservation, un remboursement ou une obligation subsiste ;
+- fermeture différée conserve toutes les obligations ;
+- `/app/user-last-stock` expose les soldes disponibles/réservés/pending/dust, les compteurs d'essai et le statut du compte ;
+- chaque transition financière et de désactivation déclenche une notification idempotente en anglais ;
+- Telegram n'est considéré comme livré que si un canal est lié ; e-mail ou notification interne sert de solution alternative ;
+- chaque notification de dépôt échoué et de désactivation précise le motif exact ;
+- aucune notification Telegram OneX en français.
+
+17.9. Dépôts fractionnés et limite de cinq transferts
+
+- un transfert unique atteignant le minimum qualifie immédiatement l'essai ;
+- cinq transferts uniques qui atteignent le minimum au plus tard avec le cinquième qualifient l'essai ;
+- cinq transferts uniques sous le minimum laissent l'essai en attente ;
+- le sixième transfert, s'il arrive avant qualification, désactive le compte et disqualifie l'essai ;
+- le sixième transfert et les cinq précédents non crédités sont placés dans le circuit de remboursement, après délai/finalité ;
+- un essai BSC-USD est compté indépendamment d'un essai XTU ; les montants des deux tokens ne sont jamais additionnés ;
+- un duplicate `tx_hash`/`log_index`, un retry RPC ou un événement redétecté ne compte pas comme un nouvel événement ;
+- les essais qualifiés ferment leur compteur et les dépôts suivants commencent un nouvel essai ;
+- le taux tfees de réception XTU est figé événement par événement selon la phase globale au moment de la finalité ; un essai traversant une frontière de campagne n'est jamais recalculé rétroactivement ;
+- une désactivation pour un autre motif transfère aussi les dépôts/essais non crédités vers le remboursement automatique ;
+- aucun double crédit, double remboursement ou double prélèvement tfees n'est possible.
+
+17.10. Inactivité et réactivation
+
+- un compte est désactivé à 360 jours exacts (360 × 24 heures) sans activité financière/transactionnelle admissible ;
+- les opérations financières admissibles mettent à jour `last_qualifying_activity_at_ms` ; login, lecture de solde, polling, worker automatique, remboursement automatique et notifications ne réinitialisent pas ce compteur ;
+- le worker verrouille et revérifie l'activité récente avant de désactiver ; aucune course ne doit désactiver un compte qui vient d'effectuer une activité admissible ;
+- le motif `inactive_360_days`, l'horodatage et l'événement d'audit sont enregistrés ;
+- l'utilisateur reçoit une notification anglaise par Telegram si lié, sinon e-mail si disponible et trace de livraison ;
+- les retraits volontaires XTU sont bloqués sur tout compte désactivé ; les remboursements automatiques et la réconciliation des paiements déjà acquis continuent ;
+- une réactivation requiert le support par un canal officiel ; d'éventuels frais peuvent être demandés au cas par cas hors serveur ; aucune somme fixe n'est définie et le paiement ne garantit pas la réactivation.
+
+======================================================================
+18. RÈGLES ANCIENNES EXPRESSÉMENT ANNULÉES
+======================================================================
+
+Les règles suivantes des versions précédentes sont supprimées :
+- achat d'actifs initiaux avec XTU ;
+- dépôt XTU soumis au minimum 20, au plafond de tranche 100 ou à l'expiration de 30 jours ;
+- frais de dépôt XTU à 75 % de tfees ;
+- crédit de XTU dans users_stock.balance ;
+- traitement XTU par le financement hebdomadaire ONEX/vendeurs pour acheter des actifs initiaux ;
+- commission contractuelle XTU 0,1 % sur transfer/transferFrom ;
+- événement TransferWithFee et transfert automatique de commission au Distribution Wallet ;
+- disbursement individuel calculé depuis users_stock.balance ou common.unit_price ;
+- disbursement global calculé depuis un solde dynamique users_stock.balance ;
+- cooldown individuel fixe de 30 jours ;
+- activation de disbursement par `.env` ;
+- suspension automatique de la réception des XTU libres et des retraits XTU pendant toute la campagne globale ; ces opérations restent désormais actives selon leurs contrôles habituels ;
+- exclusion systématique de tout XTU libre reçu après le snapshot du règlement global ; ces XTU peuvent désormais participer via un registre complémentaire distinct jusqu'à la date limite finale ;
+- absence de période supplémentaire de réclamation après la période primaire globale ; une extension de 30 jours est désormais prévue ;
+- remboursement manuel systématique après demande et approbation pour tout transfert officiel inconnu ordinaire ; ce parcours devient automatique après 30 minutes, sans demande préalable, sauf anomalie ou mise en revue ;
+- absence de remboursement automatique du BSC-USD reçu pendant le disbursement global depuis une adresse OneX enregistrée ; ces transferts sont désormais retournés automatiquement dans le même token, après 30 minutes et avec les frais applicables ;
+- affectation automatique aux réserves communes de XTU libres ou de leurs fractions inférieures à 1 après 30 jours ;
+- notification Telegram rédigée en français ;
+- minimum individuel de 200 XTU libres ;
+- minimum de retrait XTU de 5 XTU ;
+- application de tfees aux demandes de disbursement individuel ou global ;
+- bonus global par défaut de 3 % ;
+- maintien en `pending_support` des dépôts non crédités d'un compte désactivé avec re-crédit automatique après réactivation ;
+- absence de compteur limitant à cinq les événements blockchain avant qualification des dépôts BSC-USD/XTU ;
+- absence de désactivation automatique après 360 jours d'inactivité transactionnelle/financière.
+
+NOTE DE PORTÉE SUR LES SOMMES GLOBALES NON RÉCLAMÉES
+
+La possibilité d'affecter ultérieurement les paiements globaux non réclamés et les remboursements globaux restés impayés à la trésorerie nationale ou à une institution financière/publique est uniquement une préférence exprimée pour examen futur. Aucune institution ni adresse de destination n'est désignée dans cette révision. Aucun transfert automatique, changement de bénéficiaire, abandon de propriété, confiscation ou affectation comptable n'est autorisé sur cette seule base. Les soldes restent séparés et traçables jusqu'à une décision ultérieure distincte, prise après examen des circonstances réelles.
+
+FIN DE LA SPÉCIFICATION — RÉVISION 5 MISE À JOUR MAJ5

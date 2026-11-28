@@ -5,7 +5,6 @@ const BigNumber = require("bignumber.js");
 const REFUND_FEE_RATE = new BigNumber("0.01");
 const MINIMUM_AUTOMATIC_REFUND_NET = new BigNumber("1");
 const REFUND_ELIGIBILITY_DELAY_MS = 30 * 60 * 1000;
-const SMALL_REFUND_REVIEW_DELAY_MS = 30 * 24 * 60 * 60 * 1000;
 const MAXIMUM_REFUND_GAS_EQUIVALENT = new BigNumber("0.4");
 const SUPPORTED_ASSETS = new Set(["BSC-USD", "XTU"]);
 const INELIGIBLE_EVENT_STATUSES = new Set([
@@ -46,6 +45,7 @@ function calculateRefundEventFee(receivedAmountValue) {
  * its own 1% refund retention. Estimated gas is deducted once for the single
  * grouped outbound transaction. Source events younger than 30 minutes are
  * deliberately excluded until their own eligibility timestamp has passed.
+ * Small eligible groups are retained indefinitely; no age-based review exists.
  */
 function calculateAutomaticRefundGroupQuote({
   events,
@@ -75,7 +75,6 @@ function calculateAutomaticRefundGroupQuote({
 
   let grossEligible = new BigNumber(0);
   let refundFeeTotal = new BigNumber(0);
-  let grossPending = new BigNumber(0);
   const eligibleEvents = [];
   const pendingEvents = [];
   const seenEvents = new Set();
@@ -109,7 +108,6 @@ function calculateAutomaticRefundGroupQuote({
     if (!Number.isFinite(finalizedAtMs) || finalizedAtMs <= 0 || !Number.isFinite(eligibleAtMs)) {
       throw new TypeError("Each finalized source event must have valid finalized and eligibility timestamps.");
     }
-    grossPending = grossPending.plus(received);
     if (Number(nowMs) < eligibleAtMs) {
       pendingEvents.push(event);
       continue;
@@ -129,11 +127,6 @@ function calculateAutomaticRefundGroupQuote({
     .decimalPlaces(18, BigNumber.ROUND_DOWN);
   const gasWithinCeiling = gas.lte(maximumGas);
   const eligible = !manualReview && eligibleEvents.length > 0 && gasWithinCeiling && netAmount.gte(minimum);
-  const oldestReviewDueAtMs = eligibleEvents.reduce((minimumDue, event) => {
-    const due = Number(event.reviewDueAtMs ?? (Number(event.finalizedAtMs) + SMALL_REFUND_REVIEW_DELAY_MS));
-    return Number.isFinite(due) ? Math.min(minimumDue, due) : minimumDue;
-  }, Number.POSITIVE_INFINITY);
-
   return {
     groupKey,
     assetCode: String(first.assetCode).trim().toUpperCase(),
@@ -150,7 +143,6 @@ function calculateAutomaticRefundGroupQuote({
     gasWithinCeiling,
     manualReview,
     eligible,
-    reviewDue: Number.isFinite(oldestReviewDueAtMs) && Number(nowMs) >= oldestReviewDueAtMs && !eligible,
     eligibleEvents,
     pendingEvents,
   };
@@ -160,7 +152,6 @@ module.exports = {
   REFUND_FEE_RATE,
   MINIMUM_AUTOMATIC_REFUND_NET,
   REFUND_ELIGIBILITY_DELAY_MS,
-  SMALL_REFUND_REVIEW_DELAY_MS,
   MAXIMUM_REFUND_GAS_EQUIVALENT,
   getAutomaticRefundGroupKey,
   calculateRefundEventFee,
