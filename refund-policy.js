@@ -1,13 +1,13 @@
 "use strict";
 
 const BigNumber = require("bignumber.js");
-const { getMinimumOutgoingNetBscUsd } = require("./outgoing-payout-policy");
 
-function resolveMinimumRefundNetBscUsd(maximumFeeValue) {
-  return getMinimumOutgoingNetBscUsd(maximumFeeValue);
+// MAJ6 fixes the automatic-refund minimum independently of the gas ceiling.
+const MINIMUM_REFUND_NET_BSC_USD = new BigNumber("1");
+
+function resolveMinimumRefundNetBscUsd() {
+  return new BigNumber("1");
 }
-
-const MINIMUM_REFUND_NET_BSC_USD = resolveMinimumRefundNetBscUsd();
 
 function isRefundNetAmountAllowed(value) {
   if (value == null || value === "") return false;

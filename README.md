@@ -2,6 +2,28 @@
 
 Node.js backend for the OneX platform. The current payment rail accepts **Binance-Peg BSC-USD (BEP-20)** on BNB Smart Chain mainnet (chain ID 56). This token is not USDt directly issued by Tether.
 
+## MAJ6 implementation status
+
+This archive contains a **partial code integration** of the 28 November 2026 Revision 5 MAJ6 addendum on top of the Revision 4 codebase. It is not a completed Revision 5 migration and must not be treated as production-ready.
+
+Integrated in this code snapshot:
+- `common.admin_expens` and `common.total_gifts` are included in fresh-schema creation and common snapshots.
+- The protected administrative backing calculation uses `STOCK_LIMIT × SYSTEM_ADMIN_RESERVE_RATIO - common.admin_expens`; `sys_inactive_init_asset` is retained as a legacy field.
+- `POST /admin/res/minus`, `POST /admin/res/plus`, and `POST /admin/res/give` record externally settled BSC-USD operations transactionally, with unique external references, common snapshots, activity/gift records, and independent rate limits. These routes do not sign or broadcast blockchain transactions.
+- The former `POST /admin/update-common-stock` route and `calculateAdminCommonStockUpdate()` helper have been removed.
+- The BSC refund minimum and the default XTU unknown-refund policy minimum are set to one net source-token unit, independently of the gas ceiling.
+- The new automatic-refund group/event/payout tables and a pure grouping/eligibility calculator are present as the schema and policy foundation.
+
+Still requiring implementation before MAJ6 can be considered complete:
+- The automatic-refund group policy is not yet connected to the BSC payment scanner, XTU deposit scanner, or payout workers.
+- R4 still routes deposits received by deactivated accounts to `pending_support`; it does not yet automatically move every uncredited source event and later incoming transfer into the grouped refund ledger.
+- The R4 BSC refund worker still refuses known-account deposit batches and retains the legacy unknown-transfer request/approval flow.
+- The R4 XTU unknown-refund worker still uses its legacy approval flow and the current XTU contract/worker still contains the 0.1% contract-fee design. MAJ5's fee-free XTU contract and the MAJ6 off-chain 1% refund retention are not fully integrated into that execution path.
+- The other MAJ5 changes outside the MAJ6 addendum (including the autonomous XTU-free ledger and the MAJ5 individual/global disbursement architecture) have not been ported in full from the Revision 4 codebase.
+
+The schema is designed for a fresh database, as required by the project specifications; no SQL migration script is included. Static JavaScript syntax validation has been run. Runtime/database/blockchain integration tests have not been run in this environment because the project dependencies are not installed. Do not enable refund or payment workers in a live environment until the outstanding paths above are implemented and tested.
+
+
 ## Public unit: XTU (Extended Unit)
 
 XTU is the single public transfer and valuation unit of the OneX system. It is not a separately stored user-balance unit. All user, seller and internal reserve balances are stored in **initial assets**. The platform has one live public/global price, `common.unit_price`, expressed as XTU per initial asset:
@@ -20,7 +42,7 @@ XTU remains unique and public for P2P transfers, but each account has an effecti
 ## Internal accounting conventions
 
 - `users_stock.balance` and `users_stock.run_balance` are initial assets. A one-time welcome credit, when enabled, is posted to the ordinary balance and recorded in `auths` and `activities`; it is not a separate withdrawable balance.
-- `common.backed_units`, `common.inactive_init_asset`, `common.sys_inactive_init_asset`, `common.sellers_res` and `common.total_run_balance` are initial assets.
+- `common.backed_units`, `common.inactive_init_asset`, `common.admin_expens`, `common.sys_inactive_init_asset` (legacy only), `common.sellers_res` and `common.total_run_balance` are initial assets.
 - `common.total_units_price` is XTU. `common.unit_price` is an absolute, monotone global price: each snapshot stores `max(previous unit_price, total_units_price / backed_units)`. It must never fall automatically when reserve or backing values decrease; `backed_units` must remain strictly positive.
 - `activities.amount` and `activities.fees` are normally initial assets. `activities.unit_price` preserves the effective price used for the transaction's asset conversion (for P2P, the sender's individual price). For XTU externalization (`type=5`), the worker stores the net XTU amount and combined XTU-equivalent fees converted back into initial-asset units at the saved individual price, so `/app/transactions-history` returns the correct XTU values. `activities.bsc_fee_cost_usd` separately records the actual BNB gas cost.
 - `common.xtu_wallets` is the evolving net XTU amount confirmed as externalized to personal wallets and not yet returned to the system. A confirmed XTU deposit reduces it by the gross amount actually returned (before deposit or gas costs); it is not a cumulative historical counter and can never be negative. `common.xtu_wallets_reserved` separately tracks BSC-USD coverage reserved for withdrawals still in flight. Neither field is an additional reserve asset or a source of physical BSC-USD.
@@ -43,24 +65,21 @@ The initial reserve is split by a fixed quota based on `STOCK_LIMIT`, not on the
 
 ```text
 initial_admin_quota = STOCK_LIMIT * SYSTEM_ADMIN_RESERVE_RATIO
-remaining_admin_quota = initial_admin_quota - common.sys_inactive_init_asset
+remaining_admin_quota = initial_admin_quota - common.admin_expens
 ordinary_backed_available = common.backed_units - remaining_admin_quota
 ordinary_reserve_available = common.inactive_init_asset + ordinary_backed_available
 ```
 
 `STOCK_LIMIT` and `INITIAL_BACKED_UNITS` default to 18,000,000. `SYSTEM_ADMIN_RESERVE_RATIO` defaults to 0.10. The initial administrative quota is therefore 1,800,000 initial assets and the initially distributable portion is 16,200,000. The administrative quota remains included in `backed_units` and contributes to the global price. Only its remaining unspent portion is protected from ordinary deposit and individual-disbursement use.
 
-`common.sys_inactive_init_asset` is a cumulative ledger of initial assets spent administratively. It is not a spendable reserve and is not added to `inactive_init_asset`. An administrative expenditure of `amount` XTU uses the current global price:
+`common.admin_expens` is the current net amount of initial assets used for administrative expenses and not yet recovered. It is capped at 10% of `STOCK_LIMIT` (1,800,000 initial assets when the initial limit is 18,000,000). `common.sys_inactive_init_asset` remains only as a legacy field and is no longer used to calculate the protected administrative floor or distributable assets.
 
-```text
-spent_initial_asset = amount / current_unit_price
-total_units_price_after = total_units_price_before - amount
-backed_units_after = backed_units_before - spent_initial_asset
-sys_inactive_init_asset_after = sys_inactive_init_asset_before + spent_initial_asset
-unit_price_after = max(unit_price_before, total_units_price_after / backed_units_after)
-```
+Administrative reserve settlements are recorded only after the physical BSC-USD transfer has already been verified and completed outside OneXServer:
+- `POST /admin/res/minus`: ONEX → XADMIN, decreases `total_units_price` and `backed_units`, increases `admin_expens`, and writes activity type 6.
+- `POST /admin/res/plus`: XADMIN → ONEX, increases `total_units_price` and `backed_units`, decreases `admin_expens`, and writes activity type 7.
+- `POST /admin/res/give`: records a received donation by increasing `total_units_price` and `total_gifts` without issuing initial assets.
 
-Because numerator and denominator decrease proportionally, the price remains unchanged, subject to storage precision. The operation cannot spend more than the remaining administrative quota and cannot leave `backed_units` at or below zero.
+All three operations require administrator password/PIN and a unique `external_reference`. They are database accounting operations only; they do not sign or broadcast blockchain transactions.
 
 ## Single registered Android device and device-bound sessions
 
@@ -241,7 +260,7 @@ The `bsc-price-oracle.js` module reads `decimals()` and `latestRoundData()` from
 ## Administrative stock endpoints
 
 - `POST /admin/update-user-stock` credits one user through the same reserve-priority top-up allocator used by deposit processing. `amount` is public XTU/BSC-USD; the route converts it using the current global price. The normal automatic minimum is bypassed, but the user cap, ONEX-funded cooldown/cap, transaction fees, BSC recovery and administrative reserve floor remain enforced.
-- `POST /admin/update-common-stock` is exclusively an administrative expenditure. `amount` is XTU; it is converted using the current global price and debited proportionally from `total_units_price` and `backed_units`. The initial-asset basis is added to `sys_inactive_init_asset`. It does not credit a user and is not a buyback or new issuance.
+- Administrative reserve spending and recovery now use `/admin/res/minus` and `/admin/res/plus`; donations use `/admin/res/give`. The former `/admin/update-common-stock` endpoint has been removed. Automatic refunds use a fixed minimum net of 1 unit of the source token, independently of the gas ceiling.
 
 ## Database and deployment
 
@@ -353,7 +372,7 @@ Set `USDT_SELLER_PAYOUTS_ENABLED=true` only when seller treasury payouts are rea
 - `POST /admin/deposit/credit`: records an exceptional administrator-approved credit for a support-held BSC-USD deposit batch and may bypass the automatic 20 BSC-USD minimum reception threshold and the separate 100 BSC-USD first-tranche cap after support review. It still enforces the 300 XTU stock cap, the one-per-seven-day cooldown when OneX system reserves are needed, and reserve availability; inactive reserve is consumed first, seller lots second and backed reserve last.
 - `POST /admin/deposit/refund`: permanently disabled for all known-account deposit batches. Refund decisions are available only through the separate unknown-transfer administrative workflow for the exact official BSC-USD/XTU contracts sent from an unregistered source address.
 - `POST /admin/update-user-stock`: applies an administrator-approved individual stock credit through the standard deposit allocator, preserving inactive-reserve → seller-lot → backed-reserve funding priority, system cooldown/cap, fees, cost recovery and the user balance ceiling. The automatic minimum is bypassed. Requires the configured administrator password and PIN.
-- `POST /admin/update-common-stock`: records an administrative expenditure from the protected common allocation. `amount` is XTU / BSC-USD; the current unit price converts it to initial-asset basis, `total_units_price` decreases by `amount`, `unit_price` stays unchanged, and the spent basis moves from `backed_units` to `sys_inactive_init_asset`. Requires the configured administrator password and PIN.
+- `POST /admin/res/minus`, `/admin/res/plus`, and `/admin/res/give`: record externally settled administrative reserve expenditures, recoveries, and BSC-USD gifts. Each requires administrator password/PIN and a unique external reference. The endpoints do not sign or broadcast blockchain transfers.
 - `POST /admin/send-temp-pswd`: issues a seven-digit temporary password by email; valid for 10 minutes and usable only to sign in and change the permanent password.
 - `POST /app/join-system-sellers`: requests activation of a priority seller campaign.
 - `POST /app/cancel-system-sellers`: requests cancellation; the unused seller reserve remains locked pending admin review.

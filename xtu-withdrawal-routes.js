@@ -50,7 +50,7 @@ function registerXtuWithdrawalRoutes(router, context) {
     insertCommonSnapshotTx,
     getUserPriceStateTx,
     calculateEffectiveIndividualPrice,
-    calculateRemainingSystemAdminReserve,
+    calculateRemainingAdministrativeBacking,
     stock_limit,
     SYSTEM_ADMIN_RESERVE_RATIO,
   } = context;
@@ -221,10 +221,10 @@ function registerXtuWithdrawalRoutes(router, context) {
         if (!individualPrice.isFinite() || !individualPrice.isGreaterThan(0) || individualPrice.gt(globalPrice)) {
           throw new Error("The user's effective individual XTU price is invalid.");
         }
-        const protectedAdminReserve = calculateRemainingSystemAdminReserve(
+        const protectedAdminReserve = calculateRemainingAdministrativeBacking(
           stock_limit,
           SYSTEM_ADMIN_RESERVE_RATIO,
-          common.sys_inactive_init_asset || "0",
+          common.admin_expens || "0",
         ).remainingInitialAsset;
         let reservation;
         try {

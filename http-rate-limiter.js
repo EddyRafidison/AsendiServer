@@ -51,7 +51,9 @@ const ROUTE_LIMITS = Object.freeze({
   "POST /admin/activate-account": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/unlock-system-seller": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/update-user-stock": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
-  "POST /admin/update-common-stock": { limit: 20, windowMs: 5 * 60_000, authResponse: true },
+  "POST /admin/res/minus": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
+  "POST /admin/res/plus": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
+  "POST /admin/res/give": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/individual-disbursement/control": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
   "POST /admin/common-history": { limit: 10, windowMs: 5 * 60_000, authResponse: true },
 });

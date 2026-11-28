@@ -28,8 +28,10 @@ const {
   calculateGlobalUnitPrice,
   calculateDepositFundingAllocation,
   isUserBalanceWithinMaxStock,
-  calculateRemainingSystemAdminReserve,
-  calculateAdminCommonStockUpdate,
+  calculateRemainingAdministrativeBacking,
+  calculateAdministrativeReserveExpense,
+  calculateAdministrativeReserveRecovery,
+  calculateCommonReserveGift,
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,
 } = require("./stock-accounting");
@@ -392,10 +394,10 @@ async function applyWelcomeBonusAtFirstLoginTx(tx, authRow, nowMs) {
 
   const common = await getLatestCommonTx(tx, true);
   const unitPrice = new BigNumber(common.unit_price);
-  const protectedFloor = calculateRemainingSystemAdminReserve(
+  const protectedFloor = calculateRemainingAdministrativeBacking(
     stock_limit,
     SYSTEM_ADMIN_RESERVE_RATIO,
-    common.sys_inactive_init_asset || "0",
+    common.admin_expens || "0",
   ).remainingInitialAsset;
   if (!unitPrice.isFinite() || !unitPrice.isGreaterThan(0)) {
     throw new Error("The global XTU price is invalid during welcome bonus credit");
@@ -691,7 +693,7 @@ registerXtuWithdrawalRoutes(router, {
   getUserPriceStateTx,
   calculateEffectiveIndividualPrice,
   xtuToInitialAsset,
-  calculateRemainingSystemAdminReserve,
+  calculateRemainingAdministrativeBacking,
   stock_limit,
   SYSTEM_ADMIN_RESERVE_RATIO,
 });
@@ -760,10 +762,10 @@ async function assessUserDepositAvailability(username) {
     if (!sellersReserve.isFinite() || sellersReserve.isNegative() || activeSellerReserve.gt(sellersReserve)) {
       throw new Error("Active seller lots exceed common.sellers_res or the seller reserve is invalid");
     }
-    const protectedFloor = calculateRemainingSystemAdminReserve(
+    const protectedFloor = calculateRemainingAdministrativeBacking(
       stock_limit,
       SYSTEM_ADMIN_RESERVE_RATIO,
-      common.sys_inactive_init_asset || "0",
+      common.admin_expens || "0",
     ).remainingInitialAsset;
 
     const capacity = calculateMinimumDepositCapacity({
@@ -928,8 +930,8 @@ async function applyUserTopUp(
   // Incoming deposits are received directly by the treasury. OneX does not
   // deduct BSC gas from deposit amounts; only the batch's captured tfees apply.
   const actualBscFeeUsd = new BigNumber(0);
-  const protectedFloor = calculateRemainingSystemAdminReserve(
-    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+  const protectedFloor = calculateRemainingAdministrativeBacking(
+    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.admin_expens || "0",
   ).remainingInitialAsset;
   const [pendingPayoutRows] = await tx.query(
     `SELECT sold_initial_asset FROM users_usdt_disbursements
@@ -960,8 +962,8 @@ async function applyUserTopUp(
   const bonusRate = globalRun && globalRun.status === "announced" && !globalEffective
     ? new BigNumber(globalRun.bonus_rate_percent || "0")
     : new BigNumber(0);
-  const adminQuotaRemaining = calculateRemainingSystemAdminReserve(
-    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+  const adminQuotaRemaining = calculateRemainingAdministrativeBacking(
+    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.admin_expens || "0",
   ).remainingInitialAsset;
   const currentlyReserved = new BigNumber(globalRun?.admin_bonus_reserved_initial_asset || "0");
   const creditPlan = findMaximumDepositCredit({
@@ -1445,8 +1447,8 @@ async function queueSystemDisbursement(tx, username, verifiedPasswordHash, reque
     return { transf: "minimum remaining balance not met", minimum_remaining_balance: minimumRemainingXtu.toFixed(18) };
   }
 
-  const protectedInitialAssets = calculateRemainingSystemAdminReserve(
-    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+  const protectedInitialAssets = calculateRemainingAdministrativeBacking(
+    stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.admin_expens || "0",
   ).remainingInitialAsset;
   const [pendingPayoutRows] = await tx.query(
     `SELECT sold_initial_asset FROM users_usdt_disbursements
@@ -6286,8 +6288,8 @@ router.post("/admin/start-global-disbursement", async (req, res) => {
       const provisionalBonusReserve = calculateRequiredAdminBonusReserve(
         plannedTotal.multipliedBy(new BigNumber(1).minus(new BigNumber(tfees).dividedBy(100))), bonusRate,
       );
-      const availableAdminReserve = calculateRemainingSystemAdminReserve(
-        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+      const availableAdminReserve = calculateRemainingAdministrativeBacking(
+        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.admin_expens || "0",
       ).remainingInitialAsset;
       if (provisionalBonusReserve.gt(availableAdminReserve) || provisionalBonusReserve.gt(common.backed_units)) {
         return { auth: "insufficient_administrative_bonus_reserve" };
@@ -6514,8 +6516,8 @@ router.post("/admin/activate-global-disbursement", async (req, res) => {
       if (!totalInitial.isFinite() || !totalInitial.isGreaterThan(0)) {
         return { auth: "invalid_global_activation_snapshot" };
       }
-      const adminReserveAvailable = calculateRemainingSystemAdminReserve(
-        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+      const adminReserveAvailable = calculateRemainingAdministrativeBacking(
+        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.admin_expens || "0",
       ).remainingInitialAsset;
       if (requiredBonusReserve.gt(adminReserveAvailable) || requiredBonusReserve.gt(common.backed_units)) {
         return { auth: "insufficient_administrative_bonus_reserve", required: requiredBonusReserve.toFixed(30), available: adminReserveAvailable.toFixed(30) };
@@ -6722,7 +6724,7 @@ router.post("/admin/common-history", async (req, res) => {
   try {
     const columns = [
       "id", "total_units_price", "unit_price", "backed_units", "inactive_init_asset",
-      "sys_inactive_init_asset", "sellers_res", "total_run_balance", "total_tfees",
+      "sys_inactive_init_asset", "admin_expens", "total_gifts", "sellers_res", "total_run_balance", "total_tfees",
       "total_tfees_bsc_cost_usd", "total_tfees_bsc_uncovered_usd", "total_bnb_fee_actual",
       "total_bnb_fee_estimated", "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value",
       "record_date", "record_time",
@@ -7419,80 +7421,307 @@ router.post("/admin/update-user-stock", async (req, res) => {
   }
 });
 
-// Spend XTU from the protected administrative portion of the common stock.
-// This endpoint never modifies an individual user's balance.
-router.post("/admin/update-common-stock", async (req, res) => {
-  const { pswd, pin, amount, user } = req.body || {};
+// Administrative reserve settlements are recorded only after the external
+// BSC-USD transfer has already been verified by the administrator.
+function parseAdminReserveAmount(value) {
+  const text = String(value ?? "").trim();
+  if (!/^(?:0|[1-9]\d*)(?:\.\d{1,18})?$/.test(text)) return null;
+  if (text.split(".")[0].length > 18) return null;
+  const amount = new BigNumber(text);
+  return amount.isFinite() && amount.isGreaterThan(0) ? amount : null;
+}
+
+function validateAdminExternalProof(body) {
+  const txHash = body.tx_hash == null || body.tx_hash === "" ? null : String(body.tx_hash).trim();
+  const tokenContract = body.token_contract == null || body.token_contract === ""
+    ? null : String(body.token_contract).trim();
+  const senderAddress = body.sender_address == null || body.sender_address === ""
+    ? null : String(body.sender_address).trim();
+  const recipientAddress = body.recipient_address == null || body.recipient_address === ""
+    ? null : String(body.recipient_address).trim();
+  const logIndexText = body.log_index == null || body.log_index === "" ? null : String(body.log_index).trim();
+
+  if (txHash && !/^0x[0-9a-fA-F]{64}$/.test(txHash)) return { error: "invalid tx_hash" };
+  for (const [field, value] of [["token_contract", tokenContract], ["sender_address", senderAddress], ["recipient_address", recipientAddress]]) {
+    if (value && !isEvmAddress(value)) return { error: `invalid ${field}` };
+  }
+  if (logIndexText !== null && !/^\d{1,10}$/.test(logIndexText)) return { error: "invalid log_index" };
+  if (logIndexText !== null && Number(logIndexText) > 4294967295) return { error: "invalid log_index" };
+  if ((txHash || tokenContract || senderAddress || recipientAddress || logIndexText !== null) &&
+      !(txHash && tokenContract && senderAddress && recipientAddress && logIndexText !== null)) {
+    return { error: "blockchain proof fields must be supplied together" };
+  }
+  return {
+    txHash: txHash ? txHash.toLowerCase() : null,
+    tokenContract: tokenContract ? checksumEvmAddress(tokenContract) : null,
+    senderAddress: senderAddress ? checksumEvmAddress(senderAddress) : null,
+    recipientAddress: recipientAddress ? checksumEvmAddress(recipientAddress) : null,
+    logIndex: logIndexText === null ? null : Number(logIndexText),
+  };
+}
+
+async function lockCommonStateTx(tx) {
+  const [commonLockRows] = await tx.query(
+    "SELECT lock_name FROM system_locks WHERE lock_name='common_state' FOR UPDATE",
+  );
+  if (!commonLockRows.length) throw new Error("The common-state lock row has not been initialized");
+}
+
+async function checkAdminReserveGlobalStateTx(tx) {
+  // A closed run is not blocked merely because it remains in the audit table;
+  // the unresolved-payout checks below determine whether any obligation remains.
+  const [activeRuns] = await tx.query(
+    `SELECT id,status FROM global_disbursement_runs
+     WHERE status IN ('announced','active','manual_review','claim_extension','extension','settlement_pending','closed_pending_settlement')
+     ORDER BY id DESC LIMIT 1 FOR UPDATE`,
+  );
+  if (activeRuns.length) return { blocked: true, reason: "global_disbursement_open_or_unsettled" };
+
+  const [unresolvedBsc] = await tx.query(
+    `SELECT id,status FROM users_usdt_disbursements
+     WHERE global_run_id IS NOT NULL
+       AND status NOT IN ('confirmed','completed','failed','cancelled','rejected','expired')
+     ORDER BY id ASC LIMIT 1 FOR UPDATE`,
+  );
+  if (unresolvedBsc.length) return { blocked: true, reason: "global_bsc_settlement_unresolved" };
+
+  const [unresolvedXtu] = await tx.query(
+    `SELECT id,status FROM xtu_global_settlement_payouts
+     WHERE status NOT IN ('confirmed','completed','failed','cancelled','rejected')
+     ORDER BY id ASC LIMIT 1 FOR UPDATE`,
+  );
+  if (unresolvedXtu.length) return { blocked: true, reason: "global_xtu_settlement_unresolved" };
+  return { blocked: false };
+}
+
+async function getAdminSettlementRetryTx(tx, externalReference, operationType, amount) {
+  const [rows] = await tx.query(
+    `SELECT id,operation_type,external_reference,internal_reference,amount_bsc_usd,
+            common_id,activity_id,gift_id
+     FROM admin_external_settlements WHERE external_reference=? LIMIT 1 FOR UPDATE`,
+    [externalReference],
+  );
+  if (!rows.length) return null;
+  const row = rows[0];
+  if (row.operation_type !== operationType || !new BigNumber(row.amount_bsc_usd).eq(amount)) {
+    return { conflict: true };
+  }
+  const [commonRows] = await tx.query("SELECT * FROM common WHERE id=? LIMIT 1", [row.common_id]);
+  if (!commonRows.length) throw new Error("The common snapshot linked to the external settlement is missing");
+  let gift = null;
+  if (row.gift_id) {
+    const [giftRows] = await tx.query("SELECT * FROM gifts WHERE id=? LIMIT 1", [row.gift_id]);
+    gift = giftRows[0] || null;
+  }
+  return {
+    retry: true,
+    common: commonRows[0],
+    reference: row.internal_reference,
+    activity_id: row.activity_id == null ? null : String(row.activity_id),
+    gift,
+  };
+}
+
+async function insertAdminSettlementTx(tx, {
+  operationType, externalReference, internalReference, amount, commonId,
+  activityId = null, giftId = null, proof, now,
+}) {
+  await tx.query(
+    `INSERT INTO admin_external_settlements(
+       operation_type,external_reference,internal_reference,amount_bsc_usd,common_id,
+       activity_id,gift_id,admin_username,tx_hash,log_index,token_contract,
+       sender_address,recipient_address,created_at_ms
+     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [operationType, externalReference, internalReference, amount.toFixed(18), commonId,
+      activityId, giftId, "configured_admin", proof.txHash, proof.logIndex,
+      proof.tokenContract, proof.senderAddress, proof.recipientAddress, now],
+  );
+}
+
+async function createAdminReserveRoute({
+  path, operationType, activityType, sender, receiver, calculator,
+}) {
+  router.post(path, async (req, res) => {
+    const body = req.body || {};
+    const { pswd, pin } = body;
+    if (
+      pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
+      pin !== decrypt(admin_pin, DB_CONFIG.password)
+    ) return res.send({ auth: "incorrect" });
+
+    const amount = parseAdminReserveAmount(body.amount);
+    const externalReference = typeof body.external_reference === "string"
+      ? body.external_reference.trim() : "";
+    if (!amount || externalReference.length < 1 || externalReference.length > 191) {
+      return res.status(400).send({ error: "invalid amount or external_reference" });
+    }
+    const proof = validateAdminExternalProof(body);
+    if (proof.error) return res.status(400).send({ error: proof.error });
+
+    const [date, time] = getDate();
+    const now = Date.now();
+    try {
+      const result = await withTransaction(async (tx) => {
+        await lockCommonStateTx(tx);
+        const common = await getLatestCommonTx(tx, true);
+        const previous = await getAdminSettlementRetryTx(tx, externalReference, operationType, amount);
+        if (previous?.conflict) return { error: "external_reference_idempotency_conflict", http_status: 409 };
+        if (previous?.retry) return { ...previous, status: "ok" };
+        const gate = await checkAdminReserveGlobalStateTx(tx);
+        if (gate.blocked) return { error: gate.reason, http_status: 409 };
+
+        const calculation = calculator({
+          amountBscUsdValue: amount,
+          totalUnitsPriceValue: common.total_units_price,
+          unitPriceValue: common.unit_price,
+          backedUnitsValue: common.backed_units,
+          adminExpensesValue: common.admin_expens || "0",
+          initialStockValue: stock_limit,
+          ratioValue: SYSTEM_ADMIN_RESERVE_RATIO,
+        });
+        if (calculation.available === false) {
+          return {
+            error: operationType === "reserve_minus"
+              ? "administrative_reserve_capacity_exceeded"
+              : "administrative_recovery_exceeds_outstanding_expense",
+            maximum_bsc_usd: (calculation.availableValue || calculation.maximumRecoverableValue || new BigNumber(0)).toFixed(18),
+            http_status: 409,
+          };
+        }
+
+        await insertCommonSnapshotTx(tx, common, {
+          total_units_price: calculation.newTotalUnitsPrice.toFixed(30),
+          unit_price: calculation.newUnitPrice.toFixed(30),
+          backed_units: calculation.newBackedUnits.toFixed(30),
+          admin_expens: calculation.newAdminExpenses.toFixed(30),
+        }, date, time);
+        const [snapshotRows] = await tx.query("SELECT * FROM common ORDER BY id DESC LIMIT 1");
+        if (!snapshotRows.length) throw new Error("New common snapshot was not created");
+        const commonSnapshot = snapshotRows[0];
+        const internalReference = createFinancialReference(operationType === "reserve_minus" ? "ADMEXP" : "ADMREC");
+        const [activityResult] = await tx.query(
+          `INSERT INTO activities(
+             sender,receiver,type,amount,unit_price,fees,fee_unit_price,bsc_fee_cost_usd,
+             reference,record_date,record_time
+           ) VALUES(?,?,?,?,?,0,?,0,?,?,?)`,
+          [sender, receiver, activityType, calculation.initialAssetAmount.toFixed(30),
+            common.unit_price, common.unit_price, internalReference, date, time],
+        );
+        await insertAdminSettlementTx(tx, {
+          operationType, externalReference, internalReference, amount,
+          commonId: commonSnapshot.id, activityId: activityResult.insertId,
+          proof, now,
+        });
+        return {
+          status: "ok",
+          common: commonSnapshot,
+          reference: internalReference,
+          activity_id: String(activityResult.insertId),
+        };
+      });
+      if (result.http_status) return res.status(result.http_status).send(result);
+      return res.send(result);
+    } catch (error) {
+      console.error(`${path} failed:`, error);
+      if (error.code === "ER_DUP_ENTRY") return res.status(409).send({ error: "external_reference_already_used" });
+      return res.status(500).send({ error: "administrative reserve operation failed" });
+    }
+  });
+}
+
+createAdminReserveRoute({
+  path: "/admin/res/minus",
+  operationType: "reserve_minus",
+  activityType: 6,
+  sender: "ONEX",
+  receiver: "XADMIN",
+  calculator: calculateAdministrativeReserveExpense,
+});
+
+createAdminReserveRoute({
+  path: "/admin/res/plus",
+  operationType: "reserve_plus",
+  activityType: 7,
+  sender: "XADMIN",
+  receiver: "ONEX",
+  calculator: calculateAdministrativeReserveRecovery,
+});
+
+// A gift is a physical BSC-USD contribution already received outside the server.
+router.post("/admin/res/give", async (req, res) => {
+  const body = req.body || {};
+  const { pswd, pin } = body;
   if (
     pswd !== decrypt(admin_pswd, DB_CONFIG.password) ||
     pin !== decrypt(admin_pin, DB_CONFIG.password)
-  ) {
-    return res.send({ auth: "incorrect" });
-  }
+  ) return res.send({ auth: "incorrect" });
 
-  // Accept the former explicit common marker, but never route a username here.
-  if (req.body?.username !== undefined || (user !== undefined && (
-    typeof user !== "string" || user.trim().toLowerCase() !== "common"
-  ))) {
-    return res.status(400).send({ error: "use /admin/update-user-stock for individual user balances" });
+  const amount = parseAdminReserveAmount(body.amount);
+  const externalReference = typeof body.external_reference === "string"
+    ? body.external_reference.trim() : "";
+  if (!amount || externalReference.length < 1 || externalReference.length > 191) {
+    return res.status(400).send({ error: "invalid amount or external_reference" });
   }
-
-  const amountText = String(amount ?? "").trim();
-  if (!amountText || amountText.length > 100) {
-    return res.status(400).send({ error: "invalid amount" });
-  }
-  const amountValue = new BigNumber(amountText);
-  if (!amountValue.isFinite() || !amountValue.isGreaterThan(0)) {
-    return res.status(400).send({ error: "invalid amount" });
-  }
-
+  const proof = validateAdminExternalProof(body);
+  if (proof.error) return res.status(400).send({ error: proof.error });
   const [date, time] = getDate();
+  const now = Date.now();
+
   try {
     const result = await withTransaction(async (tx) => {
-      const [commonLockRows] = await tx.query(
-        "SELECT lock_name FROM system_locks WHERE lock_name=? FOR UPDATE",
-        ["common_state"],
-      );
-      if (commonLockRows.length === 0) {
-        throw new Error("The common-state lock row has not been initialized");
-      }
-
+      await lockCommonStateTx(tx);
       const common = await getLatestCommonTx(tx, true);
-      const [activeGlobalRuns] = await tx.query(
-        "SELECT id FROM global_disbursement_runs WHERE status IN ('announced','active','closed','manual_review','completed','resolved') ORDER BY id DESC LIMIT 1 FOR UPDATE",
-      );
-      if (activeGlobalRuns.length) return { error: "global disbursement in progress" };
-      const calculation = calculateAdminCommonStockUpdate(
-        amountValue,
-        common.total_units_price,
-        common.unit_price,
-        common.backed_units,
-        common.sys_inactive_init_asset || "0",
-        stock_limit,
-        SYSTEM_ADMIN_RESERVE_RATIO,
-      );
-      if (!calculation.available) {
-        return { limit: `BSC-USD ${calculation.availableValue.toFixed(18)}` };
-      }
+      const previous = await getAdminSettlementRetryTx(tx, externalReference, "gift", amount);
+      if (previous?.conflict) return { error: "external_reference_idempotency_conflict", http_status: 409 };
+      if (previous?.retry) return { ...previous, status: "ok" };
+      const gate = await checkAdminReserveGlobalStateTx(tx);
+      if (gate.blocked) return { error: gate.reason, http_status: 409 };
 
+      const calculation = calculateCommonReserveGift({
+        amountBscUsdValue: amount,
+        totalUnitsPriceValue: common.total_units_price,
+        unitPriceValue: common.unit_price,
+        backedUnitsValue: common.backed_units,
+      });
+      const newTotalGifts = new BigNumber(common.total_gifts || "0").plus(amount);
       await insertCommonSnapshotTx(tx, common, {
-        total_units_price: calculation.newTotalUnitsPrice.toFixed(),
-        unit_price: calculation.newUnitPrice.toFixed(),
-        backed_units: calculation.newBackedUnits.toFixed(),
-        sys_inactive_init_asset: calculation.newSysInactiveInitAsset.toFixed(),
+        total_units_price: calculation.newTotalUnitsPrice.toFixed(30),
+        unit_price: calculation.newUnitPrice.toFixed(30),
+        total_gifts: newTotalGifts.toFixed(30),
       }, date, time);
+      const [snapshotRows] = await tx.query("SELECT * FROM common ORDER BY id DESC LIMIT 1");
+      if (!snapshotRows.length) throw new Error("New common snapshot was not created");
+      const commonSnapshot = snapshotRows[0];
+      const internalReference = createFinancialReference("GIFT");
+      const [giftResult] = await tx.query(
+        `INSERT INTO gifts(
+           reference,external_reference,amount_bsc_usd,unit_price_before,unit_price_after,
+           common_id,admin_username,tx_hash,log_index,token_contract,sender_address,
+           recipient_address,created_at_ms
+         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [internalReference, externalReference, amount.toFixed(18), common.unit_price,
+          calculation.newUnitPrice.toFixed(30), commonSnapshot.id, "configured_admin",
+          proof.txHash, proof.logIndex, proof.tokenContract, proof.senderAddress,
+          proof.recipientAddress, now],
+      );
+      await insertAdminSettlementTx(tx, {
+        operationType: "gift", externalReference, internalReference, amount,
+        commonId: commonSnapshot.id, giftId: giftResult.insertId, proof, now,
+      });
+      const [giftRows] = await tx.query("SELECT * FROM gifts WHERE id=? LIMIT 1", [giftResult.insertId]);
       return {
-        total_units_price: "updated",
-        amount_xtu: amountValue.toFixed(18),
-        spent_initial_asset: calculation.spentInitialAsset.toFixed(30),
-        remaining_admin_initial_asset: calculation.remainingAdminInitialAsset.toFixed(30),
+        status: "ok",
+        common: commonSnapshot,
+        reference: internalReference,
+        gift: giftRows[0] || null,
       };
     });
-
+    if (result.http_status) return res.status(result.http_status).send(result);
     return res.send(result);
   } catch (error) {
-    console.error("Administrative common-stock expenditure failed:", error);
-    return res.send({ error: "error" });
+    console.error("/admin/res/give failed:", error);
+    if (error.code === "ER_DUP_ENTRY") return res.status(409).send({ error: "external_reference_already_used" });
+    return res.status(500).send({ error: "administrative reserve gift failed" });
   }
 });
 

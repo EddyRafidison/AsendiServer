@@ -41,106 +41,160 @@ function initialAssetToXtu(initialAssetValue, unitPriceValue) {
 }
 
 /**
- * Calculate the administrative reserve quota that remains protected in
- * common.backed_units. The cumulative spent amount is not a reserve balance;
- * it records how much of the original administrative quota has been consumed.
+ * Calculate the administrative backing still protected in common.backed_units.
+ * `adminExpenses` is the outstanding amount of administrative expenditure
+ * that has not yet been recovered; it is not a historical cumulative counter.
  */
-function calculateRemainingSystemAdminReserve(initialStockValue, ratioValue, spentInitialAssetValue) {
+function calculateRemainingAdministrativeBacking(initialStockValue, ratioValue, adminExpensesValue) {
   const initialStock = asBigNumber(initialStockValue, "STOCK_LIMIT");
   const ratio = asBigNumber(ratioValue, "SYSTEM_ADMIN_RESERVE_RATIO");
-  const spent = asBigNumber(spentInitialAssetValue, "common.sys_inactive_init_asset");
+  const adminExpenses = asBigNumber(adminExpensesValue, "common.admin_expens");
 
   if (!initialStock.isGreaterThan(0)) throw new RangeError("STOCK_LIMIT must be positive");
   if (ratio.isNegative() || !ratio.isLessThan(1)) {
     throw new RangeError("SYSTEM_ADMIN_RESERVE_RATIO must be between zero and one");
   }
-  if (spent.isNegative()) throw new RangeError("Administrative spending cannot be negative");
+  if (adminExpenses.isNegative()) throw new RangeError("common.admin_expens cannot be negative");
 
   const initialQuota = initialStock.multipliedBy(ratio);
-  if (spent.isGreaterThan(initialQuota)) {
-    throw new RangeError("common.sys_inactive_init_asset exceeds the initial administrative reserve quota");
+  if (adminExpenses.isGreaterThan(initialQuota)) {
+    throw new RangeError("common.admin_expens exceeds the administrative expenditure cap");
   }
   return {
     initialQuota,
-    spentInitialAsset: spent,
-    remainingInitialAsset: initialQuota.minus(spent),
+    adminExpensesInitialAsset: adminExpenses,
+    remainingInitialAsset: initialQuota.minus(adminExpenses),
   };
 }
 
-/**
- * Spend XTU from the protected administrative portion of common.backed_units.
- * The corresponding initial assets move to the cumulative system-spending
- * ledger. Numerator and denominator decrease proportionally, preserving the
- * current global price (subject only to storage precision).
- */
-function calculateAdminCommonStockUpdate(
-  amountValue,
+function roundInitialAsset(value) {
+  return new BigNumber(value).decimalPlaces(30, BigNumber.ROUND_DOWN);
+}
+
+/** Calculate an administrative reserve expenditure (ONEX -> XADMIN). */
+function calculateAdministrativeReserveExpense({
+  amountBscUsdValue,
   totalUnitsPriceValue,
   unitPriceValue,
   backedUnitsValue,
-  sysInactiveInitAssetValue,
+  adminExpensesValue,
   initialStockValue,
   ratioValue,
-) {
-  const amount = asBigNumber(amountValue, "administrative amount");
-  const totalUnitsPrice = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
-  const unitPrice = asBigNumber(unitPriceValue, "common.unit_price");
-  const backedUnits = asBigNumber(backedUnitsValue, "common.backed_units");
-  const sysInactive = asBigNumber(sysInactiveInitAssetValue, "common.sys_inactive_init_asset");
-  const reserve = calculateRemainingSystemAdminReserve(initialStockValue, ratioValue, sysInactive);
-  const calculatedPrice = calculateGlobalUnitPrice(totalUnitsPrice, backedUnits);
+}) {
+  const amount = asBigNumber(amountBscUsdValue, "administrative BSC-USD expenditure");
+  const total = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
+  const price = asBigNumber(unitPriceValue, "common.unit_price");
+  const backed = asBigNumber(backedUnitsValue, "common.backed_units");
+  const adminExpenses = asBigNumber(adminExpensesValue, "common.admin_expens");
+  const reserve = calculateRemainingAdministrativeBacking(initialStockValue, ratioValue, adminExpenses);
 
-  if (!amount.isGreaterThan(0)) throw new RangeError("Administrative amount must be positive");
-  if (!unitPrice.isGreaterThan(0)) throw new RangeError("common.unit_price must be positive");
-  if (calculatedPrice.minus(unitPrice).gt("0.000000000000000000000000000001")) {
-    throw new RangeError("common.unit_price must not be below total_units_price / backed_units");
+  if (!amount.isGreaterThan(0)) throw new RangeError("Administrative expenditure amount must be positive");
+  if (!total.isGreaterThan(amount)) throw new RangeError("Administrative expenditure must be lower than common.total_units_price");
+  if (!price.isGreaterThan(0) || !backed.isGreaterThan(0)) {
+    throw new RangeError("The global unit price and backed initial assets must remain positive");
   }
-
-  const availableInitialAsset = BigNumber.minimum(reserve.remainingInitialAsset, backedUnits);
-  const availableValue = availableInitialAsset.multipliedBy(unitPrice);
-  if (amount.isGreaterThan(availableValue)) {
+  const initialAssetAmount = roundInitialAsset(amount.dividedBy(price));
+  if (!initialAssetAmount.isGreaterThan(0)) {
+    throw new RangeError("Administrative expenditure is below the initial-asset storage precision");
+  }
+  if (initialAssetAmount.isGreaterThan(reserve.remainingInitialAsset)) {
     return {
       available: false,
-      availableValue,
-      availableInitialAsset,
-      spentInitialAsset: new BigNumber(0),
-      newTotalUnitsPrice: totalUnitsPrice,
-      newUnitPrice: unitPrice,
-      newBackedUnits: backedUnits,
-      newSysInactiveInitAsset: sysInactive,
-      remainingAdminInitialAsset: reserve.remainingInitialAsset,
+      availableInitialAsset: reserve.remainingInitialAsset,
+      availableValue: reserve.remainingInitialAsset.multipliedBy(price),
+      initialAssetAmount,
     };
   }
-  if (amount.isGreaterThanOrEqualTo(totalUnitsPrice)) {
-    throw new RangeError("Administrative amount must be lower than common.total_units_price");
-  }
 
-  const spentInitialAsset = xtuToInitialAsset(amount, unitPrice);
-  const newBackedUnits = backedUnits.minus(spentInitialAsset);
-  const newSysInactiveInitAsset = sysInactive.plus(spentInitialAsset);
-  const newTotalUnitsPrice = totalUnitsPrice.minus(amount);
-  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits, unitPrice);
-  const remainingAdminInitialAsset = reserve.remainingInitialAsset.minus(spentInitialAsset);
-
+  const newTotalUnitsPrice = total.minus(amount);
+  const newBackedUnits = backed.minus(initialAssetAmount);
+  const newAdminExpenses = adminExpenses.plus(initialAssetAmount);
+  const protectedAfter = reserve.initialQuota.minus(newAdminExpenses);
   if (
-    spentInitialAsset.isNegative() || newBackedUnits.isNegative() ||
-    newSysInactiveInitAsset.gt(reserve.initialQuota) || remainingAdminInitialAsset.isNegative() ||
-    newBackedUnits.lt(remainingAdminInitialAsset)
+    !newTotalUnitsPrice.isGreaterThan(0) || !newBackedUnits.isGreaterThan(0) ||
+    newAdminExpenses.gt(reserve.initialQuota) || newBackedUnits.lt(protectedAfter)
   ) {
-    throw new RangeError("Administrative expenditure would create an invalid reserve state");
+    throw new RangeError("Administrative expenditure would violate the protected reserve floor");
   }
-
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits, price);
   return {
     available: true,
-    availableValue,
-    availableInitialAsset,
-    spentInitialAsset,
+    amountBscUsd: amount,
+    initialAssetAmount,
     newTotalUnitsPrice,
-    newUnitPrice,
     newBackedUnits,
-    newSysInactiveInitAsset,
-    remainingAdminInitialAsset,
+    newAdminExpenses,
+    newUnitPrice,
+    protectedAdminBackingAfter: protectedAfter,
   };
+}
+
+/** Calculate the recovery of a previous administrative expenditure (XADMIN -> ONEX). */
+function calculateAdministrativeReserveRecovery({
+  amountBscUsdValue,
+  totalUnitsPriceValue,
+  unitPriceValue,
+  backedUnitsValue,
+  adminExpensesValue,
+  initialStockValue,
+  ratioValue,
+}) {
+  const amount = asBigNumber(amountBscUsdValue, "administrative BSC-USD recovery");
+  const total = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
+  const price = asBigNumber(unitPriceValue, "common.unit_price");
+  const backed = asBigNumber(backedUnitsValue, "common.backed_units");
+  const adminExpenses = asBigNumber(adminExpensesValue, "common.admin_expens");
+  const reserve = calculateRemainingAdministrativeBacking(initialStockValue, ratioValue, adminExpenses);
+
+  if (!amount.isGreaterThan(0)) throw new RangeError("Administrative recovery amount must be positive");
+  if (!price.isGreaterThan(0) || !backed.isGreaterThan(0) || !total.isGreaterThan(0)) {
+    throw new RangeError("Common reserve and global unit price must remain positive");
+  }
+  const maximumRecoverableValue = adminExpenses.multipliedBy(price);
+  if (amount.isGreaterThan(maximumRecoverableValue)) {
+    return {
+      available: false,
+      maximumRecoverableValue,
+      initialAssetAmount: roundInitialAsset(amount.dividedBy(price)),
+    };
+  }
+  const initialAssetAmount = roundInitialAsset(amount.dividedBy(price));
+  if (!initialAssetAmount.isGreaterThan(0) || initialAssetAmount.isGreaterThan(adminExpenses)) {
+    throw new RangeError("Administrative recovery exceeds the outstanding administrative expenditure");
+  }
+  const newTotalUnitsPrice = total.plus(amount);
+  const newBackedUnits = backed.plus(initialAssetAmount);
+  const newAdminExpenses = adminExpenses.minus(initialAssetAmount);
+  const protectedAfter = reserve.initialQuota.minus(newAdminExpenses);
+  if (newAdminExpenses.isNegative() || newBackedUnits.lt(protectedAfter)) {
+    throw new RangeError("Administrative recovery would create an invalid reserve state");
+  }
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, newBackedUnits, price);
+  return {
+    available: true,
+    amountBscUsd: amount,
+    initialAssetAmount,
+    maximumRecoverableValue,
+    newTotalUnitsPrice,
+    newBackedUnits,
+    newAdminExpenses,
+    newUnitPrice,
+    protectedAdminBackingAfter: protectedAfter,
+  };
+}
+
+/** Calculate a donation that increases valuation without issuing initial assets. */
+function calculateCommonReserveGift({ amountBscUsdValue, totalUnitsPriceValue, unitPriceValue, backedUnitsValue }) {
+  const amount = asBigNumber(amountBscUsdValue, "BSC-USD gift amount");
+  const total = asBigNumber(totalUnitsPriceValue, "common.total_units_price");
+  const price = asBigNumber(unitPriceValue, "common.unit_price");
+  const backed = asBigNumber(backedUnitsValue, "common.backed_units");
+  if (!amount.isGreaterThan(0) || !total.isGreaterThan(0) || !price.isGreaterThan(0) || !backed.isGreaterThan(0)) {
+    throw new RangeError("Gift, common reserve and global unit price must be positive");
+  }
+  const newTotalUnitsPrice = total.plus(amount);
+  const newUnitPrice = calculateGlobalUnitPrice(newTotalUnitsPrice, backed, price);
+  return { amountBscUsd: amount, newTotalUnitsPrice, newUnitPrice };
 }
 
 /**
@@ -460,8 +514,10 @@ module.exports = {
   calculateGlobalUnitPrice,
   xtuToInitialAsset,
   initialAssetToXtu,
-  calculateRemainingSystemAdminReserve,
-  calculateAdminCommonStockUpdate,
+  calculateRemainingAdministrativeBacking,
+  calculateAdministrativeReserveExpense,
+  calculateAdministrativeReserveRecovery,
+  calculateCommonReserveGift,
   calculateDistributableInitialAssets,
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,

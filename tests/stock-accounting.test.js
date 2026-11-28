@@ -6,8 +6,10 @@ const {
   calculateGlobalUnitPrice,
   xtuToInitialAsset,
   initialAssetToXtu,
-  calculateRemainingSystemAdminReserve,
-  calculateAdminCommonStockUpdate,
+  calculateRemainingAdministrativeBacking,
+  calculateAdministrativeReserveExpense,
+  calculateAdministrativeReserveRecovery,
+  calculateCommonReserveGift,
   calculateDistributableInitialAssets,
   calculateUnreservedDistributableInitialAssets,
   calculateTopUpReserveAllocation,
@@ -27,50 +29,72 @@ test("the global unit price is the reserve ratio, subject to a caller-supplied m
   assert.throws(() => xtuToInitialAsset("10", "0"), /unit_price/);
 });
 
-test("the initial administrative reserve is 10 percent and decreases only by recorded spending", () => {
-  const reserve = calculateRemainingSystemAdminReserve("10000000", "0.10", "100000");
-  assert.equal(fixed(reserve.initialQuota), "1000000");
-  assert.equal(fixed(reserve.remainingInitialAsset), "900000");
+test("the administrative reserve is 10 percent and protects only unrecovered expenses", () => {
+  const reserve = calculateRemainingAdministrativeBacking("18000000", "0.10", "100000");
+  assert.equal(fixed(reserve.initialQuota), "1800000");
+  assert.equal(fixed(reserve.remainingInitialAsset), "1700000");
   assert.throws(
-    () => calculateRemainingSystemAdminReserve("10000000", "0.10", "1000001"),
-    /exceeds the initial administrative reserve quota/,
+    () => calculateRemainingAdministrativeBacking("18000000", "0.10", "1800001"),
+    /exceeds the administrative expenditure cap/,
   );
 });
 
-test("administrative expenditure removes XTU and the matching initial-asset basis proportionally", () => {
-  const result = calculateAdminCommonStockUpdate(
-    "125000", "10000000", "1.25", "10000000", "0", "10000000", "0.10",
-  );
+test("administrative expenditure decreases BSC reserve and backing while preserving ordinary availability", () => {
+  const result = calculateAdministrativeReserveExpense({
+    amountBscUsdValue: "100000", totalUnitsPriceValue: "18000000", unitPriceValue: "1",
+    backedUnitsValue: "18000000", adminExpensesValue: "0", initialStockValue: "18000000", ratioValue: "0.10",
+  });
   assert.equal(result.available, true);
-  assert.equal(fixed(result.spentInitialAsset), "100000");
-  assert.equal(fixed(result.newBackedUnits), "9900000");
-  assert.equal(fixed(result.newSysInactiveInitAsset), "100000");
-  assert.equal(fixed(result.newTotalUnitsPrice), "9875000");
-  assert.equal(fixed(result.newUnitPrice), "1.25");
-  assert.equal(fixed(result.remainingAdminInitialAsset), "900000");
-});
-
-test("administrative expenditure cannot spend more than the remaining protected quota", () => {
-  const result = calculateAdminCommonStockUpdate(
-    "1000001", "10000000", "1", "10000000", "0", "10000000", "0.10",
-  );
-  assert.equal(result.available, false);
-  assert.equal(fixed(result.availableValue), "1000000");
-  assert.equal(fixed(result.newSysInactiveInitAsset), "0");
-});
-
-test("administrative expenditure preserves the distributable initial-asset capacity", () => {
-  const before = calculateDistributableInitialAssets("10000000", "0", "1000000");
-  assert.equal(fixed(before.distributableInitialAssets), "9000000");
-  const update = calculateAdminCommonStockUpdate(
-    "125000", "10000000", "1.25", "10000000", "0", "10000000", "0.10",
-  );
+  assert.equal(fixed(result.initialAssetAmount), "100000");
+  assert.equal(fixed(result.newTotalUnitsPrice), "17900000");
+  assert.equal(fixed(result.newBackedUnits), "17900000");
+  assert.equal(fixed(result.newAdminExpenses), "100000");
+  assert.equal(fixed(result.newUnitPrice), "1");
+  assert.equal(fixed(result.protectedAdminBackingAfter), "1700000");
+  const before = calculateDistributableInitialAssets("18000000", "0", "1800000");
   const after = calculateDistributableInitialAssets(
-    update.newBackedUnits, "0", update.remainingAdminInitialAsset,
+    result.newBackedUnits, "0", result.protectedAdminBackingAfter,
   );
-  assert.equal(fixed(after.distributableInitialAssets), "9000000");
+  assert.equal(fixed(before.distributableInitialAssets), fixed(after.distributableInitialAssets));
 });
 
+test("administrative expenditure cannot exceed the unused 1.8-million initial-asset cap", () => {
+  const result = calculateAdministrativeReserveExpense({
+    amountBscUsdValue: "1800001", totalUnitsPriceValue: "18000000", unitPriceValue: "1",
+    backedUnitsValue: "18000000", adminExpensesValue: "0", initialStockValue: "18000000", ratioValue: "0.10",
+  });
+  assert.equal(result.available, false);
+  assert.equal(fixed(result.availableValue), "1800000");
+});
+
+test("a recovery reverses the outstanding administrative expenditure proportionally", () => {
+  const result = calculateAdministrativeReserveRecovery({
+    amountBscUsdValue: "25000", totalUnitsPriceValue: "17900000", unitPriceValue: "1",
+    backedUnitsValue: "17900000", adminExpensesValue: "100000", initialStockValue: "18000000", ratioValue: "0.10",
+  });
+  assert.equal(result.available, true);
+  assert.equal(fixed(result.newTotalUnitsPrice), "17925000");
+  assert.equal(fixed(result.newBackedUnits), "17925000");
+  assert.equal(fixed(result.newAdminExpenses), "75000");
+  assert.equal(fixed(result.newUnitPrice), "1");
+});
+
+test("a recovery cannot exceed the BSC-USD value of outstanding administrative expenses", () => {
+  const result = calculateAdministrativeReserveRecovery({
+    amountBscUsdValue: "100001", totalUnitsPriceValue: "17900000", unitPriceValue: "1",
+    backedUnitsValue: "17900000", adminExpensesValue: "100000", initialStockValue: "18000000", ratioValue: "0.10",
+  });
+  assert.equal(result.available, false);
+  assert.equal(fixed(result.maximumRecoverableValue), "100000");
+});
+
+test("a gift increases common valuation and cumulative gifts without issuing initial assets", () => {
+  const result = calculateCommonReserveGift({
+    amountBscUsdValue: "100000", totalUnitsPriceValue: "18000000", unitPriceValue: "1", backedUnitsValue: "18000000",
+  });
+  assert.equal(fixed(result.newTotalUnitsPrice), "18100000");
+  assert.equal(fixed(result.newUnitPrice), "1.005555555555555555555555555556");
+});
 
 test("pending disbursements reserve their initial-asset capacity against later system top-ups", () => {
   const result = calculateUnreservedDistributableInitialAssets("100", "50", "10", "35");

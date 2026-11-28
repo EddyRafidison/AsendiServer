@@ -5,7 +5,7 @@ const mysql = require("mysql2");
 const BigNumber = require("bignumber.js");
 const { getDate, getDateBefore } = require("./utils");
 const { MAX_DEFAULT_STOCK, SYSTEM_ADMIN_RESERVE_RATIO } = require("./deposit-policy");
-const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
+const { calculateRemainingAdministrativeBacking } = require("./stock-accounting");
 
 const OneX = "ONEX";
 const maxStockDefault = MAX_DEFAULT_STOCK;
@@ -226,7 +226,9 @@ const TABLES = [
     xtu_wallets_reserved DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'BSC-USD cover provisionally reserved for in-flight XTU withdrawals',
     backed_units DECIMAL(50,30) NOT NULL DEFAULT 18000000,
     inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
-    sys_inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0,
+    sys_inactive_init_asset DECIMAL(50,30) NOT NULL DEFAULT 0 COMMENT 'Legacy cumulative field; not used for administrative reserve availability',
+    admin_expens DECIMAL(50,30) NOT NULL DEFAULT 0,
+    total_gifts DECIMAL(50,30) NOT NULL DEFAULT 0,
     sellers_res DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_run_balance DECIMAL(50,30) NOT NULL DEFAULT 0,
     total_bnb_fee_actual DECIMAL(50,30) NOT NULL DEFAULT 0,
@@ -249,6 +251,148 @@ const TABLES = [
     created_at_ms BIGINT UNSIGNED NOT NULL,
     updated_at_ms BIGINT UNSIGNED NOT NULL,
     KEY idx_common_price_events_status_id(status,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS gifts(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    reference VARCHAR(64) NOT NULL,
+    external_reference VARCHAR(191) NOT NULL,
+    amount_bsc_usd DECIMAL(36,18) NOT NULL,
+    unit_price_before DECIMAL(50,30) NOT NULL,
+    unit_price_after DECIMAL(50,30) NOT NULL,
+    common_id BIGINT UNSIGNED NOT NULL,
+    admin_username VARCHAR(64) NOT NULL,
+    tx_hash CHAR(66) NULL,
+    log_index INT UNSIGNED NULL,
+    token_contract CHAR(42) NULL,
+    sender_address CHAR(42) NULL,
+    recipient_address CHAR(42) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_gifts_reference(reference),
+    UNIQUE KEY uq_gifts_external_reference(external_reference),
+    KEY idx_gifts_common(common_id,id),
+    KEY idx_gifts_created(created_at_ms,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS admin_external_settlements(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    operation_type VARCHAR(24) NOT NULL,
+    external_reference VARCHAR(191) NOT NULL,
+    internal_reference VARCHAR(64) NOT NULL,
+    amount_bsc_usd DECIMAL(36,18) NOT NULL,
+    common_id BIGINT UNSIGNED NOT NULL,
+    activity_id BIGINT UNSIGNED NULL,
+    gift_id BIGINT UNSIGNED NULL,
+    admin_username VARCHAR(64) NOT NULL,
+    tx_hash CHAR(66) NULL,
+    log_index INT UNSIGNED NULL,
+    token_contract CHAR(42) NULL,
+    sender_address CHAR(42) NULL,
+    recipient_address CHAR(42) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_admin_settlement_external_reference(external_reference),
+    UNIQUE KEY uq_admin_settlement_internal_reference(internal_reference),
+    KEY idx_admin_settlement_operation(operation_type,id),
+    KEY idx_admin_settlement_common(common_id,id),
+    KEY idx_admin_settlement_created(created_at_ms,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS automatic_refund_groups(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    reference VARCHAR(64) NOT NULL,
+    chain_id BIGINT UNSIGNED NOT NULL,
+    token_contract CHAR(42) NOT NULL,
+    asset_code VARCHAR(12) NOT NULL,
+    sender_address CHAR(42) NOT NULL,
+    payout_address CHAR(42) NOT NULL,
+    username VARCHAR(30) NULL,
+    categories_json LONGTEXT NOT NULL,
+    total_gross_received DECIMAL(36,18) NOT NULL DEFAULT 0,
+    total_refund_fee DECIMAL(36,18) NOT NULL DEFAULT 0,
+    gas_estimated_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    gas_actual_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    net_estimated_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    net_paid_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    residual_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    status VARCHAR(24) NOT NULL DEFAULT 'collecting',
+    manual_review_reason TEXT NULL,
+    first_event_at_ms BIGINT UNSIGNED NOT NULL,
+    last_event_at_ms BIGINT UNSIGNED NOT NULL,
+    next_eligible_at_ms BIGINT UNSIGNED NOT NULL,
+    next_review_at_ms BIGINT UNSIGNED NOT NULL,
+    reserved_payout_id BIGINT UNSIGNED NULL,
+    last_error TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_automatic_refund_group_reference(reference),
+    UNIQUE KEY uq_automatic_refund_group_key(chain_id,token_contract,asset_code,sender_address),
+    KEY idx_automatic_refund_group_status(status,next_eligible_at_ms,id),
+    KEY idx_automatic_refund_group_review(status,next_review_at_ms,id),
+    KEY idx_automatic_refund_group_sender(sender_address,token_contract,asset_code,id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS automatic_refund_group_events(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    group_id BIGINT UNSIGNED NOT NULL,
+    source_table VARCHAR(64) NOT NULL,
+    source_id BIGINT UNSIGNED NOT NULL,
+    source_kind VARCHAR(32) NOT NULL,
+    event_identity CHAR(64) NOT NULL,
+    chain_id BIGINT UNSIGNED NOT NULL,
+    token_contract CHAR(42) NOT NULL,
+    asset_code VARCHAR(12) NOT NULL,
+    sender_address CHAR(42) NOT NULL,
+    payout_address CHAR(42) NOT NULL,
+    tx_hash CHAR(66) NOT NULL,
+    log_index INT UNSIGNED NOT NULL,
+    block_number BIGINT UNSIGNED NOT NULL,
+    block_hash CHAR(66) NOT NULL,
+    gross_amount DECIMAL(36,18) NOT NULL,
+    refund_fee_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    net_received_amount DECIMAL(36,18) NOT NULL,
+    reserved_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    refunded_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    residual_amount DECIMAL(36,18) NOT NULL DEFAULT 0,
+    finalized_at_ms BIGINT UNSIGNED NOT NULL,
+    refund_eligible_at_ms BIGINT UNSIGNED NOT NULL,
+    review_due_at_ms BIGINT UNSIGNED NOT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'collecting',
+    reason_code VARCHAR(64) NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    UNIQUE KEY uq_automatic_refund_event_identity(event_identity),
+    UNIQUE KEY uq_automatic_refund_source(source_table,source_id),
+    KEY idx_automatic_refund_event_group(group_id,status,id),
+    KEY idx_automatic_refund_event_review(status,review_due_at_ms,id),
+    CONSTRAINT fk_automatic_refund_event_group FOREIGN KEY(group_id) REFERENCES automatic_refund_groups(id)
+  ) ENGINE=InnoDB`,
+  `CREATE TABLE IF NOT EXISTS automatic_refund_payouts(
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    group_id BIGINT UNSIGNED NOT NULL,
+    reference VARCHAR(64) NOT NULL,
+    chain_id BIGINT UNSIGNED NOT NULL,
+    token_contract CHAR(42) NOT NULL,
+    asset_code VARCHAR(12) NOT NULL,
+    payout_address CHAR(42) NOT NULL,
+    gross_reserved_amount DECIMAL(36,18) NOT NULL,
+    refund_fee_amount DECIMAL(36,18) NOT NULL,
+    gas_estimated_amount DECIMAL(36,18) NOT NULL,
+    net_amount DECIMAL(36,18) NOT NULL,
+    estimated_gas_fee_bnb DECIMAL(50,30) NOT NULL DEFAULT 0,
+    bnb_usd_price DECIMAL(36,18) NOT NULL DEFAULT 0,
+    actual_gas_fee_bnb DECIMAL(50,30) NULL,
+    actual_gas_fee_token DECIMAL(36,18) NULL,
+    nonce BIGINT UNSIGNED NULL,
+    raw_tx LONGTEXT NULL,
+    tx_hash CHAR(66) NULL,
+    block_number BIGINT UNSIGNED NULL,
+    receipt_json LONGTEXT NULL,
+    status VARCHAR(24) NOT NULL DEFAULT 'queued',
+    last_error TEXT NULL,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+    confirmed_at_ms BIGINT UNSIGNED NULL,
+    UNIQUE KEY uq_automatic_refund_payout_reference(reference),
+    UNIQUE KEY uq_automatic_refund_payout_tx_hash(tx_hash),
+    KEY idx_automatic_refund_payout_status(status,id),
+    KEY idx_automatic_refund_payout_group(group_id,id),
+    CONSTRAINT fk_automatic_refund_payout_group FOREIGN KEY(group_id) REFERENCES automatic_refund_groups(id)
   ) ENGINE=InnoDB`,
   `CREATE TABLE IF NOT EXISTS user_price_state(
     username VARCHAR(30) PRIMARY KEY,
@@ -1528,11 +1672,16 @@ async function assertLatestSchema() {
     ],
     telegram_bot_state: ["state_key", "state_value", "updated_at_ms"],
     common: [
-      "total_units_price", "unit_price", "xtu_wallets", "xtu_wallets_reserved", "backed_units", "inactive_init_asset", "sys_inactive_init_asset",
+      "total_units_price", "unit_price", "xtu_wallets", "xtu_wallets_reserved", "backed_units", "inactive_init_asset", "sys_inactive_init_asset", "admin_expens", "total_gifts",
       "sellers_res", "total_run_balance", "total_tfees", "total_tfees_bsc_cost_usd", "total_tfees_bsc_uncovered_usd", "total_bnb_fee_actual", "total_bnb_fee_estimated",
       "total_bnb_fee_actual_value", "total_bnb_fee_estimated_value", "record_date", "record_time",
     ],
     common_price_events: ["old_price", "new_price", "status", "last_username", "processed_at_ms", "created_at_ms", "updated_at_ms"],
+    gifts: ["reference", "external_reference", "amount_bsc_usd", "unit_price_before", "unit_price_after", "common_id", "admin_username", "tx_hash", "log_index", "token_contract", "sender_address", "recipient_address", "created_at_ms"],
+    admin_external_settlements: ["operation_type", "external_reference", "internal_reference", "amount_bsc_usd", "common_id", "activity_id", "gift_id", "admin_username", "tx_hash", "log_index", "token_contract", "sender_address", "recipient_address", "created_at_ms"],
+    automatic_refund_groups: ["reference", "chain_id", "token_contract", "asset_code", "sender_address", "payout_address", "username", "categories_json", "total_gross_received", "total_refund_fee", "gas_estimated_amount", "gas_actual_amount", "net_estimated_amount", "net_paid_amount", "residual_amount", "status", "manual_review_reason", "first_event_at_ms", "last_event_at_ms", "next_eligible_at_ms", "next_review_at_ms", "reserved_payout_id", "last_error", "created_at_ms", "updated_at_ms"],
+    automatic_refund_group_events: ["group_id", "source_table", "source_id", "source_kind", "event_identity", "chain_id", "token_contract", "asset_code", "sender_address", "payout_address", "tx_hash", "log_index", "block_number", "block_hash", "gross_amount", "refund_fee_amount", "net_received_amount", "reserved_amount", "refunded_amount", "residual_amount", "finalized_at_ms", "refund_eligible_at_ms", "review_due_at_ms", "status", "reason_code", "created_at_ms", "updated_at_ms"],
+    automatic_refund_payouts: ["group_id", "reference", "chain_id", "token_contract", "asset_code", "payout_address", "gross_reserved_amount", "refund_fee_amount", "gas_estimated_amount", "net_amount", "estimated_gas_fee_bnb", "bnb_usd_price", "actual_gas_fee_bnb", "actual_gas_fee_token", "nonce", "raw_tx", "tx_hash", "block_number", "receipt_json", "status", "last_error", "created_at_ms", "updated_at_ms", "confirmed_at_ms"],
     user_price_state: ["username", "cycle_number", "base_price", "tfees_rate", "remuneration_rate", "target_price", "status", "start_price_event_id", "triggered_price", "triggered_at_ms", "frozen_price", "sale_group_base_initial_asset", "sale_group_volume_initial_asset", "sale_group_fee_weighted", "purchase_group_base_initial_asset", "purchase_group_volume_initial_asset", "purchase_group_fee_weighted", "updated_at_ms", "created_at_ms"],
     user_price_cycle_history: ["username", "cycle_number", "base_price", "tfees_rate", "remuneration_rate", "target_price", "start_price_event_id", "triggered_price", "triggered_at_ms", "principal_before_operation", "operation_direction", "operation_volume_initial_asset", "resumed_at_ms", "resume_reason", "created_at_ms", "updated_at_ms"],
     users_seller_campaigns: [
@@ -1774,21 +1923,21 @@ async function initDbIfEmpty() {
   const commonRows = await db.queryAsync("SELECT id FROM common ORDER BY id DESC LIMIT 1");
   if (!commonRows.length) {
     await db.queryAsync(
-      "INSERT INTO common(total_units_price,unit_price,xtu_wallets,xtu_wallets_reserved,backed_units,inactive_init_asset,sys_inactive_init_asset,sellers_res,total_run_balance,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-      [initialTotal.toFixed(), initialTotal.dividedBy(initialBacked).toFixed(30), "0", "0", initialBacked.toFixed(), "0", "0", "0", "0", "0", date, time],
+      "INSERT INTO common(total_units_price,unit_price,xtu_wallets,xtu_wallets_reserved,backed_units,inactive_init_asset,sys_inactive_init_asset,admin_expens,total_gifts,sellers_res,total_run_balance,total_tfees,record_date,record_time) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      [initialTotal.toFixed(), initialTotal.dividedBy(initialBacked).toFixed(30), "0", "0", initialBacked.toFixed(), "0", "0", "0", "0", "0", "0", "0", date, time],
     );
   }
 
   const latestCommonRows = await db.queryAsync(
-    `SELECT total_units_price,unit_price,backed_units,inactive_init_asset,sys_inactive_init_asset
+    `SELECT total_units_price,unit_price,backed_units,inactive_init_asset,admin_expens
      FROM common ORDER BY id DESC LIMIT 1`,
   );
   if (!latestCommonRows.length) throw new Error("Common reserve initialization failed");
   const latestCommon = latestCommonRows[0];
-  const remainingAdminReserve = calculateRemainingSystemAdminReserve(
+  const remainingAdminReserve = calculateRemainingAdministrativeBacking(
     initialTotal,
     SYSTEM_ADMIN_RESERVE_RATIO,
-    latestCommon.sys_inactive_init_asset || "0",
+    latestCommon.admin_expens || "0",
   ).remainingInitialAsset;
   const currentBackedInitialAssets = new BigNumber(latestCommon.backed_units);
   const currentTotalUnitsPrice = new BigNumber(latestCommon.total_units_price);

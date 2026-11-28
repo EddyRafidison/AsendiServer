@@ -32,7 +32,7 @@ const { getBnbUsdPrice, startBnbUsdPriceOracle } = require("./bsc-price-oracle")
 const { attachEthersRpcMetrics } = require("./bsc-rpc-ethers-metrics");
 const { createBscFeeLimitError, getConfiguredMaxBscTxFeeUsd } = require("./bsc-transaction-policy");
 const { SYSTEM_ADMIN_RESERVE_RATIO } = require("./deposit-policy");
-const { calculateRemainingSystemAdminReserve } = require("./stock-accounting");
+const { calculateRemainingAdministrativeBacking } = require("./stock-accounting");
 const {
   calculateRequiredAdminBonusReserve,
 } = require("./global-disbursement-policy");
@@ -981,14 +981,14 @@ async function finalizeSuccessfulPayout(db, jobId, receipt) {
         feeValueXtu: feeInitialAssets.multipliedBy(unitPrice),
         bonusInitialAsset: isGlobalDisbursement ? bonusInitialAssets : new BigNumber(0),
       },
-      common.sys_inactive_init_asset || "0",
+      common.admin_expens || "0",
       unitPrice,
     );
     if (isGlobalDisbursement) {
-      const remainingAdminReserve = calculateRemainingSystemAdminReserve(
+      const remainingAdminReserve = calculateRemainingAdministrativeBacking(
         INITIAL_STOCK_LIMIT,
         SYSTEM_ADMIN_RESERVE_RATIO,
-        common.sys_inactive_init_asset || "0",
+        common.admin_expens || "0",
       ).remainingInitialAsset;
       if (bonusInitialAssets.gt(remainingAdminReserve)) {
         throw new Error("Global bonus exceeds the remaining protected administrative reserve");

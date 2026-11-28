@@ -11,6 +11,8 @@ const COMMON_NUMERIC_FIELDS = Object.freeze([
   "backed_units",
   "inactive_init_asset",
   "sys_inactive_init_asset",
+  "admin_expens",
+  "total_gifts",
   "sellers_res",
   "total_run_balance",
   "total_tfees",
@@ -68,21 +70,20 @@ async function insertCommonSnapshotTx(tx, currentRow, overrides, date, time) {
     currentRow?.sys_inactive_init_asset || "0",
     values.sys_inactive_init_asset,
   );
+  assertNonNegative("admin_expens", values.admin_expens);
   assertCumulativeNonNegative(
-    "total_tfees",
-    currentRow?.total_tfees || "0",
-    values.total_tfees,
+    "total_gifts",
+    currentRow?.total_gifts || "0",
+    values.total_gifts,
   );
-  assertCumulativeNonNegative(
-    "total_tfees_bsc_cost_usd",
-    currentRow?.total_tfees_bsc_cost_usd || "0",
-    values.total_tfees_bsc_cost_usd,
-  );
-  assertCumulativeNonNegative(
-    "total_tfees_bsc_uncovered_usd",
-    currentRow?.total_tfees_bsc_uncovered_usd || "0",
-    values.total_tfees_bsc_uncovered_usd,
-  );
+  const stockLimit = new BigNumber(process.env.STOCK_LIMIT || "18000000");
+  const adminRatio = new BigNumber(process.env.SYSTEM_ADMIN_RESERVE_RATIO || "0.10");
+  const adminCap = stockLimit.multipliedBy(adminRatio);
+  if (!stockLimit.isFinite() || !stockLimit.isGreaterThan(0) || !adminRatio.isFinite() ||
+      adminRatio.isNegative() || !adminRatio.isLessThan(1) ||
+      new BigNumber(values.admin_expens).isGreaterThan(adminCap)) {
+    throw new RangeError("common.admin_expens exceeds the configured administrative expenditure cap.");
+  }
   const columns = [...COMMON_NUMERIC_FIELDS, "record_date", "record_time"];
   const placeholders = columns.map(() => "?").join(",");
   const params = [...COMMON_NUMERIC_FIELDS.map((field) => values[field]), date, time];

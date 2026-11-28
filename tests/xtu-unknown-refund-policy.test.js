@@ -8,7 +8,7 @@ test("XTU unknown refund uses Hot Wallet net receipt as base, then deducts gas a
   const quote = calculateXtuUnknownRefundQuote({
     hotWalletReceivedAmount: "99.9",
     estimatedGasFeeBscUsd: "0.1",
-    minimumRefundNet: "0.8",
+    minimumRefundNet: "1",
   });
   assert.equal(quote.baseReceivedAmount.toFixed(8), "99.90000000");
   assert.equal(quote.gasEquivalentXtu.toFixed(8), "0.10000000");
@@ -22,14 +22,14 @@ test("XTU unknown refund rejects gas that consumes the received Hot Wallet amoun
   assert.throws(() => calculateXtuUnknownRefundQuote({
     hotWalletReceivedAmount: "0.4",
     estimatedGasFeeBscUsd: "0.4",
-    minimumRefundNet: "0.8",
+    minimumRefundNet: "1",
   }), /Estimated gas consumes/);
 });
 
-test("XTU unknown refund enforces the existing minimum on the beneficiary net amount", () => {
+test("XTU unknown refund enforces the fixed one-unit minimum on the beneficiary net amount", () => {
   assert.throws(() => calculateXtuUnknownRefundQuote({
     hotWalletReceivedAmount: "1.0",
     estimatedGasFeeBscUsd: "0.4",
-    minimumRefundNet: "0.8",
+    minimumRefundNet: "1",
   }), (error) => error.code === "XTU_REFUND_BELOW_MINIMUM");
 });

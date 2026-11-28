@@ -3,7 +3,7 @@
 const BigNumber = require("bignumber.js");
 const {
   calculateGlobalUnitPrice,
-  calculateRemainingSystemAdminReserve,
+  calculateRemainingAdministrativeBacking,
 } = require("./stock-accounting");
 
 const PUBLIC_DEPOSIT_SNAPSHOT_SQL = `
@@ -12,7 +12,7 @@ const PUBLIC_DEPOSIT_SNAPSHOT_SQL = `
     c.unit_price,
     c.backed_units,
     c.inactive_init_asset,
-    c.sys_inactive_init_asset,
+    c.admin_expens,
     c.sellers_res,
     COALESCE((
       SELECT SUM(l.remaining_initial_asset)
@@ -49,7 +49,7 @@ function calculateAvailableDepositReserveXtu({
   unitPrice,
   backedUnits,
   inactiveInitialAsset,
-  sysInactiveInitialAsset,
+  adminExpensesInitialAsset,
   totalSellerReserve,
   activeSellerInitialAsset,
   pendingDisbursementInitialAsset = 0,
@@ -60,7 +60,7 @@ function calculateAvailableDepositReserveXtu({
   const price = asFiniteNonNegative(unitPrice, "common.unit_price");
   const backed = asFiniteNonNegative(backedUnits, "common.backed_units");
   const inactive = asFiniteNonNegative(inactiveInitialAsset, "common.inactive_init_asset");
-  const spentAdmin = asFiniteNonNegative(sysInactiveInitialAsset, "common.sys_inactive_init_asset");
+  const adminExpenses = asFiniteNonNegative(adminExpensesInitialAsset, "common.admin_expens");
   const sellerLedger = asFiniteNonNegative(totalSellerReserve, "common.sellers_res");
   const activeSellers = asFiniteNonNegative(activeSellerInitialAsset, "active seller reserve lots");
   const pendingDisbursements = asFiniteNonNegative(
@@ -80,10 +80,10 @@ function calculateAvailableDepositReserveXtu({
     throw new RangeError("common.unit_price must not be below common.total_units_price / common.backed_units");
   }
 
-  const adminReserve = calculateRemainingSystemAdminReserve(
+  const adminReserve = calculateRemainingAdministrativeBacking(
     stockLimit,
     adminReserveRatio,
-    spentAdmin,
+    adminExpenses,
   );
   if (backed.isLessThan(adminReserve.remainingInitialAsset)) {
     throw new RangeError("common.backed_units is below the remaining administrative reserve quota");
@@ -146,7 +146,7 @@ function createDepositAvailabilityCache({ ttlMs = 1000, now = Date.now } = {}) {
         unitPrice: row.unit_price,
         backedUnits: row.backed_units,
         inactiveInitialAsset: row.inactive_init_asset,
-        sysInactiveInitialAsset: row.sys_inactive_init_asset,
+        adminExpensesInitialAsset: row.admin_expens,
         totalSellerReserve: row.sellers_res,
         activeSellerInitialAsset: row.active_seller_initial_asset,
         pendingDisbursementInitialAsset: row.pending_disbursement_initial_asset,

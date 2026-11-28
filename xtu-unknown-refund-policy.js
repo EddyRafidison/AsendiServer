@@ -33,7 +33,7 @@ function toRaw(value) {
 function calculateXtuUnknownRefundQuote({
   hotWalletReceivedAmount,
   estimatedGasFeeBscUsd,
-  minimumRefundNet = "0.8",
+  minimumRefundNet = "1",
 }) {
   const baseAmount = amount(hotWalletReceivedAmount, "Hot Wallet received XTU amount");
   const gasEquivalentXtu = amount(estimatedGasFeeBscUsd, "Estimated BNB gas equivalent", true);

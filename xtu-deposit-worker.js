@@ -44,7 +44,7 @@ const { calculateXtuUnknownRefundQuote } = require("./xtu-unknown-refund-policy"
 const {
   calculateDepositFundingAllocation,
   calculateSellerOnlyDepositFundingAllocation,
-  calculateRemainingSystemAdminReserve,
+  calculateRemainingAdministrativeBacking,
 } = require("./stock-accounting");
 const { getActiveSellerReserveAvailableTx, consumeSellerReserveTx } = require("./seller-accounting");
 const { getUserPriceStateTx, previewUserOperationCapacity } = require("./user-price-accounting");
@@ -577,15 +577,15 @@ async function allocateXtuDepositFundingTx(tx, batch, credit, common, sellerAvai
     ? calculateDepositFundingAllocation(
       credit.creditedInitialAsset, common.unit_price, common.backed_units,
       common.inactive_init_asset, sellerAvailable, common.total_units_price,
-      calculateRemainingSystemAdminReserve(
-        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+      calculateRemainingAdministrativeBacking(
+        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.admin_expens || "0",
       ).remainingInitialAsset, 0,
     )
     : calculateSellerOnlyDepositFundingAllocation(
       credit.creditedInitialAsset, common.unit_price, common.backed_units,
       common.inactive_init_asset, sellerAvailable, common.total_units_price,
-      calculateRemainingSystemAdminReserve(
-        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.sys_inactive_init_asset || "0",
+      calculateRemainingAdministrativeBacking(
+        stock_limit, SYSTEM_ADMIN_RESERVE_RATIO, common.admin_expens || "0",
       ).remainingInitialAsset,
     );
   return { ...purchaseState, allocation };
